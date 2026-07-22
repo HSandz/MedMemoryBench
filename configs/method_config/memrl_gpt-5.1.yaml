@@ -41,9 +41,9 @@ agent_params:
   weight_q: 0.5                      # Weight for Q-value in hybrid scoring
   utility_mix_lambda: 0.6            # Lambda for utility mixing
 
-  max_input_tokens: 8000             # Max input tokens for memorization
-  max_context_tokens: 20480        # Max context window tokens
-  max_question_tokens: 4096          # Max question tokens
+  max_input_tokens: 120480            # Max input tokens for memorization
+  max_context_tokens: 120480        # Max context window tokens
+  max_question_tokens: 120480          # Max question tokens
 
 embedding:
   provider: "local"

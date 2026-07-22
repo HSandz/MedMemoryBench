@@ -845,10 +845,43 @@ class HippoRAGAgent(BaseAgent):
                 logger.info("[HippoRAG] Preparing retrieval objects...")
                 hipporag.prepare_retrieval_objects()
 
-            solutions, responses, metadata = hipporag.rag_qa(queries=[question])
+            # Step 1: Retrieve documents
+            query_solutions = hipporag.retrieve(queries=[question])
 
-            if solutions and len(solutions) > 0:
-                solution = solutions[0]
+            if query_solutions and len(query_solutions) > 0:
+                solution = query_solutions[0]
+
+                # Step 2: Truncate retrieved docs to fit max_context_tokens
+                raw_docs = solution.docs[:self.qa_top_k] if solution.docs else []
+                if raw_docs and self.max_context_tokens > 0:
+                    question_tokens = self.count_tokens(question)
+                    # Reserve tokens for question, QA prompt template overhead, and output
+                    available_tokens = max(self.max_context_tokens - question_tokens - 500, 0)
+
+                    truncated_docs = []
+                    current_tokens = 0
+                    for doc in raw_docs:
+                        doc_text = doc if isinstance(doc, str) else str(doc)
+                        # Account for the "Wikipedia Title: {doc}\n\n" format used by HippoRAG QA
+                        format_overhead = self.count_tokens("Wikipedia Title: \n\n")
+                        doc_tokens = self.count_tokens(doc_text)
+
+                        if current_tokens + doc_tokens + format_overhead <= available_tokens:
+                            truncated_docs.append(doc_text)
+                            current_tokens += doc_tokens + format_overhead
+                        else:
+                            remaining = available_tokens - current_tokens - format_overhead
+                            if remaining > 100:
+                                tokens = self._tokenizer.encode(doc_text)
+                                truncated_docs.append(self._tokenizer.decode(tokens[:remaining]))
+                            break
+                    solution.docs = truncated_docs
+                else:
+                    solution.docs = raw_docs
+
+                # Step 3: QA with truncated docs
+                qa_solutions, responses, metadata = hipporag.qa([solution])
+                solution = qa_solutions[0] if qa_solutions else solution
                 answer = solution.answer if hasattr(solution, 'answer') else str(solution)
 
                 retrieved_docs = []

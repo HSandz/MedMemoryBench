@@ -584,6 +584,18 @@ class LettaAgent(BaseAgent):
 
         start_time = time.time()
         try:
+            # Switch to restricted context_window for query phase (token budget truncation)
+            # Only update once per agent (build phase is always completed before query phase)
+            if self.max_context_tokens and self.max_context_tokens < self.context_window:
+                if not getattr(self, '_query_context_applied', {}).get(agent_id):
+                    query_llm_config = self._build_llm_config().model_copy(
+                        update={"context_window": self.max_context_tokens}
+                    )
+                    self._client.update_agent(agent_id, llm_config=query_llm_config)
+                    if not hasattr(self, '_query_context_applied'):
+                        self._query_context_applied = {}
+                    self._query_context_applied[agent_id] = True
+
             response = self._client.user_message(agent_id=agent_id, message=query_message)
             query_time = time.time() - start_time
         except Exception as e:

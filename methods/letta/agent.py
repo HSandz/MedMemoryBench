@@ -829,6 +829,52 @@ class Agent(BaseAgent):
             in_context_messages = self.agent_manager.get_in_context_messages(agent_id=self.agent_state.id, actor=self.user)
             input_message_sequence = in_context_messages + messages
 
+            # --- Token budget truncation: enforce context_window as hard limit ---
+            context_limit = self.agent_state.llm_config.context_window
+            if context_limit and len(input_message_sequence) > 2 and messages:
+                token_counts = get_token_counts_for_messages(input_message_sequence)
+                total_tokens = sum(token_counts)
+                if total_tokens > context_limit:
+                    num_new = len(messages)
+                    system_tokens = token_counts[0]
+                    new_msg_tokens = sum(token_counts[-num_new:])
+                    available_for_middle = context_limit - system_tokens - new_msg_tokens
+
+                    middle_msgs = input_message_sequence[1:-num_new]
+                    middle_token_counts = list(token_counts[1:-num_new])
+
+                    # Group messages into atomic units (assistant+tool_calls paired with subsequent tool responses)
+                    groups = []  # each group: (list_of_msgs, total_tokens)
+                    i = 0
+                    while i < len(middle_msgs):
+                        msg = middle_msgs[i]
+                        group_msgs = [msg]
+                        group_tokens = middle_token_counts[i]
+                        # If this is an assistant message with tool_calls, bundle subsequent tool messages
+                        if hasattr(msg, 'role') and msg.role == "assistant" and msg.tool_calls:
+                            j = i + 1
+                            while j < len(middle_msgs) and hasattr(middle_msgs[j], 'role') and middle_msgs[j].role == "tool":
+                                group_msgs.append(middle_msgs[j])
+                                group_tokens += middle_token_counts[j]
+                                j += 1
+                            i = j
+                        else:
+                            i += 1
+                        groups.append((group_msgs, group_tokens))
+
+                    # Keep as many recent groups as fit within budget
+                    kept_middle = []
+                    middle_token_sum = 0
+                    for group_msgs, group_tokens in reversed(groups):
+                        if middle_token_sum + group_tokens <= available_for_middle:
+                            kept_middle = group_msgs + kept_middle
+                            middle_token_sum += group_tokens
+                        else:
+                            break
+
+                    input_message_sequence = [input_message_sequence[0]] + kept_middle + list(messages)
+            # --- End token budget truncation ---
+
             if (
                 len(input_message_sequence) > 1
                 and input_message_sequence[-1].role != "user"

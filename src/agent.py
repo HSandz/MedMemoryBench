@@ -24,6 +24,7 @@ class AgentManager:
         "lightmem": ("methods.lightmem_agent", "LightMemAgent"),
         "remem": ("methods.remem_agent", "RememAgent"),
         "hipporag": ("methods.hipporag_agent", "HippoRAGAgent"),
+        "q2q": ("methods.q2q_agent", "Q2QBenchAgent"),
     }
 
     def __init__(
@@ -435,6 +436,28 @@ class AgentManager:
                 if self.method_config.embedding.base_url:
                     params["embedding_base_url"] = self.method_config.embedding.base_url
 
+        elif method_key == "q2q":
+            params.update({
+                "q2q_project_path": agent_params.get("q2q_project_path", ""),
+                "alpha": agent_params.get("alpha", 0.7),
+                "top_k_per_sub": agent_params.get("top_k_per_sub", 20),
+                "top_n": agent_params.get("top_n", 5),
+                "top_k_q2c": agent_params.get("top_k_q2c", 3),
+                "num_fake_queries": agent_params.get("num_fake_queries", 10),
+                "storage_backend": agent_params.get("storage_backend", "chromadb"),
+                "language": agent_params.get("language", "zh"),
+                "max_context_tokens": agent_params.get("max_context_tokens", 120000),
+                "embedding_device": agent_params.get("embedding_device", "cpu"),
+                "version_threshold": agent_params.get("version_threshold", 0.80),
+                "version_chain_depth": agent_params.get("version_chain_depth", 3),
+                "fq_confidence_threshold": agent_params.get("fq_confidence_threshold", 0.80),
+            })
+            if self.method_config.embedding:
+                params["embedding_model"] = self.method_config.embedding.model
+                params["embedding_provider"] = self.method_config.embedding.provider
+                if self.method_config.embedding.model_path:
+                    params["embedding_model_path"] = self.method_config.embedding.model_path
+
         return params
 
     def send_message(
@@ -442,7 +465,8 @@ class AgentManager:
         message: str,
         memorizing: bool = False,
         context_id: Optional[int] = None,
-        is_last_session: bool = False, 
+        is_last_session: bool = False,
+        **kwargs,
     ) -> Any:
         if context_id is not None and context_id != self._context_id:
             self._context_id = context_id

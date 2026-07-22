@@ -4,7 +4,7 @@ language: "en"
 
 data:
   root_dir: "data/locomo/data"
-  data_file: "locomo_noise.json"
+  data_file: "locomo10.json"
 
 evaluation:
   mode: "independent"

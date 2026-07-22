@@ -187,7 +187,7 @@ class MethodConfig:
         raw_agent_params = data.get("agent_params", {})
         _path_keys = {
             "amem_embedding_model", "embedding_model_path", "model_path",
-            "working_dir",
+            "working_dir", "q2q_project_path",
         }
         resolved_agent_params = {}
         for k, v in raw_agent_params.items():

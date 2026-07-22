@@ -62,3 +62,6 @@ env/
 
 # Logs
 *.log
+
+/methods/q2q_agent.py
+/configs/method_config/q2q_gpt-5.1.yaml
