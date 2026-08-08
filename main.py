@@ -30,6 +30,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-datasets", action="store_true", help="List available datasets")
     parser.add_argument("--list-agents", action="store_true", help="List available agent types")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument(
+        "--batch-api",
+        action="store_true",
+        help="Use Vertex Gemini Batch API for eligible offline evaluator stages",
+    )
+    parser.add_argument(
+        "--batch-gcs-uri",
+        type=str,
+        help="Cloud Storage staging prefix (defaults to GOOGLE_BATCH_GCS_URI)",
+    )
+    parser.add_argument(
+        "--batch-wait",
+        action="store_true",
+        help="Poll Vertex batch jobs instead of exiting for --resume",
+    )
 
     return parser.parse_args()
 
@@ -112,6 +127,9 @@ def main() -> int:
             dry_run=args.dry_run,
             verbose=not args.quiet,
             resume=args.resume,
+            batch_api=args.batch_api,
+            batch_gcs_uri=args.batch_gcs_uri,
+            batch_wait=args.batch_wait,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}")
@@ -133,6 +151,12 @@ def main() -> int:
         print("\nInterrupted")
         return 130
     except Exception as e:
+        from utils.vertex_batch import VertexBatchPending
+        if isinstance(e, VertexBatchPending):
+            print(f"\nBatch job submitted: {e.job_name}")
+            print(f"Manifest: {e.manifest_path}")
+            print("Resume after completion with the same command plus --resume --batch-api.")
+            return 0
         print(f"\nFailed: {e}")
         import traceback
         traceback.print_exc()

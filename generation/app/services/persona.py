@@ -140,7 +140,7 @@ class PersonaService:
                 messages = [
                     {
                         "role": "system",
-                        "content": "你是一个专业的用户画像扩写助手。请严格按照要求的JSON格式输出。",
+                        "content": "You are a professional user portrait expansion assistant. Please strictly follow the required JSON format output.",
                     },
                     {"role": "user", "content": prompt},
                 ]

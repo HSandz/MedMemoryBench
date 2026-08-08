@@ -42,212 +42,209 @@ def _get_report_for_persona(persona_id: int) -> dict | None:
     return None
 
 
-PERSONA_ENRICH_PROMPT = """你是一位资深的医疗健康用户研究专家，擅长构建真实、立体的用户画像。
+PERSONA_ENRICH_PROMPT = """You are a senior medical and health user research expert, good at building real and three-dimensional user portraits.
 
-## 任务
-基于原始画像信息，生成丰富且内在一致的扩展画像。
+## Task
+Generate rich and internally consistent extended portraits based on original portrait information.
 
-## 原始画像
+## Original image
 - ID: {id}
-- 类型: {type_name}
-- 性别: {gender}
-- 核心特征: {core_feature}
-- 健康目标: {health_goals}
-- 分类: {category}
+- Type: {type_name}
+- Gender: {gender}
+- Core Features: {core_feature}
+- Health Goals: {health_goals}
+- Category: {category}
 
-## 生成流程
+## Generation process
 
-### 第一步：画像理解
+### Step one: Image understanding
 <thinking>
-分析此用户的核心特征，推断：
-1. 最可能的年龄段和职业背景
-2. 与核心特征匹配的生活方式
-3. 导致当前健康状况的可能原因
-4. 此类用户的典型使用场景
+Analyze the core characteristics of this user and infer:
+1. Most likely age group and career background
+2. A lifestyle that matches core characteristics
+3. Possible causes of current health condition
+4. Typical usage scenarios for this type of users
 </thinking>
 
-### 第二步：一致性构建
-基于第一步的分析，确保以下逻辑链条成立：
-- 职业 → 生活方式 → 健康状况
-- 年龄 → 关注重点
+### Step 2: Consistency Construction
+Based on the analysis in the first step, ensure that the following logical chain is established:
+- Career → Lifestyle → Health
+- Age → focus
 
-### 第三步：生成扩展字段
-按以下结构生成，每个字段都应与核心特征呼应：
+### Step 3: Generate extended fields
+Generated according to the following structure, each field should echo the core characteristics:
 
-**基础信息**
-- age_range: 字符串，年龄范围（如 "35-40岁"）
-- occupation_detail: 字符串，职业详情（用"某XX公司/机构"替代真实名称）
+**Basic information**
+- age_range: string, age range (such as "35-40 years old")
+- occupation_detail: string, occupation details (replace the real name with "a certain XX company/organization")
 
-**lifestyle（生活方式）** - 必须是对象
-- sleep_pattern: 字符串，睡眠模式
-- diet_habits: 字符串，饮食习惯
-- exercise_frequency: 字符串，运动频率
-- stress_level: 字符串，压力水平及来源
+**lifestyle** - must be an object
+- sleep_pattern: string, sleep mode
+- diet_habits: string, eating habits
+- exercise_frequency: string, exercise frequency
+- stress_level: string, stress level and source
 
-**health_details（健康细节）** - 必须是对象
-- medical_history: 字符串数组，病史（不要包含具体年份，使用相对描述如"初期"、"确诊后"等）
+**health_details** - must be an object
+- medical_history: string array, medical history (do not include specific years, use relative descriptions such as "early stage", "after diagnosis", etc.)
 
-**background_story（背景故事）**
-- 字符串，150-250字，第三人称叙述
-- 整合以上信息，呈现完整的健康管理情境
-- 不要包含具体年份，使用相对时间描述
+**background_story (background story)**
+- String, 150-250 words, third person narrative
+- Integrate the above information to present a complete health management situation
+- Do not include specific years, use relative time descriptions
 
-### 第四步：自我检查
+### Step 4: Self-examination
 <validation>
-逐项检查：
-□ 无具体年份时间表达（如 2024年）？使用相对描述即可
-□ 无真实公司/机构名称？
-□ 所有数组字段都是数组类型（用 [] 包裹）？
-□ 所有对象字段都是对象类型（用 {{}} 包裹）？
-□ 各字段之间无逻辑矛盾？
-□ 未生成任何对话风格相关字段？
+Check item by item:□ No specific year and time expression (such as 2024)? Just use relative descriptions
+□ No real company/organization name?
+□ Are all array fields of array type (wrapped with [])?
+□ Are all object fields of object type (wrapped with {{}})?
+□ Are there no logical contradictions between the fields?
+□ No conversation style related fields generated?
 </validation>
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记（不要 ```json）
-2. 不要在 JSON 前后添加任何说明文字
-3. 确保 JSON 语法正确（正确的引号、逗号、括号匹配）
-4. 所有字符串值使用双引号
-5. 数组用 []，对象用 {{}}
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags (no ```json)
+2. Do not add any description text before or after JSON
+3. Make sure the JSON syntax is correct (correct quotes, commas, brackets matching)
+4. Use double quotes for all string values
+5. Use [] for arrays and {{}} for objects.
 
-## 输出格式
+## Output format
 {{
-    "age_range": "年龄范围字符串",
-    "occupation_detail": "职业详情字符串",
+    "age_range": "Age range string",
+    "occupation_detail": "Occupation details string",
     "lifestyle": {{
-        "sleep_pattern": "睡眠模式字符串",
-        "diet_habits": "饮食习惯字符串",
-        "exercise_frequency": "运动频率字符串",
-        "stress_level": "压力水平字符串"
+        "sleep_pattern": "Sleep mode string",
+        "diet_habits": "diet habits string",
+        "exercise_frequency": "Exercise frequency string",
+        "stress_level": "stress level string"
     }},
     "health_details": {{
-        "medical_history": ["病史1", "病史2"]
+        "medical_history": ["Medical History 1", "Medical History 2"]
     }},
-    "background_story": "背景故事字符串"
+    "background_story": "Background story string"
 }}"""
 
 
-PERSONA_ENRICH_PROMPT_WITH_REPORT = """你是一位资深的医疗健康用户研究专家，擅长构建真实、立体的用户画像。
+PERSONA_ENRICH_PROMPT_WITH_REPORT = """You are a senior medical and health user research expert, good at building real and three-dimensional user portraits.
 
-## 任务
-基于原始画像信息和疾病进展报告，生成丰富且内在一致的扩展画像。
+## Task
+Generate rich and internally consistent extended profiles based on original profile information and disease progression reports.
 
-## 原始画像
+## Original image
 - ID: {id}
-- 类型: {type_name}
-- 性别: {gender}
-- 核心特征: {core_feature}
-- 健康目标: {health_goals}
-- 分类: {category}
+- Type: {type_name}
+- Gender: {gender}
+- Core Features: {core_feature}
+- Health Goals: {health_goals}
+- Category: {category}
 
-## ⚠️ 疾病进展报告（Deep-Research Report）
-以下是该患者的详细疾病进展报告，你需要基于此报告生成画像。
+## ⚠️ Disease Progress Report (Deep-Research Report)
+Below is a detailed disease progression report for this patient, based on which you need to generate a portrait.
 
-**注意：报告中的具体年份/月份仅供参考疾病发展时间线，在生成画像时请转换为相对时间描述（如"初期"、"确诊后3个月"等），不要在输出中包含具体年份。**
+**Note: The specific year/month in the report is only for reference of the disease development timeline. When generating the portrait, please convert it to a relative time description (such as "early stage", "3 months after diagnosis", etc.), and do not include the specific year in the output. **
 
-### 第一阶段：误诊与代偿期
+### The first stage: misdiagnosis and compensation period
 {phase_1}
 
-### 第二阶段：病情转折点
+### The second stage: turning point of the disease
 {phase_2}
 
-### 第三阶段：并发症演变
+### Phase Three: Evolution of Complications
 {phase_3}
 
-### 第四阶段：生活方式与心理挑战
+### The fourth stage: lifestyle and psychological challenges
 {phase_4}
 
-### 第五阶段：复诊与疾病好转
+### The fifth stage: follow-up examination and disease improvement
 {phase_5}
 
-## 生成流程
+## Generation process
 
-### 第一步：报告理解
+### Step One: Report Understanding
 <thinking>
-分析疾病进展报告，理解：
-1. 患者的核心疾病及其特殊性（如SAID vs T2DM）
-2. 疾病发展的各个阶段和关键转折点
-3. 误诊期的症状表现和患者认知
-4. 确诊后的治疗方案变化
-5. 患者面临的生活和心理挑战
+Analyze disease progression reports and understand:
+1. The patient’s core disease and its specificities (such as SAID vs T2DM)
+2. Various stages and key turning points of disease development
+3. Symptom manifestations and patient cognition during the misdiagnosis period
+4. Changes in treatment plan after diagnosis
+5. Life and psychological challenges faced by patients
 </thinking>
 
-### 第二步：画像与报告对齐
-确保生成的画像与报告中的疾病进展逻辑一致：
-- 职业特点与报告中描述的工作环境一致
-- 生活方式与报告中描述的习惯一致
-- 病史描述要体现报告中的疾病阶段特点
+### Step 2: Align the portrait with the report
+Ensure that the generated portrait is logically consistent with the reported disease progression:
+- Occupational characteristics are consistent with the work environment described in the report
+- Lifestyle consistent with the habits described in the report
+- The medical history description should reflect the characteristics of the disease stage in the report
 
-### 第三步：生成扩展字段
+### Step 3: Generate extended fields
 
-**基础信息**
-- age_range: 字符串，年龄范围（如 "28-32岁"）
-- occupation_detail: 字符串，职业详情（用"某XX公司/机构"替代真实名称）
+**Basic information**
+- age_range: string, age range (such as "28-32 years old")- occupation_detail: string, occupation details (replace the real name with "a certain XX company/organization")
 
-**lifestyle（生活方式）** - 必须是对象
-- sleep_pattern: 字符串，睡眠模式（参考报告中的描述）
-- diet_habits: 字符串，饮食习惯（参考报告中的描述）
-- exercise_frequency: 字符串，运动频率
-- stress_level: 字符串，压力水平及来源（参考报告中的描述）
+**lifestyle** - must be an object
+- sleep_pattern: string, sleep mode (refer to the description in the report)
+- diet_habits: string, dietary habits (refer to the description in the report)
+- exercise_frequency: string, exercise frequency
+- stress_level: string, stress level and source (refer to the description in the report)
 
-**health_details（健康细节）** - 必须是对象
-- medical_history: 字符串数组，病史
-  - **重要**：不要包含具体年份！使用相对时间描述
-  - **重要**：病史要体现疾病进展的阶段性，但不要提前泄露后期信息
-  - 示例：["初期出现间歇性视力模糊和口渴症状", "曾被误诊为2型糖尿病", "后经详细检查确诊为自身免疫性糖尿病"]
-- disease_progression: 对象，疾病进展阶段摘要
-  - phase_1: 字符串，第一阶段（误诊与代偿期）的关键信息摘要
-  - phase_2: 字符串，第二阶段（病情转折点）的关键信息摘要
-  - phase_3: 字符串，第三阶段（并发症演变）的关键信息摘要
-  - phase_4: 字符串，第四阶段（生活方式与心理挑战）的关键信息摘要
-  - phase_5: 字符串，第五阶段（复诊与疾病好转）的关键信息摘要
+**health_details** - must be an object
+- medical_history: string array, medical history
+  - **Important**: Do not include specific years! Use relative time descriptions
+  - **Important**: The medical history should reflect the stages of disease progression, but do not reveal later information in advance.
+  - Example: ["Initial symptoms of intermittent blurred vision and thirst", "Was misdiagnosed as type 2 diabetes", "Later, after detailed examination, it was diagnosed as autoimmune diabetes"]
+- disease_progression: object, summary of disease progression stages
+  - phase_1: string, summary of key information in the first phase (misdiagnosis and compensation period)
+  - phase_2: string, summary of key information in the second stage (turning point of illness)
+  - phase_3: string, summary of key information in the third phase (evolution of complications)
+  - phase_4: string, summary of key information in the fourth phase (lifestyle and psychological challenges)
+  - phase_5: string, summary of key information in the fifth phase (re-diagnosis and disease improvement)
 
-**background_story（背景故事）**
-- 字符串，150-250字，第三人称叙述
-- 整合以上信息，呈现完整的健康管理情境
-- **不要包含具体年份**，使用相对时间描述
-- **不要提前泄露疾病的真实诊断**（如在故事中直接说"患有SAID"）
+**background_story (background story)**
+- String, 150-250 words, third person narrative
+- Integrate the above information to present a complete health management situation
+- **Don't include a specific year**, use relative time descriptions
+- **Don't reveal the true diagnosis of the disease ahead of time** (e.g. directly say "has SAID" in the story)
 
-### 第四步：自我检查
+### Step 4: Self-examination
 <validation>
-逐项检查：
-□ 无具体年份时间表达（如 2024年、去年8月）？
-□ 无真实公司/机构名称？
-□ 所有数组字段都是数组类型（用 [] 包裹）？
-□ 所有对象字段都是对象类型（用 {{}} 包裹）？
-□ disease_progression 包含所有五个阶段？
-□ 各字段之间无逻辑矛盾？
-□ 背景故事没有提前泄露疾病的真实诊断？
+Check item by item:
+□ No specific year and time expression (such as 2024, August last year)?
+□ No real company/organization name?
+□ Are all array fields of array type (wrapped with [])?
+□ Are all object fields of object type (wrapped with {{}})?□ disease_progression contains all five stages?
+□ Are there no logical contradictions between the fields?
+□ Did the backstory not reveal the true diagnosis of the disease in advance?
 </validation>
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记（不要 ```json）
-2. 不要在 JSON 前后添加任何说明文字
-3. 确保 JSON 语法正确（正确的引号、逗号、括号匹配）
-4. 所有字符串值使用双引号
-5. 数组用 []，对象用 {{}}
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags (no ```json)
+2. Do not add any description text before or after JSON
+3. Make sure the JSON syntax is correct (correct quotes, commas, brackets matching)
+4. Use double quotes for all string values
+5. Use [] for arrays and {{}} for objects.
 
-## 输出格式
+## Output format
 {{
-    "age_range": "年龄范围字符串",
-    "occupation_detail": "职业详情字符串",
+    "age_range": "Age range string",
+    "occupation_detail": "Occupation details string",
     "lifestyle": {{
-        "sleep_pattern": "睡眠模式字符串",
-        "diet_habits": "饮食习惯字符串",
-        "exercise_frequency": "运动频率字符串",
-        "stress_level": "压力水平字符串"
+        "sleep_pattern": "Sleep mode string",
+        "diet_habits": "diet habits string",
+        "exercise_frequency": "Exercise frequency string",
+        "stress_level": "stress level string"
     }},
     "health_details": {{
-        "medical_history": ["病史1", "病史2", "病史3"],
+        "medical_history": ["Medical History 1", "Medical History 2", "Medical History 3"],
         "disease_progression": {{
-            "phase_1": "第一阶段摘要",
-            "phase_2": "第二阶段摘要",
-            "phase_3": "第三阶段摘要",
-            "phase_4": "第四阶段摘要",
-            "phase_5": "第五阶段摘要"
+            "phase_1": "Summary of the first phase",
+            "phase_2": "Second phase summary",
+            "phase_3": "Summary of the third phase",
+            "phase_4": "Summary of the fourth phase",
+            "phase_5": "Summary of the fifth phase"
         }}
     }},
-    "background_story": "背景故事字符串"
+    "background_story": "Background story string"
 }}"""
 
 
@@ -269,7 +266,7 @@ def build_enrich_prompt(persona: dict) -> str:
             type_name=persona["type_name"],
             gender=persona["gender"],
             core_feature=persona["core_feature"],
-            health_goals="、".join(persona["health_goals"]),
+            health_goals=", ".join(persona["health_goals"]),
             category=persona["category"],
             phase_1=report.get("phase_1", ""),
             phase_2=report.get("phase_2", ""),
@@ -283,6 +280,6 @@ def build_enrich_prompt(persona: dict) -> str:
             type_name=persona["type_name"],
             gender=persona["gender"],
             core_feature=persona["core_feature"],
-            health_goals="、".join(persona["health_goals"]),
+            health_goals=", ".join(persona["health_goals"]),
             category=persona["category"],
         )

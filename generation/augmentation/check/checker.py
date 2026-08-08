@@ -133,7 +133,7 @@ class QueryDifficultyChecker:
 
         base_info = persona_info.get("base_info", {})
         if base_info:
-            lines.append("【基本Info】")
+            lines.append("【Basic Info】")
             if base_info.get("type_name"):
                 lines.append(f"- 疾病Type: {base_info['type_name']}")
             if base_info.get("gender"):
@@ -146,7 +146,7 @@ class QueryDifficultyChecker:
 
         enriched = persona_info.get("enriched_data", {})
         if enriched:
-            lines.append("【详细Info】")
+            lines.append("【Detailed Info】")
             if enriched.get("age_range"):
                 lines.append(f"- 年龄范围: {enriched['age_range']}")
             if enriched.get("occupation_detail"):
@@ -154,7 +154,7 @@ class QueryDifficultyChecker:
 
             lifestyle = enriched.get("lifestyle", {})
             if lifestyle:
-                lines.append("- 生活方式:")
+                lines.append("- Lifestyle:")
                 if lifestyle.get("sleep_pattern"):
                     lines.append(f"  · 睡眠: {lifestyle['sleep_pattern']}")
                 if lifestyle.get("diet_habits"):
@@ -167,7 +167,7 @@ class QueryDifficultyChecker:
             health = enriched.get("health_details", {})
             if health:
                 if health.get("medical_history"):
-                    lines.append("- 病史:")
+                    lines.append("- Medical history:")
                     for item in health["medical_history"]:
                         lines.append(f"  · {item}")
 
@@ -186,13 +186,13 @@ class QueryDifficultyChecker:
         """Get model response to a question (without conversation memory)."""
         persona_text = self._format_persona_info(persona_info) if persona_info else "No patient persona info"
 
-        system_prompt = """你是一位经验丰富的医学专家。你将回答一些关于特定患者的医疗问题。
+        system_prompt = """You are an experienced medical professional. You will answer some medical questions about a specific patient.
 
-注意：你只有患者的基本画像信息，没有该患者的具体对话记录和详细就诊历史。
-请基于患者画像和问题本身进行推理，结合你的医学常识来尝试回答问题。
+Note: You only have the patient's basic portrait information, but do not have the patient's specific conversation records and detailed medical history.
+Please make inferences based on the patient portrait and the question itself, and combine your medical knowledge to try to answer the question.
 
-如果问题涉及具体的检测数值、用药剂量、就诊日期等细节信息，请根据患者画像和医学常识进行合理推测。
-回答要简洁准确。"""
+If the question involves detailed information such as specific test values, medication dosage, date of treatment, etc., please make reasonable assumptions based on the patient's portrait and medical common sense.
+Answers should be concise and precise."""
 
         full_question = question
 

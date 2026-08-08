@@ -595,7 +595,7 @@ class DataGenerator:
                     "selected_event_id": event.id,
                     "event_summary": event.event[:50] if event.event else "",
                     "selection_reason": f"Chronological order (date: {event.event_date})",
-                    "dialogue_angle": "首诊",
+                    "dialogue_angle": "First consultation",
                 })
 
             if len(event_selections) < session_count:

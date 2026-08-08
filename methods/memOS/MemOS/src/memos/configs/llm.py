@@ -157,6 +157,9 @@ class LLMConfigFactory(BaseConfig):
         "deepseek": DeepSeekLLMConfig,
         "minimax": MinimaxLLMConfig,
         "openai_new": OpenAIResponsesLLMConfig,
+        "gemini": BaseLLMConfig,
+        "vertex": BaseLLMConfig,
+        "vertex_ai": BaseLLMConfig,
     }
 
     @field_validator("backend")

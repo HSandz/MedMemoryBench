@@ -1,0 +1,15 @@
+# Zep Agent Configuration using Gemini Enterprise Agent Platform.
+
+method_name: "zep"
+method_type: "agentic_memory"
+description: "Zep Agent using Gemini Enterprise Agent Platform for final answers"
+
+model:
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 1.0
+  max_completion_tokens: 100000
+
+agent_params:
+  retrieve_num: 5
+  chunk_size: 512

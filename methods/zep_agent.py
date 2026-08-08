@@ -363,8 +363,8 @@ class ZepAgent(BaseAgent):
 
         return message
 
-    def _llm_response(self, context: str, question: str) -> str:
-        """Call LLM to generate response."""
+    def _build_llm_messages(self, context: str, question: str) -> List[Dict[str, str]]:
+        """Build the final answer prompt shared by real-time and batch calls."""
         system_prompt = "You are a helpful expert assistant answering questions from users based on the provided context."
 
         # Reserve output and prompt overhead, then distribute remaining budget between question and context.
@@ -392,7 +392,11 @@ Answer:"""
             {"role": "user", "content": prompt}
         ]
 
-        response = self._llm_client.chat(messages)
+        return messages
+
+    def _llm_response(self, context: str, question: str) -> str:
+        """Call LLM to generate response."""
+        response = self._llm_client.chat(self._build_llm_messages(context, question))
         return response.content
 
     def query(
@@ -404,6 +408,25 @@ Answer:"""
         **kwargs
     ) -> AgentResponse:
         """Query the agent."""
+        prepared = self.prepare_batch_query(
+            question,
+            system_message=system_message,
+            sub_dataset=sub_dataset,
+            query_id=query_id,
+            **kwargs,
+        )
+        response = self._llm_client.chat(prepared["messages"])
+        return self.finalize_batch_query(prepared, response.content)
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        sub_dataset: str = "default",
+        query_id: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Retrieve from Zep now and batch only the final Gemini generation."""
         # Retrieve relevant memories
         retrieval_results = self._retrieve(question, sub_dataset)
 
@@ -415,31 +438,39 @@ Answer:"""
             episodes=retrieval_results["episodes"],
         )
 
-        # Call LLM to generate response
-        response_text = self._llm_response(retrieved_context, question)
-
-        # Save retrieval results
-        if query_id is not None:
-            self._save_retrieval_context(
-                query_id=query_id,
-                context_id=self._context_id,
-                sub_dataset=sub_dataset,
-                retrieved_context=retrieved_context,
-                response=response_text,
-            )
-
-        return AgentResponse(
-            output=response_text,
-            query_time=0.0,
-            retrieved_count=self.retrieve_num,
-            retrieved_memories=[
+        messages = self._build_llm_messages(retrieved_context, question)
+        return {
+            "messages": messages,
+            "retrieved_context": retrieved_context,
+            "query_id": query_id,
+            "sub_dataset": sub_dataset,
+            "retrieved_count": self.retrieve_num,
+            "retrieved_memories": [
                 {"memory": retrieved_context, "type": "zep_retrieval"}
-            ],  # Fix: properly set field
-            extra={
+            ],
+            "extra": {
                 "method": "zep",
                 "graph_id": self._current_graph_id,
                 "thread_id": self._current_thread_id,
-            }
+            },
+        }
+
+    def finalize_batch_query(self, prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Persist retrieval diagnostics after a real-time or batch answer arrives."""
+        if prepared["query_id"] is not None:
+            self._save_retrieval_context(
+                query_id=prepared["query_id"],
+                context_id=self._context_id,
+                sub_dataset=prepared["sub_dataset"],
+                retrieved_context=prepared["retrieved_context"],
+                response=content,
+            )
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def _save_retrieval_context(

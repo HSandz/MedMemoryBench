@@ -56,6 +56,7 @@ class MemOSAgent(BaseAgent):
         super().__init__(model, temperature, max_tokens, **kwargs)
 
         self.retrieve_num = retrieve_num
+        self._provider = provider.lower()
         self.memos_backend = memos_backend
         self.memos_model = memos_model or model
         self.text_mem_type = text_mem_type
@@ -147,27 +148,33 @@ class MemOSAgent(BaseAgent):
         Returns:
             MemoryConfigFactory instance with configured backend.
         """
+        use_vertex_gemini = self._provider in {"gemini", "vertex", "vertex_ai"}
+        extractor_config: Dict[str, Any] = {
+            "model_name_or_path": self.model if use_vertex_gemini else self.memos_model,
+            "temperature": self.DEFAULT_EXTRACTOR_TEMPERATURE,
+            "max_tokens": self.DEFAULT_EXTRACTOR_MAX_TOKENS,
+        }
+        if not use_vertex_gemini:
+            extractor_config.update({
+                "api_key": self._memos_api_key,
+                "api_base": self._memos_api_base,
+            })
+
         base_config: Dict[str, Any] = {
             "extractor_llm": {
-                "backend": self.memos_backend,
-                "config": {
-                    "model_name_or_path": self.memos_model,
-                    "temperature": self.DEFAULT_EXTRACTOR_TEMPERATURE,
-                    "max_tokens": self.DEFAULT_EXTRACTOR_MAX_TOKENS,
-                    "api_key": self._memos_api_key,
-                    "api_base": self._memos_api_base,
-                },
+                "backend": self._provider if use_vertex_gemini else self.memos_backend,
+                "config": extractor_config,
             }
         }
 
-        # Add embedder and vector_db config for types that need it
+        # Local model IDs are valid SentenceTransformer inputs and download from
+        # Hugging Face when no on-disk model path is available.
         if self.text_mem_type in ["general_text", "tree_text", "simple_tree_text", "pref_text"]:
-            # Embedder configuration
-            if self.embedding_provider == "local" and self.embedding_model_path:
+            if self.embedding_provider.lower() in {"local", "huggingface"}:
                 base_config["embedder"] = {
                     "backend": "sentence_transformer",
                     "config": {
-                        "model_name_or_path": self.embedding_model_path,
+                        "model_name_or_path": self.embedding_model_path or self.embedding_model,
                         "embedding_dims": self.embedding_dim,
                         "trust_remote_code": True,
                     },
@@ -368,6 +375,25 @@ class MemOSAgent(BaseAgent):
         Returns:
             AgentResponse with answer and retrieval details.
         """
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
+        response = self._llm_client.chat(prepared["messages"])
+        result = self.finalize_batch_query(prepared, response.content)
+        # The original timer starts after question truncation, immediately
+        # before MemOS search. Preserve that reporting boundary in real-time.
+        result.query_time = time.time() - prepared["query_start"]
+        result.extra["tokens_used"] = {
+            "input": response.input_tokens,
+            "output": response.output_tokens,
+        }
+        return result
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Perform read-only MemOS retrieval before a final batchable answer."""
         context_id = self._get_context_id()
         memory_system = self._get_memory_system(context_id)
 
@@ -431,27 +457,40 @@ class MemOSAgent(BaseAgent):
             )
             full_question = f"[Retrieved MemOS Memories]\n{memory_context}\n\n[Question]\n{bounded_question}"
 
-        # Use llm_client for final response generation
-        messages = format_messages(full_question, system_message)
-        response = self._llm_client.chat(messages)
-
-        total_time = time.time() - start_time
-
-        return AgentResponse(
-            output=response.content,
-            query_time=total_time,
-            retrieved_count=len(retrieved_memories),
-            retrieved_memories=retrieved_memories,
-            extra={
+        return {
+            "messages": format_messages(full_question, system_message),
+            "retrieved_count": len(retrieved_memories),
+            "retrieved_memories": retrieved_memories,
+            "query_start": start_time,
+            "extra": {
                 "method": "memos",
                 "text_mem_type": self.text_mem_type,
                 "search_time": search_time,
-                "tokens_used": {
-                    "input": response.input_tokens,
-                    "output": response.output_tokens,
-                },
             },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Return MemOS's normal response fields after final generation."""
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
+
+    @staticmethod
+    def record_batch_query_usage(
+        response: AgentResponse,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Keep batch result diagnostics identical to MemOS real-time queries."""
+        response.extra["tokens_used"] = {
+            "input": input_tokens,
+            "output": output_tokens,
+        }
 
     def reset(self) -> None:
         """Reset agent state and clear all memory systems."""

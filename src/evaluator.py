@@ -1,8 +1,10 @@
+import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
-from src.config import MethodConfig, DatasetConfig, ConfigLoader, PROJECT_ROOT
+from src.config import MethodConfig, DatasetConfig, ConfigLoader, PROJECT_ROOT, get_api_config
 from src.result import EvaluationReport, ResultCollector
 from utils.logger import get_eval_logger
 
@@ -34,12 +36,18 @@ class Evaluator:
         dry_run: bool = False,
         verbose: bool = True,
         resume: bool = False,
+        batch_api: bool = False,
+        batch_gcs_uri: Optional[str] = None,
+        batch_wait: bool = False,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
         self.dry_run = dry_run
         self.verbose = verbose
         self.resume = resume
+        self.batch_api = batch_api
+        self.batch_gcs_uri = batch_gcs_uri
+        self.batch_wait = batch_wait
 
         self.output_dir = output_dir or (PROJECT_ROOT / "outputs")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +84,11 @@ class Evaluator:
         self._log(f"  Dataset: {self.dataset_config.dataset_name}")
         self._log(f"  Dry Run: {self.dry_run}")
         self._log(f"  Resume: {self.resume}")
+        self._log(f"  Vertex Batch API: {self.batch_api}")
         self._log("=" * 60)
+
+        if self.batch_api and not self.dry_run:
+            self._validate_batch_eligibility()
 
         report = evaluate_func(
             method_config=self.method_config,
@@ -86,6 +98,9 @@ class Evaluator:
             verbose=self.verbose,
             logger=self.logger,
             resume=self.resume,
+            batch_api=self.batch_api,
+            batch_gcs_uri=self.batch_gcs_uri,
+            batch_wait=self.batch_wait,
         )
 
         end_time = datetime.now()
@@ -98,6 +113,38 @@ class Evaluator:
         self._log("=" * 60)
 
         return report
+
+    def _validate_batch_eligibility(self) -> None:
+        """Fail early when --batch-api cannot reach any safe Gemini stage."""
+        provider = self.method_config.model.provider.lower()
+        method_name = self.method_config.method_name.lower()
+        eligible_methods = (
+            "long_context", "embedding_rag", "bm25_rag", "lightmem",
+            "zep", "remem", "graph_rag", "amem", "mem0", "memos",
+            "memrl", "mirix",
+        )
+        agent_params = getattr(self.method_config, "raw_config", {}).get("agent_params", {})
+        has_method_stage = (
+            provider in {"gemini", "vertex", "vertex_ai"}
+            and any(name in method_name for name in eligible_methods)
+            and not (
+                "mirix" in method_name
+                and agent_params.get("use_native_query", True)
+            )
+        )
+        has_medmemorybench_judge = (
+            self.dataset_config.dataset_name.lower() == "medmemorybench"
+            and get_api_config().get_judge_provider().lower() in {"gemini", "vertex", "vertex_ai"}
+        )
+        if not has_method_stage and not has_medmemorybench_judge:
+            raise ValueError(
+                "--batch-api requires at least one eligible Gemini stage. "
+                "Use a supported Gemini method or configure a Gemini MedMemoryBench judge."
+            )
+        if not self.batch_gcs_uri and not os.environ.get("GOOGLE_BATCH_GCS_URI"):
+            raise ValueError(
+                "--batch-api requires --batch-gcs-uri or GOOGLE_BATCH_GCS_URI before evaluation starts."
+            )
 
 
 def _ensure_evaluators_registered():
@@ -119,6 +166,20 @@ def create_evaluator(
 
     method_config = config_loader.load_method_config(method_config_name)
     dataset_config = config_loader.load_dataset_config(dataset_name)
+
+    dataset_overrides = method_config.raw_config.get("dataset_overrides", {})
+    if dataset_overrides:
+        allowed_overrides = {
+            "persona_ids", "max_personas", "max_sessions_per_persona",
+            "evaluation_interval", "inject_noise", "evaluation_mode",
+        }
+        unexpected = set(dataset_overrides) - allowed_overrides
+        if unexpected:
+            raise ValueError(
+                f"Unsupported dataset overrides in {method_config_name}: "
+                f"{', '.join(sorted(unexpected))}"
+            )
+        dataset_config = replace(dataset_config, **dataset_overrides)
 
     return Evaluator(
         method_config=method_config,

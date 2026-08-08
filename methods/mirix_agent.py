@@ -217,7 +217,9 @@ class MIRIXAgent(BaseAgent):
             "azure": "azure_openai",
             "anthropic": "anthropic",
             "google": "google_ai",
-            "gemini": "google_ai",
+            "gemini": "google_vertex",
+            "vertex": "google_vertex",
+            "vertex_ai": "google_vertex",
         }
         return mapping.get(provider.lower(), "openai")
 
@@ -771,6 +773,9 @@ class MIRIXAgent(BaseAgent):
 
         self._run_async(do_query())
 
+        if not response_content.strip():
+            raise RuntimeError("MIRIX native query completed without an assistant answer.")
+
         query_time = time.time() - start_time
 
         return AgentResponse(
@@ -792,11 +797,32 @@ class MIRIXAgent(BaseAgent):
         system_message: Optional[str],
         start_time: float
     ) -> AgentResponse:
-        """Query using manual retrieval + external LLM (fallback).
+        """Query using manual retrieval + external LLM (fallback)."""
+        prepared = self.prepare_batch_query(question, system_message=system_message)
+        response = self._llm_client.chat(prepared["messages"])
+        result = self.finalize_batch_query(prepared, response.content)
+        result.query_time = time.time() - start_time
+        result.extra["tokens_used"] = {
+            "input": response.input_tokens,
+            "output": response.output_tokens,
+        }
+        return result
 
-        This retrieves memories via MIRIX's retrieve_memory() API,
-        then generates response using llm_client (ensuring token tracking).
-        """
+    def supports_batch_queries(self) -> bool:
+        """Only manual MIRIX queries have a standalone final generation call."""
+        return not self.use_native_query
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Run manual retrieval now and defer only the immutable final prompt."""
+        if self.use_native_query:
+            raise RuntimeError(
+                "MIRIX native queries are agent/tool loops and cannot be submitted to Vertex batch inference."
+            )
         # Retrieve relevant memories
         retrieved_memories = self._retrieve(question)
 
@@ -804,7 +830,8 @@ class MIRIXAgent(BaseAgent):
         full_question = self._truncate_to_tokens(question, self.max_question_tokens)
 
         # Add timestamp for context
-        full_question = f"{full_question}\n\nCurrent Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        request_time = kwargs.get("batch_request_time") or time.strftime("%Y-%m-%d %H:%M:%S")
+        full_question = f"{full_question}\n\nCurrent Time: {request_time}"
 
         # Calculate token budget for memory context
         base_system = system_message or ""
@@ -850,12 +877,6 @@ class MIRIXAgent(BaseAgent):
         else:
             full_system = system_message
 
-        # Call LLM for response (uses llm_client which tracks tokens)
-        messages = format_messages(full_question, full_system)
-        response = self._llm_client.chat(messages)
-
-        query_time = time.time() - start_time
-
         # Build retrieved_memories format for evaluation framework
         formatted_memories = [
             {
@@ -865,22 +886,40 @@ class MIRIXAgent(BaseAgent):
             for m in retrieved_memories
         ]
 
-        return AgentResponse(
-            output=response.content,
-            query_time=query_time,
-            retrieved_count=len(retrieved_memories),
-            retrieved_memories=formatted_memories,  # Properly set field
-            extra={
+        return {
+            "messages": format_messages(full_question, full_system),
+            "retrieved_count": len(retrieved_memories),
+            "retrieved_memories": formatted_memories,
+            "extra": {
                 "method": "mirix_manual",
                 "embedding_model": self.embedding_model,
                 "embedding_provider": self.embedding_provider,
                 "memory_types_retrieved": list(set(m.get("type", "unknown") for m in retrieved_memories)),
-                "tokens_used": {
-                    "input": response.input_tokens,
-                    "output": response.output_tokens,
-                },
-            }
+            },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Build the normal manual-MIRIX response after final generation."""
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
+
+    @staticmethod
+    def record_batch_query_usage(
+        response: AgentResponse,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Keep batch result diagnostics identical to manual MIRIX queries."""
+        response.extra["tokens_used"] = {
+            "input": input_tokens,
+            "output": output_tokens,
+        }
 
     def reset(self) -> None:
         """Reset agent state and completely reinitialize MIRIX.

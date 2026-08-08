@@ -165,9 +165,10 @@ class Mem0Agent(BaseAgent):
         print(f"[Mem0Agent DEBUG] Qdrant path: {qdrant_path}")
 
         # Build Mem0 config
+        use_vertex_gemini = self._provider.lower() in {"gemini", "vertex", "vertex_ai"}
         mem0_config = {
             "llm": {
-                "provider": "openai",
+                "provider": "gemini" if use_vertex_gemini else "openai",
                 "config": {
                     "model": self.model,
                     "temperature": self.temperature,
@@ -346,11 +347,23 @@ class Mem0Agent(BaseAgent):
         **kwargs
     ) -> AgentResponse:
         """Query the agent."""
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
+        response = self._llm_client.chat(prepared["messages"])
+        return self.finalize_batch_query(prepared, response.content)
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Retrieve locally and prepare Mem0's side-effect-free answer call."""
         # Retrieve relevant memories
         retrieved_memories = self._retrieve(question)
 
         # Bound question tokens first
-        full_question = f"{question}\n\nCurrent Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        request_time = kwargs.get("batch_request_time") or time.strftime("%Y-%m-%d %H:%M:%S")
+        full_question = f"{question}\n\nCurrent Time: {request_time}"
         full_question = self._truncate_to_tokens(full_question, self.max_question_tokens)
 
         base_system = system_message or ""
@@ -382,27 +395,32 @@ class Mem0Agent(BaseAgent):
         else:
             full_system = system_message
 
-        messages = format_messages(full_question, full_system)
-
-        # Call LLM
-        response = self._llm_client.chat(messages)
-
         # Build retrieved_memories format
         formatted_memories = [
             {"memory": m["memory"], "type": "mem0_retrieval", "score": m.get("score", 0)}
             for m in retrieved_memories
         ]
 
-        return AgentResponse(
-            output=response.content,
-            query_time=0.0,
-            retrieved_count=len(retrieved_memories),
-            retrieved_memories=formatted_memories,  # Fix: properly set field
-            extra={
+        return {
+            "messages": format_messages(full_question, full_system),
+            "retrieved_count": len(retrieved_memories),
+            "retrieved_memories": formatted_memories,
+            "extra": {
                 "method": "mem0",
                 "embedding_model": self.embedding_model,
                 "embedding_provider": self.embedding_provider,
-            }
+            },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Build Mem0's normal result shape from a completed answer request."""
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def reset(self) -> None:

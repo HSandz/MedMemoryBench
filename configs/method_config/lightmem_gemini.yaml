@@ -1,0 +1,31 @@
+# LightMem Agent Configuration using Gemini Enterprise Agent Platform.
+
+method_name: "lightmem"
+method_type: "agentic_memory"
+description: "LightMem using Gemini Enterprise Agent Platform"
+
+model:
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
+embedding:
+  provider: "local"
+  model: "BAAI/bge-small-zh-v1.5"
+  model_path: "BAAI/bge-small-zh-v1.5"
+  dim: 512
+
+agent_params:
+  retrieve_num: 20
+  pre_compress: false
+  topic_segment: true
+  index_strategy: "embedding"
+  retrieve_strategy: "embedding"
+  update_mode: "offline"
+  extraction_mode: "flat"
+  messages_use: "hybrid"
+  lightmem_temperature: 0.3
+  lightmem_max_tokens: 5000
+  lightmem_top_p: 0.1
+  max_context_tokens: 120000

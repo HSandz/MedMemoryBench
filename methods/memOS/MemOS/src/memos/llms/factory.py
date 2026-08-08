@@ -3,6 +3,7 @@ from typing import Any, ClassVar
 from memos.configs.llm import LLMConfigFactory
 from memos.llms.base import BaseLLM
 from memos.llms.deepseek import DeepSeekLLM
+from memos.llms.gemini import GeminiLLM
 from memos.llms.hf import HFLLM
 from memos.llms.hf_singleton import HFSingletonLLM
 from memos.llms.minimax import MinimaxLLM
@@ -28,6 +29,9 @@ class LLMFactory(BaseLLM):
         "deepseek": DeepSeekLLM,
         "minimax": MinimaxLLM,
         "openai_new": OpenAIResponsesLLM,
+        "gemini": GeminiLLM,
+        "vertex": GeminiLLM,
+        "vertex_ai": GeminiLLM,
     }
 
     @classmethod

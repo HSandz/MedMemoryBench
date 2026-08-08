@@ -240,30 +240,29 @@ class TrackedMemoryManager:
 
         max_workers = min(len(extract_list), 5)
 
+        def build_metadata_messages(api_call_idx: int, api_call_segments: List[List[Dict]]) -> List[Dict[str, str]]:
+            user_prompt_parts: List[str] = []
+            global_topic_ids: List[int] = []
+            if topic_id_mapping and api_call_idx < len(topic_id_mapping):
+                global_topic_ids = topic_id_mapping[api_call_idx]
+
+            for topic_idx, topic_segment in enumerate(api_call_segments):
+                global_topic_id = (
+                    global_topic_ids[topic_idx]
+                    if topic_idx < len(global_topic_ids)
+                    else topic_idx + 1
+                )
+                topic_text = concatenate_messages(topic_segment, messages_use)
+                user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
+            return [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "\n".join(user_prompt_parts)},
+            ]
+
         def process_segment_wrapper(args):
             api_call_idx, api_call_segments = args
             try:
-                user_prompt_parts: List[str] = []
-
-                global_topic_ids: List[int] = []
-                if topic_id_mapping and api_call_idx < len(topic_id_mapping):
-                    global_topic_ids = topic_id_mapping[api_call_idx]
-
-                for topic_idx, topic_segment in enumerate(api_call_segments):
-                    if topic_idx < len(global_topic_ids):
-                        global_topic_id = global_topic_ids[topic_idx]
-                    else:
-                        global_topic_id = topic_idx + 1
-
-                    topic_text = concatenate_messages(topic_segment, messages_use)
-                    user_prompt_parts.append(f"--- Topic {global_topic_id} ---\n{topic_text}")
-
-                user_prompt = "\n".join(user_prompt_parts)
-
-                metadata_messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
+                metadata_messages = build_metadata_messages(api_call_idx, api_call_segments)
 
                 raw_response, usage_info = self.generate_response(
                     messages=metadata_messages,
@@ -446,7 +445,8 @@ class LightMemAgent(BaseAgent):
             # Pre-processing
             "pre_compress": self.pre_compress,
             "topic_segment": self.topic_segment,
-            "precomp_topic_shared": False,  # Must be False when pre_compress=False
+            # Share the compressor's model with topic segmentation when available.
+            "precomp_topic_shared": self.pre_compress,
             "messages_use": self.messages_use,
 
             # Index and retrieval strategy
@@ -472,6 +472,37 @@ class LightMemAgent(BaseAgent):
                 }
             },
         }
+
+        if self.pre_compress:
+            # PromptCompressor downloads this model from Hugging Face on first use.
+            compression_model = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
+            device_map = None
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device_map = "cuda"
+            except ImportError:
+                pass
+
+            config["pre_compressor"] = {
+                "model_name": "llmlingua-2",
+                "configs": {
+                    "llmlingua_config": {
+                        "model_name": compression_model,
+                        "device_map": device_map,
+                        "use_llmlingua2": True,
+                    },
+                    "llmlingua2_config": {
+                        "max_batch_size": 50,
+                        "max_force_token": 100,
+                    },
+                    "compress_config": {
+                        "instruction": "",
+                        "rate": 0.8,
+                        "target_token": -1,
+                    },
+                },
+            }
 
         # Topic segmenter configuration (required when topic_segment=True)
         if self.topic_segment:
@@ -722,19 +753,7 @@ class LightMemAgent(BaseAgent):
         return result
 
     def _format_messages_for_lightmem(self, text: str, timestamp: str = None) -> List[Dict[str, Any]]:
-        """
-        Format text into LightMem's expected message format.
-
-        IMPORTANT: LightMem expects user+assistant message pairs. Each user message
-        must be followed by an assistant message (can be empty or real). This is required
-        by the sensory_memory buffer which processes messages in pairs.
-
-        This method parses the medical dialogue format:
-        - "患者: xxx" -> user message
-        - "医生: xxx" -> assistant message
-
-        Also extracts timestamp from text (e.g., [2024-01-05]) and uses it.
-        """
+        'Format text into LightMem\'s expected message format.\n\n        IMPORTANT: LightMem expects user+assistant message pairs. Each user message\n        must be followed by an assistant message (can be empty or real). This is required\n        by the sensory_memory buffer which processes messages in pairs.\n\n        This method parses the medical dialogue format:\n        - "Patient: xxx" -> user message\n        - "Doctor: xxx" -> assistant message\n\n        Also extracts timestamp from text (e.g., [2024-01-05]) and uses it.'
         # Try to extract timestamp from the text itself (e.g., [2024-01-05])
         extracted_timestamp = self._extract_timestamp_from_text(text)
 
@@ -760,7 +779,7 @@ class LightMemAgent(BaseAgent):
                 continue
 
             # Check for speaker patterns
-            if line.startswith('患者:') or line.startswith('患者：'):
+            if line.startswith('patient:') or line.startswith('patient:'):
                 # Save previous content if exists
                 if current_role is not None and current_content:
                     content = '\n'.join(current_content).strip()
@@ -769,10 +788,10 @@ class LightMemAgent(BaseAgent):
 
                 # Start new user turn
                 current_role = 'user'
-                content_start = line[3:].strip()  # Remove "患者:" prefix
+                content_start = line[3:].strip()  # Remove "patient:" prefix
                 current_content = [content_start] if content_start else []
 
-            elif line.startswith('医生:') or line.startswith('医生：'):
+            elif line.startswith('doctor:') or line.startswith('doctor:'):
                 # Save previous content if exists
                 if current_role is not None and current_content:
                     content = '\n'.join(current_content).strip()
@@ -781,14 +800,14 @@ class LightMemAgent(BaseAgent):
 
                 # Start new assistant turn
                 current_role = 'assistant'
-                content_start = line[3:].strip()  # Remove "医生:" prefix
+                content_start = line[3:].strip()  # Remove "Doctor:" prefix
                 current_content = [content_start] if content_start else []
 
             elif line.startswith('[') and line.endswith(']'):
                 # Skip timestamp lines like [2024-01-05]
                 continue
-            elif line.startswith('[') and '健康咨询' in line:
-                # Skip header lines like [健康咨询记录] or [关于xxx的健康咨询记录]
+            elif line.startswith('[') and 'health consultation' in line:
+                # Skip header lines like [Health consultation record] or [Health consultation record about xxx]
                 continue
             else:
                 # Continue current speaker's content
@@ -807,7 +826,7 @@ class LightMemAgent(BaseAgent):
             content_lines = []
             for line in lines:
                 line = line.strip()
-                if line and not (line.startswith('[') and (line.endswith(']') or '健康咨询' in line)):
+                if line and not (line.startswith('[') and (line.endswith(']') or 'health consultation' in line)):
                     content_lines.append(line)
 
             if content_lines:
@@ -845,7 +864,7 @@ class LightMemAgent(BaseAgent):
                                 "role": "user",
                                 "content": chunk,
                                 "speaker_id": "patient",
-                                "speaker_name": "患者",
+                                "speaker_name": "patient",
                             })
                             # Only last chunk gets the real assistant response
                             if j == len(user_chunks) - 1:
@@ -854,7 +873,7 @@ class LightMemAgent(BaseAgent):
                                     "role": "assistant",
                                     "content": assistant_content,
                                     "speaker_id": "doctor",
-                                    "speaker_name": "医生",
+                                    "speaker_name": "doctor",
                                 })
                             else:
                                 messages.append({
@@ -862,7 +881,7 @@ class LightMemAgent(BaseAgent):
                                     "role": "assistant",
                                     "content": "",
                                     "speaker_id": "doctor",
-                                    "speaker_name": "医生",
+                                    "speaker_name": "doctor",
                                 })
                     else:
                         messages.append({
@@ -870,14 +889,14 @@ class LightMemAgent(BaseAgent):
                             "role": "user",
                             "content": content,
                             "speaker_id": "patient",
-                            "speaker_name": "患者",
+                            "speaker_name": "patient",
                         })
                         messages.append({
                             "time_stamp": timestamp,
                             "role": "assistant",
                             "content": assistant_content,
                             "speaker_id": "doctor",
-                            "speaker_name": "医生",
+                            "speaker_name": "doctor",
                         })
                     i += 2
                 else:
@@ -891,14 +910,14 @@ class LightMemAgent(BaseAgent):
                                 "role": "user",
                                 "content": chunk,
                                 "speaker_id": "patient",
-                                "speaker_name": "患者",
+                                "speaker_name": "patient",
                             })
                             messages.append({
                                 "time_stamp": timestamp,
                                 "role": "assistant",
                                 "content": "",
                                 "speaker_id": "doctor",
-                                "speaker_name": "医生",
+                                "speaker_name": "doctor",
                             })
                     else:
                         messages.append({
@@ -906,14 +925,14 @@ class LightMemAgent(BaseAgent):
                             "role": "user",
                             "content": content,
                             "speaker_id": "patient",
-                            "speaker_name": "患者",
+                            "speaker_name": "patient",
                         })
                         messages.append({
                             "time_stamp": timestamp,
                             "role": "assistant",
                             "content": "",
                             "speaker_id": "doctor",
-                            "speaker_name": "医生",
+                            "speaker_name": "doctor",
                         })
                     i += 1
 
@@ -924,14 +943,14 @@ class LightMemAgent(BaseAgent):
                     "role": "user",
                     "content": "",
                     "speaker_id": "patient",
-                    "speaker_name": "患者",
+                    "speaker_name": "patient",
                 })
                 messages.append({
                     "time_stamp": timestamp,
                     "role": "assistant",
                     "content": content,
                     "speaker_id": "doctor",
-                    "speaker_name": "医生",
+                    "speaker_name": "doctor",
                 })
                 i += 1
             else:
@@ -945,14 +964,14 @@ class LightMemAgent(BaseAgent):
                     "role": "user",
                     "content": text[:5000] if len(text) > 5000 else text,
                     "speaker_id": "patient",
-                    "speaker_name": "患者",
+                    "speaker_name": "patient",
                 },
                 {
                     "time_stamp": timestamp,
                     "role": "assistant",
                     "content": "",
                     "speaker_id": "doctor",
-                    "speaker_name": "医生",
+                    "speaker_name": "doctor",
                 }
             ]
 
@@ -1059,6 +1078,17 @@ class LightMemAgent(BaseAgent):
         **kwargs,
     ) -> AgentResponse:
         """Query LightMem and generate response using official implementation."""
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
+        response = self._llm_client.chat(prepared["messages"])
+        return self.finalize_batch_query(prepared, response.content)
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
+        """Run stateful retrieval and defer only the immutable final answer call."""
         context_id = self._get_context_id()
         lightmem = self._get_lightmem_instance(context_id)
 
@@ -1111,20 +1141,24 @@ class LightMemAgent(BaseAgent):
                     full_question = f"[Retrieved Memories]\n{memory_context}\n\n[Question]\n{question}"
                     print(f"[LightMem] Memory context truncated to {truncated_len} chars")
 
-        # Generate response using our tracked LLM client
-        messages = format_messages(full_question, system_message)
-        response = self._llm_client.chat(messages)
-
-        print(f"[LightMem] Query complete, response length: {len(response.content)} chars")
-
-        return AgentResponse(
-            output=response.content,
-            query_time=0.0,
-            retrieved_count=len(retrieved_memories),
-            retrieved_memories=retrieved_memories,  # Fix: properly set field
-            extra={
+        return {
+            "messages": format_messages(full_question, system_message),
+            "retrieved_count": len(retrieved_memories),
+            "retrieved_memories": retrieved_memories,
+            "extra": {
                 "method": "lightmem",
             },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: dict, content: str) -> AgentResponse:
+        print(f"[LightMem] Query complete, response length: {len(content)} chars")
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def reset(self) -> None:

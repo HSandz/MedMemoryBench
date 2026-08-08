@@ -21,9 +21,17 @@ from .base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import (
     BaseLLMClient,
     LLMResponse,
+    LLMRetryExhaustedError,
     create_llm_client,
     format_messages,
     get_usage_tracker,
+)
+from utils.vertex_batch import (
+    BatchChatRequest,
+    VertexBatchClient,
+    VertexBatchPending,
+    make_request_id,
+    scoped_manifest_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +49,8 @@ class TrackedLLMWrapper:
         llm_name: str = "gpt-4o-mini",
         temperature: float = 0.0,
         seed: int = 0,
+        batch_client: Optional[VertexBatchClient] = None,
+        batch_stage_prefix: str = "remem-extraction",
         **kwargs,
     ):
         self.llm_client = llm_client
@@ -48,6 +58,9 @@ class TrackedLLMWrapper:
         self.temperature = temperature
         self.seed = seed
         self.kwargs = kwargs
+        self._batch_client = batch_client
+        self._batch_stage_prefix = batch_stage_prefix
+        self._batch_stage_index = 0
 
         self.llm_config = _LLMConfigProxy(
             llm_name=llm_name,
@@ -95,6 +108,13 @@ class TrackedLLMWrapper:
 
             return content, metadata, False  # cache_hit=False
 
+        except VertexBatchPending:
+            # Submit-only mode must escape the vendor wrapper so main.py can
+            # exit cleanly and the same manifest can be resumed later.
+            raise
+        except LLMRetryExhaustedError as exc:
+            logger.error("[ReMem] Gemini request exhausted retries: %s", exc)
+            raise RuntimeError("ReMem query failed; no answer was recorded.") from exc
         except Exception as e:
             logger.error(f"LLM inference error: {e}")
             return "", {"error": str(e)}, False
@@ -105,7 +125,47 @@ class TrackedLLMWrapper:
         max_workers: int = 10,
         **kwargs,
     ) -> List[Tuple[str, Dict, bool]]:
-        """Mimics CacheOpenAI.batch_infer() using a thread pool."""
+        """Mimic CacheOpenAI.batch_infer, using Vertex for independent Gemini calls."""
+        if self._batch_client is not None and messages_list:
+            stage = f"{self._batch_stage_prefix}-{self._batch_stage_index}"
+            self._batch_stage_index += 1
+            response_format = kwargs.get("response_format")
+            requests: List[BatchChatRequest] = []
+            for index, messages in enumerate(messages_list):
+                requests.append(BatchChatRequest(
+                    request_id=make_request_id("remem", f"{stage}:{index}"),
+                    messages=messages,
+                    temperature=kwargs.get("temperature", self.temperature),
+                    # ``infer()`` deliberately ignores a per-call max_tokens
+                    # override, so use the managed client's configured limit
+                    # to keep batch and real-time request parameters equal.
+                    max_tokens=self.llm_client.max_tokens,
+                    response_format=response_format,
+                    phase="memorize",
+                    metadata={"index": index, "stage": stage},
+                ))
+            responses = self._batch_client.run_stage(stage, requests)
+            results: List[Tuple[str, Dict, bool]] = []
+            for index, messages in enumerate(messages_list):
+                response = responses.get(make_request_id("remem", f"{stage}:{index}"))
+                if response is None or response.status:
+                    error = response.status if response is not None else "No output row returned"
+                    results.append(("", {"prompt": messages, "error": error}, False))
+                    continue
+                content = response.content
+                if response_format and response_format.get("type") == "json_object":
+                    if content.startswith("```json\n") and content.endswith("```"):
+                        content = content[8:-3].strip()
+                results.append((content, {
+                    "prompt": messages,
+                    "response": content,
+                    "prompt_tokens": response.input_tokens,
+                    "completion_tokens": response.output_tokens,
+                    "finish_reason": "stop",
+                }, False))
+            return results
+
+        """Fallback for non-Gemini or dependent calls."""
         results = [None] * len(messages_list)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -388,6 +448,14 @@ class RememAgent(BaseAgent):
 
         self.working_dir = working_dir
 
+        self._vertex_batch_enabled = bool(kwargs.get("vertex_batch_enabled", False))
+        self._vertex_batch_gcs_uri = kwargs.get("vertex_batch_gcs_uri")
+        self._vertex_batch_wait = bool(kwargs.get("vertex_batch_wait", False))
+        self._vertex_batch_manifest_dir = kwargs.get("vertex_batch_manifest_dir")
+        self._vertex_batch_config_hash = kwargs.get("vertex_batch_config_hash", "")
+        self._vertex_batch_progress_callback = kwargs.get("vertex_batch_progress_callback")
+        self._vertex_batch_client: Optional[VertexBatchClient] = None
+
         self._llm_client = create_llm_client(
             provider=provider,
             model=model,
@@ -408,6 +476,27 @@ class RememAgent(BaseAgent):
 
         self._setup_remem_path()
         self._remem_modules_loaded = False
+
+    def _get_internal_batch_client(self) -> Optional[VertexBatchClient]:
+        """Stage ReMem's existing independent extraction pool through Vertex."""
+        if not self._vertex_batch_enabled:
+            return None
+        if self._vertex_batch_client is None:
+            manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
+            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+                self._llm_client,
+                gcs_uri=self._vertex_batch_gcs_uri,
+                manifest_path=scoped_manifest_path(
+                    manifest_dir,
+                    "remem_internal_batch_manifest",
+                    model=self._llm_client.model,
+                    config_hash=self._vertex_batch_config_hash,
+                ),
+                wait=self._vertex_batch_wait,
+                config_hash=self._vertex_batch_config_hash,
+                progress_callback=self._vertex_batch_progress_callback,
+            )
+        return self._vertex_batch_client
 
     def _setup_remem_path(self):
         """Add ReMem src directory to Python path."""
@@ -527,6 +616,8 @@ class RememAgent(BaseAgent):
             llm_client=self._llm_client,
             llm_name=self.model,
             temperature=self.temperature,
+            batch_client=self._get_internal_batch_client(),
+            batch_stage_prefix=f"remem-extraction-context-{context_id}",
         )
 
         remem = self._ReMem(
@@ -806,6 +897,10 @@ class RememAgent(BaseAgent):
                 "time_cost": time_cost,
             }
 
+        except VertexBatchPending:
+            # ``remem.index`` can invoke ``batch_infer`` inside this wrapper.
+            # Do not turn an intentionally pending job into an index failure.
+            raise
         except Exception as e:
             logger.error(f"[ReMem] Graph construction error: {e}")
             import traceback
@@ -914,6 +1009,9 @@ class RememAgent(BaseAgent):
                 extra=extra_data,
             )
 
+        except LLMRetryExhaustedError as exc:
+            logger.error("[ReMem] Gemini request exhausted retries: %s", exc)
+            raise RuntimeError("ReMem query failed; no answer was recorded.") from exc
         except Exception as e:
             logger.error(f"[ReMem] Query error: {e}")
             import traceback

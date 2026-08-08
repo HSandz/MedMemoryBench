@@ -12,372 +12,359 @@ Key principles:
 
 # Six trap event types
 TRAP_EVENT_TYPES = [
-    "allergy",              # 过敏史
-    "medication_history",   # 用药史
-    "disease_history",      # 疾病史
-    "medication_preference", # 给药偏好
-    "diet_preference",      # 饮食偏好
-    "lifestyle_economic",   # 生活&经济情况
+    "allergy",              # Allergy history
+    "medication_history",   # Medication history
+    "disease_history",      # disease history
+    "medication_preference", # Dosing preference
+    "diet_preference",      # dietary preferences
+    "lifestyle_economic",   # Life & Economic Situation
 ]
 
 
 # ============================================================
 # Allergy history generation prompt
 # ============================================================
-TRAP_EVENT_ALLERGY_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**过敏史事件**。
+TRAP_EVENT_ALLERGY_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **allergy history event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**过敏史事件**，描述用户对某种药物、食物或物质的过敏/不耐受记录。
+## Generate target
+Generates an **Allergy History Event**, describing the user's allergy/intolerance record to a certain drug, food, or substance.
 
-## 核心要求：设计冲突
-这个过敏史必须与用户当前疾病的常规治疗方案存在**潜在冲突**。
+## Core Requirement: Design Conflict
+This allergy history must have a **potential conflict** with the user's usual treatment regimen for the current disease.
 
-常见冲突场景示例：
-- 用户对头孢类抗生素过敏，但细菌感染常规会用头孢
-- 用户对青霉素过敏，但很多感染首选青霉素类
-- 用户对磺胺类药物过敏，但某些泌尿系感染常用磺胺
-- 用户对阿司匹林过敏，但心血管疾病常需抗血小板治疗
-- 用户对造影剂过敏，但某些检查需要增强CT/MRI
-- 用户对局麻药过敏，但小手术需要局部麻醉
-- 用户对某些食物过敏（海鲜、坚果等），可能与中药配伍冲突
+Examples of common conflict scenarios:
+- The user is allergic to cephalosporins, but cephalosporins are routinely used for bacterial infections
+- The user is allergic to penicillin, but penicillins are the first choice for many infections
+- The user is allergic to sulfa drugs, but sulfonamides are commonly used for certain urinary tract infections
+- The user is allergic to aspirin, but cardiovascular disease often requires antiplatelet therapy
+- The user is allergic to contrast media, but some examinations require enhanced CT/MRI
+- The user is allergic to local anesthetics, but minor surgery requires local anesthesia
+- Users are allergic to certain foods (seafood, nuts, etc.), which may conflict with traditional Chinese medicine.
 
-## 内容规范
-描述必须包含：
-1. **过敏物质的具体名称**：不能只说"某类药物过敏"，必须写清楚具体药物/物质名称
-2. **过敏反应的具体表现**：如皮疹、呼吸困难、恶心呕吐、过敏性休克等
-3. **发现过敏的情境**：什么情况下发现的，如何确诊的
-4. **后续处理**：医生的处理、病历标注等
+## Content specifications
+The description must contain:
+1. **Specific name of allergic substance**: You cannot just say "allergic to a certain type of drug", you must clearly state the name of the specific drug/substance
+2. **Specific manifestations of allergic reactions**: such as rash, difficulty breathing, nausea and vomiting, anaphylactic shock, etc.
+3. **Situation in which allergy was discovered**: Under what circumstances was it discovered and how was it diagnosed?
+4. **Follow-up processing**: doctor's processing, medical record annotation, etc.
 
-好的示例：
-✓ "去年因为智齿发炎吃了甲硝唑，结果恶心呕吐了一整天，后来医生说是对硝基咪唑类药物不耐受。现在病历本上已经标注了这个过敏史，医生说以后开药要避开甲硝唑、奥硝唑这类药物。"
-✓ "小时候打青霉素皮试就红肿，确认是青霉素过敏。几年前感冒发烧医生开了阿莫西林，吃完全身起红疹差点呼吸困难，去急诊打了抗过敏针才好。医生说阿莫西林也是青霉素类的，以后这类抗生素都不能用。"
+Good example:
+✓ "Last year, I took metronidazole because of inflammation of my wisdom teeth. As a result, I felt nauseated and vomited all day. Later, the doctor said that I was intolerant to nitroimidazole drugs. Now this allergy history has been noted in the medical record. The doctor said that I should avoid drugs such as metronidazole and ornidazole in the future."
+✓ "When I was a child, I got red and swollen when I took a penicillin skin test, and it was confirmed that I was allergic to penicillin. A few years ago, the doctor prescribed amoxicillin for colds and fevers. After eating, I developed red rash all over my body and almost had difficulty breathing. I went to the emergency room and got an anti-allergy shot. The doctor said that amoxicillin is also a penicillin, and this kind of antibiotics cannot be used in the future."
 
-不好的示例：
-✗ "有药物过敏。"（太模糊，没有具体药物名称）
-✗ "对某种抗生素过敏。"（没有说明具体是哪种）
+Bad example:
+✗ "I have a drug allergy." (too vague, no specific drug name)
+✗ "Allergic to a certain antibiotic." (Not specified which one)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON3. event_date must be in the format of "{event_date}"
 
-## 输出格式
+## Output format
 {{
-    "event": "详细的过敏史事件描述（3-5句话，包含上述所有要素）",
+    "event": "Detailed description of allergy history events (3-5 sentences, including all the above elements)",
     "type": "allergy",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # Medication history generation prompt
 # ============================================================
-TRAP_EVENT_MEDICATION_HISTORY_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**用药史事件**。
+TRAP_EVENT_MEDICATION_HISTORY_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **medication history event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**用药史事件**，描述用户正在长期服用的药物，这些药物可能与新治疗方案产生相互作用。
+## Generate target
+Generates a **Medication History Event** describing medications the user is taking long-term that may interact with the new treatment regimen.
 
-## 核心要求：设计药物相互作用冲突
-用户正在服用的药物必须与当前疾病的常规治疗方案存在**潜在的药物相互作用**。
+## Core Requirement: Designing Drug Interaction Conflicts
+The medication the user is taking must have a **potential drug interaction** with conventional treatment options for the current disease.
 
-常见冲突场景示例：
-- 长期服用华法林抗凝 → 很多药物（阿司匹林、某些抗生素、中药）会增强/减弱抗凝效果
-- 长期服用降压药（如ACEI类） → 与某些药物合用可能引起高钾血症
-- 长期服用他汀类降脂药 → 与某些抗生素合用增加横纹肌溶解风险
-- 长期服用地高辛 → 与很多药物存在相互作用，需调整剂量
-- 长期服用抗癫痫药 → 会影响很多药物的代谢
-- 长期服用口服避孕药 → 与某些抗生素合用会降低避孕效果
-- 长期服用免疫抑制剂 → 感染时用药选择受限
+Examples of common conflict scenarios:
+- Long-term use of warfarin as anticoagulant → Many drugs (aspirin, certain antibiotics, traditional Chinese medicine) will enhance/weaken the anticoagulant effect
+- Long-term use of antihypertensive drugs (such as ACEI) → combined with certain drugs may cause hyperkalemia
+- Long-term use of statin lipid-lowering drugs → combined with certain antibiotics increases the risk of rhabdomyolysis
+- Long-term use of digoxin → It interacts with many drugs and the dose needs to be adjusted
+- Long-term use of anti-epileptic drugs → will affect the metabolism of many drugs
+- Long-term use of oral contraceptives → Concomitant use with certain antibiotics may reduce the contraceptive effect
+- Long-term use of immunosuppressants → limited medication options during infection
 
-## 内容规范
-描述必须包含：
-1. **正在服用的药物具体名称**：商品名或通用名都可以
-2. **服药的原因/适应症**：因为什么病在吃这个药
-3. **服药方案**：剂量、频次、服用时长
-4. **医嘱提醒**：医生关于用药注意事项的叮嘱
+## Content specifications
+The description must contain:
+1. **Specific name of the drug you are taking**: Trade name or generic name is acceptable
+2. **Reason/indications for taking the medicine**: What disease do you take this medicine for?
+3. **Medication plan**: dosage, frequency, duration of taking
+4. **Doctor’s Advice**: Doctor’s advice on medication precautions
 
-好的示例：
-✓ "三年前因为房颤做了射频消融手术，之后一直在吃达比加群酯抗凝，每天早晚各150mg。医生特别叮嘱不能随便停药，也不能自己乱吃别的药，尤其是阿司匹林这类的，说会增加出血风险。"
-✓ "高血压吃了五年的药了，现在吃的是氨氯地平5mg每天早上一片，加上培哚普利4mg。医生说血压控制得还行，但是要注意不能吃含钾高的代盐，也不能随便吃补钾的药。"
+Good example:
+✓ "I had a radiofrequency ablation surgery for atrial fibrillation three years ago, and I have been taking dabigatran etexilate as an anticoagulant since then, 150 mg every morning and evening. The doctor specifically warned me not to stop taking the medicine casually, nor to take other medicines on my own, especially aspirin, which is said to increase the risk of bleeding."
+✓ "I have been taking medicine for high blood pressure for five years. Now I take amlodipine 5mg one tablet every morning, plus perindopril 4mg. The doctor said that the blood pressure is well controlled, but be careful not to take salt substitutes with high potassium content, nor take potassium supplement medicine casually."
 
-不好的示例：
-✗ "一直在吃药。"（没有具体药物信息）
-✗ "有高血压在治疗。"（没有说明具体用药）
+Bad example:
+✗ "Always taking medicine." (no specific medication information)
+✗ "I am being treated for high blood pressure." (No specific medication specified)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON3. event_date must be in the format of "{event_date}"
 
-## 输出格式
+## Output format
 {{
-    "event": "详细的用药史事件描述（3-5句话，包含上述所有要素）",
+    "event": "Detailed description of medication history events (3-5 sentences, including all the above elements)",
     "type": "medication_history",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # Disease history generation prompt
 # ============================================================
-TRAP_EVENT_DISEASE_HISTORY_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**疾病史事件**。
+TRAP_EVENT_DISEASE_HISTORY_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **disease history event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**疾病史事件**，描述用户的既往病史，这些病史可能影响当前治疗方案的选择。
+## Generate target
+Generates a **Disease History Event** describing the user's past medical history that may affect the selection of current treatment options.
 
-## 核心要求：设计治疗禁忌冲突
-用户的既往病史必须使得当前疾病的某些常规治疗方案成为**相对或绝对禁忌**。
+## Core requirement: Design to treat taboo conflicts
+The user's past medical history must render certain conventional treatment options for the current disease **relatively or absolutely contraindicated**.
 
-常见冲突场景示例：
-- 既往胃溃疡/消化道出血 → NSAIDs类止痛药（布洛芬、双氯芬酸）是禁忌
-- 既往哮喘 → β受体阻滞剂类降压药（美托洛尔等）可能诱发哮喘
-- 既往肾功能不全 → 很多药物需要调整剂量或禁用
-- 既往肝功能异常 → 影响很多药物的代谢和选择
-- 既往青光眼 → 某些感冒药、抗过敏药是禁忌
-- 既往前列腺增生 → 某些抗胆碱药物会加重排尿困难
-- 既往心律失常 → 某些药物可能诱发心律失常
+Examples of common conflict scenarios:
+- Previous gastric ulcer/gastrointestinal bleeding → NSAIDs analgesics (ibuprofen, diclofenac) are contraindicated
+- Previous asthma → β-blocker antihypertensive drugs (metoprolol, etc.) may induce asthma
+-Previous renal insufficiency → Many drugs require dose adjustment or are contraindicated
+- Past abnormal liver function → affects the metabolism and selection of many drugs
+- Previous glaucoma → Certain cold and allergy medicines are contraindicated
+- Previous prostatic hyperplasia → Certain anticholinergic drugs can worsen urinary difficulty
+- Past arrhythmias → Certain drugs may induce arrhythmias
 
-## 内容规范
-描述必须包含：
-1. **既往疾病的具体名称**：不能只说"胃不好"，要明确如"胃溃疡"
-2. **发病情况和严重程度**：什么时候得的，严重到什么程度
-3. **治疗经过**：如何治疗的，是否痊愈
-4. **医嘱限制**：因为这个病史，哪些事情不能做/哪些药不能吃
+## Content specifications
+The description must contain:
+1. **Specific name of past disease**: Don’t just say “bad stomach”, it must be specific such as “gastric ulcer”
+2. **Incidence and severity**: when did you get it and how serious it is?
+3. **Treatment process**: How was it treated and whether it was cured or not
+4. **Doctor’s Order Restrictions**: Because of this medical history, what things cannot be done/what medicines cannot be taken
 
-好的示例：
-✓ "十年前得过十二指肠溃疡，当时疼得厉害还吐过血，住院治疗了一个月才好。医生说虽然后来检查溃疡愈合了，但胃肠道比较脆弱，以后要尽量避免吃伤胃的药，像布洛芬、阿司匹林这类止痛药绝对不能吃。"
-✓ "年轻时得过肺结核，在结核病医院住了半年，吃了一年多的抗结核药才治好。那时候肝功能也受了影响，转氨酶升高过。现在医生开药前都会问有没有肝病史。"
+Good example:
+✓ "I had a duodenal ulcer ten years ago. The pain was severe and I vomited blood. I was hospitalized for a month before I recovered. The doctor said that although the ulcer was healed later, the gastrointestinal tract is relatively fragile. In the future, I should try to avoid taking medicine that hurts my stomach. Painkillers such as ibuprofen and aspirin must not be taken."
+✓ "I had tuberculosis when I was young. I stayed in a tuberculosis hospital for half a year and took anti-tuberculosis drugs for more than a year before I was cured. At that time, my liver function was also affected and my transaminases were elevated. Now doctors will ask if I have a history of liver disease before prescribing medicine."
 
-不好的示例：
-✗ "以前胃不好。"（太模糊）
-✗ "有过一些病。"（没有任何具体信息）
+Bad example:
+✗ "I had a bad stomach before." (too vague)
+✗ "Have had some illnesses." (without any specific information)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON3. event_date must be in the format of "{event_date}"
 
-## 输出格式
+## Output format
 {{
-    "event": "详细的疾病史事件描述（3-5句话，包含上述所有要素）",
+    "event": "Detailed description of disease history events (3-5 sentences, including all the above elements)",
     "type": "disease_history",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # Medication preference generation prompt
 # ============================================================
-TRAP_EVENT_MEDICATION_PREFERENCE_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**给药偏好事件**。
+TRAP_EVENT_MEDICATION_PREFERENCE_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **Dosing Preference Event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**给药偏好事件**，描述用户对药物剂型、服药方式的特殊需求或限制。
+## Generate target
+Generate a **Dosing Preference Event** to describe the user's special needs or restrictions on drug dosage forms and medication methods.
 
-## 核心要求：设计剂型/用药方式冲突
-用户的给药偏好必须与当前疾病某些常规处方药物的剂型/用法存在**冲突**。
+## Core requirements: Design dosage form/medication method conflict
+The user's dosing preference must conflict with the dosage form/usage of certain conventionally prescribed medications for the current disease.
 
-常见冲突场景示例：
-- 吞咽困难 → 无法服用大药片、缓释片（不能掰开）
-- 无法耐受胃肠道反应 → 某些药物只有口服剂型
-- 晕针/害怕打针 → 需要注射的治疗方案难以接受
-- 工作时间不规律 → 难以做到定时服药
-- 需要禁食 → 某些药物必须空腹/饭后服用
-- 哺乳期/备孕 → 对药物安全性有特殊要求
-- 不接受灌肠/栓剂 → 某些直肠给药方式无法接受
+Examples of common conflict scenarios:
+- Difficulty swallowing → Unable to take large tablets or extended-release tablets (cannot be broken)
+- Intolerance of gastrointestinal reactions → Some drugs are only available in oral dosage form
+- Needle fainting/fear of injections → Treatment options that require injections are difficult to accept
+- Irregular working hours → Difficulty taking medication on time
+- Fasting required → Certain medications must be taken on an empty stomach/after meals
+- Lactation/pregnancy preparation → Special requirements for drug safety
+- Enema/suppository not acceptable → Certain rectal administration methods are not acceptable
 
-## 内容规范
-描述必须包含：
-1. **具体的用药限制或偏好**：明确说明是什么问题
-2. **产生这个偏好的原因**：为什么有这个限制
-3. **过去的相关经历**：曾经因此遇到过什么问题
-4. **期望的替代方案**：希望怎样解决
+## Content specifications
+The description must contain:
+1. **Specific Medication Restrictions or Preferences**: Clearly state what the issue is
+2. **Reason for this preference**: Why is there this restriction?
+3. **Past relevant experience**: What problems have you encountered because of this?
+4. **Desired Alternatives**: How you would like to solve the problem
 
-好的示例：
-✓ "从小咽喉就比较窄，大药片根本吞不下去。之前吃钙片的时候卡在嗓子里特别难受，喝了很多水才咽下去。后来医生开药我都会特别说明，只能吃胶囊或者很小的药片，太大的药片真的没办法吃。"
-✓ "特别怕打针，从小就这样，看到针头就紧张得手脚发抖。上次体检抽血，护士扎了三针才扎进去，当时差点晕过去。如果有口服药能解决的问题，绝对不想打针。"
+Good example:
+✓ "My throat has been narrow since I was a child, and I couldn't swallow big pills. When I took calcium tablets before, it was very uncomfortable when they got stuck in my throat, and I had to drink a lot of water before I could swallow them. Later, when the doctor prescribed medicine, I would make it clear that I could only take capsules or very small pills. I really couldn't take the pills that were too big."
+✓ "I am particularly afraid of injections. I have been like this since I was a child. I am so nervous when I see needles that my hands and feet are shaking. The last time I took blood for a physical examination, the nurse took three injections before inserting them. I almost fainted at that time. If there are problems that can be solved by oral medicine, I definitely don't want to get injections."
 
-不好的示例：
-✗ "不喜欢吃药。"（太模糊）
-✗ "对某些药物有要求。"（没有具体说明）
+Bad example:
+✗ "Don't like taking medicine." (too vague)
+✗ "Required for certain medications." (no specifics)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON
+3. event_date must be in the format of "{event_date}"
 
-## 输出格式
-{{
-    "event": "详细的给药偏好事件描述（3-5句话，包含上述所有要素）",
+## Output format
+{{"event": "Detailed description of the dosing preference event (3-5 sentences, including all the above elements)",
     "type": "medication_preference",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # Diet preference generation prompt
 # ============================================================
-TRAP_EVENT_DIET_PREFERENCE_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**饮食偏好事件**。
+TRAP_EVENT_DIET_PREFERENCE_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **food preference event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**饮食偏好事件**，描述用户的饮食习惯或限制，这些可能与医嘱产生冲突。
+## Generate target
+Generates a **dietary preference event** describing the user's dietary habits or restrictions that may conflict with medical advice.
 
-## 核心要求：设计饮食医嘱冲突
-用户的饮食偏好/习惯必须与当前疾病的饮食医嘱存在**冲突**。
+## Core Requirements: Designing Dietary Doctor Order Conflicts
+The user's dietary preferences/habits must conflict with the dietary instructions for the current disease.
 
-常见冲突场景示例：
-- 爱吃甜食 → 与糖尿病饮食控制冲突
-- 重口味/爱吃咸 → 与高血压低盐饮食冲突
-- 无肉不欢 → 与痛风低嘌呤饮食冲突
-- 爱喝酒 → 与很多药物使用、肝病等冲突
-- 素食者 → 某些营养素可能缺乏
-- 不吃某类食物（如不吃粗粮） → 与糖尿病饮食建议冲突
-- 爱喝咖啡/浓茶 → 与某些药物吸收冲突
-- 不规律进食 → 与糖尿病定时进餐要求冲突
+Examples of common conflict scenarios:
+- Sweet tooth → Conflicts with diabetes diet control
+- Heavy taste/love to eat salt → conflicts with high blood pressure and low-salt diet
+- No pleasure without meat → Conflict with gout and low purine diet
+- Love to drink → Conflicts with many drug use, liver disease, etc.
+- Vegetarians → May be deficient in certain nutrients
+- Not eating certain types of food (such as not eating whole grains) → Conflicts with diabetes dietary recommendations
+- Love to drink coffee/strong tea → conflict with the absorption of certain drugs
+- Irregular eating → conflicts with the regular meal requirements of diabetes
 
-## 内容规范
-描述必须包含：
-1. **具体的饮食习惯或偏好**：喜欢吃什么/不能吃什么
-2. **习惯的程度和频率**：多久吃一次，量有多大
-3. **形成的原因或背景**：为什么会有这个习惯
-4. **对于改变的态度**：是否愿意改变，改变有多难
+## Content specifications
+The description must contain:
+1. **Specific eating habits or preferences**: What you like to eat/what you can’t eat
+2. **Degree and frequency of habit**: how often you eat and how much you eat
+3. **Reasons or background**: Why do you have this habit?
+4. **Attitude towards change**: Are you willing to change and how difficult is it to change?
 
-好的示例：
-✓ "从小就是无肉不欢，每顿饭没有肉就觉得没吃饱。特别喜欢吃动物内脏，猪肝、腰花、卤煮这些，差不多每周都要吃个两三次。知道痛风患者不能吃这些，但真的很难忌口，之前医生让戒，坚持了一个月实在受不了又吃上了。"
-✓ "特别喜欢吃甜食，每天下午都要吃点巧克力或者蛋糕，晚上追剧还要喝奶茶。家里人说我这样不行，但甜食对我来说就像是情绪调节剂，心情不好就想吃甜的。对于燕麦粥、杂粮饭这些健康食品，真的很难接受，口感太粗糙了吃不下去。"
+Good example:
+✓ "I have been eating meat since I was a child. I feel full without meat at every meal. I especially like to eat animal offal, pork liver, kidneys, braised pork, etc., almost two or three times a week. I know that gout patients cannot eat these, but it is really difficult to avoid eating them. The doctor told me not to stop eating them before, but I couldn't stand it and started eating them again after a month."
+✓ "I particularly like sweets. I eat some chocolate or cake every afternoon, and drink milk tea in the evening to watch dramas. My family says I can't do this, but sweets are like mood regulators for me. I want to eat sweets when I'm not in a good mood. It's really hard to accept healthy foods such as oatmeal and multigrain rice. The texture is too rough and I can't eat it."
 
-不好的示例：
-✗ "喜欢吃甜食。"（太简单）
-✗ "饮食习惯不太好。"（没有具体内容）
+Bad example:
+✗ "I like sweets." (Too simple)
+✗ "My eating habits are not very good." (no specific content)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON3. event_date must be in the format of "{event_date}"
 
-## 输出格式
+## Output format
 {{
-    "event": "详细的饮食偏好事件描述（3-5句话，包含上述所有要素）",
+    "event": "Detailed description of the food preference event (3-5 sentences, including all the above elements)",
     "type": "diet_preference",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # Lifestyle & economic status generation prompt
 # ============================================================
-TRAP_EVENT_LIFESTYLE_ECONOMIC_PROMPT = """你是一个医疗健康领域的事件模拟专家。请基于以下用户画像，生成一个详细的**生活&经济情况事件**。
+TRAP_EVENT_LIFESTYLE_ECONOMIC_PROMPT = """You are an event simulation expert in the healthcare field. Please generate a detailed **Life & Economic Situation Event** based on the following user portrait.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 用户当前主要健康问题/疾病
+## User’s current main health problems/diseases
 {health_condition}
 
-## 生成目标
-生成一个**生活&经济情况事件**，描述用户的经济条件、医保情况、生活习惯等，这些会影响治疗方案的可行性。
+## Generate target
+Generate a **Life & Economic Situation Event** to describe the user's economic conditions, medical insurance status, living habits, etc., which will affect the feasibility of the treatment plan.
 
-## 核心要求：设计经济/生活与治疗可行性的冲突
-用户的经济条件或生活情况必须影响最优治疗方案的选择。
+## Core requirement: The conflict between design economy/life and therapeutic feasibility
+The user's financial conditions or living situation must influence the choice of the optimal treatment option.
 
-常见冲突场景示例：
-- 经济困难 → 无法负担昂贵的进口药或自费药
-- 异地医保报销比例低 → 倾向选择便宜的治疗方案
-- 没有医保 → 所有费用自费，经济压力大
-- 工作繁忙/出差多 → 难以定期复诊、难以住院治疗
-- 独居老人 → 难以做到复杂的用药管理
-- 家庭负担重 → 不愿意花太多钱看病
-- 交通不便 → 难以频繁往返医院
+Examples of common conflict scenarios:
+- Financial difficulties → Unable to afford expensive imported drugs or self-paid drugs
+- The reimbursement ratio of medical insurance in other places is low → tend to choose cheaper treatment options
+- No medical insurance → All expenses are paid by oneself, which puts great financial pressure
+- Busy at work/traveling a lot → Difficulty in regular follow-up visits and hospitalization
+- Elderly people living alone → Difficulty in complex medication management
+- Heavy family burden → unwilling to spend too much money on medical treatment
+- Inconvenient transportation → It is difficult to travel to and from the hospital frequently
 
-## 内容规范
-描述必须包含：
-1. **具体的经济情况**：收入水平、医保类型、报销比例等
-2. **生活情况**：工作状态、家庭结构、居住情况等
-3. **对治疗的影响**：因为这些情况，对治疗有什么具体要求
-4. **真实的数字**：如月收入、药费承受能力、报销比例等
+## Content specifications
+The description must contain:
+1. **Specific economic situation**: income level, type of medical insurance, reimbursement ratio, etc.
+2. **Living situation**: working status, family structure, living situation, etc.
+3. **Impact on treatment**: Because of these conditions, what are the specific requirements for treatment?
+4. **Real numbers**: such as monthly income, affordability of medicines, reimbursement ratio, etc.
 
-好的示例：
-✓ "在外地工作用的是老家的农村合作医疗，在这边看病门诊基本不报销，住院也只能报销40%左右。上个月买降压药和降糖药花了八百多，都是自费的，对我来说真的有点吃不消。希望医生能开便宜点的药，进口药太贵了真的负担不起。"
-✓ "自己开了个小店，每天从早忙到晚，根本没时间经常去医院。而且店里离不开人，请一天假就少挣一天的钱。如果需要住院治疗或者每周都要去医院，对我来说真的很难做到，希望能有相对简单的治疗方案。"
+Good example:
+✓ "When I work abroad, I use the rural cooperative medical system in my hometown. There is basically no reimbursement for outpatient treatment here, and only about 40% of the reimbursement for hospitalization. Last month, I spent more than 800 on antihypertensive and antidiabetic drugs, all at my own expense, which is really too much for me. I hope the doctor can prescribe cheaper drugs. Imported drugs are too expensive and I really can't afford them."
+✓ "I opened a small shop by myself, and I was busy from morning to night every day. I had no time to go to the hospital frequently. Moreover, the shop was inseparable from people, so taking one day off meant losing a day's income. If I need to be hospitalized or have to go to the hospital every week, it would be really difficult for me to do it. I hope there is a relatively simple treatment plan."
 
-不好的示例：
-✗ "经济条件一般。"（太模糊）
-✗ "工作比较忙。"（没有具体信息）
+Bad example:
+✗ "The economic conditions are average." (Too vague)
+✗ "I'm quite busy at work." (no specific information)
 
-## ⚠️ JSON 格式要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. event_date 必须是 "{event_date}" 格式
+## ⚠️ JSON format requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON3. event_date must be in the format of "{event_date}"
 
-## 输出格式
+## Output format
 {{
-    "event": "详细的生活&经济情况事件描述（3-5句话，包含上述所有要素）",
+    "event": "Detailed description of the life & economic situation event (3-5 sentences, including all the above elements)",
     "type": "lifestyle_economic",
     "event_date": "{event_date}",
     "triggered_by": []
-}}
-"""
+}}"""
 
 
 # ============================================================
 # User health status extraction prompt
 # ============================================================
-EXTRACT_HEALTH_CONDITION_PROMPT = """根据以下用户画像，简要总结用户当前的主要健康问题/疾病。
+EXTRACT_HEALTH_CONDITION_PROMPT = """Based on the following user portrait, briefly summarize the user's current major health problems/diseases.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 要求
-1. 识别用户的主要健康问题（如：糖尿病、高血压、心脏病、胃病等）
-2. 如果有多个健康问题，按重要性列出
-3. 包含当前症状和正在接受的治疗
-4. 简洁明了，2-3句话即可
+## Requirements
+1. Identify the user’s main health problems (such as diabetes, high blood pressure, heart disease, stomach problems, etc.)
+2. If there are multiple health problems, list them in order of importance
+3. Include current symptoms and treatments being received
+4. Be concise and clear, 2-3 sentences is enough
 
-## 输出格式（纯文本，不需要 JSON）
-直接输出健康状况描述即可。
+## Output format (plain text, no JSON required)
+Just output the health status description directly.
 
-示例输出：
-"用户患有2型糖尿病，目前血糖控制不佳，空腹血糖偏高。同时有高血压病史，正在服用降压药治疗。"
-"""
+Example output:
+The user suffers from type 2 diabetes and currently has poor blood sugar control and high fasting blood sugar. He also has a history of hypertension and is taking antihypertensive medication."""
 
 
 # Trap event type to prompt mapping
@@ -393,10 +380,10 @@ TRAP_EVENT_PROMPTS = {
 
 # Trap event type display names
 TRAP_EVENT_TYPE_NAMES = {
-    "allergy": "过敏史",
-    "medication_history": "用药史",
-    "disease_history": "疾病史",
-    "medication_preference": "给药偏好",
-    "diet_preference": "饮食偏好",
-    "lifestyle_economic": "生活&经济情况",
+    "allergy": "Allergy history",
+    "medication_history": "Medication history",
+    "disease_history": "disease history",
+    "medication_preference": "Dosing preference",
+    "diet_preference": "dietary preferences",
+    "lifestyle_economic": "Life & Economic Situation",
 }

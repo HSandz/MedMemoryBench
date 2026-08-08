@@ -90,12 +90,12 @@ TRAP_EVENT_TYPES = {
 
 # Category keywords for identifying trap-event knowledge points
 TRAP_CATEGORY_KEYWORDS = {
-    "过敏", "allergy",
-    "用药史", "药物史", "medication_history", "用药记录", "长期用药",
-    "疾病史", "病史", "既往史", "disease_history",
-    "给药偏好", "服药偏好", "medication_preference", "剂型偏好",
-    "饮食偏好", "饮食习惯", "diet_preference", "食物偏好",
-    "生活经济", "经济情况", "医保", "lifestyle_economic", "经济", "医保情况",
+    "allergy", "allergy",
+    "Medication history", "drug history", "medication_history", "Medication records", "long term medication",
+    "disease history", "Medical history", "past history", "disease_history",
+    "Dosing preference", "Medication preferences", "medication_preference", "Dosage form preference",
+    "dietary preferences", "eating habits", "diet_preference", "food preferences",
+    "life economy", "economic situation", "medical insurance", "lifestyle_economic", "economy", "Medical insurance situation",
 }
 
 
@@ -109,7 +109,7 @@ def is_trap_kp(kp: dict) -> bool:
         if keyword in category or keyword in name:
             return True
 
-    strong_indicators = ["过敏", "禁忌", "不能吃", "不能用", "会过敏", "禁用"]
+    strong_indicators = ["allergy", "Taboo", "Can't eat", "The ____ does not work", "Will be allergic", "Disable"]
     for indicator in strong_indicators:
         if indicator in content:
             return True

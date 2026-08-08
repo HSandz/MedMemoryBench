@@ -158,6 +158,35 @@ class RobustOpenAIController(RobustBaseLLMController):
         return response.choices[0].message.content
 
 
+class RobustGeminiController(RobustBaseLLMController):
+    """Route A-Mem's metadata and evolution prompts through Vertex Gemini."""
+
+    def __init__(
+        self,
+        model: str = "gemini-2.5-flash",
+        max_tokens: int = 1000,
+        provider: str = "gemini",
+    ):
+        from utils.llm_client import create_llm_client
+
+        self.client = create_llm_client(
+            provider=provider,
+            model=model,
+            temperature=0.7,
+            max_tokens=max_tokens,
+        )
+
+    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+        response = self.client.chat(
+            [
+                {"role": "system", "content": self.SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+        )
+        return response.content
+
+
 class RobustOllamaController(RobustBaseLLMController):
     """Direct Ollama library controller (no LiteLLM proxy)."""
 
@@ -283,7 +312,7 @@ class RobustLLMController:
     """Factory that selects the right robust LLM controller."""
 
     def __init__(self,
-                 backend: Literal["openai", "ollama", "sglang", "vllm"] = "sglang",
+                 backend: Literal["openai", "gemini", "vertex", "vertex_ai", "ollama", "sglang", "vllm"] = "sglang",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
@@ -297,6 +326,10 @@ class RobustLLMController:
                 model, api_key=api_key, api_base=api_base,
                 max_tokens=max_tokens, usage_tracker=usage_tracker
             )
+        elif backend in {"gemini", "vertex", "vertex_ai"}:
+            self.llm = RobustGeminiController(
+                model, max_tokens=max_tokens, provider=backend
+            )
         elif backend == "ollama":
             self.llm = RobustOllamaController(model)
         elif backend == "sglang":
@@ -304,7 +337,7 @@ class RobustLLMController:
         elif backend == "vllm":
             self.llm = RobustVLLMController(model, sglang_host, sglang_port, max_tokens=max_tokens)
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', 'sglang', or 'vllm'")
+            raise ValueError("Unsupported LLM backend")
 
         if check_connection:
             self.llm.check_connectivity()

@@ -5,7 +5,8 @@ import sys
 import time
 import logging
 import heapq
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -32,7 +33,13 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import (
+    EmptyGeminiResponseError,
+    create_llm_client,
+    get_usage_tracker,
+    run_with_gemini_retry,
+)
+from utils.vertex_batch import BatchChatRequest, VertexBatchClient, make_request_id, scoped_manifest_path
 
 # Setup
 load_dotenv()
@@ -88,11 +95,36 @@ def _get_chat_model(model_name: str, temperature: float = 0.7, max_tokens: int =
     model_lower = model_name.lower()
 
     if 'gemini' in model_lower:
+        from google.oauth2 import service_account
+
+        credential_file = Path(
+            os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+            or Path(__file__).resolve().parent.parent / "service-account.json"
+        )
+        if not credential_file.is_file():
+            raise FileNotFoundError(
+                f"Gemini service-account file not found: {credential_file}"
+            )
+        credentials = service_account.Credentials.from_service_account_file(
+            str(credential_file),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        if not credentials.project_id:
+            raise ValueError("Gemini service-account file does not contain a project_id")
+
+        # vertexai=True routes requests to Vertex AI instead of the Gemini Developer API.
         return ChatGoogleGenerativeAI(
+            vertexai=True,
+            project=credentials.project_id,
+            location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+            credentials=credentials,
             temperature=temperature,
             model=model_name,
             max_tokens=max_tokens,
             callbacks=callbacks,
+            # Calls below use the shared retry policy. Do not multiply it by
+            # LangChain's separate retry budget.
+            retries=1,
         )
 
     base_url = os.environ.get("OPENAI_BASE_URL")
@@ -122,6 +154,13 @@ class AnswerCheck(BaseModel):
     """Result of answer completeness check."""
     is_complete: bool = Field(description="Whether the current context provides a complete answer")
     answer: str = Field(description="The current answer based on the context")
+
+
+def _invoke_realtime_chain(chain, inputs: Any, is_gemini: bool):
+    """Invoke a LangChain runnable without bypassing Gemini retry policy."""
+    if is_gemini:
+        return run_with_gemini_retry(chain.invoke, inputs)
+    return chain.invoke(inputs)
 
 class DocumentProcessor:
     """Processes documents into chunks and creates embeddings."""
@@ -161,12 +200,30 @@ class KnowledgeGraph:
             download("en_core_web_sm")
             return spacy.load("en_core_web_sm")
 
-    def build_graph(self, splits: List, llm, embedding_model) -> None:
+    def build_graph(
+        self,
+        splits: List,
+        llm,
+        embedding_model,
+        batch_client: Optional[VertexBatchClient] = None,
+        batch_stage_prefix: str = "graphrag-concepts",
+        temperature: float = 0.7,
+        max_tokens: int = 100,
+        is_gemini: bool = False,
+    ) -> None:
         """Build the knowledge graph from document splits."""
         self._add_nodes(splits)
         embeddings = self._create_embeddings(splits, embedding_model)
         self._all_embeddings = list(embeddings)
-        self._extract_concepts(splits, llm)
+        self._extract_concepts(
+            splits,
+            llm,
+            batch_client,
+            batch_stage_prefix,
+            temperature,
+            max_tokens,
+            is_gemini,
+        )
         self._add_edges(embeddings)
 
     def _add_nodes(self, splits: List) -> None:
@@ -179,13 +236,31 @@ class KnowledgeGraph:
         texts = [split.page_content for split in splits]
         return embedding_model.embed_documents(texts)
 
-    def _extract_concepts(self, splits: List, llm) -> None:
+    def _extract_concepts(
+        self,
+        splits: List,
+        llm,
+        batch_client: Optional[VertexBatchClient] = None,
+        batch_stage_prefix: str = "graphrag-concepts",
+        temperature: float = 0.7,
+        max_tokens: int = 100,
+        is_gemini: bool = False,
+    ) -> None:
         """Extract concepts from all splits using multi-threading."""
+        if batch_client is not None:
+            self._extract_concepts_batch(
+                splits,
+                batch_client,
+                batch_stage_prefix,
+                temperature,
+                max_tokens,
+            )
+            return
         max_workers = int(os.environ.get("GRAPH_RAG_MAX_WORKERS", str(DEFAULT_MAX_WORKERS)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_node = {
-                executor.submit(self._extract_concepts_and_entities, split.page_content, llm): i
+                executor.submit(self._extract_concepts_and_entities, split.page_content, llm, is_gemini): i
                 for i, split in enumerate(splits)
             }
 
@@ -199,7 +274,88 @@ class KnowledgeGraph:
                     logger.warning(f"[GraphRAG] Concept extraction failed for node {node}: {e}")
                     self.graph.nodes[node]['concepts'] = []
 
-    def _extract_concepts_and_entities(self, content: str, llm) -> List[str]:
+    def _extract_concepts_batch(
+        self,
+        splits: List,
+        batch_client: VertexBatchClient,
+        stage: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> None:
+        """Batch independent concept prompts before graph construction begins."""
+        requests: List[BatchChatRequest] = []
+        entities_by_node: Dict[int, List[str]] = {}
+        request_by_node: Dict[int, str] = {}
+        duplicate_nodes: Dict[int, List[int]] = {}
+        first_node_by_content: Dict[str, int] = {}
+        for node, split in enumerate(splits):
+            content = split.page_content
+            if content in self.concept_cache:
+                self.graph.nodes[node]["concepts"] = self.concept_cache[content]
+                continue
+            if content in first_node_by_content:
+                # The normal concept cache intends identical splits to share a
+                # result. Submit one request so Vertex's echoed content remains
+                # unambiguous, then assign that result to every duplicate node.
+                duplicate_nodes.setdefault(first_node_by_content[content], []).append(node)
+                continue
+            first_node_by_content[content] = node
+            doc = self.nlp(content)
+            entities_by_node[node] = [
+                entity.text for entity in doc.ents
+                if entity.label_ in ["PERSON", "ORG", "GPE", "WORK_OF_ART"]
+            ]
+            request_id = make_request_id("graphrag", f"{stage}:{node}")
+            request_by_node[node] = request_id
+            requests.append(BatchChatRequest(
+                request_id=request_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Extract key concepts (excluding named entities) from the following text:\n\n"
+                            + content
+                            + "\n\nKey concepts:"
+                        ),
+                    },
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                # Match ``llm.with_structured_output(Concepts)`` below: the
+                # current LangChain Gemini integration uses native JSON schema
+                # mode rather than relying on an instruction-only JSON prompt.
+                response_format={
+                    "type": "json_object",
+                    "response_schema": Concepts.model_json_schema(),
+                },
+                phase="memorize",
+                metadata={"node": node, "stage": stage},
+            ))
+
+        responses = batch_client.run_stage(stage, requests)
+        for node, request_id in request_by_node.items():
+            response = responses.get(request_id)
+            general_concepts: List[str] = []
+            if response is None or response.status:
+                logger.warning(
+                    "[GraphRAG] Batch concept extraction failed for node %s: %s",
+                    node,
+                    response.status if response is not None else "no output row",
+                )
+            else:
+                try:
+                    general_concepts = Concepts.model_validate_json(response.content).concepts_list
+                except (TypeError, ValueError) as exc:
+                    logger.warning("[GraphRAG] Batch concept JSON parse failed for node %s: %s", node, exc)
+            # The real-time implementation preserves named entities and caches
+            # the partial result when all structured-output attempts fail.
+            concepts = list(set(entities_by_node[node] + general_concepts))
+            self.concept_cache[splits[node].page_content] = concepts
+            self.graph.nodes[node]["concepts"] = concepts
+            for duplicate_node in duplicate_nodes.get(node, []):
+                self.graph.nodes[duplicate_node]["concepts"] = concepts
+
+    def _extract_concepts_and_entities(self, content: str, llm, is_gemini: bool = False) -> List[str]:
         """Extract concepts and named entities from content."""
         if content in self.concept_cache:
             return self.concept_cache[content]
@@ -217,24 +373,13 @@ class KnowledgeGraph:
         concept_chain = concept_prompt | llm.with_structured_output(Concepts)
 
         general_concepts = []
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                result = concept_chain.invoke({"text": content})
-                general_concepts = result.concepts_list
-                break
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "rate limit" in error_msg or "429" in error_msg:
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 5
-                        logger.warning(f"[GraphRAG] Rate limit hit, waiting {wait_time}s...")
-                        time.sleep(wait_time)
-                    else:
-                        logger.warning(f"[GraphRAG] Concept extraction failed after {max_retries} retries")
-                else:
-                    logger.warning(f"[GraphRAG] Concept extraction error: {e}")
-                    break
+        try:
+            result = _invoke_realtime_chain(concept_chain, {"text": content}, is_gemini)
+            general_concepts = result.concepts_list
+        except Exception as exc:
+            # Preserve named entities when the fully retried structured call
+            # cannot complete; graph construction remains best-effort.
+            logger.warning("[GraphRAG] Concept extraction error: %s", exc)
 
         all_concepts = list(set(named_entities + general_concepts))
         self.concept_cache[content] = all_concepts
@@ -281,11 +426,12 @@ class QueryEngine:
     """Handles queries using vector store and knowledge graph traversal."""
 
     def __init__(self, vector_store, knowledge_graph: KnowledgeGraph, llm,
-                 retrieve_num: int = DEFAULT_RETRIEVE_NUM):
+                 retrieve_num: int = DEFAULT_RETRIEVE_NUM, is_gemini: bool = False):
         self.vector_store = vector_store
         self.knowledge_graph = knowledge_graph
         self.llm = llm
         self.retrieve_num = retrieve_num
+        self.is_gemini = is_gemini
         self._tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
         self.answer_check_chain = self._create_answer_check_chain()
 
@@ -359,7 +505,7 @@ class QueryEngine:
             base_compressor=compressor,
             base_retriever=retriever
         )
-        return compression_retriever.invoke(query)
+        return _invoke_realtime_chain(compression_retriever, query, self.is_gemini)
 
     def _expand_context(self, query: str, relevant_docs: List) -> Tuple[str, List[int], Dict[int, str], str]:
         """Expand context using Dijkstra-like graph traversal."""
@@ -438,7 +584,11 @@ class QueryEngine:
     def _check_answer(self, query: str, context: str) -> Tuple[bool, str]:
         """Check if context provides a complete answer."""
         try:
-            response = self.answer_check_chain.invoke({"query": query, "context": context})
+            response = _invoke_realtime_chain(
+                self.answer_check_chain,
+                {"query": query, "context": context},
+                self.is_gemini,
+            )
             return response.is_complete, response.answer
         except Exception as e:
             logger.warning(f"[GraphRAG] Answer check error: {e}")
@@ -456,7 +606,33 @@ class QueryEngine:
         response_chain = response_prompt | self.llm
 
         truncated_context = self._truncate_context(context)
-        response = response_chain.invoke({"query": query, "context": truncated_context})
+        if self.is_gemini:
+            def generate_answer():
+                response = response_chain.invoke(
+                    {"query": query, "context": truncated_context}
+                )
+                response_text = getattr(response, "content", response)
+                if not str(response_text or "").strip():
+                    metadata = getattr(response, "response_metadata", {}) or {}
+                    prompt_feedback = metadata.get("prompt_feedback", {})
+                    if not isinstance(prompt_feedback, dict):
+                        prompt_feedback = {}
+                    diagnostics = {
+                        "finish_reason": metadata.get("finish_reason"),
+                        "block_reason": prompt_feedback.get("block_reason"),
+                        "model_name": metadata.get("model_name"),
+                    }
+                    raise EmptyGeminiResponseError(
+                        "GraphRAG final-answer request completed without text "
+                        f"(Vertex metadata: {diagnostics})."
+                    )
+                return response
+
+            return run_with_gemini_retry(generate_answer)
+
+        response = response_chain.invoke(
+            {"query": query, "context": truncated_context}
+        )
 
         return response
 
@@ -474,9 +650,16 @@ class GraphRAG:
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
         edges_threshold: float = DEFAULT_EDGES_THRESHOLD,
         callbacks: List = None,
+        batch_client: Optional[VertexBatchClient] = None,
+        batch_stage_prefix: str = "graphrag-concepts",
     ):
         self.retrieve_num = retrieve_num
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self._is_gemini = "gemini" in model_name.lower()
         self._callbacks = callbacks or []
+        self.batch_client = batch_client
+        self.batch_stage_prefix = batch_stage_prefix
 
         # Initialize LLM
         self.llm = _get_chat_model(
@@ -495,12 +678,22 @@ class GraphRAG:
     def process_documents(self, documents: List[Document]) -> None:
         """Process documents and build knowledge graph."""
         splits, vector_store = self.document_processor.process_documents(documents)
-        self.knowledge_graph.build_graph(splits, self.llm, self.embedding_model)
+        self.knowledge_graph.build_graph(
+            splits,
+            self.llm,
+            self.embedding_model,
+            self.batch_client,
+            self.batch_stage_prefix,
+            self.temperature,
+            self.max_tokens,
+            self._is_gemini,
+        )
         self.query_engine = QueryEngine(
             vector_store,
             self.knowledge_graph,
             self.llm,
-            retrieve_num=self.retrieve_num
+            retrieve_num=self.retrieve_num,
+            is_gemini=self._is_gemini,
         )
 
     def query(self, query: str) -> Tuple[str, str]:
@@ -545,6 +738,12 @@ class GraphRAGAgent(BaseAgent):
         embedding_model: Optional[str] = None,
         embedding_provider: Optional[str] = None,
         embedding_model_path: Optional[str] = None,
+        vertex_batch_enabled: bool = False,
+        vertex_batch_gcs_uri: Optional[str] = None,
+        vertex_batch_wait: bool = False,
+        vertex_batch_manifest_dir: Optional[str] = None,
+        vertex_batch_config_hash: str = "",
+        vertex_batch_progress_callback: Optional[Callable[[str], None]] = None,
         **kwargs
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -560,6 +759,14 @@ class GraphRAGAgent(BaseAgent):
 
         self._embedding_model = embedding_model or embedding_model_path
         self._embedding_provider = embedding_provider
+        self._vertex_batch_enabled = vertex_batch_enabled
+        self._vertex_batch_gcs_uri = vertex_batch_gcs_uri
+        self._vertex_batch_wait = vertex_batch_wait
+        self._vertex_batch_manifest_dir = vertex_batch_manifest_dir
+        self._vertex_batch_config_hash = vertex_batch_config_hash
+        self._vertex_batch_progress_callback = vertex_batch_progress_callback
+        self._vertex_batch_client: Optional[VertexBatchClient] = None
+        self._graph_build_index = 0
 
         # State
         self._graph_rag: Optional[GraphRAG] = None
@@ -585,6 +792,7 @@ class GraphRAGAgent(BaseAgent):
         from utils.langchain_callback import TokenUsageCallbackHandler
         usage_callback = TokenUsageCallbackHandler(model_name=self.model)
 
+        self._graph_build_index += 1
         self._graph_rag = GraphRAG(
             temperature=self.temperature,
             model_name=self.model,
@@ -595,7 +803,40 @@ class GraphRAGAgent(BaseAgent):
             chunk_overlap=self.chunk_overlap,
             edges_threshold=self.edges_threshold,
             callbacks=[usage_callback],
+            batch_client=self._get_concept_batch_client(),
+            batch_stage_prefix=(
+                f"graphrag-concepts-context-{self._context_id or 0}-build-{self._graph_build_index}"
+            ),
         )
+
+    def _get_concept_batch_client(self) -> Optional[VertexBatchClient]:
+        """Use Vertex only for independent graph concept extraction prompts."""
+        if not self._vertex_batch_enabled:
+            return None
+        if self._vertex_batch_client is None:
+            llm_client = create_llm_client(
+                provider=self._provider,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                api_key=self._api_key,
+                base_url=self._base_url,
+            )
+            manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
+            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+                llm_client,
+                gcs_uri=self._vertex_batch_gcs_uri,
+                manifest_path=scoped_manifest_path(
+                    manifest_dir,
+                    "graphrag_concepts_batch_manifest",
+                    model=llm_client.model,
+                    config_hash=self._vertex_batch_config_hash,
+                ),
+                wait=self._vertex_batch_wait,
+                config_hash=self._vertex_batch_config_hash,
+                progress_callback=self._vertex_batch_progress_callback,
+            )
+        return self._vertex_batch_client
 
     def memorize(self, text: str, is_last_session: bool = False, **kwargs) -> MemoryBuildResult:
         """Accumulate text and build graph on last session of each evaluation unit.
@@ -703,10 +944,11 @@ class GraphRAGAgent(BaseAgent):
         try:
             response, retrieval_context = self._graph_rag.query(question)
             response_text = response
-        except Exception as e:
-            logger.error(f"[GraphRAG] Query failed: {e}")
-            response_text = f"Error: {e}"
-            retrieval_context = ""
+        except Exception as exc:
+            # Never score a transport error as an answer. The evaluator can
+            # resume from its checkpoint after the retry budget ends.
+            logger.error("[GraphRAG] Query failed after retries: %s", exc)
+            raise RuntimeError("GraphRAG query failed; no answer was recorded.") from exc
 
         query_time = time.time() - start_time
 

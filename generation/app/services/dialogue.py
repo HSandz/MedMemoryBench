@@ -437,23 +437,23 @@ class DialogueService:
         enriched = persona.enriched_data or {}
 
         parts = [
-            f"性别: {base.gender if base else '未知'}",
-            f"年龄段: {enriched.get('age_range', '未知')}",
-            f"职业: {enriched.get('occupation_detail', '未知')}",
-            f"用户类型: {base.type_name if base else '未知'}",
+            f"Gender: {base.gender if base else 'unknown'}",
+            f"Age range: {enriched.get('age_range', 'unknown')}",
+            f"Occupation: {enriched.get('occupation_detail', 'unknown')}",
+            f"User type: {base.type_name if base else 'unknown'}",
         ]
 
         health_details = enriched.get("health_details", {})
         if health_details.get("current_symptoms"):
-            parts.append(f"当前症状: {', '.join(health_details['current_symptoms'])}")
+            parts.append(f"Current symptoms: {', '.join(health_details['current_symptoms'])}")
         if health_details.get("medical_history"):
-            parts.append(f"既往病史: {', '.join(health_details['medical_history'])}")
+            parts.append(f"Medical history: {', '.join(health_details['medical_history'])}")
         if health_details.get("medications"):
-            parts.append(f"用药情况: {', '.join(health_details['medications'])}")
+            parts.append(f"Medications: {', '.join(health_details['medications'])}")
 
         lifestyle = enriched.get("lifestyle", {})
         if lifestyle.get("stress_level"):
-            parts.append(f"压力水平: {lifestyle['stress_level']}")
+            parts.append(f"Stress level: {lifestyle['stress_level']}")
 
         return "\n".join(parts)
 
@@ -462,18 +462,18 @@ class DialogueService:
     ) -> str:
         """Build event context for user agent, marking the current consultation topic."""
         trap_type_names = {
-            "allergy": "过敏史",
-            "medication_history": "用药史",
-            "disease_history": "疾病史",
-            "medication_preference": "给药偏好",
-            "diet_preference": "饮食偏好",
-            "lifestyle_economic": "生活&经济情况",
+            "allergy": "Allergy history",
+            "medication_history": "Medication history",
+            "disease_history": "disease history",
+            "medication_preference": "Dosing preference",
+            "diet_preference": "dietary preferences",
+            "lifestyle_economic": "Life & Economic Situation",
         }
 
         regular_type_names = {
-            "health": "健康",
-            "life": "生活",
-            "work": "工作",
+            "health": "healthy",
+            "life": "Life",
+            "work": "Work",
         }
 
         parts = []
@@ -486,18 +486,18 @@ class DialogueService:
             type_label = regular_type_names.get(current_type, current_type)
 
         parts.append("=" * 50)
-        parts.append(f"【本次咨询主题】类型: {type_label} ({current_type})")
-        parts.append(f"事件内容: {current_event.event}")
+        parts.append(f"[Consultation topic] Type: {type_label} ({current_type})")
+        parts.append(f"Event details: {current_event.event}")
         parts.append("")
-        parts.append("⚠️ 你这次对话必须围绕上述事件展开！")
-        parts.append("⚠️ 事件中提到的所有具体信息（数值、药物名、症状等）都要在对话中表达出来！")
+        parts.append("⚠️ Your conversation must be centered around the above events!")
+        parts.append("⚠️ All specific information mentioned in the event (values, drug names, symptoms, etc.) must be expressed in the conversation!")
         parts.append("=" * 50)
         parts.append("")
 
         # Background events (for reference)
         background_events = [e for e in context_events if e.id != current_event.id]
         if background_events:
-            parts.append("【背景信息】以下是你近期的其他健康相关事件，可在适当时候提及：")
+            parts.append("[Background information] The following are your other recent health-related events, which can be mentioned at the appropriate time:")
             for event in background_events:
                 if event.type in trap_type_names:
                     type_label = trap_type_names[event.type]
@@ -513,51 +513,51 @@ class DialogueService:
 
         trap_prompts = {
             "allergy": (
-                "你现在需要咨询医生，在对话中自然地提及你的过敏史。"
-                "请根据【本次咨询主题】中的过敏信息，告诉医生你对什么过敏、"
-                "之前有过什么反应，以便医生在开药时能够避开。"
+                "You need to talk to your doctor now and bring up your allergy history naturally in the conversation."
+                "Please tell the doctor what you are allergic to according to the allergy information in [This consultation topic],"
+                "Any previous reactions that doctors can avoid when prescribing medication."
             ),
             "medication_history": (
-                "你现在需要咨询医生，在对话中告诉医生你正在长期服用的药物。"
-                "请根据【本次咨询主题】中的用药信息，说明你在吃什么药、"
-                "为什么吃、医生有什么特别叮嘱。"
+                "You need to talk to your doctor now and tell your doctor during the conversation about the medications you are taking long-term."
+                "Please explain what medicines you are taking according to the medication information in [This consultation topic],"
+                "Why should I eat it? What special instructions does the doctor have?"
             ),
             "disease_history": (
-                "你现在需要咨询医生，在对话中提及你的既往病史。"
-                "请根据【本次咨询主题】中的疾病史信息，告诉医生你以前得过什么病、"
-                "当时的情况、医生对你有什么提醒。"
+                "You now need to consult your doctor and mention your past medical history in the conversation."
+                "Please tell the doctor what diseases you have had in the past based on the disease history information in [This consultation topic]."
+                "What was the situation at that time and what did the doctor remind you?"
             ),
             "medication_preference": (
-                "你现在需要咨询医生，在对话中表达你对药物剂型的特殊需求。"
-                "请根据【本次咨询主题】中的信息，告诉医生你在服药方面有什么困难或偏好。"
+                "You now need to consult with your doctor and express your specific needs regarding the dosage form of the drug during the conversation."
+                "Please tell the doctor any difficulties or preferences you have in taking medicine based on the information in [This consultation topic]."
             ),
             "diet_preference": (
-                "你现在需要咨询医生，在对话中自然地提及你的饮食习惯。"
-                "请根据【本次咨询主题】中的饮食偏好信息，告诉医生你的饮食习惯，"
-                "尤其是那些可能与医嘱冲突的地方。"
+                "You need to talk to your doctor now and bring up your eating habits naturally in the conversation."
+                "Please tell the doctor your eating habits based on the dietary preference information in [This consultation topic],"
+                "Especially those that may conflict with medical advice."
             ),
             "lifestyle_economic": (
-                "你现在需要咨询医生，在对话中表达你的经济或生活方面的顾虑。"
-                "请根据【本次咨询主题】中的信息，告诉医生你的医保情况、经济压力、"
-                "或者工作生活中的困难。"
+                "You need to talk to your doctor now and bring up your financial or life concerns in the conversation."
+                "Please tell the doctor your medical insurance situation, financial pressure,"
+                "Or difficulties in work life."
             ),
         }
 
         regular_prompts = {
             "health": (
-                "你现在联系医生进行健康咨询。"
-                "请根据【本次咨询主题】中描述的具体健康问题开始对话，"
-                "完整描述事件中提到的症状、检查结果、数值等信息。"
+                "You now contact your doctor for a health consultation."
+                "Please start the conversation based on the specific health issue described in [This consultation topic],"
+                "Completely describe the symptoms, test results, numerical values ​​and other information mentioned in the incident."
             ),
             "life": (
-                "你现在联系医生咨询一些生活方面的健康问题。"
-                "请根据【本次咨询主题】中描述的生活变化或调整来开始对话，"
-                "说明这些变化与你的健康有什么关系。"
+                "You are now contacting your doctor to consult about some health issues in your life."
+                "Please start the conversation based on the life changes or adjustments described in [This consultation topic],"
+                "Explain how these changes relate to your health."
             ),
             "work": (
-                "你现在联系医生咨询工作对健康的影响。"
-                "请根据【本次咨询主题】中描述的工作相关问题开始对话，"
-                "说明工作对你健康造成了什么影响。"
+                "You now contact your doctor to ask about the health effects of work."
+                "Please start the conversation based on the work-related issues described in [This consultation topic],"
+                "Explain how work has affected your health."
             ),
         }
 
@@ -571,7 +571,7 @@ class DialogueService:
     async def _check_dialogue_end(self, messages: list[Message]) -> bool:
         """Check if dialogue should naturally end using small model."""
         dialogue_history = "\n".join([
-            f"{'患者' if m.agent_type == 'user_agent' else '医生'}: {m.content}"
+            f"{'patient' if m.agent_type == 'user_agent' else 'doctor'}: {m.content}"
             for m in messages
         ])
 
@@ -610,7 +610,7 @@ class DialogueService:
             Newly extracted knowledge points with time and session_id fields.
         """
         dialogue_history = "\n".join([
-            f"第{m.turn_number}轮 {'患者' if m.agent_type == 'user_agent' else '医生'}: {m.content}"
+            f"Turn {m.turn_number}, {'patient' if m.agent_type == 'user_agent' else 'doctor'}: {m.content}"
             for m in messages
         ])
 
@@ -619,15 +619,15 @@ class DialogueService:
             existing_text = self._format_existing_key_points(accumulated_key_points)
             prompt = KNOWLEDGE_EXTRACT_PROMPT_ACCUMULATED.format(
                 current_session_id=session_id or 0,
-                event_time=event_time or "未知",
+                event_time=event_time or "unknown",
                 dialogue_history=dialogue_history,
                 existing_key_points=existing_text,
-                event_context=event_context or "（无事件背景）",
+                event_context=event_context or "(No event background)",
             )
         else:
             prompt = KNOWLEDGE_EXTRACT_PROMPT_INITIAL.format(
                 dialogue_history=dialogue_history,
-                event_context=event_context or "（无事件背景）",
+                event_context=event_context or "(No event background)",
             )
 
         try:
@@ -719,12 +719,12 @@ class DialogueService:
         Returns:
             A fallback key point dict, or None if not applicable.
         """
-        if not event_context or event_context == "（无事件背景）" or event_context == "（未知事件）":
+        if not event_context or event_context == "(No event background)" or event_context == "(unknown event)":
             return None
 
         fallback_kp = {
-            "category": "疾病状况",
-            "name": "就诊事件",
+            "category": "disease condition",
+            "name": "Medical treatment event",
             "content": event_context[:100] if len(event_context) > 100 else event_context,
             "trap_score": 0.5,
             "time": event_time,
@@ -756,11 +756,11 @@ class DialogueService:
             Formatted key points string.
         """
         if not accumulated or accumulated.total_entries == 0:
-            return "（暂无历史知识点）"
+            return "(No historical knowledge points yet)"
 
         lines = []
         for entry in accumulated.to_flat_list():
-            time_str = entry.get("time") or "未知时间"
+            time_str = entry.get("time") or "unknown time"
             line = EXISTING_KEY_POINTS_FORMAT.format(
                 category=entry.get("category", ""),
                 name=entry.get("name", ""),
@@ -797,35 +797,35 @@ class DialogueService:
 
         # Trap event type names (Chinese labels)
         trap_type_names = {
-            "allergy": "过敏史",
-            "medication_history": "用药史",
-            "disease_history": "疾病史",
-            "medication_preference": "给药偏好",
-            "diet_preference": "饮食偏好",
-            "lifestyle_economic": "生活&经济情况",
+            "allergy": "Allergy history",
+            "medication_history": "Medication history",
+            "disease_history": "disease history",
+            "medication_preference": "Dosing preference",
+            "diet_preference": "dietary preferences",
+            "lifestyle_economic": "Life & Economic Situation",
         }
 
         # Build events list with priority indicator
         events_list_parts = []
         for e in events:
-            type_label = {"health": "健康", "life": "生活", "work": "工作"}.get(e.type, e.type)
+            type_label = {"health": "healthy", "life": "Life", "work": "Work"}.get(e.type, e.type)
             # Show Chinese label for trap event types
             if e.type in trap_type_names:
                 type_label = trap_type_names[e.type]
             priority = ""
             if e.type == "health":
-                priority = "【推荐】"
+                priority = "[Recommended]"
             elif e.type in TRAP_EVENT_TYPES_SET:
-                priority = "【陷阱事件】"
-            events_list_parts.append(f"- ID: {e.id}, 类型: {type_label} {priority}, 日期: {e.event_date}, 描述: {e.event}")
+                priority = "[Trap event]"
+            events_list_parts.append(f"- ID: {e.id}, Type: {type_label} {priority}, Date: {e.event_date}, Description: {e.event}")
         events_list = "\n".join(events_list_parts)
 
         # Build selected events info
         if selected_event_ids:
             selected_info = ", ".join([str(eid) for eid in selected_event_ids])
-            selected_events = f"已选择的事件ID: {selected_info}"
+            selected_events = f"Selected event IDs: {selected_info}"
         else:
-            selected_events = "（尚未选择任何事件）"
+            selected_events = "(No events selected yet)"
 
         if ensure_trap_coverage:
             selected_trap_types = set()
@@ -887,8 +887,8 @@ class DialogueService:
                         return {
                             "selected_event_id": trap_event.id,
                             "event_summary": trap_event.event[:50],
-                            "selection_reason": f"自动选择陷阱事件（LLM失败: {str(e)}）",
-                            "dialogue_angle": f"透露{trap_type_names.get(trap_type, trap_type)}",
+                            "selection_reason": f"Automatically selected trap event (LLM failure: {str(e)})",
+                            "dialogue_angle": f"Reveal {trap_type_names.get(trap_type, trap_type)}",
                         }
 
             # Final fallback: pick a health event or the first available event
@@ -897,8 +897,8 @@ class DialogueService:
             return {
                 "selected_event_id": fallback_event.id,
                 "event_summary": fallback_event.event[:50],
-                "selection_reason": f"默认选择（LLM调用失败: {str(e)}）",
-                "dialogue_angle": "首诊",
+                "selection_reason": f"Default selection (LLM call failed: {str(e)})",
+                "dialogue_angle": "First visit",
             }
 
     def select_events_by_time_order(
@@ -923,12 +923,12 @@ class DialogueService:
 
         # Trap event type mapping
         trap_type_names = {
-            "allergy": "过敏史",
-            "medication_history": "用药史",
-            "disease_history": "疾病史",
-            "medication_preference": "给药偏好",
-            "diet_preference": "饮食偏好",
-            "lifestyle_economic": "生活&经济情况",
+            "allergy": "Allergy history",
+            "medication_history": "Medication history",
+            "disease_history": "disease history",
+            "medication_preference": "Dosing preference",
+            "diet_preference": "dietary preferences",
+            "lifestyle_economic": "Life & Economic Situation",
         }
 
         # Sort all events by date
@@ -957,8 +957,8 @@ class DialogueService:
             selection = {
                 "selected_event_id": event.id,
                 "event_summary": event.event[:100] if event.event else "",
-                "selection_reason": f"按时间顺序选取（{event.event_date}）",
-                "dialogue_angle": f"透露{type_name}" if is_trap else "常规问诊",
+                "selection_reason": f"Selected in chronological order ({event.event_date})",
+                "dialogue_angle": f"Reveal {type_name}" if is_trap else "Routine consultation",
                 "event_date": event.event_date,
                 "event_type": event.type,
             }
@@ -1201,7 +1201,7 @@ class DialogueService:
             import logging
             logger = logging.getLogger(__name__)
             logger.warning(
-                f"[Dialogue] 事件数量不足: 需要 {count} 个，仅有 {len(event_selections)} 个可用"
+                f"[Dialogue] Insufficient events: {count} required, only {len(event_selections)} available"
             )
 
         # Accumulated knowledge points for doctor agent memory

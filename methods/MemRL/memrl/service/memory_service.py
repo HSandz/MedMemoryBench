@@ -576,6 +576,7 @@ class MemoryService:
         task_description: str,
         trajectory: str,
         metadata: Optional[Dict[str, Any]] = None,
+        prebuilt_memory_content: Optional[str] = None,
     ) -> str:
         """
         Build procedural memory from task trajectory using the configured build strategy.
@@ -597,9 +598,15 @@ class MemoryService:
             raw_success = (metadata or {}).get("success", None)
             success = _coerce_success(raw_success)
 
-            # Use Builder pattern to generate memory content
-            builder = get_builder(self.strategy_config.build, self.llm_provider)
-            memory_content = builder.build(task_description, trajectory)
+            # Use the original builder unless the adapter already completed
+            # its independent trajectory-to-script request through Vertex
+            # batch inference. All parsing, keying, and writes below remain
+            # ordered and identical in either path.
+            if prebuilt_memory_content is None:
+                builder = get_builder(self.strategy_config.build, self.llm_provider)
+                memory_content = builder.build(task_description, trajectory)
+            else:
+                memory_content = prebuilt_memory_content
 
             # Create procedural memory based on build strategy
             if self.strategy_config.build == BuildStrategy.TRAJECTORY:

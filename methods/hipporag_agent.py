@@ -20,6 +20,7 @@ from .base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import (
     BaseLLMClient,
     LLMResponse,
+    LLMRetryExhaustedError,
     create_llm_client,
     format_messages,
     get_usage_tracker,
@@ -94,6 +95,9 @@ class TrackedLLMWrapper:
 
             return content, metadata, False  # cache_hit=False
 
+        except LLMRetryExhaustedError as exc:
+            logger.error("[HippoRAG] Gemini request exhausted retries: %s", exc)
+            raise RuntimeError("HippoRAG query failed; no answer was recorded.") from exc
         except Exception as e:
             logger.error(f"LLM inference error: {e}")
             return "", {"error": str(e), "prompt_tokens": 0, "completion_tokens": 0, "finish_reason": "error"}, False
@@ -929,6 +933,9 @@ class HippoRAGAgent(BaseAgent):
                 },
             )
 
+        except LLMRetryExhaustedError as exc:
+            logger.error("[HippoRAG] Gemini request exhausted retries: %s", exc)
+            raise RuntimeError("HippoRAG query failed; no answer was recorded.") from exc
         except Exception as e:
             logger.error(f"[HippoRAG] Query error: {e}")
             import traceback

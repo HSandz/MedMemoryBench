@@ -90,6 +90,54 @@ class MetricsCalculator:
             **kwargs
         )
 
+    def get_metric_name(self, query_type: str, metric_name: Optional[str] = None) -> str:
+        """Resolve the configured metric without evaluating it."""
+        return metric_name or self.metric_mapping.get(query_type, "string_contain")
+
+    def prepare_batch(
+        self,
+        query_id: str,
+        query_type: str,
+        model_output: str,
+        expected_answers: List[str],
+        question: str = "",
+        metric_name: Optional[str] = None,
+        **kwargs,
+    ) -> Optional[Dict[str, Any]]:
+        """Prepare an LLM-judge request, returning ``None`` for local metrics."""
+        resolved_name = self.get_metric_name(query_type, metric_name)
+        if resolved_name not in {"llm_judge", "llm_judge_mcd"}:
+            return None
+        metric = self._get_metric(resolved_name)
+        return {
+            "metric_name": resolved_name,
+            "prepared": metric.prepare_batch(
+                query_id=query_id,
+                query_type=query_type,
+                model_output=model_output,
+                expected_answers=expected_answers,
+                question=question,
+                **kwargs,
+            ),
+        }
+
+    def get_batch_judge_client(
+        self,
+        query_type: str,
+        metric_name: Optional[str] = None,
+    ):
+        """Return the judge's Gemini client, or ``None`` for real-time fallback."""
+        resolved_name = self.get_metric_name(query_type, metric_name)
+        if resolved_name not in {"llm_judge", "llm_judge_mcd"}:
+            return None
+        metric = self._get_metric(resolved_name)
+        return metric.get_batch_client()
+
+    def finalize_batch(self, batch_payload: Dict[str, Any], result_text: str) -> MetricResult:
+        """Turn a Vertex judge response back into the normal metric result."""
+        metric = self._get_metric(batch_payload["metric_name"])
+        return metric.finalize_batch(batch_payload["prepared"], result_text)
+
 
 class MetricsAggregator:
     """Aggregates evaluation results."""

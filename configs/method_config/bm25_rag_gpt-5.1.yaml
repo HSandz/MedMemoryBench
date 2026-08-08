@@ -14,7 +14,7 @@ agent_params:
   top_k: 5
   k1: 1.5
   b: 0.75
-  language: "auto"  # auto / zh / en
+  language: "en"  # auto / zh / en
   chunk_size: 512
   chunk_overlap: 50
   max_context_tokens: 100000

@@ -1,5 +1,7 @@
 """LoCoMo evaluation module."""
 
+import hashlib
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,17 @@ from methods.base import MemoryBuildResult
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from utils.templates import get_prompt_manager
 from utils.llm_client import get_usage_tracker
+from utils.vertex_batch import (
+    BatchChatRequest,
+    VertexBatchClient,
+    VertexBatchError,
+    make_request_id,
+    PREPARED_QUERY_METADATA_KEY,
+    restore_prepared_query,
+    scoped_manifest_path,
+    snapshot_prepared_query,
+    should_use_batch,
+)
 
 
 # Default chunk size for memory injection (in characters)
@@ -34,6 +47,9 @@ class LoCoMoEvaluator:
         verbose: bool = True,
         logger: Optional[logging.Logger] = None,
         resume: bool = False,
+        batch_api: bool = False,
+        batch_gcs_uri: Optional[str] = None,
+        batch_wait: bool = False,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -42,6 +58,9 @@ class LoCoMoEvaluator:
         self.verbose = verbose
         self.logger = logger
         self.resume = resume
+        self.batch_api = batch_api
+        self.batch_gcs_uri = batch_gcs_uri
+        self.batch_wait = batch_wait
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -62,11 +81,22 @@ class LoCoMoEvaluator:
         self.result_collector = ResultCollector()
 
         self._memory_build_logs: List[Dict[str, Any]] = []
+        self._batch_client: Optional[VertexBatchClient] = None
+        self._batch_fallback_logged = False
 
         # Memory chunk configuration
         # Get from dataset config or use default
         eval_config = dataset_config.raw_config.get("evaluation", {})
         self.memory_chunk_size = eval_config.get("memory_chunk_size", DEFAULT_MEMORY_CHUNK_SIZE)
+
+    def _batch_config_hash(self) -> str:
+        """Bind a resumable batch manifest to the evaluated configuration."""
+        payload = {
+            "method": self.method_config.raw_config,
+            "dataset": self.dataset_config.raw_config,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
     def _log(self, message: str, level: str = "INFO") -> None:
         if self.verbose:
@@ -108,6 +138,12 @@ class LoCoMoEvaluator:
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
+                batch_api=self.batch_api,
+                batch_gcs_uri=self.batch_gcs_uri,
+                batch_wait=self.batch_wait,
+                batch_manifest_dir=self.output_dir / "batch",
+                batch_config_hash=self._batch_config_hash(),
+                batch_progress_callback=self._log,
             )
 
         self.agent_manager.set_context_id(context_id)
@@ -317,14 +353,127 @@ class LoCoMoEvaluator:
         query_count = len(unit.queries_to_evaluate)
         memory_time_per_query = total_memory_time / query_count if query_count > 0 else 0.0
 
-        for query in unit.queries_to_evaluate:
-            result = self._evaluate_query(query, unit.context_id)
+        if self._can_batch_queries(len(unit.queries_to_evaluate)):
+            query_results = self._evaluate_batch_queries(unit)
+        else:
+            if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
+                self._log(
+                    "Vertex batch API is unavailable or this stage is too small; "
+                    "using real-time generation for dependent requests.",
+                    level="WARNING",
+                )
+                self._batch_fallback_logged = True
+            query_results = [
+                self._evaluate_query(query, unit.context_id)
+                for query in unit.queries_to_evaluate
+            ]
+
+        for result in query_results:
             result.memory_construction_time = memory_time_per_query
             results.append(result)
 
             status = "✓" if result.is_correct else "✗"
             self._log(f"    [{status}] {query.query_id} ({query.query_type}): {result.score:.2f}")
 
+        return results
+
+    def _can_batch_queries(self, request_count: int) -> bool:
+        return bool(
+            should_use_batch(request_count)
+            and self.batch_api
+            and self.agent_manager
+            and self.agent_manager.supports_batch_queries()
+        )
+
+    def _get_batch_client(self) -> VertexBatchClient:
+        if self._batch_client is None:
+            if self.agent_manager is None:
+                raise VertexBatchError("Agent manager is not initialized for batch execution.")
+            llm_client = self.agent_manager.get_batch_llm_client()
+            if llm_client is None:
+                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
+            self._batch_client = VertexBatchClient.from_gemini_client(
+                llm_client,
+                gcs_uri=self.batch_gcs_uri,
+                manifest_path=scoped_manifest_path(
+                    self.output_dir / "batch",
+                    "locomo_batch_manifest",
+                    model=llm_client.model,
+                    config_hash=self._batch_config_hash(),
+                ),
+                wait=self.batch_wait,
+                config_hash=self._batch_config_hash(),
+                progress_callback=self._log,
+            )
+        return self._batch_client
+
+    def _evaluate_batch_queries(self, unit: EvaluationUnit) -> List[MetricResult]:
+        prepared_by_id: Dict[str, tuple[LoCoMoQuery, Dict[str, Any]]] = {}
+        requests: List[BatchChatRequest] = []
+        stage = f"query-unit-{unit.unit_id}"
+        batch_client = self._get_batch_client()
+        for query in unit.queries_to_evaluate:
+            request_id = make_request_id(
+                "query",
+                f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
+            )
+            saved_request = batch_client.get_saved_request(stage, request_id)
+            prepared = restore_prepared_query(saved_request) if saved_request else None
+            if prepared is None:
+                batch_request_time = (
+                    saved_request.metadata.get("batch_request_time")
+                    if saved_request is not None
+                    else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                formatted_question = self.prompt_manager.format_query(
+                    question=query.question,
+                    query_type=query.query_type,
+                )
+                prepared = self.agent_manager.prepare_batch_query(
+                    formatted_question,
+                    query_id=query.query_id,
+                    context_id=unit.context_id,
+                    batch_request_time=batch_request_time,
+                )
+
+            if saved_request is not None:
+                requests.append(saved_request)
+            else:
+                requests.append(
+                    BatchChatRequest(
+                        request_id=request_id,
+                        messages=prepared["messages"],
+                        temperature=self.method_config.model.temperature,
+                        max_tokens=(
+                            self.method_config.model.max_completion_tokens
+                            or self.method_config.model.max_tokens
+                        ),
+                        phase="query",
+                        metadata={
+                            "query_id": query.query_id,
+                            "unit_id": unit.unit_id,
+                            "batch_request_time": batch_request_time,
+                            PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared),
+                        },
+                    )
+                )
+            prepared_by_id[request_id] = (query, prepared)
+
+        responses = batch_client.run_stage(stage, requests)
+        results: List[MetricResult] = []
+        for request_id, (query, prepared) in prepared_by_id.items():
+            batch_response = responses.get(request_id)
+            if batch_response is None or batch_response.status:
+                error = batch_response.status if batch_response else "No output row returned"
+                results.append(self._api_error_result(query, f"Vertex batch request failed: {error}"))
+                continue
+            response = self.agent_manager.finalize_batch_query(
+                prepared,
+                batch_response.content,
+                input_tokens=batch_response.input_tokens,
+                output_tokens=batch_response.output_tokens,
+            )
+            results.append(self._score_agent_response(query, response))
         return results
 
     def _evaluate_query(self, query: LoCoMoQuery, context_id: Any) -> MetricResult:
@@ -351,11 +500,31 @@ class LoCoMoEvaluator:
             context_id=context_id,
         )
 
+        return self._score_agent_response(query, response)
+
+    def _api_error_result(self, query: LoCoMoQuery, error_message: str) -> MetricResult:
+        return MetricResult(
+            query_id=query.query_id,
+            query_type=query.query_type,
+            score=0.0,
+            is_correct=False,
+            model_output="[API_ERROR] Vertex batch request failed",
+            expected_answer=", ".join(query.get_correct_answers()),
+            question=query.question,
+            details={"api_error": True, "error_message": error_message},
+        )
+
+    def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
         if isinstance(response, dict):
             model_output = response.get("output", "")
             query_time = response.get("query_time", 0.0)
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
+        elif hasattr(response, "output"):
+            model_output = response.output
+            query_time = getattr(response, "query_time", 0.0)
+            retrieved_memories = getattr(response, "retrieved_memories", [])
+            retrieved_count = getattr(response, "retrieved_count", 0)
         else:
             model_output = str(response)
             query_time = 0.0
@@ -485,6 +654,9 @@ def evaluate_locomo(
     verbose: bool = True,
     logger: Optional[logging.Logger] = None,
     resume: bool = False,
+    batch_api: bool = False,
+    batch_gcs_uri: Optional[str] = None,
+    batch_wait: bool = False,
     **kwargs
 ) -> EvaluationReport:
     evaluator = LoCoMoEvaluator(
@@ -495,5 +667,8 @@ def evaluate_locomo(
         verbose=verbose,
         logger=logger,
         resume=resume,
+        batch_api=batch_api,
+        batch_gcs_uri=batch_gcs_uri,
+        batch_wait=batch_wait,
     )
     return evaluator.evaluate()

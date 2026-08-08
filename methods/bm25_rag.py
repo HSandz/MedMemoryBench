@@ -141,6 +141,17 @@ class BM25RAGAgent(BaseAgent):
         **kwargs
     ) -> AgentResponse:
         """Query the agent with BM25 retrieval."""
+        prepared = self.prepare_batch_query(question, system_message=system_message)
+        response = self._llm_client.chat(prepared["messages"])
+        return self.finalize_batch_query(prepared, response.content)
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
+        """Do BM25 retrieval locally and make the final request batchable."""
         retrieved_docs = self._retrieve(question)
         truncated_docs = self.truncate_docs_to_context(
             docs=retrieved_docs,
@@ -158,27 +169,33 @@ class BM25RAGAgent(BaseAgent):
         else:
             full_message = question
 
-        messages = format_messages(full_message, system_message)
-        response = self._llm_client.chat(messages)
-
         formatted_memories = [
             {"memory": doc[:500] + "..." if len(doc) > 500 else doc, "type": "bm25_retrieval"}
             for doc in truncated_docs
         ]
 
-        return AgentResponse(
-            output=response.content,
-            query_time=0.0,
-            retrieved_count=len(truncated_docs),
-            retrieved_memories=formatted_memories,
-            extra={
+        return {
+            "messages": format_messages(full_message, system_message),
+            "retrieved_count": len(truncated_docs),
+            "retrieved_memories": formatted_memories,
+            "extra": {
                 "method": "bm25_rag",
                 "k1": self.k1,
                 "b": self.b,
                 "language": self.language,
                 "original_retrieved_count": len(retrieved_docs),
                 "truncated_count": len(truncated_docs),
-            }
+            },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: dict, content: str) -> AgentResponse:
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def reset(self) -> None:

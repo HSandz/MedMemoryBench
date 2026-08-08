@@ -20,6 +20,8 @@ class MedMemoryBenchCheckpoint:
     model_name: str
     dataset_name: str = "medmemorybench"
     config_hash: str = ""
+    # Keeps each fresh batch run separate while allowing its resume to find it.
+    batch_manifest_scope: str = ""
 
     status: str = "in_progress"
     evaluation_mode: str = "independent"
@@ -50,6 +52,7 @@ class MedMemoryBenchCheckpoint:
             "model_name": "",
             "dataset_name": "medmemorybench",
             "config_hash": "",
+            "batch_manifest_scope": "",
             "status": "in_progress",
             "evaluation_mode": "independent",
             "completed_personas": [],
@@ -123,13 +126,15 @@ class MedMemoryBenchCheckpointManager:
     ) -> MedMemoryBenchCheckpoint:
         import uuid
 
+        checkpoint_id = str(uuid.uuid4())
         self._checkpoint = MedMemoryBenchCheckpoint(
-            checkpoint_id=str(uuid.uuid4()),
+            checkpoint_id=checkpoint_id,
             created_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat(),
             method_name=self.method_name,
             model_name=self.model_name,
             config_hash=self.config_hash,
+            batch_manifest_scope=checkpoint_id,
             evaluation_mode=evaluation_mode,
             total_personas=total_personas,
             total_queries=total_queries,
@@ -166,11 +171,16 @@ class MedMemoryBenchCheckpointManager:
             self._checkpoint.current_persona_injected_sessions.append(session_id)
             self.save()
 
-    def mark_query_completed(self, query_id: str, result_dict: Dict[str, Any]) -> None:
+    def mark_query_completed(
+        self,
+        query_id: str,
+        result_dict: Dict[str, Any],
+        persona_id: Optional[int] = None,
+    ) -> None:
         if self._checkpoint is None:
             return
 
-        persona_id = self._checkpoint.current_persona_id
+        persona_id = persona_id if persona_id is not None else self._checkpoint.current_persona_id
         if persona_id is None:
             return
 
@@ -238,6 +248,12 @@ class MedMemoryBenchCheckpointManager:
         if self._checkpoint is None:
             return None
         return self._checkpoint.current_persona_id
+
+    def get_batch_manifest_scope(self) -> str:
+        """Return the persisted batch namespace for a fresh/resumed run."""
+        if self._checkpoint is None:
+            return ""
+        return self._checkpoint.batch_manifest_scope
 
     def get_resume_info(self) -> Dict[str, Any]:
         if self._checkpoint is None:

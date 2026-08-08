@@ -30,6 +30,7 @@ class Qdrant(VectorStoreBase):
         path: str = None,
         url: str = None,
         api_key: str = None,
+        https: bool = None,
         on_disk: bool = False,
     ):
         """
@@ -44,6 +45,8 @@ class Qdrant(VectorStoreBase):
             path (str, optional): Path for local Qdrant database. Defaults to None.
             url (str, optional): Full URL for Qdrant server. Defaults to None.
             api_key (str, optional): API key for Qdrant server. Defaults to None.
+            https (bool, optional): Force HTTPS for a host/port connection. Explicit
+                URL schemes take precedence. Defaults to None.
             on_disk (bool, optional): Enables persistent storage. Defaults to False.
         """
         if client:
@@ -57,6 +60,8 @@ class Qdrant(VectorStoreBase):
             if host and port:
                 params["host"] = host
                 params["port"] = port
+                if https is not None:
+                    params["https"] = https
             if not params:
                 params["path"] = path
                 if not on_disk:

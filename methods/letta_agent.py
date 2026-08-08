@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
-from utils.llm_client import get_usage_tracker, LLMResponse
+from utils.llm_client import (
+    LLMResponse,
+    LLMRetryExhaustedError,
+    create_llm_client,
+    get_usage_tracker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,7 @@ class LettaAgent(BaseAgent):
         super().__init__(model, temperature, max_tokens, **kwargs)
 
         self.provider = provider
+        self._uses_vertex_gemini = provider.lower() in {"gemini", "vertex", "vertex_ai"}
         self.api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = (
             base_url
@@ -86,6 +92,14 @@ class LettaAgent(BaseAgent):
         # Agent management: one agent per context_id
         self._agent_ids: Dict[int, str] = {}
         self._client = None
+        self._vertex_client = None
+        if self._uses_vertex_gemini:
+            self._vertex_client = create_llm_client(
+                provider=provider,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
         self._apply_openai_compatible_env()
         self._load_letta_package()
@@ -133,10 +147,13 @@ class LettaAgent(BaseAgent):
 
     def _apply_openai_compatible_env(self) -> None:
         """Set OpenAI-compatible env vars so vendored Letta can pick up credentials."""
-        if self.api_key:
-            os.environ["OPENAI_API_KEY"] = self.api_key
-        if self.base_url:
-            os.environ["OPENAI_BASE_URL"] = self.base_url
+        if self._uses_vertex_gemini:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(self._vertex_client.service_account_file)
+        else:
+            if self.api_key:
+                os.environ["OPENAI_API_KEY"] = self.api_key
+            if self.base_url:
+                os.environ["OPENAI_BASE_URL"] = self.base_url
         self.persistence_root.mkdir(parents=True, exist_ok=True)
         os.environ["LETTA_DIR"] = str(self.persistence_root)
 
@@ -172,10 +189,14 @@ class LettaAgent(BaseAgent):
     def _init_client(self) -> None:
         """Initialize Letta client with proper settings."""
         letta_settings = importlib.import_module("letta.settings")
-        if self.api_key:
-            letta_settings.model_settings.openai_api_key = self.api_key
-        if self.base_url:
-            letta_settings.model_settings.openai_api_base = self.base_url
+        if self._uses_vertex_gemini:
+            letta_settings.model_settings.google_cloud_project = self._vertex_client.project
+            letta_settings.model_settings.google_cloud_location = self._vertex_client.location
+        else:
+            if self.api_key:
+                letta_settings.model_settings.openai_api_key = self.api_key
+            if self.base_url:
+                letta_settings.model_settings.openai_api_base = self.base_url
 
         letta_client = importlib.import_module("letta.client.client")
         self._LLMConfig = importlib.import_module("letta.schemas.llm_config").LLMConfig
@@ -214,6 +235,18 @@ class LettaAgent(BaseAgent):
 
     def _build_llm_config(self):
         """Build LLMConfig for Letta agent creation."""
+        if self._uses_vertex_gemini:
+            location = self._vertex_client.location
+            project = self._vertex_client.project
+            return self._LLMConfig(
+                model=self.model,
+                model_endpoint_type="google_vertex",
+                model_endpoint=f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}",
+                model_wrapper=None,
+                context_window=self.context_window,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
         endpoint = self.base_url or self.BIGMODEL_BASE_URL
         return self._LLMConfig(
             model=self.model,
@@ -598,6 +631,9 @@ class LettaAgent(BaseAgent):
 
             response = self._client.user_message(agent_id=agent_id, message=query_message)
             query_time = time.time() - start_time
+        except LLMRetryExhaustedError as exc:
+            logger.error("Letta Gemini request exhausted retries: %s", exc)
+            raise RuntimeError("Letta query failed; no answer was recorded.") from exc
         except Exception as e:
             logger.error(f"Letta user_message failed: {e}")
             return AgentResponse(

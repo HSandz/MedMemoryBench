@@ -21,7 +21,7 @@ model:
 embedding:
   provider: "local"
   model: "BAAI/bge-small-zh-v1.5"
-  model_path: "models/bge-small-zh-v1.5"
+  model_path: "BAAI/bge-small-zh-v1.5"
   dim: 512
 
 # ============================================================================
@@ -70,9 +70,9 @@ agent_params:
   # --------------------------------------------------------------------------
   # API Concurrency Configuration
   # --------------------------------------------------------------------------
-  # 降低并发度以减轻 API 超时压力
-  # - 默认 5 个并发请求（原默认值为 10）
-  # - 如果仍有超时问题，可以进一步降低到 3 或 2
+  # Lower concurrency to reduce API timeouts.
+  # - Default: 5 concurrent requests (previously 10)
+  # - If timeouts persist, reduce this further to 3 or 2.
   extraction_max_workers: 4
 
   # --------------------------------------------------------------------------

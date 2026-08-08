@@ -55,7 +55,7 @@ async def export_dialogues(
         persona = await persona_service.get_expanded_persona(dialogue.expanded_persona_id)
         persona_summary = ""
         if persona:
-            persona_summary = f"{persona.name or '未知'}, {persona.age or '?'}岁, {persona.occupation or '未知'}"
+            persona_summary = f"{persona.name or 'unknown'}, age {persona.age or '?'}, {persona.occupation or 'unknown'}"
 
         # Get event context
         event_context = ""
@@ -215,7 +215,7 @@ async def generate_batch_dialogues(
         task_id=task.id,
         status="pending",
         total_count=request.count,
-        message=f"批量生成任务已创建，共 {request.count} 个对话",
+        message=f"Batch generation task created with {request.count} dialogues",
     )
 
 

@@ -16,6 +16,10 @@ class QdrantConfig(BaseModel):
     path: Optional[str] = Field("/tmp/qdrant", description="Path for local Qdrant database")
     url: Optional[str] = Field(None, description="Full URL for Qdrant server")
     api_key: Optional[str] = Field(None, description="API key for Qdrant server")
+    https: Optional[bool] = Field(
+        None,
+        description="Whether to force HTTPS for a host/port connection",
+    )
     on_disk: Optional[bool] = Field(False, description="Enables persistent storage")
 
     @model_validator(mode="before")

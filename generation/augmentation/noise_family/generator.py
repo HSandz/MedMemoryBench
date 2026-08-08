@@ -22,262 +22,56 @@ logger = logging.getLogger(__name__)
 # Prompts
 # ============================================================================
 
-ROLE_GENERATION_PROMPT = """【重要声明】本任务是医学人工智能学术研究项目的一部分，用于构建医疗对话基准数据集（MedMemoryBench）。生成的所有内容均为**完全虚构的角色设定**，仅用于：
-1. 训练和评估医疗AI助手的对话能力
-2. 测试AI系统对复杂健康咨询场景的理解
-3. 学术论文发表和科研用途
+ROLE_GENERATION_PROMPT = '[Important Statement] This task is part of the medical artificial intelligence academic research project and is used to build the medical conversation benchmark data set (MedMemoryBench). All generated content is **completely fictional character creations** and is intended only for:\n1. Training and evaluating the conversational capabilities of medical AI assistants\n2. Test the AI system’s understanding of complex health consultation scenarios\n3. Academic paper publication and scientific research purposes\n\nAll generated content will not be used for actual medical decision-making, please feel free to generate fictional character data that meets the requirements.\n\n---\n\nPlease generate the roles of relatives and friends around the user based on the user\'s portrait information. Each role must have a complete and detailed health file that can support long-term and in-depth health consultation.\n\n## User portrait\n{persona_info}\n\n## Generate requirements\n\n### 1. Basic information (each role)\nGenerate {num_roles} roles, each containing:\n- relationship: relationship with the user (father/mother/spouse/in-laws/friends/children, etc.)\n- name: colloquial title (such as "my dad", "Lao Zhang", "Xiao Li")\n- age_range: specific age range (such as "62-65 years old")\n- occupation: occupation or status\n- Personality: Personality characteristics (affecting attitude and compliance with medical treatment)\n- Lifestyle_habits: Overview of lifestyle habits (diet, exercise, work and rest, tobacco and alcohol, etc.)\n\n### 2. Health profile (3-5 health problems for each character, this is the key!)\nEach health_condition must contain the following details:\n\n**Basic information:**\n- condition_name: the exact medical name of the disease/symptom\n- icd_category: Disease categories (such as cardiovascular, endocrine, orthopedics, respiratory system, etc.)\n- severity: severity (mild/moderate/severe) + specific instructions\n- duration: exact duration of illness\n\n**Condition details:**\n- diagnosis_history: diagnosis process (when, how it was discovered, what examinations were performed)\n- symptoms_detail: specific symptom description (frequencyrate, extent, incentives, mitigating factors)\n- recent_changes: recent changes (symptom changes in the last 1-2 weeks)\n- lab_results: recent inspection/laboratory results (specific values are required)\n\n**Treatment status:**\n- Medications: Detailed medication plan, format: drug name + dosage + frequency + duration of medication + effect evaluation\n- treatment_history: past treatment history (what treatments have been done and the effects)\n- doctor_recommendations: recommendations given by doctors\n\n**Focus:**\n- concerns: the issues that family members are most worried about (concrete)\n- questions_to_ask: List of specific questions that the family wants to ask (3-5)\n- upcoming_events: upcoming medical events (review, surgery, dressing change, etc.)\n\n### 3. Role diversity requirements\n- Elderly people (parents/grandparents): Chronic disease management (hypertension, diabetes, coronary heart disease, osteoarthritis, chronic obstructive pulmonary disease, etc.), often coexisting with multiple diseases\n- Middle-aged people (spouse/siblings): sub-health, occupational diseases, stress-related diseases (cervical spondylosis, fatty liver, stomach problems, anxiety and depression)\n- Children/Adolescents (Kids): Growth and Development, Immunity, Allergy, Myopia, Mental Health\n- Friends and colleagues: It can be special diseases (tumor rehabilitation, autoimmune diseases, rare diseases, etc.)\n\n### 4. Health problem correlation\nHealth issues in the same role should be intrinsically related, for example:\n- Diabetes → Diabetic retinopathy risk → Diabetic nephropathy monitoring\n- Hypertension → Coronary heart disease → Hyperlipidemia\n- Long-term sitting → Cervical spondylosis + Lumbar disc herniation + Fatty liver\n\n## Output format\nReturn a JSON array to ensure that each character\'s health file is detailed, authentic, and credible enough to support at least 20 rounds of in-depth medical consultation conversations.\n\n```json\n[\n  {{\n    "relationship": "father",\n    "name": "my dad",\n    "age_range": "62-65 years old",\n    "occupation": "retired worker",\n    "personality": "Stubborn, afraid of trouble, and doesn\'t like going to the hospital",\n    "lifestyle_habits": "Eats a salty diet, doesn\'t like to exercise, smokes for 30 years (1 pack a day), drinks occasionally",\n    "health_conditions": [\n      {{\n        "condition_name": "Type 2 diabetes",\n        "icd_category": "Endocrine metabolism",\n        "severity": "Moderate - unstable blood sugar control",\n        "duration": "5 years since diagnosis",\n        "diagnosis_history": "In 2019, a physical examination at the work unit found that fasting blood sugar was elevated (7.8mmol/L), and I later went to the hospital for a glucose tolerance test to confirm the diagnosis.",\n        "symptoms_detail": "Occasionally thirsty and excessive drinking, blurred vision, and occasional numbness in both feet",\n        "recent_changes": "Blood sugar has fluctuated greatly in the past week, and blood sugar after meals often exceeds 12mmol/L",\n        "lab_results": "The latest (2 weeks ago): fasting blood glucose 8.2mmol/L, glycosylated hemoglobin 7.8%, urine microalbumin 30mg/L",\n        "medications": "Metformin extended-release tablets 0.5g bid (after breakfast and dinner), taken for 3 years, the effect is average; glimepiride 2mg qd (before breakfast), added for 1 month",\n        "treatment_history": "Initially, metformin alone was used, and the control was acceptable. Blood sugar began to rise last year, and the doctor recommended combined medication.",\n        "doctor_recommendations": "Control diet, monitor blood sugar, and review glycation in 3 months",\n        "concerns": "Concern about developing complications of diabetes, especially the eyes and kidneys",\n        "questions_to_ask": ["Is blood sugar fluctuations due to insufficient medicine?", "Ankle numbnessIs it a sign of complications?", "Should I take insulin?", "How to control diet specifically?"],\n        "upcoming_events": "Appointment for fundus examination next month"\n      }}\n    ]\n  }}\n]\n```\n\nOnly return the JSON array and no other content.'
 
-所有生成内容不会用于实际医疗决策，请放心生成符合要求的虚构角色数据。
+FAMILY_USER_SYSTEM_PROMPT = 'You are a user consulting an online doctor about the health of a loved one. You know your loved one’s condition very well and can tell you detailed symptoms, medications, and examinations.\n\n## Your identity\n{user_identity}\n\n## Information about relatives you want to consult\n- Relationship: {family_relationship}\n- Title: {family_name}\n- Age: {family_age}\n- Occupation: {family_occupation}\n- Personality traits: {family_personality}\n\n## The relative’s complete health record\n{health_conditions_detail}\n\n## Focus of this consultation\n{current_consultation_focus}\n\n## Summary of past consultation records\n{past_consultations}\n\n## Dialogue requirements\n\n### 1. Ask questions about professionalism\n- Ability to accurately describe the location, nature, frequency, duration, and triggers of symptoms\n- Be able to tell the specific test result values (such as "fasting blood glucose 8.2", "blood pressure 150/95")\n- Be able to tell the complete medication plan (drug name, dosage, taking time)\n- Able to describe the effects and adverse reactions of medication\n\n### 2. Consult continuity\n- If this is the first consultation: give a complete introduction to the background of the condition and ask the questions you are most concerned about\n- If it is a follow-up consultation:\n  * First give feedback on the implementation and effect of the last doctor’s advice\n  * Describe the latest changes in the condition\n  * Ask further questions based on new information\n\n### 3. Conversational style\n- Speak like a family member who truly cares about their loved one, reflecting anxiety and concern\n- Can express confusion ("I don\'t quite understand...", "Is this indicator...")\n- You can ask for details ("What should be done specifically?", "Can this medicine be taken with XX")\n- Each reply should be 2-4 sentences, which can include multiple related questions\n- Use colloquial expressions appropriately, but the medical information must be accurate\n\n### 4. Focus on the key points of consultation\nQuestions must be closely related to the focus of this consultation "{current_consultation_focus}", but can be naturally related to other health issues (because chronic diseases often interact with each other)Influence).\n\nPlease reply directly as the user without adding any role tags or prefixes.'
 
----
+FAMILY_DOCTOR_SYSTEM_PROMPT = """You are a senior online consultation doctor with rich clinical experience. You are responding to a family member's inquiry about a loved one's health.
 
-请根据用户画像信息，生成该用户身边的亲人朋友角色。每个角色必须有完整、详细的健康档案，能够支撑长期、深入的健康咨询。
+## Basic patient information
+- Relationship with the consultant: {family_relationship} of the consultant
+- Title: {family_name}
+- Age: {family_age}
 
-## 用户画像
-{persona_info}
-
-## 生成要求
-
-### 1. 基本信息（每个角色）
-生成 {num_roles} 个角色，每个包含：
-- relationship: 与用户的关系（父亲/母亲/配偶/公婆/朋友/孩子等）
-- name: 口语化称呼（如"我爸"、"老张"、"小李"）
-- age_range: 具体年龄范围（如"62-65岁"）
-- occupation: 职业或身份
-- personality: 性格特点（影响就医态度和依从性）
-- lifestyle_habits: 生活习惯概述（饮食、运动、作息、烟酒等）
-
-### 2. 健康档案（每个角色3-5个健康问题，这是重点！）
-每个 health_condition 必须包含以下详细信息：
-
-**基础信息：**
-- condition_name: 疾病/症状的准确医学名称
-- icd_category: 疾病大类（如心血管、内分泌、骨科、呼吸系统等）
-- severity: 严重程度（轻度/中度/重度）+ 具体说明
-- duration: 确切患病时长
-
-**病情详情：**
-- diagnosis_history: 诊断经过（什么时候、怎么发现的、做过什么检查）
-- symptoms_detail: 具体症状描述（频率、程度、诱因、缓解因素）
-- recent_changes: 近期变化（最近1-2周的症状变化）
-- lab_results: 最近的检查/化验结果（要有具体数值）
-
-**治疗情况：**
-- medications: 详细用药方案，格式：药名+剂量+频次+用药时长+效果评价
-- treatment_history: 既往治疗史（做过什么治疗、效果如何）
-- doctor_recommendations: 医生曾给出的建议
-
-**关注点：**
-- concerns: 家属最担心的问题（具体化）
-- questions_to_ask: 家属想咨询的具体问题列表（3-5个）
-- upcoming_events: 即将发生的医疗事件（复查、手术、换药等）
-
-### 3. 角色多样化要求
-- 老年人（父母/祖父母）：慢性病管理（高血压、糖尿病、冠心病、骨关节病、慢阻肺等），常有多病共存
-- 中年人（配偶/兄弟姐妹）：亚健康、职业病、压力相关疾病（颈椎病、脂肪肝、胃病、焦虑抑郁）
-- 儿童/青少年（孩子）：生长发育、免疫力、过敏、近视、心理健康
-- 朋友同事：可以是特殊病种（肿瘤康复、自身免疫病、罕见病等）
-
-### 4. 健康问题关联性
-同一角色的健康问题应有内在联系，例如：
-- 糖尿病 → 糖尿病视网膜病变风险 → 糖尿病肾病监测
-- 高血压 → 冠心病 → 高血脂
-- 长期久坐 → 颈椎病 + 腰椎间盘突出 + 脂肪肝
-
-## 输出格式
-返回JSON数组，确保每个角色的健康档案足够详细、真实、可信，能够支撑至少20轮深入的医疗咨询对话。
-
-```json
-[
-  {{
-    "relationship": "父亲",
-    "name": "我爸",
-    "age_range": "62-65岁",
-    "occupation": "退休工人",
-    "personality": "性格倔强，怕麻烦，不爱去医院",
-    "lifestyle_habits": "饮食偏咸，不爱运动，有30年烟龄（每天1包），偶尔喝酒",
-    "health_conditions": [
-      {{
-        "condition_name": "2型糖尿病",
-        "icd_category": "内分泌代谢",
-        "severity": "中度 - 血糖控制不稳定",
-        "duration": "确诊5年",
-        "diagnosis_history": "2019年单位体检发现空腹血糖升高(7.8mmol/L)，后到医院做糖耐量试验确诊",
-        "symptoms_detail": "偶尔口渴多饮，视物模糊时有发生，双脚偶有麻木感",
-        "recent_changes": "最近一周血糖波动较大，餐后血糖经常超过12mmol/L",
-        "lab_results": "最近一次（2周前）：空腹血糖8.2mmol/L，糖化血红蛋白7.8%，尿微量白蛋白30mg/L",
-        "medications": "二甲双胍缓释片0.5g bid（早晚餐后），服用3年，效果一般；格列美脲2mg qd（早餐前），新加1个月",
-        "treatment_history": "最初单用二甲双胍，控制尚可。去年开始血糖升高，医生建议联合用药",
-        "doctor_recommendations": "控制饮食，监测血糖，3个月复查糖化",
-        "concerns": "担心发展成糖尿病并发症，特别是眼睛和肾脏",
-        "questions_to_ask": ["血糖波动大是不是药不够", "脚麻是不是并发症的信号", "要不要打胰岛素", "饮食具体怎么控制"],
-        "upcoming_events": "下个月预约眼底检查"
-      }}
-    ]
-  }}
-]
-```
-
-只返回JSON数组，不要其他内容。"""
-
-FAMILY_USER_SYSTEM_PROMPT = """你是一个正在向在线医生咨询亲人健康问题的用户。你对亲人的病情非常了解，能说出详细的症状、用药和检查情况。
-
-## 你的身份
-{user_identity}
-
-## 你要咨询的亲人信息
-- 关系：{family_relationship}
-- 称呼：{family_name}
-- 年龄：{family_age}
-- 职业：{family_occupation}
-- 性格特点：{family_personality}
-
-## 该亲人的完整健康档案
+## Patient complete health file
 {health_conditions_detail}
 
-## 本次咨询重点
+## Focus of this consultation
 {current_consultation_focus}
 
-## 过往咨询记录摘要
-{past_consultations}
+## Reply to request
 
-## 对话要求
+### 1. Professionalism
+- The reply should reflect the understanding of the patient's overall condition, not talk in general terms
+- Can give targeted suggestions based on the patient's specific examination results and medication status
+- Be easy to understand when explaining medical concepts, but be precise in terminology
+- Explain the medical rationale behind the recommendation when necessary
 
-### 1. 提问专业度
-- 能准确描述症状的部位、性质、频率、持续时间、诱因
-- 能说出具体的检查结果数值（如"空腹血糖8.2"、"血压150/95"）
-- 能说出完整的用药方案（药名、剂量、服用时间）
-- 能描述用药后的效果和不良反应
+### 2. The reply content can include
+- **Explanation of condition**: Explain the meaning of symptoms/indicators and possible causes
+- **Medication Guidance**: Specific medication adjustment suggestions (dose, time, precautions)
+- **Lifestyle**: Specific suggestions on diet, exercise, and work and rest (must be actionable)
+- **Monitoring recommendations**: Indicators that need attention, monitoring frequency, and recording methods
+- **Review Arrangement**: When to review and what items to check
+- **Warning Signs**: Dangerous symptoms to be alert to, situations that require immediate medical attention
+- **Ask for details**: If there is insufficient information, you can ask for more details to give accurate suggestions.
 
-### 2. 咨询连贯性
-- 如果是首次咨询：完整介绍病情背景，提出最关心的问题
-- 如果是后续咨询：
-  * 先反馈上次医生建议的执行情况和效果
-  * 描述病情的最新变化
-  * 基于新情况提出进一步问题
+### 3. Safety principles
+- For serious cases, clearly recommend offline medical treatment, do not just give online advice
+- Do not change the medication plan at will. For major adjustments, it is recommended to consult the attending doctor.
+- Reminder of medication contraindications and interactions
 
-### 3. 对话风格
-- 像真正关心亲人的家属一样说话，体现焦虑和关心
-- 可以表达困惑（"我不太理解..."、"这个指标是不是..."）
-- 可以追问细节（"那具体应该怎么做"、"这个药能和XX一起吃吗"）
-- 每次回复2-4句话，可以包含多个相关问题
-- 适当使用口语化表达，但医学信息要准确
+### 4. Reply style
+- Speak professionally but kindly, like a responsible doctor
+- Reply in 3-6 sentences, with substantial content but not lengthy
+- Use bulleted descriptions, but do not over-format them
+- Key values and precautions should be clear
 
-### 4. 围绕咨询重点展开
-必须紧扣本次咨询重点 "{current_consultation_focus}" 来提问，但可以自然地关联到其他健康问题（因为慢性病往往相互影响）。
+Please reply directly as a physician without adding any role tags or prefixes."""
 
-请直接以用户身份回复，不要添加任何角色标签或前缀。"""
+CONSULTATION_FOCUS_PROMPT = 'Plan the specific focus topics for this consultation based on your loved one’s health records and past consultation history.\n\n## Relatives’ health records\n{health_conditions_detail}\n\n## Past consultation history\n{past_consultations}\n\n## Consult key planning strategies\n\n### If this is your first consultation:\nChoose one of the following as your entry point:\n1. The most pressing problem (symptoms that have become significantly worse or changed recently)\n2. The most troublesome problems in daily life\n3. Preparations for upcoming medical events (review, surgery, etc.)\n4. The risk of complications that family members are most worried about\n\n### If it is a follow-up consultation (with consultation history):\nSelect by priority:\n1. Implementation feedback since the last consultation + emerging situations\n2. In-depth questioning of questions that were not fully answered last time\n3. New changes and new symptoms of the condition\n4. Interpretation of review results or next treatment plan\n5. Follow up on previously mentioned matters of concern\n\n### Topic specific requirements:\nTopics must be specific and clear, including:\n- Specific symptoms/indicators/drug names\n- Time nodes or description of changes\n- Clear purpose of consultation\n\n**Good example:**\n- "My father\'s post-meal blood sugar has often exceeded 12 in the past week. I would like to ask if the medication plan needs to be adjusted."\n- "Last time, after increasing the dose of metformin recommended by the doctor, my stomach felt uncomfortable. I would like to ask if there are any alternatives."\n- "I will have a fundus examination next week, and I would like to know the precautions and possible results of the examination in advance."\n- "My mother\'s bone density has dropped again. Which brand of calcium tablets is better?"\n\n**Bad Example:**\n- "Blood sugar problems" (too broad)\n- "Diabetes consultation" (no specific point)\n- "Not feeling well" (unclear)\n\n## Output\nPlease return directly to a specific consultation topic (one sentence, 15-40 words) without any other content.'
 
-FAMILY_DOCTOR_SYSTEM_PROMPT = """你是一位资深的在线问诊医生，有丰富的临床经验。你正在回复一位家属关于其亲人健康问题的咨询。
-
-## 患者基本信息
-- 与咨询者关系：咨询者的{family_relationship}
-- 称呼：{family_name}
-- 年龄：{family_age}
-
-## 患者完整健康档案
-{health_conditions_detail}
-
-## 本次咨询重点
-{current_consultation_focus}
-
-## 回复要求
-
-### 1. 专业性
-- 回复要体现对患者整体病情的了解，不是泛泛而谈
-- 能结合患者的具体检查结果、用药情况给出针对性建议
-- 解释医学概念时要通俗易懂，但术语要准确
-- 必要时说明建议背后的医学原理
-
-### 2. 回复内容可以包括
-- **病情解释**：解释症状/指标的含义、可能的原因
-- **用药指导**：具体的药物调整建议（剂量、时间、注意事项）
-- **生活方式**：饮食、运动、作息的具体建议（要可操作）
-- **监测建议**：需要关注的指标、监测频率、记录方法
-- **复查安排**：什么时候复查、查什么项目
-- **警示信号**：需要警惕的危险症状，什么情况需要立即就医
-- **追问细节**：如信息不足，可询问更多细节以给出准确建议
-
-### 3. 安全原则
-- 对于严重情况，明确建议线下就医，不要只给在线建议
-- 不随意更改用药方案，重大调整建议咨询主治医生
-- 提醒用药禁忌和相互作用
-
-### 4. 回复风格
-- 语气专业但亲切，像一位负责任的医生
-- 回复3-6句话，内容充实但不冗长
-- 可以使用分点说明，但不要过度格式化
-- 关键数值和注意事项要明确
-
-请直接以医生身份回复，不要添加任何角色标签或前缀。"""
-
-CONSULTATION_FOCUS_PROMPT = """根据亲人的健康档案和过往咨询历史，规划本次咨询的具体重点话题。
-
-## 亲人健康档案
-{health_conditions_detail}
-
-## 过往咨询历史
-{past_consultations}
-
-## 咨询重点规划策略
-
-### 如果是首次咨询：
-选择以下之一作为切入点：
-1. 最紧迫的问题（近期有明显加重或变化的症状）
-2. 最困扰日常生活的问题
-3. 即将进行的医疗事件（复查、手术等）相关准备
-4. 家属最担心的并发症风险
-
-### 如果是后续咨询（有咨询历史）：
-按优先级选择：
-1. 上次咨询后的执行反馈 + 新出现的情况
-2. 上次未完全解答的问题的深入追问
-3. 病情的新变化、新症状
-4. 复查结果解读或下一步治疗方案
-5. 之前提到要关注的事项的跟进
-
-### 话题具体化要求：
-话题必须具体、明确，包含：
-- 具体的症状/指标/药物名称
-- 时间节点或变化描述
-- 明确的咨询目的
-
-**好的示例：**
-- "父亲最近一周餐后血糖经常超过12，想问是否需要调整用药方案"
-- "上次医生建议的二甲双胍加量后，胃不舒服，想问有什么替代方案"
-- "下周要做眼底检查，想提前了解检查注意事项和可能的结果"
-- "母亲骨密度又下降了，钙片换成什么品牌比较好"
-
-**不好的示例：**
-- "血糖问题"（太宽泛）
-- "糖尿病咨询"（没有具体点）
-- "身体不舒服"（不明确）
-
-## 输出
-请直接返回一个具体的咨询话题（一句话，15-40字），不要其他任何内容。"""
-
-EXTRACT_SUMMARY_PROMPT = """请从以下对话中提取关键信息摘要，用于后续咨询时的上下文参考。
-
-## 亲人信息
-- 关系：{family_relationship}
-- 称呼：{family_name}
-
-## 本次咨询重点
-{consultation_focus}
-
-## 对话内容
-{dialogue_text}
-
-## 要求
-提取3-5个关键要点，包括：
-1. 本次咨询的主要问题
-2. 医生给出的具体建议和指导
-3. 需要后续关注或复查的事项
-4. 用药或生活方式的调整建议
-5. 下一步行动计划（如有）
-
-请用简洁的中文描述，每个要点一行，用"-"开头。只返回摘要内容，不要其他说明。
-"""
+EXTRACT_SUMMARY_PROMPT = 'Please extract a summary of key information from the conversation below for contextual reference in subsequent consultations.\n\n## Family information\n- Relationship: {family_relationship}\n- Title: {family_name}\n\n## Focus of this consultation\n{consultation_focus}\n\n##Conversation content\n{dialogue_text}\n\n## Requirements\nExtract 3-5 key points, including:\n1. Main issues of this consultation\n2. Specific advice and guidance given by doctors\n3. Matters requiring follow-up attention or review\n4. Suggestions on medication or lifestyle adjustments\n5. Next action plan (if any)\n\nPlease describe in concise Chinese, with one line for each point, starting with "-". Only the summary content is returned, no other explanation is required.'
 
 
 # ============================================================================
@@ -425,7 +219,7 @@ class FamilyRole:
     def get_health_conditions_detail(self) -> str:
         """Get detailed health profile text."""
         if not self.health_conditions:
-            return "暂无详细健康记录"
+            return "No detailed health records yet"
 
         lines = []
         for i, hc in enumerate(self.health_conditions, 1):
@@ -713,13 +507,13 @@ class FamilyDialogueGenerator:
                     hc = HealthCondition(
                         condition_name=hc_data.get("condition_name", ""),
                         icd_category=hc_data.get("icd_category", ""),
-                        severity=hc_data.get("severity", "中度"),
+                        severity=hc_data.get("severity", "Moderate"),
                         duration=hc_data.get("duration", ""),
                         diagnosis_history=hc_data.get("diagnosis_history", ""),
                         symptoms_detail=hc_data.get("symptoms_detail", ""),
                         recent_changes=hc_data.get("recent_changes", ""),
                         lab_results=hc_data.get("lab_results", ""),
-                        medications=hc_data.get("medications", "无"),
+                        medications=hc_data.get("medications", "none"),
                         treatment_history=hc_data.get("treatment_history", ""),
                         doctor_recommendations=hc_data.get("doctor_recommendations", ""),
                         concerns=hc_data.get("concerns", ""),
@@ -734,8 +528,8 @@ class FamilyDialogueGenerator:
                     persona_id=persona_id,
                     relationship=role_data.get("relationship", "family"),
                     name=role_data.get("name", "family"),
-                    age_range=role_data.get("age_range", "未知"),
-                    occupation=role_data.get("occupation", "未知"),
+                    age_range=role_data.get("age_range", "unknown"),
+                    occupation=role_data.get("occupation", "unknown"),
                     personality=role_data.get("personality", ""),
                     health_conditions=health_conditions,
                 )
@@ -766,286 +560,286 @@ class FamilyDialogueGenerator:
         """Generate default family roles with detailed health conditions."""
         default_configs = [
             {
-                "relationship": "父亲",
-                "name": "我爸",
-                "age_range": "62-65岁",
-                "occupation": "退休工人",
-                "personality": "性格倔强，怕麻烦，不爱去医院",
+                "relationship": "Father",
+                "name": "my dad",
+                "age_range": "62-65 years old",
+                "occupation": "retired worker",
+                "personality": "Stubborn, afraid of trouble, and doesn’t like going to the hospital",
                 "health_conditions": [
                     HealthCondition(
-                        condition_name="2型糖尿病",
-                        icd_category="内分泌代谢",
-                        severity="中度 - 血糖控制不稳定",
-                        duration="确诊5年",
-                        diagnosis_history="2019年单位体检发现空腹血糖升高(7.8mmol/L)，后到医院做糖耐量试验确诊",
-                        symptoms_detail="偶尔口渴多饮，视物模糊时有发生，双脚偶有麻木感",
-                        recent_changes="最近一周血糖波动较大，餐后血糖经常超过12mmol/L",
-                        lab_results="最近一次（2周前）：空腹血糖8.2mmol/L，糖化血红蛋白7.8%，尿微量白蛋白30mg/L",
-                        medications="二甲双胍缓释片0.5g bid（早晚餐后），服用3年；格列美脲2mg qd（早餐前），新加1个月",
-                        treatment_history="最初单用二甲双胍控制尚可，去年Start血糖升高后联合用药",
-                        doctor_recommendations="控制饮食，监测血糖，3个月复查糖化血红蛋白",
-                        concerns="担心发展成糖尿病并发症，特别是眼睛和肾脏",
-                        questions_to_ask=["血糖波动大是不是药不够", "脚麻是不是并发症的信号", "要不要打胰岛素"],
-                        upcoming_events="下个月预约眼底检查",
+                        condition_name="type 2 diabetes",
+                        icd_category="endocrine metabolism",
+                        severity="Moderate - Unstable blood sugar control",
+                        duration="5 years since diagnosis",
+                        diagnosis_history="In 2019, a physical examination at work found that fasting blood sugar was elevated (7.8mmol/L), and I later went to the hospital for a glucose tolerance test to confirm the diagnosis.",
+                        symptoms_detail="Occasionally thirsty and excessive drinking, blurred vision, and occasional numbness in both feet",
+                        recent_changes="Blood sugar has fluctuated greatly in the past week, and blood sugar after meals often exceeds 12mmol/L.",
+                        lab_results="The most recent time (2 weeks ago): fasting blood glucose 8.2mmol/L, glycosylated hemoglobin 7.8%, urine microalbumin 30mg/L",
+                        medications="Metformin extended-release tablets 0.5g bid (after breakfast and dinner), taken for 3 years; glimepiride 2mg qd (before breakfast), added for 1 month",
+                        treatment_history="Initially, metformin alone was able to control the disease, but last year, when blood sugar started to rise, it was combined with metformin.",
+                        doctor_recommendations="Control diet, monitor blood sugar, and review glycated hemoglobin in 3 months",
+                        concerns="Worry about developing complications of diabetes, especially the eyes and kidneys",
+                        questions_to_ask=["Is it because the blood sugar fluctuates greatly that the medicine is not enough?", "Is numbness in the feet a sign of complications?", "Do you need insulin?"],
+                        upcoming_events="Make an appointment for a fundus examination next month",
                     ),
                     HealthCondition(
-                        condition_name="高血压",
-                        icd_category="心血管",
-                        severity="中度 - 2级高血压",
-                        duration="确诊8年",
-                        diagnosis_history="2016年头晕就诊发现血压160/100mmHg，确诊高血压",
-                        symptoms_detail="平时无明显症状，劳累或情绪激动时偶有头晕",
-                        recent_changes="最近天气变化，血压有所波动，早上偶尔超过150/95",
-                        lab_results="上个月复查：血压142/88mmHg，心电图大致正常，肾功能正常",
-                        medications="苯磺酸氨氯地平5mg qd（晨起），服用5年，控制尚可",
-                        treatment_history="最初用厄贝沙坦效果不佳，后换成氨氯地平控制较好",
-                        doctor_recommendations="低盐饮食，每日监测血压，保持情绪稳定",
-                        concerns="担心长期用药副作用，担心发展为心脏病或脑血管病",
-                        questions_to_ask=["血压药能长期吃吗", "有没有副作用小的药", "血压多少算控制好"],
+                        condition_name="hypertension",
+                        icd_category="cardiovascular",
+                        severity="Moderate - stage 2 hypertension",
+                        duration="Diagnosed 8 years ago",
+                        diagnosis_history="In 2016, I went to the hospital for dizziness and found that my blood pressure was 160/100mmHg, and I was diagnosed with hypertension.",
+                        symptoms_detail="No obvious symptoms at ordinary times, but occasionally dizziness when tired or emotional",
+                        recent_changes="The weather has changed recently and my blood pressure has fluctuated, occasionally exceeding 150/95 in the morning.",
+                        lab_results="Review last month: blood pressure 142/88mmHg, electrocardiogram generally normal, renal function normal",
+                        medications="Amlodipine besylate 5 mg qd (morning), taken for 5 years, control is acceptable",
+                        treatment_history="Initially, the effect of irbesartan was not good, but later it was switched to amlodipine and the control was better.",
+                        doctor_recommendations="Eat a low-salt diet, monitor blood pressure daily, and maintain emotional stability",
+                        concerns="Worry about the side effects of long-term medication and the development of heart disease or cerebrovascular disease",
+                        questions_to_ask=["Can I take blood pressure medicine for a long time?", "Are there any medicines with few side effects?", "How much blood pressure is considered to be well controlled?"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="腰椎间盘突出",
-                        icd_category="骨科",
-                        severity="中度 - L4/L5突出",
-                        duration="确诊5年，反复发作",
-                        diagnosis_history="2019年腰痛伴右腿放射痛就诊，CT显示L4/L5椎间盘突出",
-                        symptoms_detail="腰部酸痛，久坐后加重，弯腰时右腿有牵扯感",
-                        recent_changes="最近帮忙搬东西后又Start疼，右腿麻木感明显",
-                        lab_results="去年MRI：L4/L5椎间盘突出，硬膜囊受压",
-                        medications="发作时用双氯芬酸钠止痛贴，疼痛剧烈时口服塞来昔布",
-                        treatment_history="做过3个疗程理疗，效果一般。医生建议过手术，但不想做",
-                        doctor_recommendations="避免久坐弯腰，加强腰背肌锻炼，严重时考虑手术",
-                        concerns="怕手术风险，但又担心病情加重会瘫痪",
-                        questions_to_ask=["不做手术能好吗", "有什么保守治疗方法", "日常怎么锻炼"],
+                        condition_name="Lumbar disc herniation",
+                        icd_category="orthopedics",
+                        severity="Moderate - L4/L5 prominence",
+                        duration="Diagnosed 5 years ago, recurring attacks",
+                        diagnosis_history="In 2019, I went to the hospital with low back pain and radiating pain in my right leg. CT showed L4/L5 intervertebral disc herniation.",
+                        symptoms_detail="Waist pain, aggravated by sitting for a long time, and a pulling sensation in the right leg when bending over",
+                        recent_changes="Recently, I started to feel pain again after helping to move things, and the numbness in my right leg was obvious.",
+                        lab_results="MRI last year: L4/L5 disc herniation, dural sac compression",
+                        medications="Use diclofenac sodium analgesic patch during an attack, and take celecoxib orally when the pain is severe.",
+                        treatment_history="I had 3 courses of physical therapy with average results. The doctor recommended surgery, but I didn’t want to do it",
+                        doctor_recommendations="Avoid sitting and bending for long periods of time, strengthen your back muscles, and consider surgery in severe cases",
+                        concerns="Afraid of the risks of surgery, but also worried about paralysis if the condition worsens",
+                        questions_to_ask=["Is it okay without surgery?", "What are the conservative treatments?", "How to exercise daily"],
                         upcoming_events="",
                     ),
                 ],
             },
             {
-                "relationship": "母亲",
-                "name": "我妈",
-                "age_range": "60-63岁",
-                "occupation": "退休教师",
-                "personality": "爱操心，容易焦虑，对健康Question比较敏感",
+                "relationship": "Mother",
+                "name": "my mother",
+                "age_range": "60-63 years old",
+                "occupation": "retired teacher",
+                "personality": "Loves to worry, is easily anxious, and is sensitive to health questions",
                 "health_conditions": [
                     HealthCondition(
-                        condition_name="骨质疏松症",
-                        icd_category="骨科/内分泌",
-                        severity="中度 - T值-2.8",
-                        duration="确诊4年",
-                        diagnosis_history="2020年体检骨密度检查发现，当时腰椎T值-2.5",
-                        symptoms_detail="偶有腰背部隐痛，身高较年轻时矮了2cm",
-                        recent_changes="上次复查骨密度又下降了，T值从-2.5降到-2.8",
-                        lab_results="3个月前骨密度：腰椎T值-2.8，股骨颈T值-2.3。血钙正常，维生素D偏低(18ng/ml)",
-                        medications="钙尔奇D 600mg 每日一片，阿法骨化醇0.25μg每日一次",
-                        treatment_history="一直在补钙，但效果不明显，医生建议加用双膦酸盐类药物",
-                        doctor_recommendations="继续补钙补D，考虑抗骨质疏松药物，注意防跌倒",
-                        concerns="非常担心骨折，特别怕髋部骨折后卧床",
-                        questions_to_ask=["骨密度还能恢复吗", "双膦酸盐有什么副作用", "日常怎么预防骨折"],
-                        upcoming_events="下周预约内分泌科门诊",
+                        condition_name="osteoporosis",
+                        icd_category="Orthopedics/Endocrinology",
+                        severity="Moderate - T-score -2.8",
+                        duration="Diagnosed 4 years ago",
+                        diagnosis_history="The bone density test during the physical examination in 2020 found that the T value of the lumbar spine at that time was -2.5",
+                        symptoms_detail="I occasionally have dull pain in my lower back, and my height is 2cm shorter than when I was younger.",
+                        recent_changes="The bone density dropped again during the last review, and the T-score dropped from -2.5 to -2.8.",
+                        lab_results="Bone density 3 months ago: lumbar spine T-score -2.8, femoral neck T-score -2.3. Blood calcium is normal, vitamin D is low (18ng/ml)",
+                        medications="Calcium D 600mg one tablet per day, alfacalcidol 0.25μg once per day",
+                        treatment_history="I have been taking calcium supplements, but the effect is not obvious. The doctor recommended adding bisphosphonates.",
+                        doctor_recommendations="Continue to supplement calcium and D, consider anti-osteoporosis drugs, and pay attention to preventing falls",
+                        concerns="Very worried about fractures, especially about being bedridden after hip fracture",
+                        questions_to_ask=["Can bone density be restored?", "What are the side effects of bisphosphonates?", "How to prevent fractures every day"],
+                        upcoming_events="Make an appointment with the endocrinology clinic next week",
                     ),
                     HealthCondition(
-                        condition_name="失眠症",
-                        icd_category="神经/心理",
-                        severity="轻到中度",
-                        duration="2年多",
-                        diagnosis_history="退休后Start出现睡眠Question，入睡困难，经常凌晨3点醒来就睡不着",
-                        symptoms_detail="入睡need1-2小时，半夜易醒，早醒后难以再入睡，白天疲乏",
-                        recent_changes="最近因为担心骨质疏松的事，睡眠更差了",
-                        lab_results="未做专门检查",
-                        medications="阿普唑仑0.4mg 睡前（仅在实在睡不着时吃），每周吃2-3次",
-                        treatment_history="试过褪黑素、酸枣仁丸等，效果不明显",
-                        doctor_recommendations="规律作息，睡前不要看手机，必要时药物助眠",
-                        concerns="担心安眠药上瘾，但不吃又睡不着",
-                        questions_to_ask=["怎么能不吃药也睡好", "安眠药能长期吃吗", "有没有中药调理的方法"],
+                        condition_name="insomnia",
+                        icd_category="neurological/psychological",
+                        severity="mild to moderate",
+                        duration="More than 2 years",
+                        diagnosis_history="After retiring, Start developed sleep problems and had difficulty falling asleep. He often woke up at 3 a.m. and could not fall asleep.",
+                        symptoms_detail="It takes 1-2 hours to fall asleep, easy to wake up in the middle of the night, difficult to fall back asleep after waking up early, and tired during the day",
+                        recent_changes="Recently, I have been sleeping even worse because I am worried about osteoporosis.",
+                        lab_results="No special inspection was done",
+                        medications="Alprazolam 0.4 mg before bed (only when you really can't sleep), 2-3 times a week",
+                        treatment_history="I have tried melatonin, jujube kernel pills, etc., but the effect is not obvious.",
+                        doctor_recommendations="Keep a regular schedule, don’t look at your phone before going to bed, and take medication to help you sleep if necessary.",
+                        concerns="Worried about being addicted to sleeping pills, but can’t sleep without taking them",
+                        questions_to_ask=["How can I sleep well without taking medicine?", "Can sleeping pills be taken for a long time?", "Is there any way to treat it with Chinese medicine?"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="甲状腺结节",
-                        icd_category="内分泌",
-                        severity="轻度 - TI-RADS 3类",
-                        duration="发现1年",
-                        diagnosis_history="去年体检B超发现甲状腺左侧叶一个0.8cm结节，边界清，无钙化",
-                        symptoms_detail="无明显症状，不疼不痒，吞咽无异常",
-                        recent_changes="半年前复查结节无明显变化，仍为0.8cm",
-                        lab_results="甲功正常：TSH 2.1mIU/L，FT3、FT4均正常。B超：左叶结节0.8×0.6cm，TI-RADS 3类",
-                        medications="无",
-                        treatment_history="医生建议定期随访观察",
-                        doctor_recommendations="每6个月复查B超，观察结节变化",
-                        concerns="非常担心会癌变，看到网上说的甲状腺癌就害怕",
-                        questions_to_ask=["结节会不会癌变", "需不need做穿刺", "平时饮食要注意什么"],
-                        upcoming_events="2个月后复查B超",
+                        condition_name="Thyroid nodules",
+                        icd_category="endocrine",
+                        severity="Mild - TI-RADS Category 3",
+                        duration="Found 1 year",
+                        diagnosis_history="Last year's physical examination and B-ultrasound revealed a 0.8cm nodule in the left lobe of the thyroid gland, with a clear border and no calcification.",
+                        symptoms_detail="No obvious symptoms, no pain or itching, no abnormalities in swallowing",
+                        recent_changes="There was no obvious change in the nodule during reexamination half a year ago, it was still 0.8cm.",
+                        lab_results="Thyroid function is normal: TSH 2.1mIU/L, FT3 and FT4 are both normal. B-ultrasound: left lobe nodule 0.8×0.6cm, TI-RADS category 3",
+                        medications="none",
+                        treatment_history="Doctors recommend regular follow-up observations",
+                        doctor_recommendations="Review B-ultrasound every 6 months to observe changes in nodules",
+                        concerns="I am very worried that it will become cancerous. I am scared when I read about thyroid cancer on the Internet.",
+                        questions_to_ask=["Can nodules become cancerous?", "Do you need a puncture?", "What should you pay attention to in your daily diet?"],
+                        upcoming_events="Review B-ultrasound after 2 months",
                     ),
                 ],
             },
             {
-                "relationship": "配偶",
-                "name": "老公",
-                "age_range": "32-35岁",
-                "occupation": "程序员",
-                "personality": "工作狂，经常加班，不太注意身体，讳疾忌医",
+                "relationship": "spouse",
+                "name": "husband",
+                "age_range": "32-35 years old",
+                "occupation": "programmer",
+                "personality": "Workaholic, often works overtime, doesn’t pay much attention to health, and avoids medical treatment for illnesses.",
                 "health_conditions": [
                     HealthCondition(
-                        condition_name="颈椎病",
-                        icd_category="骨科",
-                        severity="轻度 - 颈型",
-                        duration="2年多",
-                        diagnosis_history="长期对着电脑工作，颈部酸痛，去年拍片显示颈椎生理曲度变直",
-                        symptoms_detail="颈部僵硬酸痛，低头工作2小时以上加重，偶有向肩部放射",
-                        recent_changes="最近项目忙加班多，颈椎疼痛加重，有时还头晕",
-                        lab_results="颈椎X光：生理曲度变直，C5-C6椎间隙稍窄。未做MRI",
-                        medications="疼痛时贴膏药，偶尔按摩",
-                        treatment_history="买过颈椎按摩仪，用了几次就搁置了",
-                        doctor_recommendations="纠正坐姿，每小时活动颈部，建议做颈椎操",
-                        concerns="担心发展成颈椎间盘突出，影响工作",
-                        questions_to_ask=["颈椎病会越来越严重吗", "有什么好的治疗方法", "need做MRI吗"],
+                        condition_name="cervical spondylosis",
+                        icd_category="orthopedics",
+                        severity="Mild - neck type",
+                        duration="More than 2 years",
+                        diagnosis_history="I have been working in front of the computer for a long time and my neck is sore. The X-ray taken last year showed that the physiological curvature of the cervical spine has straightened.",
+                        symptoms_detail="Stiffness and soreness in the neck, aggravated by working with the head down for more than 2 hours, sometimes radiating to the shoulder",
+                        recent_changes="I have been busy with projects and worked overtime recently, and my cervical spine pain has worsened, and I sometimes feel dizzy.",
+                        lab_results="Cervical spine X-ray: The physiological curvature becomes straightened, and the C5-C6 intervertebral space is slightly narrowed. No MRI",
+                        medications="Apply plaster when in pain and massage occasionally",
+                        treatment_history="I bought a cervical massager and put it aside after using it a few times.",
+                        doctor_recommendations="Correct your sitting posture and move your neck every hour. It is recommended to do cervical spine exercises.",
+                        concerns="Worry about developing cervical disc herniation and affecting work",
+                        questions_to_ask=["Will cervical spondylosis become more and more serious?", "What are some good treatments?", "Do you need an MRI?"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="脂肪肝",
-                        icd_category="消化内科",
-                        severity="轻度",
-                        duration="发现1年",
-                        diagnosis_history="去年公司体检B超发现，当时转氨酶正常",
-                        symptoms_detail="无明显症状，偶有右上腹不适感",
-                        recent_changes="最近体检转氨酶有点高了，ALT 68U/L",
-                        lab_results="B超：肝脏回声增强，提示轻度脂肪肝。ALT 68U/L(正常<40)，AST 45U/L",
-                        medications="无",
-                        treatment_history="医生说要减肥运动，但一直没行动",
-                        doctor_recommendations="控制体重，低脂饮食，加强运动，戒酒",
-                        concerns="担心发展成肝硬化或肝癌",
-                        questions_to_ask=["转氨酶高要不要吃药", "脂肪肝能逆转吗", "多久复查一次"],
+                        condition_name="fatty liver",
+                        icd_category="Gastroenterology",
+                        severity="Mild",
+                        duration="Found 1 year",
+                        diagnosis_history="The B-ultrasound of the company's physical examination last year found that the transaminase was normal at that time",
+                        symptoms_detail="No obvious symptoms, occasional right upper quadrant discomfort",
+                        recent_changes="The recent physical examination showed that the transaminase was a bit high, ALT 68U/L.",
+                        lab_results="B-ultrasound: The liver echo is enhanced, indicating mild fatty liver. ALT 68U/L (normal <40), AST 45U/L",
+                        medications="none",
+                        treatment_history="The doctor said I should lose weight and exercise, but I haven’t taken any action.",
+                        doctor_recommendations="Control your weight, eat a low-fat diet, exercise more, and quit drinking",
+                        concerns="Worry about developing cirrhosis or liver cancer",
+                        questions_to_ask=["Should I take medicine if my transaminase is high?", "Can fatty liver be reversed?", "How often to review"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="慢性胃炎",
-                        icd_category="消化内科",
-                        severity="轻度 - 浅表性",
-                        duration="3年",
-                        diagnosis_history="饮食不规律，经常胃痛胃胀，做胃镜显示慢性浅表性胃炎，幽门螺杆菌阴性",
-                        symptoms_detail="进食后胃胀，空腹时胃部隐痛，嗳气反酸",
-                        recent_changes="最近加班吃外卖多，胃不舒服次数增加",
-                        lab_results="2年前胃镜：慢性浅表性胃炎。HP(-)。",
-                        medications="胃不舒服时吃奥美拉唑20mg和铝碳酸镁",
-                        treatment_history="吃过一段Time胃药好转，但停药后反复",
-                        doctor_recommendations="规律饮食，少吃刺激性食物，避免空腹太久",
-                        concerns="担心发展成胃溃疡或更严重的Question",
-                        questions_to_ask=["need再做胃镜吗", "怎么才能根治", "长期吃奥美拉唑有副作用吗"],
+                        condition_name="chronic gastritis",
+                        icd_category="Gastroenterology",
+                        severity="Mild - Superficial",
+                        duration="3 years",
+                        diagnosis_history="Irregular diet, frequent stomachache and bloating. Gastroscopy showed chronic superficial gastritis and negative Helicobacter pylori.",
+                        symptoms_detail="Stomach bloating after eating, dull stomach pain during fasting, belching and acid reflux",
+                        recent_changes="Recently, I have been working overtime and eating a lot of takeaways, and my stomach upsets have increased.",
+                        lab_results="Gastroscopy 2 years ago: chronic superficial gastritis. HP(-).",
+                        medications="Take omeprazole 20mg and aluminum magnesium carbonate when you have an upset stomach",
+                        treatment_history="My stomach improved after taking medicine for a while, but it relapsed after stopping the medicine.",
+                        doctor_recommendations="Eat regularly, eat less irritating foods, and avoid fasting for too long",
+                        concerns="Worried about developing gastric ulcer or more serious Question",
+                        questions_to_ask=["Do I need another gastroscopy?", "How can we cure it?", "Are there any side effects of taking omeprazole for a long time?"],
                         upcoming_events="",
                     ),
                 ],
             },
             {
                 "relationship": "friend",
-                "name": "老王",
-                "age_range": "38-42岁",
-                "occupation": "销售总监",
-                "personality": "应酬多，喜欢喝酒，生活不规律，对健康比较大意",
+                "name": "Lao Wang",
+                "age_range": "38-42 years old",
+                "occupation": "Sales Director",
+                "personality": "Socializes a lot, likes to drink, lives an irregular life, and is careless about health",
                 "health_conditions": [
                     HealthCondition(
-                        condition_name="痛风/高尿酸血症",
-                        icd_category="内分泌代谢",
-                        severity="中度 - 有过急性发作",
-                        duration="确诊2年",
-                        diagnosis_history="2年前夜间右脚大脚趾剧痛红肿，急诊查尿酸580μmol/L，确诊痛风",
-                        symptoms_detail="急性期过后无明显症状，但尿酸一直偏高",
-                        recent_changes="最近应酬多，上周又有点脚趾隐痛，担心又要发作",
-                        lab_results="上个月：尿酸495μmol/L(正常<420)，肝肾功能正常",
-                        medications="非布司他40mg每日一次，服用1年多",
-                        treatment_history="急性发作用秋水仙碱+消炎痛控制，之后长期服用降尿酸药",
-                        doctor_recommendations="严格忌口，禁酒，多喝水，坚持服药",
-                        concerns="担心再次发作，那个疼实在受不了",
-                        questions_to_ask=["吃了药尿酸还高正常吗", "能不能偶尔喝点酒", "这个药要吃一辈子吗"],
+                        condition_name="Gout/Hyperuricemia",
+                        icd_category="endocrine metabolism",
+                        severity="Moderate - had an acute attack",
+                        duration="Diagnosed 2 years ago",
+                        diagnosis_history="Two years ago, I experienced severe pain, redness and swelling in my right big toe at night. In the emergency room, my uric acid level was 580 μmol/L and I was diagnosed with gout.",
+                        symptoms_detail="There are no obvious symptoms after the acute phase, but uric acid remains high.",
+                        recent_changes="I've been doing a lot of socializing recently, and last week I had a dull pain in my toes, and I'm worried that it's going to happen again.",
+                        lab_results="Last month: uric acid 495 μmol/L (normal <420), normal liver and kidney function",
+                        medications="Febuxostat 40 mg once daily for more than 1 year",
+                        treatment_history="Acute attacks are controlled with colchicine + indomethacin, followed by long-term use of uric acid-lowering drugs.",
+                        doctor_recommendations="Strict food taboos, abstain from alcohol, drink plenty of water, and insist on taking medication",
+                        concerns="I'm worried about it happening again. The pain is really unbearable.",
+                        questions_to_ask=["Is it normal for uric acid to still be high after taking medicine?", "Can I have a drink once in a while?", "Do I need to take this medicine for the rest of my life?"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="高血脂",
-                        icd_category="心血管/代谢",
-                        severity="轻度 - 以甘油三酯升高为主",
-                        duration="发现1年多",
-                        diagnosis_history="体检发现，与长期应酬饮酒有关",
-                        symptoms_detail="无明显症状",
-                        recent_changes="甘油三酯从2.8升到3.2mmol/L",
-                        lab_results="总胆固醇5.8mmol/L，甘油三酯3.2mmol/L(正常<1.7)，低密度脂蛋白3.5mmol/L",
-                        medications="暂未用药",
-                        treatment_history="医生建议先生活方式干预3个月",
-                        doctor_recommendations="戒酒，低脂饮食，增加运动",
-                        concerns="担心发展成动脉硬化、冠心病",
-                        questions_to_ask=["需不need吃降脂药", "高血脂有什么症状", "甘油三酯高和胆固醇高哪个更危险"],
-                        upcoming_events="下月复查血脂",
+                        condition_name="Hyperlipidemia",
+                        icd_category="cardiovascular/metabolic",
+                        severity="Mild - mainly elevated triglycerides",
+                        duration="Found more than 1 year ago",
+                        diagnosis_history="Physical examination found that it was related to long-term social drinking",
+                        symptoms_detail="no obvious symptoms",
+                        recent_changes="Triglycerides rose from 2.8 to 3.2mmol/L",
+                        lab_results="Total cholesterol 5.8mmol/L, triglyceride 3.2mmol/L (normal <1.7), low-density lipoprotein 3.5mmol/L",
+                        medications="No medication yet",
+                        treatment_history="Doctors recommend lifestyle intervention for 3 months first",
+                        doctor_recommendations="Stop drinking, eat a low-fat diet, and exercise more",
+                        concerns="Worry about developing arteriosclerosis and coronary heart disease",
+                        questions_to_ask=["Do you need to take lipid-lowering drugs?", "What are the symptoms of hyperlipidemia?", "Which is more dangerous, high triglycerides or high cholesterol?"],
+                        upcoming_events="Check blood lipids again next month",
                     ),
                     HealthCondition(
-                        condition_name="焦虑Status",
-                        icd_category="心理/神经",
-                        severity="轻度",
-                        duration="半年左右",
-                        diagnosis_history="工作压力大，业绩考核重，出现紧张、心慌、失眠，未正式就诊",
-                        symptoms_detail="工作时容易紧张，开会前心慌手抖，晚上睡眠浅，易惊醒",
-                        recent_changes="最近业绩压力大，症状有加重",
-                        lab_results="未做检查",
-                        medications="无，不想吃药",
-                        treatment_history="自己买过一些安神的保健品，效果不明显",
-                        doctor_recommendations="未就诊",
-                        concerns="不想被认为是心理有Question，也担心吃药会影响工作",
-                        questions_to_ask=["这算是焦虑症吗", "不吃药能好吗", "有什么调节的方法"],
+                        condition_name="AnxietyStatus",
+                        icd_category="psychological/neurological",
+                        severity="Mild",
+                        duration="About half a year",
+                        diagnosis_history="High work pressure, heavy performance appraisal, nervousness, panic, insomnia, no formal medical treatment",
+                        symptoms_detail="Easily nervous at work, flustered and shaking hands before meetings, sleep lightly at night, easily woken up",
+                        recent_changes="I've been under a lot of performance pressure lately and my symptoms have gotten worse.",
+                        lab_results="No inspection",
+                        medications="No, I don’t want to take medicine",
+                        treatment_history="I have bought some soothing health products, but the effect is not obvious.",
+                        doctor_recommendations="Did not see a doctor",
+                        concerns="I don’t want to be thought of as having psychological questions, and I’m also worried that taking medicine will affect my work.",
+                        questions_to_ask=["Is this an anxiety disorder?", "Is it okay if I don’t take medicine?", "Is there any way to adjust it?"],
                         upcoming_events="",
                     ),
                 ],
             },
             {
-                "relationship": "孩子",
-                "name": "宝宝",
-                "age_range": "4-5岁",
-                "occupation": "幼儿园小friend",
-                "personality": "活泼好动，有点挑食，对打针吃药比较抗拒",
+                "relationship": "child",
+                "name": "Baby",
+                "age_range": "4-5 years old",
+                "occupation": "Kindergarten friend",
+                "personality": "Lively and active, a bit picky about food, and resistant to injections and medicines",
                 "health_conditions": [
                     HealthCondition(
-                        condition_name="反复呼吸道感染",
-                        icd_category="儿科/呼吸",
-                        severity="轻度 - 每年感冒6-8次",
-                        duration="1年多",
-                        diagnosis_history="上幼儿园后Start频繁生病，换季时尤其明显",
-                        symptoms_detail="感冒症状为主：流涕、咳嗽、发热，每次持续5-7天",
-                        recent_changes="这个月已经感冒2次了，刚好又Start流鼻涕",
-                        lab_results="上次感冒查血常规：白细胞正常，淋巴细胞比例偏高",
-                        medications="感冒时对症用药：小儿氨酚黄那敏、易坦静等",
-                        treatment_history="吃过一段Time的维生素和益生菌，效果不明显",
-                        doctor_recommendations="加强营养，增加户外活动，流感季节注意防护",
-                        concerns="担心是不是免疫力太低，会不会影响生长发育",
-                        questions_to_ask=["need查免疫功能吗", "怎么提高免疫力", "要不要打流感疫苗"],
-                        upcoming_events="准备预约儿童保健科检查",
+                        condition_name="recurrent respiratory infections",
+                        icd_category="Pediatrics/Respiratory",
+                        severity="Mild - 6-8 colds per year",
+                        duration="More than 1 year",
+                        diagnosis_history="Start got sick frequently after entering kindergarten, especially during the change of seasons.",
+                        symptoms_detail="Cold symptoms are mainly: runny nose, cough, fever, lasting 5-7 days each time",
+                        recent_changes="I've had two colds this month, and my nose just started to run again.",
+                        lab_results="Routine blood test from the last cold: normal white blood cells, high lymphocyte ratio",
+                        medications="Symptomatic medicines for colds: children's acetaminophen, xanthanamine, Yitanjing, etc.",
+                        treatment_history="I have been taking vitamins and probiotics for a while, but the effect is not obvious.",
+                        doctor_recommendations="Strengthen nutrition, increase outdoor activities, and pay attention to protection during flu season",
+                        concerns="I’m worried about whether my immunity is too low, which will affect my growth and development.",
+                        questions_to_ask=["Do you need to check your immune function?", "How to improve immunity", "Should I get a flu shot?"],
+                        upcoming_events="Preparing for an appointment with a child health department",
                     ),
                     HealthCondition(
-                        condition_name="过敏性鼻炎",
-                        icd_category="儿科/耳鼻喉",
-                        severity="轻度 - 间歇性",
-                        duration="半年多",
-                        diagnosis_history="早晨起床后连续打喷嚏、流清鼻涕，医生说是过敏性鼻炎",
-                        symptoms_detail="早晨和接触灰尘后明显，打喷嚏、流清涕、揉鼻子揉眼睛",
-                        recent_changes="最近换季症状加重，晚上睡觉有点鼻塞",
-                        lab_results="查过过敏原：尘螨2级阳性，其他阴性",
-                        medications="生理盐水洗鼻，症状重时用糠酸莫米松喷鼻",
-                        treatment_history="洗鼻有一定效果，但孩子不太配合",
-                        doctor_recommendations="坚持洗鼻，保持室内清洁，必要时用鼻喷激素",
-                        concerns="担心发展成哮喘，听说过敏性鼻炎和哮喘有关系",
-                        questions_to_ask=["会发展成哮喘吗", "鼻喷激素对孩子有影响吗", "能根治吗"],
+                        condition_name="allergic rhinitis",
+                        icd_category="Pediatrics/ENT",
+                        severity="Mild - intermittent",
+                        duration="more than half a year",
+                        diagnosis_history="After getting up in the morning, I sneezed continuously and had a runny nose. The doctor said it was allergic rhinitis.",
+                        symptoms_detail="Obvious in the morning and after exposure to dust, sneezing, runny nose, rubbing nose and eyes",
+                        recent_changes="Symptoms have worsened during the recent change of seasons, and I feel a little stuffy when I sleep at night.",
+                        lab_results="Allergens checked: dust mite level 2 positive, other negative",
+                        medications="Rinse the nose with normal saline, and use mometasone furoate nasal spray if symptoms are severe",
+                        treatment_history="Nasal washing has a certain effect, but the children are not very cooperative",
+                        doctor_recommendations="Keep washing your nose, keep the room clean, and use nasal spray hormones when necessary",
+                        concerns="I am worried about developing asthma. I heard that allergic rhinitis is related to asthma.",
+                        questions_to_ask=["Will it develop into asthma?", "Do nasal spray hormones have any effect on children?", "Can it be cured?"],
                         upcoming_events="",
                     ),
                     HealthCondition(
-                        condition_name="挑食/体重偏轻",
-                        icd_category="儿科/营养",
-                        severity="轻度 - 体重在第15百分位",
-                        duration="1年多",
-                        diagnosis_history="不爱吃蔬菜和肉，主食吃得也少，体检体重一直偏轻",
-                        symptoms_detail="吃饭磨蹭，对新食物抗拒，喜欢吃零食，正餐吃几口就说饱了",
-                        recent_changes="最近生病后胃口更差了",
-                        lab_results="身高105cm（P50），体重15kg（P15）。血红蛋白110g/L（略偏低），微量元素铁、锌偏低",
-                        medications="补充维生素AD、葡萄糖酸锌口服液",
-                        treatment_history="试过各种方法，效果不持久",
-                        doctor_recommendations="培养良好进食习惯，增加食物多样性，必要时补充营养素",
-                        concerns="担心营养不良影响生长发育和智力发展",
-                        questions_to_ask=["need吃什么营养品吗", "怎么让孩子爱吃饭", "会影响长高吗"],
+                        condition_name="Picky eaters/underweight",
+                        icd_category="Pediatrics/Nutrition",
+                        severity="Mild - weight in the 15th percentile",
+                        duration="More than 1 year",
+                        diagnosis_history="I don’t like to eat vegetables and meat, and I eat less staple food. My body weight has always been underweight during physical examinations.",
+                        symptoms_detail="Slowly eats, resists new foods, likes to eat snacks, and feels full after just a few bites of a meal",
+                        recent_changes="My appetite has worsened recently after I got sick.",
+                        lab_results="Height 105cm (P50), weight 15kg (P15). Hemoglobin 110g/L (slightly low), trace elements iron and zinc are low",
+                        medications="Supplement vitamin AD, zinc gluconate oral solution",
+                        treatment_history="Tried various methods, but the effect is not lasting",
+                        doctor_recommendations="Develop good eating habits, increase food diversity, and supplement nutrients when necessary",
+                        concerns="Worry about malnutrition affecting growth and intellectual development",
+                        questions_to_ask=["Do you need any nutritional supplements?", "How to make children love to eat", "Will it affect your height?"],
                         upcoming_events="",
                     ),
                 ],
@@ -1078,7 +872,7 @@ class FamilyDialogueGenerator:
         summaries = self._role_past_summaries.get(role_key, [])
 
         if not summaries:
-            return "（这是首次为这位family咨询）"
+            return "(This is the first time for this family to consult)"
 
         # Show recent consultation records
         recent = summaries[-5:]
@@ -1139,7 +933,7 @@ class FamilyDialogueGenerator:
     ) -> str:
         """Generate user turn."""
         enriched = persona.get("enriched_data", {})
-        user_identity = f"年龄 {enriched.get('age_range', '未知')}，职业 {enriched.get('occupation_detail', '未知')}"
+        user_identity = f"年龄 {enriched.get('age_range', 'unknown')}，职业 {enriched.get('occupation_detail', 'unknown')}"
 
         past_consultations = self._get_past_consultations_for_role(role.persona_id, role.role_id)
 
@@ -1200,7 +994,7 @@ class FamilyDialogueGenerator:
             return self._call_llm(llm_messages, caller="_generate_doctor_turn")
         except Exception as e:
             logger.error(f"[FamilyDialogueGenerator] Doctor turn generation failed: {e}")
-            return "根据您描述的情况，我给您几点建议..."
+            return "Based on the situation you describe, I will give you some suggestions..."
 
     async def _extract_session_summary(
         self,
@@ -1210,7 +1004,7 @@ class FamilyDialogueGenerator:
     ) -> str:
         """Extract session summary."""
         dialogue_text = "\n".join([
-            f"{'User' if m.agent_type == 'user_agent' else '医生'}: {m.content}"
+            f"{'User' if m.agent_type == 'user_agent' else 'doctor'}: {m.content}"
             for m in messages
         ])
 
@@ -1252,7 +1046,7 @@ class FamilyDialogueGenerator:
             List of knowledge points (1-3 items).
         """
         dialogue_text = "\n".join([
-            f"{'User' if m.agent_type == 'user_agent' else '医生'}: {m.content}"
+            f"{'User' if m.agent_type == 'user_agent' else 'doctor'}: {m.content}"
             for m in messages
         ])
 
@@ -1320,7 +1114,7 @@ class FamilyDialogueGenerator:
 
             if len(kps) == 0:
                 kps = [{
-                    "category": "family健康",
+                    "category": "family health",
                     "name": f"{role.name}咨询",
                     "content": f"关于{role.name}的{consultation_focus}",
                     "trap_score": 0.1,
@@ -1333,7 +1127,7 @@ class FamilyDialogueGenerator:
         except Exception as e:
             logger.warning(f"[FamilyDialogueGenerator] Knowledge points extraction failed: {e}")
             return [{
-                "category": "family健康",
+                "category": "family health",
                 "name": f"{role.name}咨询",
                 "content": f"关于{role.name}的{consultation_focus}",
                 "trap_score": 0.1,

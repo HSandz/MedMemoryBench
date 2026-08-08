@@ -18,71 +18,39 @@ logger = logging.getLogger(__name__)
 
 
 # Noise user agent system prompt
-NOISE_USER_SYSTEM_PROMPT = """你是一位普通用户，正在通过线上医疗健康咨询平台与AI医生进行咨询。
-
-## 咨询类型
-你的咨询可能属于以下几种类型之一：
-1. **症状咨询**：描述某些疾病对应出现的不适症状，想了解在医学上可能的原因和应对方法（最主要类型）
-2. **医学常识**：询问一些医学知识，比如什么情况需要就医、用药注意事项等
-3. **预防保健**：了解如何预防某些疾病或保持健康的生活方式
-4. **健康疑问**：对网上看到的健康信息有疑问，想求证或了解更多
-
-## 当前咨询话题
-{topic}
-
-## 咨询背景
-{background}
-
-## 对话风格要求
-- 像真实患者/咨询者一样自然地表达
-- 如果是症状咨询，要描述一下症状效果、持续时间、伴随症状等细节，但不要有“我”、“家人”这样的人称，就像单纯描述医学症状咨询问题一样
-- 如果是常识咨询，可以说明为什么想了解这个问题
-- 可以根据医生的回答追问细节或表达担忧
-- 语气自然，可以有些口语化
-- 回复长度适中，1-4句话
-
-## 注意事项
-- 这是一次独立的健康咨询，与你之前的就诊记录无关
-- 回答时不要提及任何"之前看过病"或"上次医生说"之类的内容
-- 专注于当前咨询的话题
-- 要避免当前咨询的话题和之前的话题出现重复，要咨询不一样的内容
-
-## 过往咨询（尽量避免重复构建同样的内容）
-{past_summary}
-"""
+NOISE_USER_SYSTEM_PROMPT = 'You are an ordinary user who is consulting with an AI doctor through an online medical and health consultation platform.\n\n## Consultation type\nYour inquiry may fall into one of the following categories:\n1. **Symptom consultation**: Describe the uncomfortable symptoms corresponding to certain diseases, and want to know the possible medical causes and coping methods (the most important type)\n2. **Medical knowledge**: Ask about some medical knowledge, such as when you need medical treatment, medication precautions, etc.\n3. **Preventive Care**: Learn how to prevent certain diseases or maintain a healthy lifestyle\n4. **Health Questions**: I have questions about the health information I saw online and want to ask for confirmation or learn more.\n\n## Current consultation topics\n{topic}\n\n## Consulting background\n{background}\n\n## Conversation style requirements\n- Express yourself as naturally as a real patient/consultant\n- If it is a symptom consultation, describe the symptom effect, duration, accompanying symptoms and other details, but do not use personal pronouns such as "I" or "family", just like simply describing the medical symptom consultation question\n- If it is a common sense consultation, you can explain why you want to know about this issue\n- You can ask for details or express concerns based on the doctor’s answer\n- The tone is natural and can be somewhat colloquial\n-Reply length is moderate, 1-4 sentences\n\n## Notes\n- This is an independent health consultation and has nothing to do with your previous medical visits\n- Don\'t mention anything like "you\'ve seen a doctor before" or "the last time the doctor said" when answering.\n- Focus on the current topic of inquiry\n- To avoid duplication of current consultation topics and previous topics, consult on different content\n\n## Past consultation (try to avoid building the same content repeatedly)\n{past_summary}'
 
 # Noise doctor agent system prompt
-NOISE_DOCTOR_SYSTEM_PROMPT = """你是一位专业、耐心的AI医生，正在为用户提供线上健康咨询服务。
+NOISE_DOCTOR_SYSTEM_PROMPT = """You are a professional and patient AI doctor who is providing online health consultation services to users.
 
-## 角色定位
-- 专业严谨但语言通俗易懂
-- 温暖耐心，善于倾听
-- 注重健康教育和预防
+## Role positioning
+- Professional and rigorous yet easy-to-understand language
+- Warm and patient, good at listening
+- Focus on health education and prevention
 
-## 回复原则
-1. **针对症状咨询**：
-   - 询问必要的细节（持续时间、伴随症状、加重/缓解因素等）
-   - 分析可能的原因，但避免直接下诊断
-   - 给出初步的应对建议
-   - 必要时建议就医检查
+## Reply Principle
+1. **Consultation based on symptoms**:
+   - Ask for necessary details (duration, accompanying symptoms, aggravating/mitigating factors, etc.)
+   - Analyze possible causes but avoid making a direct diagnosis
+   - Give preliminary response suggestions
+   - It is recommended to seek medical examination if necessary
 
-2. **针对医学常识**：
-   - 提供准确、实用的医学知识
-   - 用通俗语言解释专业概念
-   - 纠正常见的健康误区
-   - 强调个体差异，建议具体问题具体咨询
+2. **Based on medical common sense**:
+   - Provide accurate and practical medical knowledge
+   -Explain professional concepts in layman’s terms
+   - Correct common health misunderstandings
+   - Emphasize individual differences and recommend specific consultation on specific issues
 
-3. **针对预防保健**：
-   - 提供科学的预防建议
-   - 推荐健康的生活方式
-   - 解释预防措施背后的原理
+3. **For preventive care**:
+   - Provide scientific prevention advice
+   - Recommend healthy lifestyle
+   - Explain the rationale behind preventive measures
 
-## 回复要求
-- 回复长度适中，像真实医生在线咨询
-- 可以分点说明，但不要过于教条
-- 适当表达关心
-- 重要提醒：有严重症状时应及时就医
-"""
+## Reply to request
+- The reply length is moderate, like an online consultation with a real doctor
+- You can explain in points, but don’t be too dogmatic.
+- Express concern appropriately
+- Important reminder: If you have severe symptoms, you should seek medical treatment promptly."""
 
 
 @dataclass
@@ -324,10 +292,10 @@ class NoiseDialogueGenerator:
         ]
 
         # Determine topic type by keywords and select background
-        symptom_keywords = ["痛", "痒", "麻", "胀", "闷", "晕", "咳", "疼", "不适", "异物感",
-                           "失眠", "疲劳", "没精神", "溃疡", "耳鸣", "模糊", "心慌"]
-        knowledge_keywords = ["什么情况", "多少度", "怎么看", "正常值", "注意事项", "禁忌",
-                             "能一起", "多久", "need"]
+        symptom_keywords = ["pain", "itch", "numb", "swell", "stuffy", "faint", "cough", "pain", "discomfort", "Foreign body sensation",
+                           "Insomnia", "fatigue", "Lack of energy", "ulcer", "tinnitus", "Vague", "Flustered"]
+        knowledge_keywords = ["What's going on", "how many degrees", "How to see", "normal value", "Things to note", "Taboo",
+                             "can be together", "how long", "need"]
 
         if any(kw in topic for kw in symptom_keywords):
             return random.choice(symptom_backgrounds)
@@ -339,11 +307,11 @@ class NoiseDialogueGenerator:
     def _get_past_summary(self) -> str:
         """Get past consultation summaries (for deduplication)."""
         if not self._past_summaries:
-            return "（这是你第一次咨询）"
+            return "(This is your first consultation)"
 
         # Show only the most recent entries
         recent = self._past_summaries[-5:]
-        return "你之前咨询过以下话题：\n" + "\n".join(f"- {s}" for s in recent)
+        return "You have previously consulted on the following topics:" + "\n".join(f"- {s}" for s in recent)
 
     async def _generate_user_turn(
         self,
@@ -414,7 +382,7 @@ class NoiseDialogueGenerator:
             return self._call_llm(llm_messages, caller="_generate_doctor_turn")
         except Exception as e:
             logger.error(f"[NoiseDialogueGenerator] Doctor turn generation failed: {e}")
-            return "这是一个很好的Question。让我为您解答一下..."
+            return "This is a good question. Let me answer it for you..."
 
     async def _extract_knowledge_points(
         self,
@@ -435,7 +403,7 @@ class NoiseDialogueGenerator:
             List of knowledge points (1-3 items).
         """
         dialogue_text = "\n".join([
-            f"{'User' if m['agent_type'] == 'user_agent' else '医生'}: {m['content']}"
+            f"{'User' if m['agent_type'] == 'user_agent' else 'doctor'}: {m['content']}"
             for m in messages
         ])
 
@@ -502,7 +470,7 @@ class NoiseDialogueGenerator:
             # Ensure at least 1 entry
             if len(kps) == 0:
                 kps = [{
-                    "category": "健康知识",
+                    "category": "health knowledge",
                     "name": topic[:6],
                     "content": f"关于{topic}的咨询记录",
                     "trap_score": 0.1,
@@ -514,7 +482,7 @@ class NoiseDialogueGenerator:
         except Exception as e:
             logger.warning(f"[NoiseDialogueGenerator] Knowledge point extraction failed: {e}")
             return [{
-                "category": "健康知识",
+                "category": "health knowledge",
                 "name": topic[:6],
                 "content": f"关于{topic}的咨询记录",
                 "trap_score": 0.1,

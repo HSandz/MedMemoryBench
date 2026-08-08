@@ -89,23 +89,38 @@ class LongContextAgent(BaseAgent):
         **kwargs
     ) -> AgentResponse:
         """Query the agent."""
-        # Concatenate context and question; truncation already done in memorize phase
-        if self._context:
-            full_message = f"{self._context}\n\n{question}"
-        else:
-            full_message = question
-
-        messages = format_messages(full_message, system_message)
+        prepared = self.prepare_batch_query(question, system_message=system_message)
+        messages = prepared["messages"]
         response = self._llm_client.chat(messages)
+        return self.finalize_batch_query(prepared, response.content)
 
-        return AgentResponse(
-            output=response.content,
-            query_time=0.0,
-            retrieved_count=0,
-            extra={
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> dict:
+        """Prepare the immutable final-answer request for Vertex batch mode."""
+        full_message = f"{self._context}\n\n{question}" if self._context else question
+        return {
+            "messages": format_messages(full_message, system_message),
+            "retrieved_count": 0,
+            "retrieved_memories": [],
+            "extra": {
                 "context_tokens": self.count_tokens(self._context) if self._context else 0,
                 "method": "long_context",
-            }
+            },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: dict, content: str) -> AgentResponse:
+        """Build the normal response shape from a completed batch row."""
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def reset(self) -> None:

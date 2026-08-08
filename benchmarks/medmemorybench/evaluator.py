@@ -1,5 +1,6 @@
 """MedMemoryBench evaluation module."""
 
+import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,17 @@ from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.base import MetricResult as BaseMetricResult
 from utils.templates import get_prompt_manager
 from utils.llm_client import get_usage_tracker, LLMRetryExhaustedError
+from utils.vertex_batch import (
+    BatchChatRequest,
+    VertexBatchClient,
+    VertexBatchError,
+    make_request_id,
+    PREPARED_QUERY_METADATA_KEY,
+    restore_prepared_query,
+    scoped_manifest_path,
+    snapshot_prepared_query,
+    should_use_batch,
+)
 
 from benchmarks.medmemorybench.checkpoint import (
     MedMemoryBenchCheckpointManager,
@@ -35,6 +47,9 @@ class MedMemoryBenchEvaluator:
         verbose: bool = True,
         logger: Optional[logging.Logger] = None,
         resume: bool = False,
+        batch_api: bool = False,
+        batch_gcs_uri: Optional[str] = None,
+        batch_wait: bool = False,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -43,6 +58,9 @@ class MedMemoryBenchEvaluator:
         self.verbose = verbose
         self.logger = logger
         self.resume = resume
+        self.batch_api = batch_api
+        self.batch_gcs_uri = batch_gcs_uri
+        self.batch_wait = batch_wait
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -64,6 +82,11 @@ class MedMemoryBenchEvaluator:
         self.result_collector = ResultCollector()
 
         self._memory_build_logs: List[Dict[str, Any]] = []
+        self._batch_client: Optional[VertexBatchClient] = None
+        self._judge_batch_client: Optional[VertexBatchClient] = None
+        self._batch_fallback_logged = False
+        self._judge_batch_fallback_logged = False
+        self._deferred_judges: List[Dict[str, Any]] = []
 
         self._checkpoint_manager: Optional[MedMemoryBenchCheckpointManager] = None
         self._checkpoint_enabled = False
@@ -218,11 +241,97 @@ class MedMemoryBenchEvaluator:
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
+                batch_api=self.batch_api,
+                batch_gcs_uri=self.batch_gcs_uri,
+                batch_wait=self.batch_wait,
+                batch_manifest_dir=self.output_dir / "batch",
+                batch_config_hash=self._batch_manifest_config_hash(),
+                batch_progress_callback=self._log,
             )
             self._log(f"[DEBUG] AgentManager created successfully")
 
         self.agent_manager.set_context_id(context_id)
         self._log(f"[DEBUG] Context ID set to {context_id}")
+
+    def _batch_config_hash(self) -> str:
+        return compute_config_hash(self.method_config, self.dataset_config)
+
+    def _batch_manifest_config_hash(self) -> str:
+        """Namespace manifests by checkpoint so only --resume reuses a run."""
+        config_hash = self._batch_config_hash()
+        checkpoint_manager = getattr(self, "_checkpoint_manager", None)
+        scope = (
+            checkpoint_manager.get_batch_manifest_scope()
+            if checkpoint_manager
+            else ""
+        )
+        # Older checkpoints have no scope and retain their legacy manifest path.
+        return f"{config_hash}{scope.replace('-', '')}" if scope else config_hash
+
+    def _batch_manifest_path(self, stem: str, model: str) -> Path:
+        """Keep manifests isolated when different methods share one output directory."""
+        return scoped_manifest_path(
+            self.output_dir / "batch",
+            stem,
+            model=model,
+            config_hash=self._batch_manifest_config_hash(),
+        )
+
+    def _deferred_judge_state_paths(self) -> List[Path]:
+        batch_dir = self.output_dir / "batch"
+        return sorted(batch_dir.glob(
+            f"medmemorybench_deferred_judges-*-{self._batch_manifest_config_hash()}.json"
+        ))
+
+    def _save_deferred_judges(self, judge_client) -> None:
+        """Persist judge inputs before submitting so resume never regenerates them."""
+        path = self._batch_manifest_path("medmemorybench_deferred_judges", judge_client.model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "config_hash": self._batch_manifest_config_hash(),
+            "judge_model": judge_client.model,
+            "items": self._deferred_judges,
+        }
+        temporary_path = path.with_suffix(".tmp")
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        temporary_path.replace(path)
+
+    def _load_deferred_judges(self) -> None:
+        """Restore submitted-or-ready judge work before rebuilding evaluation units."""
+        paths = self._deferred_judge_state_paths()
+        if not paths:
+            return
+        if len(paths) != 1:
+            raise VertexBatchError(
+                "Found multiple deferred-judge state files for this configuration. "
+                "Use a separate output directory to resume safely."
+            )
+        path = paths[0]
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise VertexBatchError(f"Cannot read deferred judge state {path}: {exc}") from exc
+        if (
+            payload.get("version") != 1
+            or payload.get("config_hash") != self._batch_manifest_config_hash()
+        ):
+            raise VertexBatchError(f"Deferred judge state does not match this evaluator: {path}")
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise VertexBatchError(f"Deferred judge state is invalid: {path}")
+        self._deferred_judges = items
+        self._log(f"[Vertex Batch] Restored {len(items):,} deferred LLM-judge request(s) from {path}.")
+
+    def _clear_deferred_judges(self) -> None:
+        for path in self._deferred_judge_state_paths():
+            path.unlink(missing_ok=True)
+        self._deferred_judges = []
+
+    def _is_deferred_judge_query(self, query_id: str) -> bool:
+        return any(item.get("query_id") == query_id for item in self._deferred_judges)
 
     def evaluate(self) -> EvaluationReport:
         start_time = datetime.now()
@@ -234,6 +343,12 @@ class MedMemoryBenchEvaluator:
         resumed = False
         if self.resume and self._checkpoint_enabled:
             resumed = self._try_resume_from_checkpoint()
+
+        # Deferred judge inputs belong to the loaded checkpoint namespace.
+        # Do not attach a fresh run to an older namespace when no checkpoint
+        # was successfully resumed.
+        if resumed and self.batch_api and not self.dry_run:
+            self._load_deferred_judges()
 
         if not resumed and self._checkpoint_enabled:
             self._create_new_checkpoint()
@@ -263,7 +378,7 @@ class MedMemoryBenchEvaluator:
                 continue
 
             if persona_id != current_context_id:
-                if current_context_id is not None and self._checkpoint_manager:
+                if current_context_id is not None and self._checkpoint_manager and not self.batch_api:
                     self._checkpoint_manager.complete_persona(current_context_id)
 
                 if current_context_id is not None:
@@ -286,7 +401,22 @@ class MedMemoryBenchEvaluator:
                 self.aggregator.add_result(result)
                 self.result_collector.add_result(result, persona_id)
 
-        if current_context_id is not None and self._checkpoint_manager:
+        for item in self._complete_deferred_judges():
+            result = item["result"]
+            persona_id = item["persona_id"]
+            self.aggregator.add_result(result)
+            self.result_collector.add_result(result, persona_id)
+            if self._checkpoint_manager:
+                self._checkpoint_manager.mark_query_completed(
+                    result.query_id,
+                    result.to_dict(),
+                    persona_id=persona_id,
+                )
+
+        if self._checkpoint_manager and self.batch_api:
+            for persona_id in self.dataset.get_persona_ids():
+                self._checkpoint_manager.complete_persona(persona_id)
+        elif current_context_id is not None and self._checkpoint_manager:
             self._checkpoint_manager.complete_persona(current_context_id)
 
     def _evaluate_unit_with_checkpoint(self, unit: EvaluationUnit) -> List[MetricResult]:
@@ -392,30 +522,210 @@ class MedMemoryBenchEvaluator:
         query_count = len(unit.queries_to_evaluate)
         memory_time_per_query = total_memory_time / query_count if query_count > 0 else 0.0
 
-        for query in unit.queries_to_evaluate:
-            if self._checkpoint_manager and self._checkpoint_manager.is_query_completed(query.query_id):
-                self._log(f"    [Skip] {query.query_id} (completed)")
-                continue
-
-            result = self._evaluate_query(query, unit.context_id)
-            result.memory_construction_time = memory_time_per_query
-            results.append(result)
-            total_query_time += result.query_time
-
-            status = "✓" if result.is_correct else "✗"
-            self._log(f"    [{status}] {query.query_id} ({query.query_type}): {result.score:.2f}")
-
-            if self._checkpoint_manager:
-                self._checkpoint_manager.mark_query_completed(
-                    query.query_id,
-                    result.to_dict(),
+        pending_query_count = sum(
+            1
+            for query in unit.queries_to_evaluate
+            if not (
+                self._checkpoint_manager
+                and self._checkpoint_manager.is_query_completed(query.query_id)
+            )
+            and not self._is_deferred_judge_query(query.query_id)
+        )
+        if self._can_batch_queries(pending_query_count):
+            query_results = self._evaluate_batch_queries(unit, memory_time_per_query)
+            for result in query_results:
+                results.append(result)
+                total_query_time += result.query_time
+                status = "✓" if result.is_correct else "✗"
+                self._log(f"    [{status}] {result.query_id} ({result.query_type}): {result.score:.2f}")
+                if self._checkpoint_manager:
+                    self._checkpoint_manager.mark_query_completed(
+                        result.query_id,
+                        result.to_dict(),
+                    )
+        else:
+            if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
+                self._log(
+                    "Vertex batch API is unavailable or this stage is too small; "
+                    "using real-time generation for dependent requests.",
+                    level="WARNING",
                 )
+                self._batch_fallback_logged = True
+
+            for query in unit.queries_to_evaluate:
+                if self._checkpoint_manager and self._checkpoint_manager.is_query_completed(query.query_id):
+                    self._log(f"    [Skip] {query.query_id} (completed)")
+                    continue
+                if self._is_deferred_judge_query(query.query_id):
+                    self._log(f"    [Skip] {query.query_id} (awaiting saved Vertex judge result)")
+                    continue
+
+                result = self._evaluate_query(
+                    query,
+                    unit.context_id,
+                    memory_time_per_query=memory_time_per_query,
+                )
+                if result is None:
+                    continue
+                results.append(result)
+                total_query_time += result.query_time
+
+                status = "✓" if result.is_correct else "✗"
+                self._log(f"    [{status}] {query.query_id} ({query.query_type}): {result.score:.2f}")
+
+                if self._checkpoint_manager:
+                    self._checkpoint_manager.mark_query_completed(
+                        query.query_id,
+                        result.to_dict(),
+                    )
 
         self._log(f"    --- Query Evaluation Done, time={total_query_time:.2f}s ---")
 
         return results
 
-    def _evaluate_query(self, query, context_id: int) -> MetricResult:
+    def _can_batch_queries(self, request_count: int) -> bool:
+        return bool(
+            should_use_batch(request_count)
+            and self.batch_api
+            and self.agent_manager
+            and self.agent_manager.supports_batch_queries()
+        )
+
+    def _get_batch_client(self) -> VertexBatchClient:
+        if self._batch_client is None:
+            if self.agent_manager is None:
+                raise VertexBatchError("Agent manager is not initialized for batch execution.")
+            llm_client = self.agent_manager.get_batch_llm_client()
+            if llm_client is None:
+                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
+            self._batch_client = VertexBatchClient.from_gemini_client(
+                llm_client,
+                gcs_uri=self.batch_gcs_uri,
+                manifest_path=self._batch_manifest_path("medmemorybench_batch_manifest", llm_client.model),
+                wait=self.batch_wait,
+                config_hash=self._batch_manifest_config_hash(),
+                progress_callback=self._log,
+            )
+        return self._batch_client
+
+    def _get_judge_batch_client(self, judge_client) -> VertexBatchClient:
+        """Create an independent manifest because judge and agent models may differ."""
+        if self._judge_batch_client is None:
+            self._judge_batch_client = VertexBatchClient.from_gemini_client(
+                judge_client,
+                gcs_uri=self.batch_gcs_uri,
+                manifest_path=self._batch_manifest_path(
+                    "medmemorybench_judge_batch_manifest", judge_client.model
+                ),
+                wait=self.batch_wait,
+                config_hash=self._batch_manifest_config_hash(),
+                progress_callback=self._log,
+            )
+        return self._judge_batch_client
+
+    def _evaluate_batch_queries(
+        self,
+        unit: EvaluationUnit,
+        memory_time_per_query: float,
+    ) -> List[MetricResult]:
+        """Prepare local retrieval for a unit, then batch its final generations."""
+        prepared_by_id: Dict[str, tuple[Any, Dict[str, Any]]] = {}
+        requests: List[BatchChatRequest] = []
+        stage = f"query-unit-{unit.unit_id}"
+        batch_client = self._get_batch_client()
+
+        for query in unit.queries_to_evaluate:
+            if self._checkpoint_manager and self._checkpoint_manager.is_query_completed(query.query_id):
+                self._log(f"    [Skip] {query.query_id} (completed)")
+                continue
+            if self._is_deferred_judge_query(query.query_id):
+                self._log(f"    [Skip] {query.query_id} (awaiting saved Vertex judge result)")
+                continue
+            request_id = make_request_id(
+                "query",
+                f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
+            )
+            saved_request = batch_client.get_saved_request(stage, request_id)
+            prepared = restore_prepared_query(saved_request) if saved_request else None
+            if prepared is None:
+                # Reuse a persisted display timestamp for legacy manifests that
+                # predate prepared-query snapshots. New manifests do not rerun
+                # retrieval at all when collecting a completed stage.
+                batch_request_time = (
+                    saved_request.metadata.get("batch_request_time")
+                    if saved_request is not None
+                    else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                formatted_question = self.prompt_manager.format_query(
+                    question=query.question,
+                    query_type=query.query_type,
+                )
+                prepared = self.agent_manager.prepare_batch_query(
+                    formatted_question,
+                    query_id=query.query_id,
+                    context_id=unit.context_id,
+                    batch_request_time=batch_request_time,
+                )
+
+            if saved_request is not None:
+                # Reuse the exact staged request. This protects a resume from
+                # both timestamp changes and non-deterministic retrieval.
+                requests.append(saved_request)
+            else:
+                requests.append(
+                    BatchChatRequest(
+                        request_id=request_id,
+                        messages=prepared["messages"],
+                        temperature=self.method_config.model.temperature,
+                        max_tokens=(
+                            self.method_config.model.max_completion_tokens
+                            or self.method_config.model.max_tokens
+                        ),
+                        phase="query",
+                        metadata={
+                            "query_id": query.query_id,
+                            "unit_id": unit.unit_id,
+                            "batch_request_time": batch_request_time,
+                            PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared),
+                        },
+                    )
+                )
+            prepared_by_id[request_id] = (query, prepared)
+
+        self._log(
+            f"    [Vertex Batch] Stage '{stage}': local preparation complete; "
+            f"submitting {len(requests):,} final-answer request(s)."
+        )
+        responses = batch_client.run_stage(stage, requests)
+        results: List[MetricResult] = []
+        for request_id, (query, prepared) in prepared_by_id.items():
+            batch_response = responses.get(request_id)
+            if batch_response is None or batch_response.status:
+                error = batch_response.status if batch_response else "No output row returned"
+                results.append(self._api_error_result(query, f"Vertex batch request failed: {error}"))
+                continue
+            response = self.agent_manager.finalize_batch_query(
+                prepared,
+                batch_response.content,
+                input_tokens=batch_response.input_tokens,
+                output_tokens=batch_response.output_tokens,
+            )
+            result = self._score_agent_response(
+                query,
+                response,
+                context_id=unit.context_id,
+                memory_construction_time=memory_time_per_query,
+            )
+            if result is not None:
+                results.append(result)
+        return results
+
+    def _evaluate_query(
+        self,
+        query,
+        context_id: int,
+        memory_time_per_query: float = 0.0,
+    ) -> Optional[MetricResult]:
         if self.dry_run:
             return MetricResult(
                 query_id=query.query_id,
@@ -466,6 +776,39 @@ class MedMemoryBenchEvaluator:
                 },
             )
 
+        return self._score_agent_response(
+            query,
+            response,
+            context_id=context_id,
+            memory_construction_time=memory_time_per_query,
+        )
+
+    def _api_error_result(self, query, error_message: str) -> MetricResult:
+        return MetricResult(
+            query_id=query.query_id,
+            query_type=query.query_type,
+            score=0.0,
+            is_correct=False,
+            model_output="[API_ERROR] Connection failed after retries",
+            expected_answer=", ".join(query.get_correct_answers()),
+            question=query.question,
+            details={
+                "api_error": True,
+                "error_type": "LLMRetryExhaustedError",
+                "error_message": error_message,
+            },
+        )
+
+    def _score_agent_response(
+        self,
+        query,
+        response: Any,
+        context_id: Optional[int] = None,
+        memory_construction_time: float = 0.0,
+    ) -> Optional[MetricResult]:
+        """Score a normal or batch-finalized agent response with unchanged metrics."""
+        answers_data = query.answers_data if isinstance(query, MedQuery) else None
+
         if isinstance(response, dict):
             model_output = response.get("output", "")
             query_time = response.get("query_time", 0.0)
@@ -482,21 +825,143 @@ class MedMemoryBenchEvaluator:
             retrieved_memories = []
             retrieved_count = 0
 
-        result = self.metrics_calculator.compute(
-            query_id=query.query_id,
-            query_type=query.query_type,
-            model_output=model_output,
-            expected_answers=query.get_correct_answers(),
-            question=query.question,
-            answers_data=answers_data,
-            metadata=query.metadata,
-        )
+        metric_kwargs = {
+            "answers_data": answers_data,
+            "metadata": query.metadata,
+        }
+        prepared_metric = None
+        judge_client = None
+        if self.batch_api and not self.dry_run:
+            prepared_metric = self.metrics_calculator.prepare_batch(
+                query_id=query.query_id,
+                query_type=query.query_type,
+                model_output=model_output,
+                expected_answers=query.get_correct_answers(),
+                question=query.question,
+                **metric_kwargs,
+            )
+            if prepared_metric is not None:
+                judge_client = self.metrics_calculator.get_batch_judge_client(query.query_type)
+
+        if prepared_metric is not None and judge_client is not None:
+            judge_payload = prepared_metric["prepared"]["judge_payload"]
+            if "immediate" not in judge_payload:
+                self._deferred_judges.append({
+                    "query_id": query.query_id,
+                    "persona_id": context_id,
+                    "prepared_metric": prepared_metric,
+                    "expected_answers": query.get_correct_answers(),
+                    "metric_kwargs": metric_kwargs,
+                    "query_time": query_time,
+                    "memory_construction_time": memory_construction_time,
+                    "retrieved_memories": retrieved_memories,
+                    "retrieved_count": retrieved_count,
+                })
+                return None
+            result = self.metrics_calculator.finalize_batch(prepared_metric, "")
+        else:
+            if prepared_metric is not None and not self._judge_batch_fallback_logged:
+                self._log(
+                    "Vertex batch API cannot batch the configured LLM judge; "
+                    "using its existing real-time client.",
+                    level="WARNING",
+                )
+                self._judge_batch_fallback_logged = True
+            result = self.metrics_calculator.compute(
+                query_id=query.query_id,
+                query_type=query.query_type,
+                model_output=model_output,
+                expected_answers=query.get_correct_answers(),
+                question=query.question,
+                **metric_kwargs,
+            )
 
         result.query_time = query_time
+        result.memory_construction_time = memory_construction_time
         result.retrieved_memories = retrieved_memories
         result.retrieved_count = retrieved_count
 
         return result
+
+    def _complete_deferred_judges(self) -> List[Dict[str, Any]]:
+        """Submit all independent MedMemoryBench judge prompts as one final stage."""
+        if not self._deferred_judges:
+            return []
+
+        can_fallback_to_realtime = all(
+            "expected_answers" in item and "metric_kwargs" in item
+            for item in self._deferred_judges
+        )
+        if not should_use_batch(len(self._deferred_judges)) and can_fallback_to_realtime:
+            self._log(
+                f"[Vertex Batch] Only {len(self._deferred_judges):,} judge request(s); "
+                "using real-time judging."
+            )
+            finalized: List[Dict[str, Any]] = []
+            for item in self._deferred_judges:
+                prepared = item["prepared_metric"]["prepared"]
+                result = self.metrics_calculator.compute(
+                    query_id=prepared["query_id"],
+                    query_type=prepared["query_type"],
+                    model_output=prepared["model_output"],
+                    expected_answers=item["expected_answers"],
+                    question=prepared["question"],
+                    **item["metric_kwargs"],
+                )
+                result.query_time = item["query_time"]
+                result.memory_construction_time = item["memory_construction_time"]
+                result.retrieved_memories = item["retrieved_memories"]
+                result.retrieved_count = item["retrieved_count"]
+                finalized.append({"persona_id": item["persona_id"], "result": result})
+            self._clear_deferred_judges()
+            return finalized
+
+        first_prepared = self._deferred_judges[0]["prepared_metric"]["prepared"]
+        judge_client = self.metrics_calculator.get_batch_judge_client(first_prepared["query_type"])
+        if judge_client is None:
+            raise VertexBatchError(
+                "Deferred LLM-judge work requires the original Gemini judge configuration."
+            )
+        # This is written before the remote submission.  If the process exits
+        # afterward, resume can collect the same job without regenerating answers.
+        self._save_deferred_judges(judge_client)
+        requests: List[BatchChatRequest] = []
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for item in self._deferred_judges:
+            payload = item["prepared_metric"]["prepared"]["judge_payload"]
+            request_id = make_request_id(
+                "judge",
+                f"{self.method_config.method_name}:{item['persona_id']}:{item['query_id']}",
+            )
+            requests.append(
+                BatchChatRequest(
+                    request_id=request_id,
+                    messages=[{"role": "user", "content": payload["prompt"]}],
+                    temperature=1.0,
+                    max_tokens=payload["max_tokens"],
+                    response_format={"type": "json_object"},
+                    phase="query",
+                    metadata={"query_id": item["query_id"], "phase": "judge"},
+                )
+            )
+            by_id[request_id] = item
+
+        self._log(
+            f"[Vertex Batch] Stage 'judge-final': prepared {len(requests):,} LLM-judge request(s)."
+        )
+        responses = self._get_judge_batch_client(judge_client).run_stage("judge-final", requests)
+        finalized: List[Dict[str, Any]] = []
+        for request_id, item in by_id.items():
+            response = responses.get(request_id)
+            result_text = response.content if response is not None and not response.status else ""
+            result = self.metrics_calculator.finalize_batch(item["prepared_metric"], result_text)
+            result.query_time = item["query_time"]
+            result.memory_construction_time = item["memory_construction_time"]
+            result.retrieved_memories = item["retrieved_memories"]
+            result.retrieved_count = item["retrieved_count"]
+            finalized.append({"persona_id": item["persona_id"], "result": result})
+        self._clear_deferred_judges()
+        return finalized
 
     def _generate_report(
         self,
@@ -605,6 +1070,9 @@ def evaluate_medmemorybench(
     verbose: bool = True,
     logger: Optional[logging.Logger] = None,
     resume: bool = False,
+    batch_api: bool = False,
+    batch_gcs_uri: Optional[str] = None,
+    batch_wait: bool = False,
     **kwargs
 ) -> EvaluationReport:
     """MedMemoryBench evaluation entry point."""
@@ -616,5 +1084,8 @@ def evaluate_medmemorybench(
         verbose=verbose,
         logger=logger,
         resume=resume,
+        batch_api=batch_api,
+        batch_gcs_uri=batch_gcs_uri,
+        batch_wait=batch_wait,
     )
     return evaluator.evaluate()

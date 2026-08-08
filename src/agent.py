@@ -1,5 +1,7 @@
+import os
 import time
-from typing import Dict, Any, Optional, List
+from pathlib import Path
+from typing import Callable, Dict, Any, Optional, List
 
 from src.config import MethodConfig, DatasetConfig, get_api_config
 from methods.base import MemoryBuildResult, AgentResponse
@@ -31,10 +33,23 @@ class AgentManager:
         self,
         method_config: MethodConfig,
         dataset_config: DatasetConfig,
+        *,
+        batch_api: bool = False,
+        batch_gcs_uri: Optional[str] = None,
+        batch_wait: bool = False,
+        batch_manifest_dir: Optional[Path] = None,
+        batch_config_hash: str = "",
+        batch_progress_callback: Optional[Callable[[str], None]] = None,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
         self.method_name = method_config.method_name.lower()
+        self._batch_api = batch_api
+        self._batch_gcs_uri = batch_gcs_uri
+        self._batch_wait = batch_wait
+        self._batch_manifest_dir = batch_manifest_dir
+        self._batch_config_hash = batch_config_hash
+        self._batch_progress_callback = batch_progress_callback
 
         self._api_config = get_api_config()
 
@@ -68,6 +83,18 @@ class AgentManager:
     def _build_agent_params(self, method_key: str) -> Dict[str, Any]:
         model_config = self.method_config.model
         agent_params = self.method_config.agent_params or {}
+        env_embedding_model = os.environ.get("DEFAULT_EMBEDDING_MODEL")
+        env_embedding_provider = os.environ.get("EMBEDDING_PROVIDER", "").lower()
+        use_env_embedding = bool(
+            env_embedding_model
+            and env_embedding_provider in ("local", "huggingface")
+        )
+        amem_embedding_model = agent_params.get("amem_embedding_model", "all-MiniLM-L6-v2")
+        use_env_amem_embedding = (
+            use_env_embedding
+            and amem_embedding_model.startswith(("models/", "./", "/"))
+            and not Path(amem_embedding_model).exists()
+        )
 
         effective_max_tokens = model_config.max_completion_tokens or model_config.max_tokens
 
@@ -85,6 +112,20 @@ class AgentManager:
                 or self._api_config.openai_base_url
             ),
         }
+
+        if (
+            self._batch_api
+            and model_config.provider.lower() in {"gemini", "vertex", "vertex_ai"}
+            and method_key in {"lightmem", "remem", "graph_rag", "memrl"}
+        ):
+            params.update({
+                "vertex_batch_enabled": True,
+                "vertex_batch_gcs_uri": self._batch_gcs_uri,
+                "vertex_batch_wait": self._batch_wait,
+                "vertex_batch_manifest_dir": str(self._batch_manifest_dir) if self._batch_manifest_dir else None,
+                "vertex_batch_config_hash": self._batch_config_hash,
+                "vertex_batch_progress_callback": self._batch_progress_callback,
+            })
 
         if method_key == "long_context":
             params.update({
@@ -133,7 +174,11 @@ class AgentManager:
                 "retrieve_num": agent_params.get("retrieve_num", 5),
                 "amem_backend": agent_params.get("amem_backend", "openai"),
                 "amem_model": agent_params.get("amem_model", model_config.name),
-                "amem_embedding_model": agent_params.get("amem_embedding_model", "all-MiniLM-L6-v2"),
+                "amem_embedding_model": (
+                    env_embedding_model
+                    if use_env_amem_embedding
+                    else amem_embedding_model
+                ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
                 "amem_max_tokens": agent_params.get("amem_max_tokens"),
                 "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
@@ -275,7 +320,6 @@ class AgentManager:
                 "chunk_size": agent_params.get("chunk_size", 512),
             })
             # Zep API Key
-            import os
             zep_api_key = agent_params.get("zep_api_key") or os.environ.get("ZEP_API_KEY")
             if zep_api_key:
                 params["zep_api_key"] = zep_api_key
@@ -476,6 +520,48 @@ class AgentManager:
             return self._handle_memorize(message, is_last_session=is_last_session)
         else:
             return self._handle_query(message)
+
+    def supports_batch_queries(self) -> bool:
+        """Return whether this adapter can separate retrieval from final generation."""
+        adapter_support = getattr(self._agent, "supports_batch_queries", None)
+        if callable(adapter_support) and not adapter_support():
+            return False
+        return bool(
+            self.method_config.model.provider.lower() in {"gemini", "vertex", "vertex_ai"}
+            and hasattr(self._agent, "prepare_batch_query")
+            and hasattr(self._agent, "finalize_batch_query")
+        )
+
+    def get_batch_llm_client(self):
+        """Expose the managed client only for the evaluator's batch transport."""
+        if not self.supports_batch_queries():
+            return None
+        return getattr(self._agent, "_llm_client", None)
+
+    def prepare_batch_query(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Prepare local retrieval and an immutable final-answer request."""
+        if not self.supports_batch_queries():
+            raise RuntimeError(f"{self.method_name} does not support Vertex batch queries")
+        context_id = kwargs.pop("context_id", None)
+        if context_id is not None and context_id != self._context_id:
+            self._context_id = context_id
+            self._agent.set_context_id(context_id)
+        get_usage_tracker().set_phase("query")
+        return self._agent.prepare_batch_query(message, **kwargs)
+
+    def finalize_batch_query(
+        self,
+        prepared: Dict[str, Any],
+        content: str,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+    ) -> AgentResponse:
+        """Convert one Vertex output row to the method's normal response shape."""
+        response = self._agent.finalize_batch_query(prepared, content)
+        record_usage = getattr(self._agent, "record_batch_query_usage", None)
+        if callable(record_usage) and input_tokens is not None and output_tokens is not None:
+            record_usage(response, input_tokens, output_tokens)
+        return response
 
     def _handle_memorize(self, message: str, is_last_session: bool = False) -> MemoryBuildResult:
         get_usage_tracker().set_phase("memorize")

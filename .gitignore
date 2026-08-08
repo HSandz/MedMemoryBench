@@ -50,7 +50,8 @@ env/
 
 # Project specific
 /requirements_frozen.txt
-/tests/
+/tests/*
+!/tests/test_vertex_batch.py
 /docker/
 /.serena/
 /.spec-workflow/
@@ -65,3 +66,5 @@ env/
 
 /methods/q2q_agent.py
 /configs/method_config/q2q_gpt-5.1.yaml
+
+service-account.json

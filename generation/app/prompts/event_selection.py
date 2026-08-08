@@ -10,93 +10,90 @@ TRAP_EVENT_TYPES_SET = {
     "lifestyle_economic",
 }
 
-EVENT_SELECTION_PROMPT = """你是一个医疗对话数据集生成助手。请从以下事件列表中选择一个最适合作为健康咨询起点的事件。
+EVENT_SELECTION_PROMPT = """You are a medical conversation dataset generation assistant. Please select an event from the list of events below that is most appropriate as a starting point for your health consultation.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 可选事件列表
+## Optional event list
 {events_list}
 
-## 已选择的事件（避免重复）
+## Selected events (to avoid duplication)
 {selected_events}
 
-## 选择要求
-1. **优先选择健康相关事件**（type=health），这些事件最适合作为医疗咨询的起点
-2. 其他类型事件也可选择，如果它们可能引发健康问题（如工作压力导致失眠、家庭矛盾导致焦虑等）
-3. 尽量避免选择已选事件列表中的事件
-4. 如果必须复用事件（事件数量不足），请选择一个不同的对话角度：
-   - 首诊：第一次咨询这个问题
-   - 追问细节：针对某个具体症状深入询问
-   - 寻求建议：症状有变化，想获得新的建议
-   - 家属咨询：以家属身份替患者咨询
+## Select requirements
+1. **Prioritize health-related events** (type=health), which are most suitable as a starting point for medical consultation
+2. Other types of events can also be selected if they may cause health problems (such as insomnia caused by work pressure, anxiety caused by family conflicts, etc.)
+3. Try to avoid selecting events in the selected events list
+4. If you must reuse events (there are not enough events), choose a different conversation angle:
+   - First consultation: Consulting on this issue for the first time
+   - Ask for details: Ask in depth about a specific symptom
+   - Asking for advice: Symptoms have changed and you want new advice
+   - Family consultation: Consulting for the patient as a family member
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记（不要 ```json）
-2. 不要在 JSON 前后添加任何说明文字
-3. selected_event_id 必须是整数（如 1, 2, 3），不能是字符串
-4. 其他字段必须是字符串
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags (no ```json)
+2. Do not add any description text before or after JSON
+3. selected_event_id must be an integer (such as 1, 2, 3), not a string
+4. Other fields must be strings
 
-## 输出格式
+## Output format
 {{
     "selected_event_id": 1,
-    "event_summary": "事件简要描述字符串",
-    "selection_reason": "选择该事件的理由字符串",
-    "dialogue_angle": "首诊"
-}}
-"""
+    "event_summary": "A brief description string of the event",
+    "selection_reason": "The reason string for selecting this event",
+    "dialogue_angle": "First consultation"
+}}"""
 
 
 # Trap-priority event selection prompt (ensures all 6 trap types are covered)
-EVENT_SELECTION_TRAP_PRIORITY_PROMPT = """你是一个医疗对话数据集生成助手。请从以下事件列表中选择一个最适合作为健康咨询起点的事件。
+EVENT_SELECTION_TRAP_PRIORITY_PROMPT = """You are a medical conversation dataset generation assistant. Please select an event from the list of events below that is most appropriate as a starting point for your health consultation.
 
-## 用户画像
+## User portrait
 {persona_context}
 
-## 可选事件列表
+## Optional event list
 {events_list}
 
-## 已选择的事件（避免重复）
+## Selected events (to avoid duplication)
 {selected_events}
 
-## 尚未选择的陷阱事件类型（必须优先选择！）
+## Trap event type not yet selected (must be selected first!)
 {missing_trap_types}
 
-## 选择要求（按优先级排序）
+## Select requirements (sorted by priority)
 
-### ⚠️ 最高优先级：覆盖所有陷阱事件类型
-如果「尚未选择的陷阱事件类型」不为空，**必须优先**从这些类型中选择一个事件！
-陷阱事件类型说明：
-- allergy: 过敏史相关事件
-- medication_history: 用药史相关事件
-- disease_history: 疾病史相关事件
-- medication_preference: 给药偏好相关事件
-- diet_preference: 饮食偏好相关事件
-- lifestyle_economic: 生活&经济情况相关事件
+### ⚠️ Highest priority: covers all trap event types
+If "Trap Event Types Not Selected" is not empty, an event from these types must be selected first!
+Trap event type description:
+- allergy: events related to allergy history
+- medication_history: events related to medication history
+- disease_history: events related to disease history
+- medication_preference: Medication preference related events
+- diet_preference: Diet preference related events
+- lifestyle_economic: Life & economic related events
 
-### 次要优先级：选择健康相关事件
-如果所有陷阱事件类型都已覆盖，则优先选择 health 类型的事件。
+### Secondary Priority: Select Health Related Events
+If all trap event types are covered, health type events are preferred.
 
-### 其他事件
-其他类型事件（life, work）也可选择，如果它们可能引发健康问题。
+### Other events
+Other types of events (life, work) may also be selected if they may cause health problems.
 
-## 对话角度
-根据事件类型选择合适的对话角度：
-- 陷阱事件：重点是如何在对话中**自然地透露**这些个人信息（过敏史、用药史等）
-- health 事件：首诊、追问细节、寻求建议、复查反馈等
-- 其他事件：压力咨询、健康担忧、预防咨询等
+## Dialogue angle
+Choose the appropriate conversation angle based on the type of event:
+- Trap events: The focus is on how to **naturally reveal** this personal information (allergy history, medication history, etc.) in the conversation
+- health events: first diagnosis, asking for details, seeking advice, review feedback, etc.
+- Other events: stress counseling, health concerns, prevention counseling, etc.
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记
-2. 不要在 JSON 前后添加任何说明文字
-3. selected_event_id 必须是整数
-4. 其他字段必须是字符串
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags
+2. Do not add any description text before or after JSON
+3. selected_event_id must be an integer
+4. Other fields must be strings
 
-## 输出格式
+## Output format
 {{
     "selected_event_id": 1,
-    "event_summary": "事件简要描述字符串",
-    "selection_reason": "选择该事件的理由字符串",
-    "dialogue_angle": "首诊/透露过敏史/提及用药史/等"
-}}
-"""
+    "event_summary": "A brief description string of the event",
+    "selection_reason": "The reason string for selecting this event","dialogue_angle": "First visit/revelation of allergy history/mention of medication history/etc."
+}}"""

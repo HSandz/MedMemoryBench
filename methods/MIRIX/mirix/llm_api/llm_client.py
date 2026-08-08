@@ -48,5 +48,11 @@ class LLMClient:
                 return GoogleAIClient(
                     llm_config=llm_config,
                 )
+            case "google_vertex":
+                from mirix.llm_api.google_vertex_client import GoogleVertexClient
+
+                return GoogleVertexClient(
+                    llm_config=llm_config,
+                )
             case _:
                 return None

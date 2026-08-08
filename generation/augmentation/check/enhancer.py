@@ -164,7 +164,7 @@ class DifficultyEnhancer:
 
         for line in lines:
             line = line.strip()
-            if line.startswith("## 分析"):
+            if line.startswith("## analyze"):
                 current_section = "analysis"
             elif line.startswith("## Enhancement suggestions"):
                 current_section = "suggestions"

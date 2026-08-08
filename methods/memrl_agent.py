@@ -22,6 +22,12 @@ from utils.llm_client import (
     get_usage_tracker,
     LLMResponse,
 )
+from utils.vertex_batch import (
+    BatchChatRequest,
+    VertexBatchClient,
+    make_request_id,
+    scoped_manifest_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +136,12 @@ Keywords:"""
         Returns:
             High-level script representation
         """
+        messages = self.prepare_script_messages(trajectory)
+        return self.generate(messages, temperature=0.7, max_tokens=500)
+
+    @staticmethod
+    def prepare_script_messages(trajectory: str) -> List[Dict[str, str]]:
+        """Build the exact script-generation request used by MemRL builders."""
         prompt = f"""Analyze the following detailed task trajectory and create a concise,
 high-level script that captures the essential steps and decision points.
 
@@ -143,9 +155,13 @@ Trajectory:
 {trajectory}
 
 High-level script:"""
+        return [{"role": "user", "content": prompt}]
 
-        messages = [{"role": "user", "content": prompt}]
-        return self.generate(messages, temperature=0.7, max_tokens=500)
+    def record_batch_result(self, input_tokens: int, output_tokens: int) -> None:
+        """Keep MemRL's local diagnostics aligned with shared batch accounting."""
+        self._call_count += 1
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cumulative usage statistics."""
@@ -353,6 +369,18 @@ class MemRLAgent(BaseAgent):
         )
         self._provider = provider
 
+        # Batch is limited to the independent script-generation map phase.
+        # Ordered memory writes and all value/Q updates still use MemRL's
+        # original synchronous control flow.
+        self._vertex_batch_enabled = bool(kwargs.get("vertex_batch_enabled", False))
+        self._vertex_batch_gcs_uri = kwargs.get("vertex_batch_gcs_uri")
+        self._vertex_batch_wait = bool(kwargs.get("vertex_batch_wait", False))
+        self._vertex_batch_manifest_dir = kwargs.get("vertex_batch_manifest_dir")
+        self._vertex_batch_config_hash = kwargs.get("vertex_batch_config_hash", "")
+        self._vertex_batch_progress_callback = kwargs.get("vertex_batch_progress_callback")
+        self._vertex_batch_client: Optional[VertexBatchClient] = None
+        self._vertex_batch_stage_index = 0
+
         # Create LLM client for all API calls (with token tracking)
         self._llm_client: BaseLLMClient = create_llm_client(
             provider=provider,
@@ -396,6 +424,20 @@ class MemRLAgent(BaseAgent):
     def _create_mos_config(self) -> str:
         """Create a temporary MemOS configuration file."""
         self._temp_dir = tempfile.mkdtemp(prefix="memrl_agent_")
+        use_vertex_gemini = self._provider.lower() in {"gemini", "vertex", "vertex_ai"}
+        llm_config = {
+            "model_name_or_path": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        extractor_config = {
+            "model_name_or_path": self.model,
+            "temperature": 0.0,
+            "max_tokens": 4096,
+        }
+        if not use_vertex_gemini:
+            llm_config.update({"api_key": self._api_key, "api_base": self._base_url})
+            extractor_config.update({"api_key": self._api_key, "api_base": self._base_url})
 
         # Embedder config based on provider
         if self.embedding_provider == "local":
@@ -424,27 +466,15 @@ class MemRLAgent(BaseAgent):
                 }
             },
             "chat_model": {
-                "backend": "openai",
-                "config": {
-                    "model_name_or_path": self.model,
-                    "api_key": self._api_key,
-                    "api_base": self._base_url,
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                }
+                "backend": "gemini" if use_vertex_gemini else "openai",
+                "config": llm_config,
             },
             "mem_reader": {
                 "backend": "simple_struct",
                 "config": {
                     "llm": {
-                        "backend": "openai",
-                        "config": {
-                            "model_name_or_path": self.model,
-                            "api_key": self._api_key,
-                            "api_base": self._base_url,
-                            "temperature": 0.0,
-                            "max_tokens": 4096,
-                        }
+                        "backend": "gemini" if use_vertex_gemini else "openai",
+                        "config": extractor_config,
                     },
                     "embedder": embedder_config,
                     "chunker": {
@@ -546,6 +576,80 @@ class MemRLAgent(BaseAgent):
         logger.info(f"  - Strategy: {strategy_config}")
         logger.info(f"  - Embedding: {self.embedding_provider}/{self.embedding_model}")
 
+    def _get_script_batch_client(self) -> Optional[VertexBatchClient]:
+        """Create the shared Vertex transport for independent builder scripts."""
+        if not self._vertex_batch_enabled:
+            return None
+        if self._vertex_batch_client is None:
+            manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
+            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+                self._llm_client,
+                gcs_uri=self._vertex_batch_gcs_uri,
+                manifest_path=scoped_manifest_path(
+                    manifest_dir,
+                    "memrl_scripts_batch_manifest",
+                    model=self._llm_client.model,
+                    config_hash=self._vertex_batch_config_hash,
+                ),
+                wait=self._vertex_batch_wait,
+                config_hash=self._vertex_batch_config_hash,
+                progress_callback=self._vertex_batch_progress_callback,
+            )
+        return self._vertex_batch_client
+
+    def _batch_build_contents(self, chunks: List[str]) -> Dict[int, str]:
+        """Batch only MemRL's independent trajectory-to-script map operation."""
+        batch_client = self._get_script_batch_client()
+        build_strategy = getattr(getattr(self._memory_service, "strategy_config", None), "build", None)
+        strategy_value = getattr(build_strategy, "value", str(build_strategy or "")).lower()
+        if batch_client is None or strategy_value not in {"script", "proceduralization"}:
+            return {}
+
+        stage = (
+            f"memrl-scripts-context-{self._context_id or 0}-"
+            f"memorize-{self._vertex_batch_stage_index}"
+        )
+        self._vertex_batch_stage_index += 1
+        requests: List[BatchChatRequest] = []
+        request_by_index: Dict[int, str] = {}
+        for index, chunk in enumerate(chunks):
+            request_id = make_request_id("memrl-script", f"{stage}:{index}")
+            request_by_index[index] = request_id
+            requests.append(
+                BatchChatRequest(
+                    request_id=request_id,
+                    messages=self._tracked_llm.prepare_script_messages(chunk),
+                    # These are the constants in TrackedLLMProvider.generate_script.
+                    temperature=0.7,
+                    max_tokens=500,
+                    phase="memorize",
+                    metadata={"chunk_index": index, "stage": stage},
+                )
+            )
+
+        logger.info("[Vertex Batch] Stage '%s': prepared %d MemRL script request(s).", stage, len(requests))
+        responses = batch_client.run_stage(stage, requests)
+        contents: Dict[int, str] = {}
+        for index, request_id in request_by_index.items():
+            response = responses.get(request_id)
+            if response is None or response.status or not response.content:
+                logger.warning(
+                    "[Vertex Batch] MemRL script %d was incomplete; using the original real-time builder for it.",
+                    index,
+                )
+                continue
+            # ProceduralizationBuilder wraps the generated script together
+            # with its trajectory.  Preserve that exact builder output so
+            # MemoryService does not fall back to a second real-time script
+            # request while parsing the prebuilt content.
+            contents[index] = (
+                f"SCRIPT:\n{response.content}\n\nTRAJECTORY:\n{chunks[index]}"
+                if strategy_value == "proceduralization"
+                else response.content
+            )
+            self._tracked_llm.record_batch_result(response.input_tokens, response.output_tokens)
+        return contents
+
     def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
         """Truncate text to max_tokens."""
         if not text or max_tokens <= 0:
@@ -618,6 +722,11 @@ class MemRLAgent(BaseAgent):
         self._build_progress.start(len(chunks))
         logger.info(f"[MemRL Memory Build] Starting memorization of {len(chunks)} chunks...")
 
+        # A script depends only on its own trajectory. Generate those scripts
+        # together, then retain the original chunk order for every stateful
+        # build/write that follows.
+        batched_contents = self._batch_build_contents(chunks)
+
         memory_entries: List[Dict[str, Any]] = []
         all_memory_ids: List[str] = []
         build_details: List[Dict[str, Any]] = []
@@ -629,15 +738,20 @@ class MemRLAgent(BaseAgent):
                 # Use MemRL's official build_memory method
                 # Pass the full chunk as both task_description and trajectory
                 # (following official implementation without artificial truncation)
-                memory_id = self._memory_service.build_memory(
-                    task_description=chunk,  # Full chunk as task description
-                    trajectory=chunk,  # Full chunk as trajectory
-                    metadata={
+                build_kwargs = {
+                    "task_description": chunk,
+                    "trajectory": chunk,
+                    "metadata": {
                         "source_benchmark": "medmemorybench",
                         "chunk_index": i,
                         "total_chunks": len(chunks),
-                        # Don't assume success - let MemRL handle Q-value initialization
-                    }
+                        # Don't assume success - let MemRL handle Q-value initialization.
+                    },
+                }
+                if i in batched_contents:
+                    build_kwargs["prebuilt_memory_content"] = batched_contents[i]
+                memory_id = self._memory_service.build_memory(
+                    **build_kwargs,
                 )
 
                 chunk_time = time.time() - chunk_start
@@ -737,6 +851,24 @@ class MemRLAgent(BaseAgent):
         4. Generates response using the tracked LLM client
         """
         start_time = time.time()
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
+        response = self._llm_client.chat(prepared["messages"])
+        result = self.finalize_batch_query(prepared, response.content)
+        result.query_time = time.time() - start_time
+        result.extra["tokens_used"] = {
+            "input": response.input_tokens,
+            "output": response.output_tokens,
+        }
+        return result
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Run value-aware retrieval and isolate the final answer request."""
+        start_time = time.time()
 
         # Truncate question if needed
         bounded_question = self._truncate_to_tokens(question, self.max_question_tokens)
@@ -820,12 +952,6 @@ class MemRLAgent(BaseAgent):
             ])
             full_question = f"[Retrieved Memories from MemRL]\n{memory_context}\n\n[Question]\n{bounded_question}"
 
-        # Generate response using tracked LLM client
-        messages = format_messages(full_question, system_message)
-        response = self._llm_client.chat(messages)
-
-        total_time = time.time() - start_time
-
         # Get LLM stats from tracked provider
         memrl_llm_stats = self._tracked_llm.get_stats() if self._tracked_llm else {}
 
@@ -842,12 +968,11 @@ class MemRLAgent(BaseAgent):
             for m in retrieved_memories
         ]
 
-        return AgentResponse(
-            output=response.content,
-            query_time=total_time,
-            retrieved_count=len(retrieved_memories),
-            retrieved_memories=formatted_memories,
-            extra={
+        return {
+            "messages": format_messages(full_question, system_message),
+            "retrieved_count": len(retrieved_memories),
+            "retrieved_memories": formatted_memories,
+            "extra": {
                 "method": "memrl",
                 "retrieval_time": retrieval_time,
                 "embedding_model": self.embedding_model,
@@ -862,13 +987,32 @@ class MemRLAgent(BaseAgent):
                     "weight_sim": self.weight_sim,
                     "weight_q": self.weight_q,
                 },
-                "tokens_used": {
-                    "input": response.input_tokens,
-                    "output": response.output_tokens,
-                },
                 "memrl_llm_stats": memrl_llm_stats,
             },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Return the standard MemRL response after a final-answer batch row."""
+        return AgentResponse(
+            output=content,
+            query_time=0.0,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
+
+    @staticmethod
+    def record_batch_query_usage(
+        response: AgentResponse,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Keep batch result diagnostics identical to MemRL real-time queries."""
+        response.extra["tokens_used"] = {
+            "input": input_tokens,
+            "output": output_tokens,
+        }
 
     def _extract_memory_content(self, mem: Dict[str, Any]) -> str:
         """Extract content from a memory object returned by retrieve_query.

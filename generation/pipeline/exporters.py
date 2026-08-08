@@ -362,7 +362,7 @@ class DialogueExporter:
                         "key_points_structure": {
                             "description": "Accumulated knowledge points list - each session contains all KPs up to that session (additive, deduplicated)",
                             "fields": {
-                                "category": "检查Result/生理指标/用药记录/疾病状况/User偏好",
+                                "category": "Check Result/physiological indicators/medication records/disease status/User preferences",
                                 "name": "Key item name (1-4 chars)",
                                 "content": "Content excerpt",
                                 "trap_score": "Difficulty score (0.0-1.0)",

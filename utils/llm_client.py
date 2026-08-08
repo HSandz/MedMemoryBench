@@ -1,8 +1,9 @@
-"""LLM client module - unified interface for multiple providers (OpenAI, Azure, Anthropic)."""
+"""LLM client module - unified interface for multiple providers."""
 
 import os
 import time
 import logging
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Type
 from dataclasses import dataclass
 from functools import wraps
@@ -97,6 +98,9 @@ def get_usage_tracker() -> LLMUsageTracker:
 DEFAULT_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
 DEFAULT_RETRY_MIN_DELAY = float(os.environ.get("LLM_RETRY_MIN_DELAY", "10.0"))
 DEFAULT_RETRY_MAX_DELAY = float(os.environ.get("LLM_RETRY_MAX_DELAY", "20.0"))
+GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "100"))
+GEMINI_RETRY_INITIAL_DELAY = 1.0
+GEMINI_RETRY_MAX_DELAY = 100.0
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,10 @@ class LLMRetryExhaustedError(LLMAPIError):
         super().__init__(message)
         self.last_exception = last_exception
         self.attempts = attempts
+
+
+class EmptyGeminiResponseError(LLMAPIError):
+    """A completed Gemini request without generated text."""
 
 
 def _is_retryable_exception(exc: Exception) -> Tuple[bool, str]:
@@ -136,8 +144,32 @@ def _is_retryable_exception(exc: Exception) -> Tuple[bool, str]:
         "OverloadedError",
     ]
 
-    # Check by exception type name
-    if exc_type in retryable_openai_errors or exc_type in retryable_anthropic_errors:
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code is not None:
+        if status_code in {408, 409, 429} or 500 <= status_code < 600:
+            return True, f"Retryable HTTP status: {status_code}"
+        if 400 <= status_code < 500:
+            return False, f"Non-retryable HTTP status: {status_code}"
+
+    # Google API Core exceptions used by the Gemini Enterprise Agent Platform SDK.
+    retryable_google_errors = [
+        "ResourceExhausted",
+        "ServiceUnavailable",
+        "InternalServerError",
+        "DeadlineExceeded",
+        "ServerError",
+        "TooManyRequests",
+    ]
+
+    if (
+        exc_type in retryable_openai_errors
+        or exc_type in retryable_anthropic_errors
+        or exc_type in retryable_google_errors
+    ):
         return True, f"Retryable exception type: {exc_type}"
 
     # Check by exception message (compatibility)
@@ -145,6 +177,8 @@ def _is_retryable_exception(exc: Exception) -> Tuple[bool, str]:
         "rate limit",
         "rate_limit",
         "too many requests",
+        "429",
+        "resource exhausted",
         "connection error",
         "connection reset",
         "timeout",
@@ -203,18 +237,13 @@ def _log_retry_attempt(
         f"Reason: {reason}\n"
         f"Will retry in {delay:.1f} seconds..."
     )
-    # Also print to console
-    print(
-        f"⚠️  API call failed (attempt {attempt}/{max_retries}): {type(exc).__name__}\n"
-        f"   Reason: {reason}\n"
-        f"   Will retry in {delay:.1f} seconds..."
-    )
 
 
 def with_retry(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_min_delay: float = DEFAULT_RETRY_MIN_DELAY,
     retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
+    exponential_backoff: bool = False,
 ):
     """API call retry decorator with jitter strategy.
 
@@ -222,9 +251,10 @@ def with_retry(
         max_retries: Maximum number of retry attempts (default: 10)
         retry_min_delay: Minimum delay between retries in seconds (default: 10.0)
         retry_max_delay: Maximum delay between retries in seconds (default: 20.0)
+        exponential_backoff: Double the delay after each failure, capped at max delay.
 
     The actual delay is randomly chosen between retry_min_delay and retry_max_delay
-    (jitter strategy) to avoid thundering herd problem.
+    (jitter strategy) unless exponential_backoff is enabled.
     """
     def decorator(func):
         @wraps(func)
@@ -244,8 +274,13 @@ def with_retry(
                         raise
 
                     if attempt < max_retries:
-                        # Calculate delay with jitter
-                        delay = _get_retry_delay(retry_min_delay, retry_max_delay)
+                        if exponential_backoff:
+                            delay = min(
+                                retry_min_delay * (2 ** (attempt - 1)),
+                                retry_max_delay,
+                            )
+                        else:
+                            delay = _get_retry_delay(retry_min_delay, retry_max_delay)
                         # Log and wait for retry
                         _log_retry_attempt(attempt, max_retries, delay, exc, reason)
                         time.sleep(delay)
@@ -265,6 +300,17 @@ def with_retry(
 
         return wrapper
     return decorator
+
+
+@with_retry(
+    max_retries=GEMINI_MAX_RETRIES,
+    retry_min_delay=GEMINI_RETRY_INITIAL_DELAY,
+    retry_max_delay=GEMINI_RETRY_MAX_DELAY,
+    exponential_backoff=True,
+)
+def run_with_gemini_retry(operation, *args, **kwargs):
+    """Run a raw Gemini SDK call with the shared retry policy."""
+    return operation(*args, **kwargs)
 
 
 @dataclass
@@ -557,6 +603,150 @@ class AnthropicClient(BaseLLMClient):
         get_usage_tracker().record(llm_response)
         return llm_response
 
+
+class GeminiEnterpriseClient(BaseLLMClient):
+    """Gemini client using Gemini Enterprise Agent Platform (formerly Vertex AI)."""
+
+    def __init__(
+        self,
+        model: str = "gemini-2.5-flash",
+        temperature: float = 1.0,
+        max_tokens: int = 2000,
+        project: Optional[str] = None,
+        location: Optional[str] = None,
+        service_account_file: Optional[str] = None,
+        **kwargs
+    ):
+        super().__init__(model, temperature, max_tokens, **kwargs)
+
+        try:
+            from google import genai
+            from google.oauth2 import service_account
+        except ImportError as exc:
+            raise ImportError(
+                "Gemini Enterprise support requires google-genai and google-auth. "
+                "Install dependencies with: pip install -r requirements.txt"
+            ) from exc
+
+        default_credentials_file = Path(__file__).resolve().parent.parent / "service-account.json"
+        self.service_account_file = Path(
+            service_account_file
+            or os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+            or default_credentials_file
+        )
+        if not self.service_account_file.is_file():
+            raise FileNotFoundError(
+                "Gemini Enterprise service-account file not found: "
+                f"{self.service_account_file}"
+            )
+
+        credentials = service_account.Credentials.from_service_account_file(
+            str(self.service_account_file),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        # Reused by the optional Vertex batch transport; never serialize it.
+        self.credentials = credentials
+        self.project = project or credentials.project_id
+        self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+        if not self.project:
+            raise ValueError(
+                "Gemini Enterprise requires a project_id in the service-account file "
+                "or a project argument."
+            )
+
+        # enterprise=True selects Google Agent Platform, not the Gemini Developer API.
+        self.client = genai.Client(
+            enterprise=True,
+            credentials=credentials,
+            project=self.project,
+            location=self.location,
+        )
+
+    @with_retry(
+        max_retries=GEMINI_MAX_RETRIES,
+        retry_min_delay=GEMINI_RETRY_INITIAL_DELAY,
+        retry_max_delay=GEMINI_RETRY_MAX_DELAY,
+        exponential_backoff=True,
+    )
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ) -> LLMResponse:
+        from google.genai import types
+
+        start_time = time.time()
+        system_messages = []
+        contents = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content", "")
+            if role == "system":
+                system_messages.append(content)
+                continue
+            if role not in ("user", "assistant"):
+                raise ValueError(f"Unsupported Gemini message role: {role}")
+            contents.append(
+                types.Content(
+                    role="model" if role == "assistant" else "user",
+                    parts=[types.Part.from_text(text=content)],
+                )
+            )
+
+        if not contents:
+            raise ValueError("Gemini requires at least one user or assistant message.")
+
+        config = {
+            "max_output_tokens": max_tokens if max_tokens is not None else self.max_tokens,
+            "temperature": temperature if temperature is not None else self.temperature,
+        }
+        if system_messages:
+            config["system_instruction"] = "\n\n".join(system_messages)
+
+        # LightMem asks for OpenAI's JSON-object response format. Map its equivalent.
+        response_format = kwargs.pop("response_format", None)
+        if response_format and response_format.get("type") == "json_object":
+            config["response_mime_type"] = "application/json"
+
+        for key in ("top_p", "top_k", "seed", "response_mime_type", "response_json_schema"):
+            if key in kwargs:
+                config[key] = kwargs.pop(key)
+
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(**config),
+        )
+        latency = time.time() - start_time
+        content = getattr(response, "text", "") or ""
+        if not content.strip():
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
+            prompt_feedback = getattr(response, "prompt_feedback", None)
+            block_reason = str(getattr(prompt_feedback, "block_reason", "") or "")
+            is_blocked = block_reason and "UNSPECIFIED" not in block_reason.upper()
+            if "SAFETY" in finish_reason.upper() or is_blocked:
+                raise LLMAPIError(
+                    "Gemini returned no text because the response was blocked "
+                    f"(finish_reason={finish_reason or 'unknown'})."
+                )
+            raise EmptyGeminiResponseError(
+                "Gemini returned an empty response without a blocking reason."
+            )
+        usage = getattr(response, "usage_metadata", None)
+        llm_response = LLMResponse(
+            content=content,
+            input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+            output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+            latency=latency,
+            model=self.model,
+            raw_response=response,
+        )
+        get_usage_tracker().record(llm_response)
+        return llm_response
+
 def create_llm_client(
     provider: str = "openai",
     model: str = "gpt-4o-mini",
@@ -569,6 +759,9 @@ def create_llm_client(
         "openai": OpenAIClient,
         "azure": AzureOpenAIClient,
         "anthropic": AnthropicClient,
+        "gemini": GeminiEnterpriseClient,
+        "vertex_ai": GeminiEnterpriseClient,
+        "vertex": GeminiEnterpriseClient,
     }
 
     client_class = provider_map.get(provider.lower())
@@ -603,9 +796,11 @@ __all__ = [
     "OpenAIClient",
     "AzureOpenAIClient",
     "AnthropicClient",
+    "GeminiEnterpriseClient",
     # Exceptions
     "LLMAPIError",
     "LLMRetryExhaustedError",
+    "EmptyGeminiResponseError",
     # Factory functions
     "create_llm_client",
     "format_messages",
@@ -613,7 +808,11 @@ __all__ = [
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_RETRY_MIN_DELAY",
     "DEFAULT_RETRY_MAX_DELAY",
+    "GEMINI_MAX_RETRIES",
+    "GEMINI_RETRY_INITIAL_DELAY",
+    "GEMINI_RETRY_MAX_DELAY",
     "with_retry",
+    "run_with_gemini_retry",
     # Usage tracking
     "TokenUsage",
     "LLMUsageTracker",

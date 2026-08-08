@@ -17,4 +17,4 @@ agent_params:
 
 embedding:
   provider: "local"
-  model: "models/bge-small-zh-v1.5"
+  model: "BAAI/bge-small-zh-v1.5"

@@ -62,6 +62,8 @@ class AMemAgent(BaseAgent):
         self.amem_max_tokens = amem_max_tokens or max_tokens
         self.amem_max_context_tokens = amem_max_context_tokens
         self.amem_chunk_size_tokens = amem_chunk_size_tokens or self.DEFAULT_CHUNK_SIZE_TOKENS
+        self._amem_backend = provider if provider.lower() in {"gemini", "vertex", "vertex_ai"} else amem_backend
+        self._amem_model = model if provider.lower() in {"gemini", "vertex", "vertex_ai"} else self.amem_model
 
         # API configuration for A-Mem internal LLM calls
         self._amem_api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -117,8 +119,8 @@ class AMemAgent(BaseAgent):
 
         system = self._amem_class(
             model_name=self.amem_embedding_model,
-            llm_backend=self.amem_backend,
-            llm_model=self.amem_model,
+            llm_backend=self._amem_backend,
+            llm_model=self._amem_model,
             evo_threshold=self.amem_evo_threshold,
             api_key=self._amem_api_key,
             api_base=self._amem_api_base,
@@ -312,10 +314,22 @@ class AMemAgent(BaseAgent):
         2. Construct context with retrieved memories
         3. Generate response using LLM
         """
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
+        response = self._llm_client.chat(prepared["messages"])
+        return self.finalize_batch_query(prepared, response.content)
+
+    def prepare_batch_query(
+        self,
+        question: str,
+        system_message: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Retrieve locally and defer only A-Mem's immutable final answer."""
         context_id = self._get_context_id()
         memory_system = self._get_memory_system(context_id)
 
-        # Retrieve related memories
+        # This retrieval is read-only. Note analysis and evolution remain in
+        # ``memorize`` because each note can update its predecessors.
         memory_str, indices = memory_system.find_related_memories(question, k=self.retrieve_num)
 
         # Calculate available tokens for memory context
@@ -335,10 +349,6 @@ class AMemAgent(BaseAgent):
         else:
             full_question = question
 
-        # Generate response
-        messages = format_messages(full_question, system_message)
-        response = self._llm_client.chat(messages)
-
         # Build retrieved memories list for logging
         indices_list = indices.tolist() if hasattr(indices, "tolist") else list(indices)
         retrieved_memories: List[Dict[str, Any]] = []
@@ -349,14 +359,24 @@ class AMemAgent(BaseAgent):
                 "indices": indices_list,
             })
 
-        return AgentResponse(
-            output=response.content,
-            retrieved_count=len(indices_list),
-            retrieved_memories=retrieved_memories,
-            extra={
+        return {
+            "messages": format_messages(full_question, system_message),
+            "retrieved_count": len(indices_list),
+            "retrieved_memories": retrieved_memories,
+            "extra": {
                 "method": "amem",
                 "context_id": context_id,
             },
+        }
+
+    @staticmethod
+    def finalize_batch_query(prepared: Dict[str, Any], content: str) -> AgentResponse:
+        """Return the normal A-Mem response after real-time or batch generation."""
+        return AgentResponse(
+            output=content,
+            retrieved_count=prepared["retrieved_count"],
+            retrieved_memories=prepared["retrieved_memories"],
+            extra=prepared["extra"],
         )
 
     def reset(self) -> None:
@@ -374,8 +394,8 @@ class AMemAgent(BaseAgent):
         info = super().get_info()
         info.update({
             "retrieve_num": self.retrieve_num,
-            "amem_backend": self.amem_backend,
-            "amem_model": self.amem_model,
+            "amem_backend": self._amem_backend,
+            "amem_model": self._amem_model,
             "amem_embedding_model": self.amem_embedding_model,
             "amem_evo_threshold": self.amem_evo_threshold,
             "amem_max_tokens": self.amem_max_tokens,

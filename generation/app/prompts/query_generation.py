@@ -13,784 +13,759 @@ Key constraints:
 
 # ========== EEM (Entity Exact Match) - single KP fill-in-the-blank ==========
 
-EEM_SINGLE_KP_PROMPT = """你是一个专业的医学 Query 生成专家。任务是基于给定的单个知识点，生成一个**实体精确匹配类（EEM: Entity Exact Match）**的填空题。
+EEM_SINGLE_KP_PROMPT = """You are a professional medical query generation expert. The task is to generate a fill-in-the-blank question based on a given single knowledge point (EEM: Entity Exact Match).
 
-## 当前 Session ID
+## Current Session ID
 {current_session_id}
 
-## 目标知识点
+## Target knowledge points
 {kp_text}
 
-## 任务说明
-请基于上述知识点，生成**1个**实体精确匹配类填空题。
+## Mission description
+Please generate **1** entity exact matching fill-in-the-blank questions based on the above knowledge points.
 
-### EEM 填空题设计原则
-1. **提取实体**：从知识点内容中找出一个精确的实体/数值（如：药物名称、检查数值、疾病名称、剂量等）
-2. **构造问句**：将该实体替换为问句形式，让模型填空
-3. **答案唯一**：答案必须是精确的、唯一的事实值
+### EEM fill-in-the-blank question design principles
+1. **Extract entity**: Find an accurate entity/value from the knowledge point content (such as: drug name, inspection value, disease name, dosage, etc.)
+2. **Construct a question**: Replace the entity with a question form and let the model fill in the blanks
+3. **Unique Answer**: The answer must be a precise and unique factual value
 
-### ⚠️ 禁止生成时间相关问题（非常重要）
+### ⚠️ Prohibit generation time related issues (very important)
 
-**EEM 类问题严禁回答时间！时间相关问题属于 TLA 类型！**
+**Answer time is strictly prohibited for EEM questions! Time-related questions are of the TLA type! **
 
-**禁止的问题类型：**
-- ✗ "患者是什么时间做的检查？"
-- ✗ "这个事件发生在哪一天？"
-- ✗ "患者是几月几号开始服药的？"
-- ✗ 任何答案是日期/时间的问题
+**BANNED QUESTION TYPES:**
+- ✗ "When did the patient undergo the examination?"
+- ✗ "What day did this incident occur?"
+- ✗ "On what day of the month did the patient start taking the medicine?"
+- ✗ Any answer is a date/time question
 
-**可以的问题类型：**
-- ✓ "患者的空腹血糖值是多少？"（数值）
-- ✓ "患者正在服用的降糖药名称是什么？"（药物名称）
-- ✓ "患者对哪类药物过敏？"（过敏物质）
-- ✓ "患者的用药剂量是多少？"（剂量）
-- ✓ "患者被诊断为什么疾病？"（疾病名称）
-- ✓ "患者需要进行的检查项目是什么？"（检查项目）
+**Available question types:**
+- ✓ "What is the patient's fasting blood glucose value?" (numeric value)
+- ✓ "What is the name of the antidiabetic drug the patient is taking?" (drug name)
+- ✓ "What type of drugs is the patient allergic to?" (allergic substances)
+- ✓ "What is the dose of medication for the patient?" (Dose)
+- ✓ "What disease was the patient diagnosed with?" (name of disease)
+- ✓ "What are the examination items that the patient needs to undergo?" (Examination items)
 
-### ⚠️ 答案格式规范
+### ⚠️Answer format specification
 
-为了确保答案能够被精确匹配，答案必须遵循以下格式：
+To ensure an exact match, the answer must follow the following format:
 
-**数值类答案格式：**
-- 血糖值：使用 "X.X mmol/L" 格式（如："8.2 mmol/L"）
-- 血压值：使用 "XXX/XX mmHg" 格式（如："150/95 mmHg"）
-- 药物剂量：使用 "XXXmg" 或 "XXXml" 格式（如："500mg"、"10ml"）
-- 体重：使用 "XXkg" 格式（如："65kg"）
+**Numerical answer format:**
+- Blood glucose value: use "X.X mmol/L" format (eg: "8.2 mmol/L")
+- Blood pressure value: use "XXX/XX mmHg" format (eg: "150/95 mmHg")
+- Medication dosage: use "XXXmg" or "XXXml" format (e.g.: "500mg", "10ml")
+- Weight: use "XXkg" format (eg: "65kg")
 
-**专业名词类答案格式：**
-- 药物名称：使用**通用名**（如："二甲双胍"而非"格华止"）
-- 疾病名称：使用**标准医学术语**（如："2型糖尿病"而非"糖尿病"）
-- 检查项目：使用**标准检查名称**（如："糖化血红蛋白"而非"HbA1c"）
+**Answer format for professional nouns:**
+- Drug name: use **common name** (eg: "Metformin" not "Glucophage")- Disease name: use **standard medical terminology** (eg: "type 2 diabetes" instead of "diabetes")
+- Test items: Use **standard test name** (e.g.: "glycated hemoglobin" instead of "HbA1c")
 
-**禁止的答案格式：**
-- ✗ 日期或时间（属于 TLA 类型）
-- ✗ 口语化表达（如："血糖有点高"）
-- ✗ 模糊表达（如："大约8点多"）
-- ✗ 包含解释的答案（如："8.2 mmol/L，属于偏高"）
+**Forbidden answer format:**
+- ✗ Date or time (of type TLA)
+- ✗ Colloquial expressions (eg: "Blood sugar is a bit high")
+- ✗ Vague expressions (eg: "about 8 o'clock")
+- ✗ Answer with explanation (eg: "8.2 mmol/L, which is high")
 
-### 生成规则
-- 问题应该是自然的问句形式（不要直接挖空）
-- 答案必须来自知识点内容，不能编造
-- 答案必须是简洁的、可精确匹配的格式
-- 问题不要透露太多信息，保持一定难度
-- **绝对不要问时间相关问题**
+### Generate rules
+- Questions should be in the form of natural questions (don’t directly fill in the blanks)
+- Answers must come from knowledge points and cannot be made up
+- Answers must be in a concise, exact-match format
+- Don’t reveal too much information in the questions and keep them at a certain level of difficulty
+- **Never ask time related questions**
 
-### 示例
+### Example
 
-知识点：空腹血糖 | 内容：测量得到空腹血糖 8.2 mmol/L
-生成问题："患者最近一次的空腹血糖值是多少？"
-答案："8.2 mmol/L"
+Knowledge point: Fasting blood sugar | Content: Measured fasting blood sugar 8.2 mmol/L
+Generate question: "What was the patient's most recent fasting blood glucose value?"
+Answer: "8.2 mmol/L"
 
-知识点：用药 | 内容：开始服用二甲双胍 500mg 每日两次
-生成问题："患者正在服用的降糖药物名称是什么？"
-答案："二甲双胍"
+Knowledge point: Medication | Content: Start taking metformin 500mg twice a day
+Generate question: "What is the name of the antidiabetic medication the patient is taking?"
+Answer: "Metformin"
 
-知识点：过敏史 | 内容：对青霉素类抗生素过敏
-生成问题："患者对哪类抗生素过敏？"
-答案："青霉素类"
+Knowledge point: Allergy history | Content: Allergy to penicillin antibiotics
+Generate question: "To which antibiotics is the patient allergic?"
+Answer: "Penicillins"
 
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## ⚠️ Output format requirements
+**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
     "query": {{
         "query_type": "entity_exact_match",
-        "question": "问题内容（不得涉及时间）",
+        "question": "Question content (no time involved)",
         "answers": [
             {{
-                "content": "精确的实体/数值答案（不能是日期）",
+                "content": "Exact entity/numeric answer (cannot be a date)",
                 "is_correct": true,
-                "explanation": "答案来源说明"
+                "explanation": "Answer source explanation"
             }}
         ],
-        "metadata": {{
-            "entity_type": "实体类型（medication/disease/test_value/dosage/allergy等，不能是date）",
-            "entity_value": "被提取的实体原值",
-            "answer_format": "答案格式类型（numeric/medication_name/disease_name/dosage等，不能是date）",
-            "difficulty": "难度等级（easy/medium/hard）"
+        "metadata": {{"entity_type": "Entity type (medication/disease/test_value/dosage/allergy, etc., cannot be date)",
+            "entity_value": "The original value of the extracted entity",
+            "answer_format": "Answer format type (numeric/medication_name/disease_name/dosage, etc., cannot be date)",
+            "difficulty": "Difficulty level (easy/medium/hard)"
         }}
     }}
-}}
-"""
+}}"""
 
 # ========== TLA (Temporal Localization Accuracy) - single KP temporal ==========
 
-TLA_SINGLE_KP_PROMPT = """你是一个专业的医学 Query 生成专家。任务是基于给定的单个知识点，生成一个**时间定位匹配类（TLA: Temporal Localization Accuracy）**的问题。
+TLA_SINGLE_KP_PROMPT = """You are a professional medical query generation expert. The task is to generate a **temporal localization matching class (TLA: Temporal Localization Accuracy)** problem based on a given single knowledge point.
 
-## 当前 Session ID
+## Current Session ID
 {current_session_id}
 
-## 目标知识点
+## Target knowledge points
 {kp_text}
 
-## 任务说明
-请基于上述知识点，生成**1个**时间定位类问题。
+## Mission description
+Please generate **1** time positioning questions based on the above knowledge points.
 
-### TLA 问题设计原则
-1. **时间信息**：问题必须涉及知识点中的时间信息
-2. **两种问法**：
-   - 问"某事件发生在什么时间？"（答案是时间）
-   - 问"在某时间发生了什么事件？"（答案是事件内容）
-3. **精确性**：答案必须是可验证的
+### TLA question design principles
+1. **Time information**: The question must involve the time information in the knowledge point
+2. **Two ways to ask**:
+   - Ask "When did a certain event occur?" (the answer is time)
+   - Ask "What event happened at a certain time?" (The answer is the content of the event)
+3. **Accuracy**: The answer must be verifiable
 
-### 生成规则
-- 时间答案需结合知识点的time字段，以及知识点内容推断
-- 比如知识点内容提到"昨天的血糖检测"，而time字段是"2024-01-16"，则时间答案是"2024-01-15"
-- 答案必须来自知识点内容
+### Generate rules
+- The time answer needs to be combined with the time field of the knowledge point and the inference of the content of the knowledge point.
+- For example, if the knowledge point content mentions "yesterday's blood glucose test" and the time field is "2024-01-16", then the time answer is "2024-01-15"
+- The answer must come from the knowledge point content
 
-### 示例
+### Example
 
-知识点：血糖检测 | 时间：2024-01-15 | 内容：今天测得空腹血糖 8.2 mmol/L
-生成问题："患者在 2024-01-15 的血糖检测结果是多少？"
-答案："空腹血糖 8.2 mmol/L"
+Knowledge point: Blood glucose testing | Time: 2024-01-15 | Content: Fasting blood glucose measured today is 8.2 mmol/L
+Generate question: "What is the patient's blood glucose test result on 2024-01-15?"
+Answer: "Fasting blood glucose 8.2 mmol/L"
 
-知识点：用药调整 | 时间：2024-02-03 | 内容：前天的二甲双胍剂量从 500mg 调整为 850mg
-生成问题："患者的二甲双胍剂量调整发生在什么时间？"
-答案："2024-02-01"
+Knowledge point: Medication adjustment | Time: 2024-02-03 | Content: The dose of metformin the day before yesterday was adjusted from 500mg to 850mg
+Generate question: "When did the patient's metformin dose adjustment occur?"
+Answer: "2024-02-01"
 
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## ⚠️ Output format requirements
+**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
     "query": {{
         "query_type": "temporal_localization",
-        "question": "问题内容",
+        "question": "question content",
         "answers": [
             {{
-                "content": "时间或事件答案",
-                "is_correct": true,
-                "explanation": "答案来源说明"
+                "content": "Time or event answer","is_correct": true,
+                "explanation": "Answer source explanation"
             }}
         ],
         "metadata": {{
-            "time_type": "时间类型（absolute_time/event_at_time）",
-            "target_time": "涉及的时间点",
-            "difficulty": "难度等级（easy/medium/hard）"
+            "time_type": "Time type (absolute_time/event_at_time)",
+            "target_time": "Involved time point",
+            "difficulty": "Difficulty level (easy/medium/hard)"
         }}
     }}
-}}
-"""
+}}"""
 
 # ========== SUA (State Update Accuracy) - category KP temporal updates ==========
 
-SUA_CATEGORY_PROMPT = """你是一个专业的医学 Query 生成专家。任务是基于某个类别的多条知识点，生成一个**状态准确更新类（SUA: State Update Accuracy）**的问题。
+SUA_CATEGORY_PROMPT = """You are a professional medical query generation expert. The task is to generate a **State Update Accuracy (SUA: State Update Accuracy)** problem based on multiple knowledge points of a certain category.
 
-## 当前 Session ID
+## Current Session ID
 {current_session_id}
 
-## 类别名称
+## Category name
 {category}
 
-## 该类别的所有知识点（按时间排序）
-共 {kps_count} 条记录：
+## All knowledge points in this category (sorted by time)
+Total {kps_count} records:
 
 {kps_text}
 
-## ⚠️ 前置检查（极其重要）
+## ⚠️ Pre-check (extremely important)
 
-在生成问题之前，你必须先分析这些知识点，判断是否存在**真正的状态变化或数值更新**。
+Before generating a question, you must first analyze these knowledge points to determine whether there is a real state change or numerical update.
 
-### 什么是"真正的状态变化"？
+### What is a "real state change"?
 
-**✓ 符合条件的变化（可以生成 SUA 问题）：**
-- 同一指标在不同时间有不同的数值（如血糖从 11.2 变为 8.5 mmol/L）
-- 同一药物的剂量发生调整（如二甲双胍从 500mg 调整为 850mg）
-- 同一症状的严重程度变化（如低血糖频率从每周 2 次降为每月 1 次）
-- 治疗方案的变更（如从口服药改为胰岛素注射）
-- 检查结果的前后对比（如糖化血红蛋白从 9.2% 降至 7.5%）
+**✓ Qualifying changes (can generate SUA issues):**
+- The same indicator has different values at different times (such as blood sugar changing from 11.2 to 8.5 mmol/L)
+- Dosage adjustment of the same drug (e.g. metformin from 500mg to 850mg)
+- Change in severity of the same symptom (e.g. frequency of hypoglycemia decreases from 2 times per week to 1 per month)
+- Change in treatment regimen (such as changing from oral medications to insulin injections)
+- Before and after test results (e.g. glycosylated hemoglobin dropped from 9.2% to 7.5%)
 
-**✗ 不符合条件（不能生成 SUA 问题）：**
-- 多条知识点描述的是**不同的事物**，没有前后对比关系
-- 只是同一类别下的**不同方面**，没有更新或冲突
-- 信息是**新增**的，而非**更新**的（如首次记录某个指标）
-- 多条知识点内容**本质相同**，只是表述不同
+**✗ Not eligible (cannot generate SUA issues):**
+- Multiple knowledge points describe **different things**, with no comparison between before and after.
+- Just **different aspects** under the same category, no updates or conflicts
+- The information is **new**, not **updated** (such as recording an indicator for the first time)
+- The content of multiple knowledge points is **essentially the same**, but the expressions are different.
 
-### 判断流程
+### Judgment process
 
-1. 仔细阅读所有知识点
-2. 寻找是否有两条或以上的知识点，体现了数值/状态的变化或更新
-3. 如果找到变化，基于这个变化点生成问题
-4. 如果没有找到变化，在 Query 中**虚构一个“背景信息”**来与现有 KP 形成对比
+1. Read all knowledge points carefully
+2. Look for whether there are two or more knowledge points that reflect changes or updates in values/states
+3. If a change is found, generate a question based on this change point
+4. If no changes are found, create a fictional "background information" in Query to compare with the existing KP
 
-## 任务说明
-如果存在真正的状态变化，请生成**1个**状态更新类问题。
+## Mission description
+If there is a real status change, please generate **1** status update type question.
 
-### ⚠️ SUA 问题设计原则
+### ⚠️ SUA question design principles
 
-**核心要求：聚焦具体变化点，不要问总体趋势！**
+**Core requirement: Focus on specific changes, don’t ask about the overall trend! **SUA type questions test whether the model can accurately track the **latest value** or **specific change** of a specific value/status.
 
-SUA 类问题要测试的是：模型是否能准确追踪某个具体数值/状态的**最新值**或**具体变化**。
+**Example Question Type:**
+- ✓ "What is the patient's **current/latest** fasting blood glucose value?" (track latest status)
+- ✓ "From what to what level** should the patient's metformin dose be adjusted?" (specific changes)
+- ✓ "What was the patient's **most recent** blood pressure measurement?" (latest value)
+- ✓ "The patient took some Weifuchun capsules this month. Has his medication regimen changed?" (In the knowledge point, only the patient bought Omeprazole last month, so a virtual scene investigation of taking Weifuchun can be constructed)
+- ✓ "The patient's blood sugar measured last week was 10.9mmol/L. What is his recent blood sugar value?" (In the knowledge point, only the patient's blood sugar value measured last week was 12.3mmol/L, so a virtual value was constructed for investigation)
 
-**示例问题类型：**
-- ✓ "患者**当前/最新**的空腹血糖值是多少？"（追踪最新状态）
-- ✓ "患者的二甲双胍剂量**从多少调整到多少**？"（具体变化）
-- ✓ "患者**最近一次**血压测量结果是多少？"（最新值）
-- ✓ "患者这个月吃了点胃复春胶囊，请问他的用药方案发生变化了吗？"（知识点里只有患者上个月买了奥美拉挫来吃，因此可以构造一个虚拟的吃胃复春的场景考察）
-- ✓ "患者上上周测了血糖为10.9mmol/L，请问他最近测血糖数值是多少？"（知识点里只有患者上周测血糖数值为12.3mmol/L，因此构造一个虚拟数值来考察）
+### SUA question generation strategy
 
-### SUA 问题生成策略
+1. **Prioritize changes in the latest session**: Find out the new status/new value that appears in the latest session
+2. **Ask "What is the current state"**: Let the model distinguish between the historical state and the current state
+3. **Ask "How much has changed specifically"**: For example, "How much has the dose been adjusted from 500mg?"
 
-1. **优先关注最新 session 中的变化**：找出最新 session 中出现的新状态/新数值
-2. **问"当前状态是什么"**：让模型区分历史状态和当前状态
-3. **问"具体变化了多少"**：如 "剂量从 500mg 调整到了多少？"
+### Answer format requirements
 
-### 答案格式要求
+The answer must be in an exact, matchable format:
+- Numerical answers: use standard formats (e.g. "8.2 mmol/L", "850mg")
+- Status answer: clear and clear (such as "discontinued", "doubled dose")
 
-答案必须是**精确的、可匹配的**格式：
-- 数值答案：使用标准格式（如 "8.2 mmol/L"、"850mg"）
-- 状态答案：明晰清楚（如 "已停药"、"剂量加倍"）
+### Example
 
-### 示例
+**Example 1 (Correct - Ask for latest status):**
+List of knowledge points:
+[1] Blood sugar | 2024-01-15 | Fasting blood sugar 11.2 mmol/L
+[2] Blood sugar | 2024-02-01 | Fasting blood sugar 8.5 mmol/L
+[3] Blood sugar | 2024-03-01 | Fasting blood sugar 7.8 mmol/L
 
-**示例 1（正确 - 问最新状态）：**
-知识点列表：
-[1] 血糖 | 2024-01-15 | 空腹血糖 11.2 mmol/L
-[2] 血糖 | 2024-02-01 | 空腹血糖 8.5 mmol/L
-[3] 血糖 | 2024-03-01 | 空腹血糖 7.8 mmol/L
+Question: "What is the patient's current (latest) fasting blood glucose value?"
+Answer: "7.8 mmol/L"
 
-问题："患者当前（最新）的空腹血糖值是多少？"
-答案："7.8 mmol/L"
+**Example 2 (Correct - ask for specific changes):**
+List of knowledge points:
+[1] Medication | 2024-01-10 | Start taking metformin 500mg bid
+[2] Medication | 2024-02-20 | Metformin dose adjusted to 850mg bidQuestion: "To what dose was the patient's metformin dose adjusted from 500 mg?"
+Answer: "850mg"
 
-**示例 2（正确 - 问具体变化）：**
-知识点列表：
-[1] 用药 | 2024-01-10 | 开始服用二甲双胍 500mg bid
-[2] 用药 | 2024-02-20 | 二甲双胍剂量调整为 850mg bid
+**Example 3 (Correct - Constructed Scenario Question):**
+List of knowledge points:
+[1] Blood sugar | 2024-03-01 | Fasting blood sugar 7.8 mmol/L
 
-问题："患者的二甲双胍剂量从 500mg 调整到了多少？"
-答案："850mg"
+Question: "The patient's fasting blood sugar was measured on February 12 and was 8.9mmol/L. What is his latest fasting blood sugar value?"
+Answer: "7.8 mmol/L"
 
-**示例 3（正确 - 构造情景提问）：**
-知识点列表：
-[1] 血糖 | 2024-03-01 | 空腹血糖 7.8 mmol/L
-
-问题：“患者在2月12日测了空腹血糖为8.9mmol/L，请问他最新的空腹血糖数值是多少？”
-答案：“7.8 mmol/L”
-
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## ⚠️ Output format requirements
+**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
     "query": {{
         "query_type": "state_update",
-        "question": "问题内容（聚焦具体变化或最新状态）",
+        "question": "Question content (focus on specific changes or latest status)",
         "answers": [
             {{
-                "content": "精确的状态/数值答案（简洁可匹配）",
+                "content": "Exact status/numeric answer (succinct to match)",
                 "is_correct": true,
-                "explanation": "答案来源说明"
+                "explanation": "Answer source explanation"
             }}
         ],
         "metadata": {{
-            "state_type": "状态类型（symptom/medication/test_result/treatment_plan/lifestyle）",
-            "change_type": "变化类型（latest_value/specific_change/recent_update）",
-            "focus_session": "聚焦的 session ID（通常是最新的）",
-            "difficulty": "难度等级（easy/medium/hard）",
-            "change_description": "简述检测到的状态变化（如：血糖从11.2降至7.8）"
+            "state_type": "State type (symptom/medication/test_result/treatment_plan/lifestyle)",
+            "change_type": "Change type (latest_value/specific_change/recent_update)",
+            "focus_session": "Focused session ID (usually the latest)",
+            "difficulty": "Difficulty level (easy/medium/hard)",
+            "change_description": "Brief description of the detected status change (eg: blood sugar dropped from 11.2 to 7.8)"
         }}
     }}
-}}
-"""
+}}"""
 
 # ========== Common instruction template ==========
 
-KEY_POINTS_STRUCTURE_DESC = """
-## 知识点（Key Points）结构说明
+KEY_POINTS_STRUCTURE_DESC = """## Knowledge point (Key Points) structure description
 
-每个知识点包含以下字段：
-- **category**: 类别（检查结果/生理指标/用药记录/疾病状况/用户偏好）
-- **name**: 关键项名称（1-4字，如"血糖"、"胰岛素"）
-- **content**: 具体内容摘录
-- **trap_score**: 难度评分（0.0-1.0，越高越适合用来构造题目）
-- **time**: 事件发生时间
-- **session_id**: 来源 session ID
+Each knowledge point contains the following fields:
+- **category**: Category (examination results/physiological indicators/medication records/disease status/user preferences)
+- **name**: Key item name (1-4 words, such as "blood sugar", "insulin")
+- **content**: Excerpt of specific content
+- **trap_score**: Difficulty score (0.0-1.0, the higher it is, the more suitable it is for constructing questions)
+- **time**: the time when the event occurred
+- **session_id**: source session ID
 
-知识点是累加模式，同一个 name 可能在不同时间有多条记录，代表不同时间点的信息。
-"""
+The knowledge point is the accumulation mode. The same name may have multiple records at different times, representing information at different time points."""
 
 # ========== Two-stage generation: Phase 1 - Trap Reasoning ==========
 
-TRAP_REASONING_PROMPT = """你是一位资深的医学考试出题专家，擅长设计需要结合患者个人信息才能正确作答的陷阱题目。
+TRAP_REASONING_PROMPT = """You are a senior medical examination question setting expert and are good at designing trap questions that require the patient's personal information to be answered correctly.
 
-## 核心目标
-设计**必须结合该患者过往信息才能答对**的题目陷阱背景。如果只凭医学常识回答，一定会答错！
+## Core Objectives
+Design a question trap background that must be combined with the patient's past information to answer the question correctly. If you only rely on medical common sense to answer, you will definitely get the answer wrong!
 
-## 任务说明
-你需要基于一条**目标知识点**及其**来源事件的完整上下文**，深度挖掘它与患者**背景信息**之间可能存在的医学冲突和陷阱。
+## Mission description
+You need to deeply dig into the possible medical conflicts and traps between a **target knowledge point** and its **source event** and the possible medical conflicts and pitfalls between it and the patient's **background information**.
 
-## 目标知识点（本次出题的核心依据）
-类别: {target_category}
-名称: {target_name}
-内容: {target_content}
-时间: {target_time}
-来源Session: {target_session_id}
+## Target knowledge points (the core basis for this question)
+Category: {target_category}
+Name: {target_name}
+Content: {target_content}
+Time: {target_time}
+SourceSession: {target_session_id}
 
-## 来源事件
-以下是目标知识点所属 session 对应的**原始事件描述**：
+## Source event
+The following is the **original event description** corresponding to the session to which the target knowledge point belongs:
 
 {source_event_content}
 
-## 患者背景信息（所有历史知识点）
-以下是与该患者相关的所有已知信息，你需要从中寻找可能与目标知识点产生关联或冲突的信息：
+## Patient background information (all historical knowledge points)
+The following is all the known information related to this patient. You need to look for information that may be related to or conflict with the target knowledge point:
 
 {background_kps}
 
-## 陷阱推理任务
+## Trap reasoning task
 
-请你深度思考以下问题：
+Please think deeply about the following questions:
 
-### 1. 目标知识点与来源事件分析
-- 这条知识点描述的核心内容是什么？
-- **来源事件**中有哪些额外的医学细节可以利用？
-- 它涉及哪些医学概念（药物、疾病、检查、生活方式等）？
-- **从来源事件中**能提取出哪些独特的出题角度？（这是增加题目多样性的关键！）
+### 1. Analysis of target knowledge points and source events
+- What is the core content of this knowledge point description?
+- What additional medical details are available in the **source event**?
+- What medical concepts does it involve (drugs, diseases, tests, lifestyle, etc.)?
+- What unique angles can be extracted from the source events? (This is the key to increasing the variety of questions!)
 
-### 2. 潜在冲突与陷阱挖掘
+### 2. Exploring potential conflicts and traps
 
-**核心思路：找出背景信息中与目标知识点相关的"隐藏条件"**
+**Core idea: Find out the "hidden conditions" related to the target knowledge point in the background information**
 
-仔细审视背景信息，思考以下方面：
+Review the background information carefully and consider the following:
 
-**时间/状态变化冲突：**
-- 最近是否发生了重要的状态变化？（数值变化、症状变化、用药调整）
-- 是否有时间相关的关键信息？（如刚吃过某药、刚做完某检查）
-- 是否有与目标知识点相关的**时间点**或**状态变化**？
+**Time/Status Change Conflict:**
+- Has there been an important status change recently? (Numerical changes, symptom changes, medication adjustments)
+- Is there critical information related to time? (For example, you have just taken a certain medicine or just completed a certain examination)
+- Is there a **time point** or **status change** related to the target knowledge point?
 
-**药物相关冲突：**
-- 患者是否对某些药物/成分过敏？（如青霉素过敏、碘过敏、乳胶过敏）
-- 患者正在服用的药物是否会与某些常规治疗产生相互作用？
-- 患者是否有用药偏好或禁忌？（如怕打针、吞咽困难）
+**Drug Related Conflicts:**
+- Is the patient allergic to certain medications/ingredients? (such as penicillin allergy, iodine allergy, latex allergy)
+- Will the medications the patient is taking interact with certain conventional treatments?
+- Does the patient have any medication preferences or contraindications?(such as fear of injections, difficulty swallowing)
 
-**疾病相关冲突：**
-- 患者的既往病史是否影响某些治疗方案？（如胃溃疡禁用NSAIDs）
-- 患者当前的疾病状态是否与常规处理方式矛盾？
+**Disease Related Conflicts:**
+- Does the patient's past medical history influence certain treatment options? (NSAIDs are contraindicated in case of gastric ulcer)
+- Does the patient's current disease state conflict with conventional management?
 
-**生活方式冲突：**
-- 患者的饮食偏好/禁忌是否与医嘱建议冲突？（如素食者、不吃某类食物）
-- 患者的经济/医保情况是否影响用药选择？
-- 患者的作息、工作、运动习惯是否需要特殊考量？
+**Lifestyle Conflict:**
+-Do the patient’s dietary preferences/contraindications conflict with physician recommendations? (such as vegetarians, those who do not eat certain types of food)
+- Does the patient’s financial/medical insurance situation affect medication selection?
+-Does the patient’s work, rest, and exercise habits require special consideration?
 
-### 3. 陷阱设计要点
+### 3. Key points of trap design
 
-基于上述分析，设计 3-4 个高质量陷阱描述。**每个陷阱必须满足：**
-1. **医学常识误导**：看起来是正确的医学建议，但对该特定患者是错误的
-2. **需要记忆**：必须记住患者的特定信息才能避免踩坑
-3. **专业性**：陷阱在医学上是合理的，而非低级错误
-4. **多样性**：优先从**来源事件**中挖掘独特的陷阱角度
+Based on the above analysis, design 3-4 high-quality trap descriptions. **Each trap must meet:**
+1. **Misleading Medical Common Sense**: Medical advice that appears to be correct, but is wrong for this particular patient
+2. **Memory required**: Patient-specific information must be remembered to avoid pitfalls
+3. **Professionality**: The trap is medically sound and not a simple mistake
+4. **Diversity**: Prioritize exploring unique trap angles from **source events**
 
-### 可选的陷阱类型（请尽量选择多样化的类型）
-- allergy: 过敏相关（药物过敏、食物过敏、交叉过敏）
-- drug_interaction: 药物相互作用（多药联用风险）
-- contraindication: 禁忌症相关（疾病禁忌、状态禁忌）
-- preference: 用药/治疗偏好（患者明确表达的偏好或抵触）
-- lifestyle: 生活方式冲突（饮食、作息、经济条件限制）
-- temporal_change: 时间/状态变化（近期发生的变化、剂量调整）
-- dosage_adjustment: 剂量相关（剂量调整时机、叠加风险）
-- symptom_differential: 症状鉴别（相似症状混淆、药物副作用误判）
-- compliance: 依从性相关（实际执行与医嘱差异）
-- monitoring: 监测相关（血糖监测、指标追踪）
-- timing: 用药/进食时机（时间敏感性操作）
-- economic: 经济因素（费用、医保、耗材成本）
+### Optional trap types (please choose as diverse types as possible)
+- allergy: allergy related (drug allergy, food allergy, cross allergy)
+- drug_interaction: drug interaction (risk of multi-drug combination)
+- contraindication: contraindication related (disease contraindication, state contraindication)
+- preference: medication/treatment preference (patient’s expressed preference or resistance)
+- Lifestyle: lifestyle conflicts (diet, work and rest, financial constraints)
+- temporal_change: time/state change (recent changes, dose adjustment)
+- dosage_adjustment: dose-related (timing of dose adjustment, superimposed risk)
+- symptom_differential: symptom identification (confusion of similar symptoms, misjudgment of drug side effects)
+- compliance: Compliance related (difference between actual implementation and doctor’s orders)
+- monitoring: monitoring related (blood glucose monitoring, indicator tracking)
+- timing: medication/eating timing (time-sensitive operations)
+- economic: economic factors (expenses, medical insurance, consumable costs)
 
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## ⚠️ Output format requirements
+**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
-    "target_kp_analysis": {{
-        "content_summary": "目标知识点的核心内容概述",
-        "source_event_insights": "从来源事件中提取的额外医学要点（用于增加多样性）",
-        "medical_concepts": ["涉及的医学概念列表"],
-        "potential_question_angles": ["可以从哪些角度出题（优先来自来源事件的独特角度）"]
+    "target_kp_analysis": {{"content_summary": "Summary of the core content of the target knowledge point",
+        "source_event_insights": "Additional medical insights extracted from source events (for added variety)",
+        "medical_concepts": ["List of medical concepts involved"],
+        "potential_question_angles": ["What angles can the question be asked from (preferably from unique angles of the source event)"]
     }},
     "conflict_analysis": {{
         "medication_conflicts": [
             {{
-                "conflict": "具体陷阱描述",
-                "related_background": "背景信息中的相关内容",
+                "conflict": "Specific trap description",
+                "related_background": "Related content in background information",
                 "trap_potential": "high/medium/low"
             }}
         ],
         "disease_conflicts": [
             {{
-                "conflict": "具体陷阱描述",
-                "related_background": "背景信息中的相关内容",
+                "conflict": "Specific trap description",
+                "related_background": "Related content in background information",
                 "trap_potential": "high/medium/low"
             }}
         ],
         "lifestyle_conflicts": [
             {{
-                "conflict": "具体陷阱描述",
-                "related_background": "背景信息中的相关内容",
+                "conflict": "Specific trap description",
+                "related_background": "Related content in background information",
                 "trap_potential": "high/medium/low"
             }}
-        ],
-        "temporal_conflicts": [
+        ],"temporal_conflicts": [
             {{
-                "conflict": "具体陷阱描述",
-                "related_background": "背景信息中的相关内容",
+                "conflict": "Specific trap description",
+                "related_background": "Related content in background information",
                 "trap_potential": "high/medium/low"
             }}
         ]
     }},
     "trap_points": [
         {{
-            "trap_scenario": "陷阱场景：描述一个看似合理但实际上不适合该患者的医学建议/选择",
-            "why_trap_works": "为什么这个陷阱有效：仅凭医学常识会怎么回答，为什么那样回答是错的",
-            "correct_approach": "正确的做法：考虑到患者特殊情况后应该怎么回答",
-            "required_memory": ["必须记住的患者信息列表"],
-            "trap_type": "陷阱类型（从上述可选类型中选择，尽量多样化）",
+            "trap_scenario": "Trap scenario: A description of a medical recommendation/choice that seems reasonable but is not actually appropriate for the patient",
+            "why_trap_works": "Why this trap works: What would you answer based on medical common sense alone, and why that answer is wrong",
+            "correct_approach": "Correct approach: How to answer after taking into account the patient's special situation",
+            "required_memory": ["List of patient information that must be remembered"],
+            "trap_type": "Trap type (select from the above optional types, try to be as diverse as possible)",
             "difficulty": "hard"
         }}
     ],
     "best_trap_for_question": {{
         "selected_trap_index": 0,
-        "reason": "为什么选择这个陷阱作为出题基础",
+        "reason": "Why did you choose this trap as the basis for the question",
         "recommended_question_type": "mq/ig"
     }}
-}}
-"""
+}}"""
 
 
 # ========== Two-stage generation: Phase 2 - MQ from trap reasoning ==========
 
-MQ_FROM_TRAP_PROMPT = """你是一位资深的医学考试出题专家，专门设计需要结合患者个人信息才能正确作答的「记忆陷阱题」。
+MQ_FROM_TRAP_PROMPT = """You are a senior medical examination question setting expert who specializes in designing "memory trap questions" that require the patient's personal information to be answered correctly.
 
-## 核心原则
-这道题必须满足以下全部要求：
-1. **记忆依赖性**：如果不记得患者的特殊信息，一定会答错
-2. **专业迷惑性**：所有选项看起来都是合理的医学建议
-3. **陷阱隐蔽性**：错误选项在一般情况下是完全正确的标准答案
+## Core Principles
+This question must meet all of the following requirements:
+1. **Memory dependence**: If you don’t remember the patient’s special information, you will definitely answer the question incorrectly.
+2. **Professional Confusion**: All options appear to be sound medical advice
+3. **Trap Concealment**: Wrong options are completely correct standard answers under normal circumstances.
 
-## 目标知识点及对应的事件内容
-类别: {target_category}
-名称: {target_name}
-内容: {target_content}
-事件内容：{source_event_content}
+## Target knowledge points and corresponding event content
+Category: {target_category}
+Name: {target_name}
+Content: {target_content}
+Event content: {source_event_content}
 
-## 陷阱分析结果（必须使用！）
+## Trap analysis results (must be used!)
 {trap_reasoning}
 
-## 患者背景信息摘要
+## Summary of patient background information
 {background_summary}
 
-## 已生成过的题目
+## Generated questions
 {existing_queries_hint}
 
 ---
 
-## ⚠️ 陷阱类型强制要求
+## ⚠️ Trap type mandatory requirements
 
-你必须从以下陷阱类型中选择一种来设计题目（优先选择与已生成题目不同的类型）：
+You must choose one of the following trap types to design the question (preferably choosing a type different from the generated question):
 
-### 高价值陷阱类型（优先使用）
+### High value trap type (priority used)
 
-1. **过敏交叉反应 (allergy_cross)**
-   - 患者对某药物/食物过敏 → 结构相似的物质也可能过敏
-   - 例：磺胺过敏 → 磺脲类降糖药交叉过敏风险
-   - 例：青霉素过敏 → 头孢类需谨慎
-   - 例：乳胶过敏 → 某些水果（香蕉、牛油果）交叉过敏
+1. **Allergy Cross Reaction (allergy_cross)**
+   - The patient is allergic to a certain drug/food → Substances with similar structures may also be allergic
+   - Example: Sulfonamide allergy → Risk of cross-allergy to sulfonylurea antidiabetic drugs
+   - Example: Penicillin allergy → Be cautious when taking cephalosporins
+   - Example: latex allergy → cross-allergy to certain fruits (banana, avocado)
 
-2. **药物相互作用 (drug_interaction)**
-   - 患者正在服用的药物与某些选项存在相互作用
-   - 例：服用华法林 → 不宜同时大量服用维生素K丰富食物
-   - 例：服用二甲双胍 → 碘造影剂前需停药
-   - 例：服用他汀类 → 西柚汁影响代谢
+2. **Drug Interaction (drug_interaction)**
+   - The patient is taking medications that interact with certain options
+   - Example: Taking warfarin → It is not advisable to take large amounts of vitamin K-rich foods at the same time
+   - Example: Taking metformin → You need to stop taking metformin before taking iodinated contrast agent
+   - Example: Taking statins → Grapefruit juice affects metabolism
 
-3. **疾病状态禁忌 (contraindication)**
-   - 患者的某个疾病史使某些选项成为禁忌
-   - 例：胃溃疡 → NSAIDs禁忌
-   - 例：肾功能不全 → 某些药物需调整剂量或禁用
-   - 例：心功能不全 → 某些降糖药（TZDs）禁忌
+3. **Disease state contraindication**
+   - The patient has a medical history that makes certain options contraindicated
+   - Example: gastric ulcer → NSAIDs contraindications
+   - Example: Renal insufficiency → Some drugs need to be adjusted in dose or disabled
+   - Example: cardiac insufficiency → contraindications for certain antidiabetic drugs (TZDs)4. **Time/state change (temporal_state)**
+   - Recent changes in the patient that make conventional recommendations no longer applicable
+   - Example: Just had surgery → Certain drugs are not suitable for the time being
+   -Example: The dose has just been adjusted → needs to be observed rather than readjusted
+   -Example: Hypoglycemia has occurred frequently recently → the blood sugar lowering target needs to be relaxed
 
-4. **时间/状态变化 (temporal_state)**
-   - 患者近期发生的变化使常规建议不再适用
-   - 例：刚做完手术 → 某些药物暂不适合
-   - 例：剂量刚调整 → 需要观察而非再调
-   - 例：近期低血糖频发 → 降糖目标需放宽
+5. **Personal Preference/Compliance (preference_compliance)**
+   - The patient’s clearly expressed preferences or limitations
+   - Example: Fear of needles → The plan that requires injections is not suitable
+   - Example: Financial difficulties → High-priced drugs are not suitable
+   - Example: Irregular work → Not suitable for projects that require strict timing
 
-5. **个人偏好/依从性 (preference_compliance)**
-   - 患者明确表达过的偏好或限制
-   - 例：恐针 → 需要注射的方案不适合
-   - 例：经济困难 → 高价药物不适合
-   - 例：工作不规律 → 需要严格定时的方案不适合
-
-6. **数值记忆陷阱 (value_memory)**
-   - 需要记住患者的具体数值（历史vs最新）
-   - 例：患者HbA1c从9%降到7.5% → 问"当前"需回答最新值
-   - 例：血糖目标从严格变为放宽 → 选项涉及目标值
+6. **Numeric Memory Trap (value_memory)**
+   - Need to remember patient specific values (historical vs latest)
+   - Example: The patient's HbA1c dropped from 9% to 7.5% → When asking "current", you need to answer the latest value
+   - Example: Blood glucose target changes from strict to relaxed → option involves target value
 
 ---
 
-## 多选题设计要求
+## Multiple choice question design requirements
 
-### 问题设计
-- **形式**：患者（用户）向医生的口语化提问
-- **长度**：简洁自然，10-20字
-- **核心**：绝不透露病史/过敏史/禁忌等关键信息
+### Problem design
+- **Form**: Colloquial questions from patients (users) to doctors
+- **Length**: concise and natural, 10-20 words
+- **Core**: Never disclose key information such as medical history/allergy history/contraindications
 
-**好的问题示例：**
-- "医生，我头疼，吃什么止痛药好？"（不提胃溃疡）
-- "医生，降糖效果不好，要不要换药？"（不提过敏史）
-- "医生，早餐吃什么合适？"（不提食物过敏/偏好）
-- "医生，最近血糖有点飘，要调药吗？"（不提近期变化）
+**Examples of good questions:**
+- "Doctor, I have a headache, what painkillers should I take?" (not mentioning gastric ulcers)
+- "Doctor, the hypoglycemic effect is not good, do you need to change the medicine?" (Do not mention allergy history)
+- "Doctor, what's good for breakfast?" (no mention of food allergies/preferences)
+- "Doctor, your blood sugar has been a little fluctuating recently. Do you need to adjust your medicine?" (not mentioning recent changes)
 
-**差的问题示例：**
-- ✗ "我有胃溃疡，头疼吃什么药？"（暴露了关键信息）
-- ✗ "我对磺胺过敏，能用格列本脲吗？"（暴露了陷阱）
+**Example of bad questions:**
+- ✗ "I have a stomach ulcer and what medicine should I take if I have a headache?" (exposed key information)
+- ✗ "I am allergic to sulfa, can I use glyburide?" (exposed the trap)
 
-### 选项设计（4个选项，1-3个正确）
+### Option design (4 options, 1-3 correct)
 
-**正确选项**：
-- 考虑了患者特殊情况后真正适合的建议
-- 表述简洁、专业
+**Correct option**:
+- Recommendations that are truly appropriate after taking into account the patient's special circumstances
+- Concise and professional presentation
 
-**错误选项（陷阱）**：
-- 在**一般情况下是完全正确的医学建议**
-- 只是因为该患者的特殊情况才不适用
-- 表述同样简洁、专业、自信
-- **绝不使用**暗示错误的措辞（如"慎用"、"可能"、"有风险"）
+**Wrong Options (Traps)**:
+- In **generally correct medical advice**
+- Does not apply only because of the patient's unique circumstances
+- Expressions are equally concise, professional and confident
+- **Never use** wording that implies an error (e.g. "use with caution," "may," "risky")
 
-### 正确答案数量
-**必须根据实际情况设置1-3个正确答案**：
-- 不要固定为2个
-- 根据陷阱设计的需要灵活设置
-- 可以只有1个正确答案（其他都是陷阱）
-- 也可以有3个正确答案（只有1个陷阱）
-
----
-
-## 专业示例
-
-### 示例1：过敏交叉反应陷阱（1个正确答案）
-**背景**：患者对磺胺类抗生素过敏
-**问题**：医生，血糖控制不好，有什么口服药推荐？
-A. 格列美脲
-B. 二甲双胍
-C. 格列本脲
-D. 格列齐特
-**正确答案**：B
-**陷阱机制**：A/C/D都是磺脲类药物，与磺胺类存在交叉过敏风险
-
-### 示例2：疾病禁忌陷阱（1个正确答案）
-**背景**：患者有慢性胃溃疡病史
-**问题**：医生，膝盖疼，吃什么消炎止痛？
-A. 布洛芬
-B. 对乙酰氨基酚
-C. 双氯芬酸钠
-D. 萘普生
-**正确答案**：B
-**陷阱机制**：A/C/D都是NSAIDs，胃溃疡患者禁忌
-
-### 示例3：药物相互作用陷阱（2个正确答案）
-**背景**：患者正在服用华法林抗凝
-**问题**：医生，想补点维生素，吃什么好？
-A. 维生素C片
-B. 维生素E软胶囊
-C. 维生素K片
-D. 复合维生素B
-**正确答案**：A、D
-**陷阱机制**：C会拮抗华法林，B可能增强抗凝作用
-
-### 示例4：时间状态陷阱（2个正确答案）
-**背景**：患者刚经历一次严重低血糖事件
-**问题**：医生，血糖还是偏高，要不要加药？
-A. 暂时观察，稳定后再评估
-B. 增加胰岛素剂量
-C. 适当放宽血糖控制目标
-D. 加用另一种降糖药
-**正确答案**：A、C
-**陷阱机制**：刚发生低血糖后应避免激进降糖
+### Number of correct answers
+**Must set 1-3 correct answers according to actual situation**:
+- Don't fix it to 2- Flexible setting according to the needs of trap design
+- There can be only 1 correct answer (others are traps)
+- Can also have 3 correct answers (only 1 trap)
 
 ---
 
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## Professional Example
+
+### Example 1: Allergy Cross-Reactivity Trap (1 correct answer)
+**Background**: Patient is allergic to sulfonamide antibiotics
+**Question**: Doctor, I have poor blood sugar control. What oral medication do you recommend?
+A. Glimepiride
+B. Metformin
+C. Glibenclamide
+D. Glezite
+**Correct answer**: B
+**Trap Mechanism**: A/C/D are all sulfonylureas, and there is a risk of cross-allergy with sulfonamides
+
+### Example 2: Disease Taboo Trap (1 correct answer)
+**Background**: The patient has a history of chronic gastric ulcer
+**Question**: Doctor, my knee hurts. What should I take to relieve inflammation and relieve pain?
+A. Ibuprofen
+B. Acetaminophen
+C. Diclofenac sodium
+D. Naproxen
+**Correct answer**: B
+**Trap Mechanism**: A/C/D are all NSAIDs and are contraindicated in patients with gastric ulcers
+
+### Example 3: Drug interaction trap (2 correct answers)
+**Background**: Patient is taking warfarin for anticoagulation
+**Question**: Doctor, I want to take some vitamins, what should I eat?
+A. Vitamin C tablets
+B. Vitamin E soft capsules
+C. Vitamin K tablets
+D. Vitamin B complex
+**Correct Answer**: A, D
+**Trap mechanism**: C will antagonize warfarin, B may enhance the anticoagulant effect
+
+### Example 4: Time state trap (2 correct answers)
+**Background**: The patient has just experienced a severe hypoglycemic event.
+**Question**: Doctor, my blood sugar is still high. Do I need to add more medicine?
+A. Observe temporarily and then evaluate after stabilization.
+B. Increase insulin dose
+C. Appropriately relax blood sugar control goals
+D. Add another antidiabetic drug
+**Correct Answer**: A, C
+**Trap Mechanism**: Radical hypoglycemia should be avoided immediately after hypoglycemia occurs
+
+---
+
+## ⚠️ Output format requirements
+**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
     "query": {{
         "query_type": "multiple_choice",
-        "question": "简洁的患者提问（绝不透露关键病史信息）\\n\\nA. 选项A\\nB. 选项B\\nC. 选项C\\nD. 选项D",
-        "answers": [
-            {{
-                "content": "A. 选项内容",
+        "question": "Concise patient questions (never reveal key medical history information)\n\nA. Option A\nB. Option B\nC. Option C\nD. Option D",
+        "answers": [{{
+                "content": "A. Option content",
                 "is_correct": false,
-                "explanation": "虽然一般情况下合理，但因为患者[具体原因]不适用"
+                "explanation": "Although reasonable under normal circumstances, it is not applicable because of [specific reasons] for the patient"
             }},
             {{
-                "content": "B. 选项内容",
+                "content": "B. Option content",
                 "is_correct": true,
-                "explanation": "适合该患者，因为[具体原因]"
+                "explanation": "Suitable for this patient because [specific reason]"
             }},
             {{
-                "content": "C. 选项内容",
+                "content": "C. Option content",
                 "is_correct": false,
-                "explanation": "虽然一般情况下合理，但因为患者[具体原因]不适用"
+                "explanation": "Although reasonable under normal circumstances, it is not applicable because of [specific reasons] for the patient"
             }},
             {{
-                "content": "D. 选项内容",
+                "content": "D. Option content",
                 "is_correct": true,
-                "explanation": "适合该患者，因为[具体原因]"
+                "explanation": "Suitable for this patient because [specific reason]"
             }}
         ],
         "trap_design": {{
-            "trap_type": "陷阱类型（从上述6种中选择）",
-            "trap_mechanism": "详细说明陷阱如何运作",
-            "why_others_fail": "不知道患者信息的人为什么会选错",
-            "required_patient_info": ["必须记住的患者信息1", "必须记住的患者信息2"]
-        }},
-        "source_key_points": [
+            "trap_type": "Trap type (select from the above 6 types)",
+            "trap_mechanism": "Details of how the trap works",
+            "why_others_fail": "Why do people who don't know the patient's information choose the wrong one?",
+            "required_patient_info": ["Patient information that must be remembered 1", "Patient information that must be remembered 2"]
+        }},"source_key_points": [
             {{
-                "category": "类别",
-                "name": "知识点名称",
-                "content": "知识点内容",
-                "session_id": 来源session_id
+                "category": "category",
+                "name": "Name of knowledge point",
+                "content": "Knowledge point content",
+                "session_id": source session_id
             }}
         ],
         "metadata": {{
             "difficulty": "hard",
-            "correct_count": "正确答案数量（1-3）",
-            "trap_count": "陷阱选项数量"
+            "correct_count": "Number of correct answers (1-3)",
+            "trap_count": "Number of trap options"
         }}
     }}
-}}
-"""
+}}"""
 
 
 # ========== Two-stage generation: Phase 2 - IG from trap reasoning ==========
 
-IG_FROM_TRAP_PROMPT = """你是一位资深的医学考试出题专家。请基于已分析的陷阱要点，生成一道**高质量的推理问答题**。
+IG_FROM_TRAP_PROMPT = """You are a senior medical exam question setting expert. Please generate a **high-quality reasoning question** based on the analyzed trap points.
 
-## 核心原则
-这道题必须是**需要结合患者个人信息才能正确作答**的陷阱题。
-- 题目看起来是常规的医学咨询问题
-- 如果仅凭医学常识回答，答案会是错误的或有害的！
-- 只有记住并考虑患者的特殊情况，才能给出正确的回答
-- 这道题必须围绕目标知识点来设计
-- **问题要结合患者的经历情境来提问**
+## Core Principles
+This question must be a trap question that requires the patient’s personal information to be answered correctly.
+- The question appears to be a routine medical consultation question
+- If you answer based on medical common sense alone, the answer will be wrong or harmful!
+- Correct answers can only be given by remembering and considering the patient's special circumstances
+- This question must be designed around the target knowledge points
+- **Questions should be asked based on the patient’s experience**
 
-## 目标知识点及对应的事件内容
-类别: {target_category}
-名称: {target_name}
-内容: {target_content}
-事件内容：{source_event_content}
+## Target knowledge points and corresponding event content
+Category: {target_category}
+Name: {target_name}
+Content: {target_content}
+Event content: {source_event_content}
 
-## 陷阱分析结果
+## Trap analysis results
 {trap_reasoning}
 
-## 患者背景信息摘要
+## Summary of patient background information
 {background_summary}
 
-## 已生成过的题目
+## Generated questions
 {existing_queries_hint}
 
-## 推理题设计要求
+## Reasoning question design requirements
 
-### 题目格式
-- 题目是**患者（用户）向医生咨询**的形式
-- 答案需要结合患者特殊情况进行推理
+### Question format
+- The topic is a form for **patients (users) to consult** with doctors
+- The answer requires reasoning based on the patient’s special circumstances
 
-### ⚠️ 问题设计核心原则（极其重要）
+### ⚠️ Core principles of problem design (extremely important)
 
-**问题要结合患者经历过的事件来提问，模拟真实患者的口语化提问：**
+**Questions should be asked based on the events experienced by the patient, simulating the colloquial questioning of real patients: **
 
-**正确示例（结合情境、简洁自然，且足够专业）：**
-- "医生，我前段时间刚吃完高碳水外卖，血糖就飙到十几了。最近这种情况又有了，该怎么做呢？"
-- "医生，我最近检查发现自己HbA1c已经下降不少了，请问我现在需要调整用药吗？"
+**Correct example (combined with the situation, concise and natural, and professional enough):**
+- "Doctor, I just ate a high-carbohydrate takeaway some time ago, and my blood sugar spiked to over ten. This situation has happened again recently. What should I do?"
+- "Doctor, I recently checked and found that my HbA1c has dropped a lot. Do I need to adjust my medication now?"
 
-**错误示例（透露太多信息，严禁使用）：**
-- ✗ "医生，我是糖尿病患者，正在服用二甲双胍，最近因为皮肤过敏在吃糖皮质激素，现在血糖升高了，请问是否需要调整降糖药？"
-- ✗ "我有胃排空延迟的问题，在用胰岛素..."
+**Error example (revealing too much information, use strictly prohibited):**
+- ✗ "Doctor, I am a diabetic patient and I am taking metformin. I have been taking glucocorticoids recently because of skin allergies. Now my blood sugar has increased. Do I need to adjust my anti-diabetic drugs?"
+- ✗ "I have delayed gastric emptying and am taking insulin..."
 
-**核心要点：**
-1. 患者提问时不会主动说出病史、用药史等信息，这正是陷阱的来源！
-2. 但问题可以自然地提及当前经历的情况
+**Core Points:**
+1. Patients will not take the initiative to disclose medical history, medication history and other information when asking questions. This is the source of the trap!
+2. But the question can naturally refer to the current situation experienced
 
-### ⚠️ 常规错误答案设计原则（极其重要）
+### ⚠️ Common wrong answer design principles (extremely important)
 
-**错误答案必须"看起来完全像正确答案"：**
+**Wrong answers must "look exactly like the correct answers":**
 
-1. **严禁绝对化措辞**：
-   - ✗ "绝对不能"、"一定要"、"必须立即"、"严格禁止"
-   - ✓ 使用正常、专业的医学建议语气
+1. **Absolute wording is strictly prohibited**:- ✗ "Absolutely not", "Must", "Must immediately", "Strictly prohibited"
+   - ✓ Use a normal, professional tone of medical advice
 
-2. **错误答案必须是"合理的医学建议"**：
-   - 错误答案在**普通情况下**必须是完全正确的标准医学建议
-   - 只是因为没考虑到该患者的特殊情况才不适用
-   - 不知道患者信息的人，会认为这个答案很专业、很正确
+2. **Wrong answer must be "reasonable medical advice"**:
+   - Wrong answers must be completely correct standard medical advice in **normal circumstances**
+   - Does not apply simply because the patient's special circumstances have not been taken into account
+   - People who don’t know the patient’s information will think that this answer is very professional and correct.
 
-3. **错误答案的表述要专业、自信**：
-   - 使用专业术语和标准医学表述
-   - 不要有任何犹豫或保留的语气
-   - 让人感觉这是"教科书式的标准答案"
+3. **Wrong answers must be expressed professionally and confidently**:
+   - Use professional terminology and standard medical expressions
+   - Do not have any hesitation or reservation in your tone
+   - It feels like this is a "textbook standard answer"
 
-4. **正确答案与错误答案的差异**：
-   - 差异仅在于：是否考虑了患者的特殊情况
-   - 两个答案在医学逻辑上都应该是通顺的
+4. **Difference between correct answer and wrong answer**:
+   - The only difference lies in whether the patient's special circumstances are taken into account
+   -Both answers should be consistent in medical logic.
 
-### 示例
+### Example
 
-**示例1（药物相互作用陷阱）：**
-患者背景：糖尿病，最近因皮肤过敏在服用糖皮质激素
-问题：医生，血糖突然升高了，要加药吗？
+**Example 1 (drug interaction trap):**
+Patient background: Diabetes, recently taking glucocorticoids due to skin allergies
+Question: Doctor, my blood sugar has suddenly risen. Do I need to add more medicine?
 
-常规答案（错误）：血糖升高需要重视，建议增加降糖药剂量或调整用药方案来控制血糖。
-正确答案：您的血糖升高可能与正在使用的糖皮质激素有关，这是药物的常见副作用。建议先密切监测，等激素治疗结束后血糖往往会恢复，如果持续偏高再考虑短期调整方案。
+Conventional answer (wrong): Elevated blood sugar requires attention. It is recommended to increase the dose of antidiabetic drugs or adjust the medication regimen to control blood sugar.
+Correct answer: Your elevated blood sugar may be related to the corticosteroids you are taking and is a common side effect of the medication. It is recommended to monitor closely first. Blood sugar will tend to recover after hormone treatment is over. If it continues to be high, short-term adjustments may be considered.
 
-**示例2（疾病状态陷阱）：**
-患者背景：糖尿病，胃镜检查发现胃排空延迟
-问题：医生，胰岛素什么时候打好？
+**Example 2 (Disease State Trap):**
+Patient background: diabetes, gastroscopy revealed delayed gastric emptying
+Question: Doctor, when will the insulin be injected?
 
-常规答案（错误）：速效胰岛素建议在餐前15-30分钟注射，这样能更好地控制餐后血糖峰值。
-正确答案：由于您有胃排空延迟的情况，食物消化吸收会比较慢，按常规时间注射可能导致低血糖。建议在开始进食时或进食后注射，具体时间可根据血糖监测结果调整。
+Conventional answer (wrong): Rapid-acting insulin is recommended to be injected 15-30 minutes before meals to better control post-meal blood sugar spikes.
+Correct answer: Because you have delayed gastric emptying, food digestion and absorption will be slower, and injecting at regular times may lead to hypoglycemia. It is recommended to inject when starting to eat or after eating. The specific time can be adjusted according to the blood glucose monitoring results.
 
-**示例3（过敏史陷阱）：**
-患者背景：对磺胺类药物过敏
-问题：医生，格列齐特降糖效果好吗？
+**Example 3 (allergy history trap):**
+Patient background: allergic to sulfa drugs
+Question: Doctor, is gliclazide effective in lowering blood sugar?
 
-常规答案（错误）：格列齐特是磺脲类降糖药，降糖效果确实不错，适合2型糖尿病患者使用。
-正确答案：格列齐特属于磺脲类药物，与磺胺类有相似的化学结构，考虑到您的过敏史，存在交叉过敏风险。建议选择其他类型的降糖药，如DPP-4抑制剂或GLP-1受体激动剂。
+Conventional answer (wrong): Gliclazide is a sulfonylurea hypoglycemic drug with a good hypoglycemic effect and is suitable for patients with type 2 diabetes.
+Correct answer: Gliclazide belongs to the sulfonylureas and has a similar chemical structure to sulfonamides. Considering your allergic history, there is a risk of cross-allergy. It is recommended to choose other types of antidiabetic drugs, such as DPP-4 inhibitors or GLP-1 receptor agonists.
 
-## ⚠️ 输出格式要求
-**直接输出纯JSON，不要有任何额外的文字、说明或markdown标记。**
+## ⚠️ Output format requirements**Output pure JSON directly without any additional text, descriptions or markdown tags. **
 
 {{
     "query": {{
         "query_type": "inference_generation",
-        "question": "极简的患者提问（10字左右，绝不透露任何病史信息）",
+        "question": "A minimalist patient question (about 10 words, never reveal any medical history information)",
         "answers": [
             {{
-                "content": "正确答案（考虑患者特殊情况的完整建议）",
+                "content": "Correct answer (complete advice taking into account the patient's special circumstances)",
                 "is_correct": true,
-                "explanation": "推理过程：如何结合患者特殊情况得出正确答案"
+                "explanation": "The reasoning process: how to arrive at the correct answer based on the patient's special situation"
             }}
         ],
         "common_wrong_answer": {{
-            "content": "常规答案（专业、自信的标准医学建议，但没考虑患者特殊情况）",
-            "why_wrong": "为什么这个答案对该患者不正确"
+            "content": "General answers (professional and confident standard medical advice, but do not take into account the patient's special circumstances)",
+            "why_wrong": "Why this answer is incorrect for this patient"
         }},
         "trap_design": {{
-            "trap_type": "陷阱类型",
-            "trap_mechanism": "陷阱机制说明",
-            "required_patient_info": ["必须记住的患者信息列表"]
+            "trap_type": "trap type",
+            "trap_mechanism": "Trap mechanism description",
+            "required_patient_info": ["List of patient information that must be remembered"]
         }},
         "source_key_points": [
             {{
-                "category": "类别",
-                "name": "知识点名称",
-                "content": "知识点内容",
-                "session_id": 来源session_id
+                "category": "category",
+                "name": "Name of knowledge point",
+                "content": "Knowledge point content",
+                "session_id": source session_id
             }}
-        ],
-        "metadata": {{
+        ],"metadata": {{
             "difficulty": "hard",
-            "inference_type": "推理类型"
+            "inference_type": "inference type"
         }}
     }}
-}}
-"""
+}}"""
 
 
 # ========== Legacy prompts (deprecated, kept for compatibility) ==========
 
-EEM_QUERY_PROMPT = EEM_SINGLE_KP_PROMPT  # 兼容旧代码
-TLA_QUERY_PROMPT = TLA_SINGLE_KP_PROMPT  # 兼容旧代码
-SUA_QUERY_PROMPT = SUA_CATEGORY_PROMPT    # 兼容旧代码
+EEM_QUERY_PROMPT = EEM_SINGLE_KP_PROMPT  # Compatible with old code
+TLA_QUERY_PROMPT = TLA_SINGLE_KP_PROMPT  # Compatible with old code
+SUA_QUERY_PROMPT = SUA_CATEGORY_PROMPT    # Compatible with old code

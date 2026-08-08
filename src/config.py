@@ -39,6 +39,7 @@ class APIConfig:
     embedding_provider: str = "openai"
 
     judge_model: str = ""
+    judge_provider: str = "openai"
     judge_api_key: str = ""
     judge_base_url: str = ""
 
@@ -54,6 +55,9 @@ class APIConfig:
 
     def get_judge_model(self) -> str:
         return self.judge_model or self.default_llm_model
+
+    def get_judge_provider(self) -> str:
+        return self.judge_provider
 
     def get_judge_api_key(self) -> str:
         return self.judge_api_key or self.openai_api_key
@@ -97,6 +101,7 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
         default_embedding_model=os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-3-small"),
         embedding_provider=os.getenv("EMBEDDING_PROVIDER", "openai"),
         judge_model=os.getenv("JUDGE_MODEL", ""),
+        judge_provider=os.getenv("JUDGE_PROVIDER", "openai"),
         judge_api_key=os.getenv("JUDGE_API_KEY", ""),
         judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
     )
@@ -157,14 +162,30 @@ class MethodConfig:
         embedding_config = None
         if "embedding" in data:
             emb_data = data["embedding"]
+            configured_model = emb_data.get("model", "text-embedding-3-small")
+            env_embedding_model = os.getenv("DEFAULT_EMBEDDING_MODEL")
+            env_embedding_provider = os.getenv("EMBEDDING_PROVIDER", "").lower()
             raw_model_path = emb_data.get("model_path")
+            if raw_model_path is None and configured_model.startswith(("models/", "./", "/")):
+                raw_model_path = configured_model
             # Resolve relative model paths against PROJECT_ROOT
             if raw_model_path and not os.path.isabs(raw_model_path):
                 raw_model_path = str(PROJECT_ROOT / raw_model_path)
+            missing_local_model = bool(
+                raw_model_path
+                and emb_data.get("provider", "openai").lower() in ("local", "huggingface")
+                and not Path(raw_model_path).exists()
+            )
+            use_env_embedding = bool(
+                env_embedding_model
+                and env_embedding_provider in ("local", "huggingface")
+                and missing_local_model
+            )
             embedding_config = EmbeddingConfig(
-                provider=emb_data.get("provider", "openai"),
-                model=emb_data.get("model", "text-embedding-3-small"),
-                model_path=raw_model_path,
+                provider=env_embedding_provider if use_env_embedding else emb_data.get("provider", "openai"),
+                model=env_embedding_model if use_env_embedding else configured_model,
+                # A missing local path falls back to the configured Hugging Face ID.
+                model_path=None if use_env_embedding or missing_local_model else raw_model_path,
                 dim=emb_data.get("dim"),
                 api_key=emb_data.get("api_key"),
                 base_url=emb_data.get("base_url"),

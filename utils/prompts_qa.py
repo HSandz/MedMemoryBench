@@ -5,75 +5,75 @@ from typing import Dict
 QA_TEMPLATES: Dict[str, str] = {
 
     # MedMemoryBench - Entity Exact Match
-    "medmemorybench_entity_exact_match_qa": """请根据{memory_source}，准确回答以下问题。
+    "medmemorybench_entity_exact_match_qa": """Please answer the following questions accurately based on {memory_source}.
 
-问题：{question}
+Question: {question}
 
-【回答要求】请直接给出实体名称，无需长篇解释，只需精简地回答关键实体词即可。
+[Answer requirements] Please give the entity name directly. No long explanation is needed. Just answer the key entity words concisely.
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - Temporal Localization
-    "medmemorybench_temporal_localization_qa": """请根据{memory_source}，准确回答以下问题。
+    "medmemorybench_temporal_localization_qa": """Please answer the following questions accurately based on {memory_source}.
 
-问题：{question}
+Question: {question}
 
-【回答要求】如果问题询问时间，请使用 YYYY-MM-DD 格式回答（如 2024-01-15）；如果问题询问某时间发生的事件，请清晰描述事件的具体内容和细节。
+[Answer requirements] If the question asks about the time, please use the YYYY-MM-DD format to answer (such as 2024-01-15); if the question asks about an event that occurred at a certain time, please clearly describe the specific content and details of the event.
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - State Update
-    "medmemorybench_state_update_qa": """请根据{memory_source}，准确回答以下问题。
+    "medmemorybench_state_update_qa": """Please answer the following questions accurately based on {memory_source}.
 
-问题：{question}
+Question: {question}
 
-【回答要求】
-- 描述患者的最新状态，体现状态的前后变化
-- 语气亲切专业，像患者的私人医疗助手
-- 简洁直接，避免冗长解释
+【Answer request】
+- Describe the patient's latest status and reflect the changes in status before and after
+- Speak in a friendly and professional tone, like the patient's personal medical assistant
+- Be concise and direct, avoid lengthy explanations
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - Multiple Choice
-    "medmemorybench_multiple_choice_qa": """请根据{memory_source}，结合患者过往的过敏史、疾病史、用药及个人偏好等信息，回答如下问题：
+    "medmemorybench_multiple_choice_qa": """Please answer the following questions based on {memory_source}, combined with the patient’s past allergies, disease history, medications, personal preferences and other information:
 
 {question}
 
-【回答要求】请选择所有正确的选项，直接给出选项字母（如 B 或 B,D），无需解释。
+[Answer requirements] Please select all correct options and directly give the option letter (such as B or B, D) without explanation.
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - Inference Generation
-    "medmemorybench_inference_generation_qa": """请根据{memory_source}，结合患者过往的过敏史、疾病史、用药及个人偏好等信息，回答如下问题：
+    "medmemorybench_inference_generation_qa": """Please answer the following questions based on {memory_source}, combined with the patient’s past allergies, disease history, medications, personal preferences and other information:
 
 {question}
 
-【回答要求】
-- 必须基于记忆中该患者的具体信息进行推理，不要给出通用医学建议
-- 语气亲切专业，像患者的私人医疗助手
-- 简洁直接，回答到点子上，避免废话和套话
-- 如有建议或不建议某事，需简要说明基于该患者情况的原因
+【Answer request】
+- Reasoning must be based on specific information remembered about the patient and not general medical advice
+- Speak in a friendly and professional tone, like the patient's personal medical assistant
+- Be concise and direct, answer to the point, avoid nonsense and clichés
+- If something is recommended or not recommended, briefly explain the reasons based on the patient's condition
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - Multi-hop Clinical Deduction
-    "medmemorybench_multi_hop_clinical_deduction_qa": """请根据{memory_source}，仔细回顾患者的完整病史记录，结合多次就诊的信息进行综合分析：
+    "medmemorybench_multi_hop_clinical_deduction_qa": """Please carefully review the patient's complete medical history record according to {memory_source}, and conduct a comprehensive analysis based on the information from multiple medical visits:
 
 {question}
 
-【回答要求】请深入检索之前的记忆内容，结合多个历史信息点进行推理。回答时需要：
-1. 明确列出你所依据的记忆内容
-2. 展示清晰的推理路径（从哪些信息推导出哪些结论）
-3. 给出最终的综合判断
+[Answer requirements] Please search in depth the previous memory content and make inferences based on multiple historical information points. Your answer requires:
+1. Clearly list the memory content you are relying on
+2. Demonstrate a clear line of reasoning (which conclusions are derived from which information)
+3. Give the final comprehensive judgment
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - Default fallback
-    "medmemorybench_default_qa": """请根据{memory_source}，准确回答以下问题。
+    "medmemorybench_default_qa": """Please answer the following questions accurately based on {memory_source}.
 
-问题：{question}
+Question: {question}
 
-答案：""",
+Answer:""",
 
     # MedMemoryBench - English: Entity Exact Match
     "medmemorybench_en_entity_exact_match_qa": """Based on {memory_source}, accurately answer the following question.

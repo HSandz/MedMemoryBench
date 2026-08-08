@@ -1,288 +1,279 @@
 """Prompt templates for extracting knowledge points from dialogue."""
 
-KNOWLEDGE_EXTRACT_PROMPT = """请从以下对话中提取可用于记忆评测的知识点（key_points）。
+KNOWLEDGE_EXTRACT_PROMPT = """Please extract knowledge points (key_points) from the following conversation that can be used for memory evaluation.
 
-## 对话历史
+## Conversation History
 {dialogue_history}
 
-## 已积累的知识点（历史 sessions 提取）
+## Accumulated knowledge points (extracted from historical sessions)
 {accumulated_key_points}
 
-## 提取要求
+## Extraction requirements
 
-### 1. 知识点定义
-知识点是指对话中提到的、AI医生在后续对话中可能需要回忆或参考的关键信息。
+### 1. Definition of knowledge points
+Knowledge points refer to key information mentioned in the conversation that the AI doctor may need to recall or refer to in subsequent conversations.
 
-### 2. 类别分类（category）
-请将每个知识点归类到以下类别之一：
-- **检查结果**：各类检查的具体数值或结果（如血糖18.2mmol/L、尿酮阳性、CT结果等）
-- **生理指标**：身体状态相关指标（如血压、心率、体重、体温等）
-- **用药记录**：针对用户当前诊疗方案，采用的药物名称、剂量、用法、漏服情况等
-- **疾病状况**：诊断结果、病史、症状表现、病情变化等
-- **用户偏好**：饮食偏好、用药偏好、治疗态度、生活经济情况等**与医疗相关的偏好信息**
+### 2. Category (category)
+Please classify each knowledge point into one of the following categories:
+- **Examination results**: Specific values or results of various examinations (such as blood sugar 18.2mmol/L, positive urine ketones, CT results, etc.)
+- **Physiological indicators**: indicators related to physical status (such as blood pressure, heart rate, weight, body temperature, etc.)
+- **Medication Record**: Based on the user's current diagnosis and treatment plan, the drug name, dosage, usage, missed doses, etc.
+- **Disease status**: diagnosis results, medical history, symptoms, changes in condition, etc.
+- **User preferences**: dietary preferences, medication preferences, treatment attitudes, living and economic conditions, etc. **Medical-related preference information**
 
-### ⚠️ 知识点过滤规则（非常重要）
+### ⚠️ Knowledge point filtering rules (very important)
 
-**必须记录的信息：**
-- 任何具体的医学指标或检查数值
-- 药物名称、剂量、服用方式、过敏史
-- 明确的诊断结果或疾病史
-- 与医疗相关的偏好（如：对某类药物的偏好、饮食禁忌、经济考量等）
-- 可能影响用药或治疗方案的生活习惯（如：酗酒、作息紊乱等）
+**Information that must be recorded:**
+- Any specific medical indicators or test values
+- Drug name, dosage, administration method, allergy history
+- A clear diagnosis or disease history
+- Medical-related preferences (such as preferences for certain types of drugs, dietary taboos, economic considerations, etc.)
+- Lifestyle habits that may affect medication or treatment plans (such as alcoholism, disordered work and rest, etc.)
 
-**不要记录的信息（过滤掉）：**
-- 无关紧要的日常生活琐事（如：今天天气很好、刚吃完午饭等）
-- 泛泛的情绪表达（如：心情不错、有点累等，除非与病情相关）
-- 与医疗决策无关的生活细节（如：喜欢看电视、养了一只猫等）
-- 常识性或过于笼统的健康观念（如：想要更健康、会注意身体等）
+**Information not to be logged (filtered out):**
+- Insignificant daily life matters (such as: the weather is very good today, just finished lunch, etc.)
+- General emotional expressions (such as: feeling good, a little tired, etc., unless related to the illness)
+- Details of life that are not relevant to medical decision-making (such as: like watching TV, raising a cat, etc.)
+- Common sense or overly general health concepts (such as: wanting to be healthier, taking care of your body, etc.)
 
-**判断原则：该信息是否可能影响AI医生的用药建议或治疗方案？如果不会，则不记录。**
+**Judgment principle: Is this information likely to affect the AI doctor’s medication recommendations or treatment plans? If not, it will not be recorded. **
 
-### 3. 关键项命名（name）
-用1-4个字概括该知识点涉及的核心项，例如：
-- "血糖"、"尿酮"、"胰岛素"、"过敏史"、"作息"、"饮食"
+### 3. Key item naming (name)
+Use 1-4 words to summarize the core items involved in this knowledge point, for example:
+- "Blood sugar", "urinary ketones", "insulin", "allergy history", "work and rest", "diet"
 
-### 4. 内容摘录（content）
-- 简洁准确地记录关键信息，包含具体数值、时间、程度等
-- 不是泛泛的总结，而是精确的事实摘录
-- 示例：✓ "睡前血糖18.2mmol/L"  ✗ "患者血糖偏高"
+### 4. Content excerpt (content)
+- Record key information concisely and accurately, including specific values, time, degree, etc.- Not a general summary, but precise factual excerpts
+- Example: ✓ "Bedtime blood sugar 18.2mmol/L" ✗ "Patient's blood sugar is high"
 
-### 5. trap_score 评分标准（0.0-1.0）
-评估该知识点是否适合用来生成高难度记忆测试题：
+### 5. trap_score scoring standard (0.0-1.0)
+Evaluate whether this knowledge point is suitable for generating difficult memory test questions:
 
-**高分（0.7-1.0）情况：**
-- 具体数值类信息（容易记错或混淆）
-- 用药情况、过敏史、疾病史（关乎安全，必须准确记忆）
-- 用户明确表达的偏好或禁忌
-- 非显而易见、需要特别记住的细节
-- 时间敏感的信息（何时发生、持续多久）
+**High score (0.7-1.0) situation:**
+- Specific numerical information (easy to misremember or confuse)
+- Medication status, allergy history, disease history (relevant to safety, must be remembered accurately)
+- User's clearly expressed preferences or prohibitions
+- Non-obvious details that need to be remembered
+- Time-sensitive information (when it happens, how long it lasts)
 
-**中等（0.5-0.6）情况：**
-- 一般性症状描述
-- 常规生活习惯信息
-- 可从上下文推断的信息
+**Medium (0.5-0.6) case:**
+- General description of symptoms
+- General lifestyle information
+- Information that can be inferred from the context
 
-**低分（0.0-0.4）情况：**
-- 过于笼统的描述
-- 常识性信息
-- 当前对话即时可见的信息
+**Low score (0.0-0.4) situation:**
+- Overly general description
+- Common sense information
+- Instantly visible information about the current conversation
 
-### 6. 生成原则（非常重要）
-- **只提取新信息**：只提取本次对话中出现的新知识点
-- **去重**：不要重复已有的相同内容的知识点
-- 宁缺毋滥，每个知识点都应该是有意义的，确保对后续 queries 的生成有参考价值
+### 6. Generation principle (very important)
+- **Only extract new information**: Only extract new knowledge points that appear in this conversation
+- **Remove duplicates**: Do not repeat existing knowledge points with the same content
+- It is better to be lacking than to overflow. Every knowledge point should be meaningful to ensure that it has reference value for the generation of subsequent queries.
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记（不要 ```json）
-2. 不要在 JSON 前后添加任何说明文字
-3. knowledge_points 必须是数组（即使为空也要是 []）
-4. trap_score 必须是数字（如 0.85），不是字符串
-5. category, name, content 必须是字符串
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags (no ```json)
+2. Do not add any description text before or after JSON
+3. knowledge_points must be an array (even if it is empty, it must be [])
+4. trap_score must be a number (such as 0.85), not a string
+5. category, name, content must be strings
 
-## 输出格式
+## Output format
 {{
     "knowledge_points": [
         {{
-            "category": "检查结果",
-            "name": "血糖",
-            "content": "睡前血糖18.2mmol/L",
+            "category": "Check results",
+            "name": "blood sugar",
+            "content": "Blood sugar before going to bed 18.2mmol/L",
             "trap_score": 0.85
         }},
         {{
-            "category": "用药记录",
-            "name": "胰岛素",
-            "content": "漏打晚餐前速效胰岛素",
+            "category": "Medication Record","name": "insulin",
+            "content": "Missed rapid-acting insulin before dinner",
             "trap_score": 0.9
         }}
     ]
-}}
-"""
+}}"""
 
 
 # Simplified prompt for first-time extraction (no historical knowledge points)
-KNOWLEDGE_EXTRACT_PROMPT_INITIAL = """请从以下对话中提取可用于记忆评测的知识点（key_points）。
+KNOWLEDGE_EXTRACT_PROMPT_INITIAL = """Please extract knowledge points (key_points) from the following conversation that can be used for memory evaluation.
 
-## 当前session对应的事件背景
+## Event background corresponding to the current session
 {event_context}
 
-## 对话历史
+## Conversation History
 {dialogue_history}
 
-## 提取要求
+## Extraction requirements
 
-### 1. 知识点定义
-知识点是指对话中提到的、AI医生在后续对话中可能需要回忆或参考的关键信息。
+### 1. Definition of knowledge points
+Knowledge points refer to key information mentioned in the conversation that the AI doctor may need to recall or refer to in subsequent conversations.
 
-### 2. 类别分类（category）
-请将每个知识点归类到以下类别之一：
-- **检查结果**：各类检查的具体数值或结果（如血糖18.2mmol/L、尿酮阳性、CT结果等）
-- **生理指标**：身体状态相关指标（如血压、心率、体重、体温等）
-- **用药记录**：药物名称、剂量、用法、漏服情况等
-- **疾病状况**：诊断结果、病史、症状表现、病情变化等
-- **用户偏好**：饮食偏好、用药偏好、治疗态度、生活经济情况等**与医疗相关的偏好信息**
+### 2. Category (category)
+Please classify each knowledge point into one of the following categories:
+- **Examination results**: Specific values or results of various examinations (such as blood sugar 18.2mmol/L, positive urine ketones, CT results, etc.)
+- **Physiological indicators**: indicators related to physical status (such as blood pressure, heart rate, weight, body temperature, etc.)
+- **Medication records**: drug name, dosage, usage, missed doses, etc.
+- **Disease status**: diagnosis results, medical history, symptoms, changes in condition, etc.
+- **User preferences**: dietary preferences, medication preferences, treatment attitudes, living and economic conditions, etc. **Medical-related preference information**
 
-### ⚠️ 知识点过滤规则（非常重要）
+### ⚠️ Knowledge point filtering rules (very important)
 
-**必须记录的信息：**
-- 任何具体的医学指标或检查数值
-- 药物名称、剂量、服用方式、过敏史
-- 明确的诊断结果或疾病史
-- 与医疗相关的偏好（如：对某类药物的偏好、饮食禁忌、经济考量等）
-- 可能影响用药或治疗方案的生活习惯（如：酗酒、作息紊乱等）
+**Information that must be recorded:**
+- Any specific medical indicators or test values
+- Drug name, dosage, administration method, allergy history
+- A clear diagnosis or disease history
+- Medical-related preferences (such as preferences for certain types of drugs, dietary taboos, economic considerations, etc.)
+- Lifestyle habits that may affect medication or treatment plans (such as alcoholism, disordered work and rest, etc.)
 
-**不要记录的信息（过滤掉）：**
-- 无关紧要的日常生活琐事（如：今天天气很好、刚吃完午饭等）
-- 泛泛的情绪表达（如：心情不错、有点累等，除非与病情相关）
-- 与医疗决策无关的生活细节（如：喜欢看电视、养了一只猫等）
-- 常识性或过于笼统的健康观念（如：想要更健康、会注意身体等）
+**Information not to be logged (filtered out):**
+- Insignificant daily life matters (such as: the weather is very good today, just finished lunch, etc.)
+- General emotional expressions (such as: feeling good, a little tired, etc., unless related to the illness)
+- Details of life that are not relevant to medical decision-making (such as: like watching TV, raising a cat, etc.)
+- Common sense or overly general health concepts (such as: wanting to be healthier, taking care of your body, etc.)
 
-**判断原则：该信息是否可能影响AI医生的用药建议或治疗方案？如果不会，则不记录。**
+**Judgment principle: Is this information likely to affect the AI doctor’s medication recommendations or treatment plans? If not, it will not be recorded. **
 
-### 3. 关键项命名（name）
-用1-4个字概括该知识点涉及的核心项，例如：
-- "血糖"、"尿酮"、"胰岛素"、"过敏史"、"作息"、"饮食"
+### 3. Key item naming (name)
+Use 1-4 words to summarize the core items involved in this knowledge point, for example:
+- "Blood sugar", "urinary ketones", "insulin", "allergy history", "work and rest", "diet"
 
-### 4. 内容摘录（content）
-- 简洁准确地记录关键信息，包含具体数值、时间、程度等
-- 不是泛泛的总结，而是精确的事实摘录
-- 示例：✓ "睡前血糖18.2mmol/L"  ✗ "患者血糖偏高"
+### 4. Content excerpt (content)
+- Record key information concisely and accurately, including specific values, time, degree, etc.
+- Not a general summary, but precise factual excerpts- Example: ✓ "Bedtime blood sugar 18.2mmol/L" ✗ "Patient's blood sugar is high"
 
-### 5. trap_score 评分标准（0.0-1.0）
-评估该知识点是否适合用来生成高难度记忆测试题：
+### 5. trap_score scoring standard (0.0-1.0)
+Evaluate whether this knowledge point is suitable for generating difficult memory test questions:
 
-**高分（0.7-1.0）情况：**
-- 具体数值类信息（容易记错或混淆）
-- 用药史、过敏史、疾病史（关乎安全，必须准确记忆）
-- 用户明确表达的偏好或禁忌
-- 非显而易见、需要特别记住的细节
-- 时间敏感的信息（何时发生、持续多久）
+**High score (0.7-1.0) situation:**
+- Specific numerical information (easy to misremember or confuse)
+- Medication history, allergy history, disease history (relevant to safety, must be remembered accurately)
+- User's clearly expressed preferences or prohibitions
+- Non-obvious details that need to be remembered
+- Time-sensitive information (when it happens, how long it lasts)
 
-**中等（0.4-0.6）情况：**
-- 一般性症状描述
-- 常规生活习惯信息
-- 可从上下文推断的信息
+**Medium (0.4-0.6) case:**
+- General description of symptoms
+- General lifestyle information
+- Information that can be inferred from the context
 
-**低分（0.0-0.3）情况：**
-- 过于笼统的描述
-- 常识性信息
-- 当前对话即时可见的信息
+**Low score (0.0-0.3) situation:**
+- Overly general description
+- Common sense information
+- Instantly visible information about the current conversation
 
-### 6. 生成原则
-- **每个 session 必须至少提取 1 个知识点**
-- 结合「当前session对应的事件背景」中的信息，对话可能没有明确提及的数值或细节，但事件背景中有的，也可以作为知识点提取
-- 确保每个知识点对后续 queries 生成有参考价值
+### 6. Generating principles
+- **Each session must extract at least 1 knowledge point**
+- Combined with the information in the "event background corresponding to the current session", the dialogue may not explicitly mention values or details, but there are some in the event background, which can also be extracted as knowledge points
+- Ensure that each knowledge point has reference value for subsequent query generation
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有任何 markdown 代码块标记（不要 ```json）
-2. 不要在 JSON 前后添加任何说明文字
-3. knowledge_points 必须是数组，**不能为空**（每个session至少1个）
-4. trap_score 必须是数字（如 0.85），不是字符串
-5. category, name, content 必须是字符串
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without any markdown code block tags (no ```json)
+2. Do not add any description text before or after JSON
+3. knowledge_points must be an array, **cannot be empty** (at least 1 per session)
+4. trap_score must be a number (such as 0.85), not a string
+5. category, name, content must be strings
 
-## 输出格式
+## Output format
 {{
     "knowledge_points": [
         {{
-            "category": "检查结果",
-            "name": "血糖",
-            "content": "睡前血糖18.2mmol/L",
+            "category": "Check results",
+            "name": "blood sugar",
+            "content": "Blood sugar before going to bed 18.2mmol/L",
             "trap_score": 0.85
         }},
         {{
-            "category": "用药记录",
-            "name": "胰岛素",
-            "content": "漏打晚餐前速效胰岛素",
+            "category": "Medication Record","name": "insulin",
+            "content": "Missed rapid-acting insulin before dinner",
             "trap_score": 0.9
         }}
     ]
-}}
-"""
+}}"""
 
 
 # Accumulated knowledge extraction prompt (simplified: dedup and append only)
-KNOWLEDGE_EXTRACT_PROMPT_ACCUMULATED = """请从当前对话中提取新的知识点。
+KNOWLEDGE_EXTRACT_PROMPT_ACCUMULATED = """Please extract new knowledge points from the current conversation.
 
-## 当前session对应的事件背景
+## Event background corresponding to the current session
 {event_context}
 
-## 当前对话（Session {current_session_id}，时间：{event_time}）
+## Current conversation (Session {current_session_id}, time: {event_time})
 {dialogue_history}
 
-## 已有知识点（请勿重复）
+## Already have knowledge points (please do not repeat)
 {existing_key_points}
 
-## 任务说明
+## Mission description
 
-你需要分析当前对话，提取其中的**新**知识点。
+You need to analyze the current conversation and extract **new** knowledge points.
 
-### 重要原则
-1. **每个 session 必须至少提取 1 个知识点**：即使对话内容较少或与已有知识点相似，也要尽量从对话或事件背景中提取至少一个有意义的新知识点
-2. **只提取新信息**：只输出本次对话中出现的、与已有知识点内容不重复的信息
-3. **去重判断**：如果已有知识点中存在完全相同的内容，则不要重复输出，但如果有新的细节或数值变化，仍可以提取
-4. **累加模式**：所有知识点都是累加的，不需要考虑"更新"或"替换"
-5. **结合事件背景**：对话中可能没有明确提及的数值或细节，但事件背景中有的，也可以作为知识点提取
+### Important Principles
+1. **Each session must extract at least 1 knowledge point**: Even if the conversation content is small or similar to existing knowledge points, try to extract at least one meaningful new knowledge point from the conversation or event background.
+2. **Only extract new information**: Only output information that appears in this conversation and does not overlap with existing knowledge points.
+3. **Duplication removal**: If there is exactly the same content in the existing knowledge point, do not output it repeatedly, but if there are new details or numerical changes, it can still be extracted.
+4. **Cumulative mode**: All knowledge points are cumulative, and there is no need to consider "update" or "replacement"
+5. **Combined with the background of the event**: Values or details may not be explicitly mentioned in the conversation, but there are some in the background of the event, which can also be extracted as knowledge points
 
-### 类别分类（category）
-- **检查结果**：检查数值或结果（如血糖、尿酮、CT结果等）
-- **生理指标**：身体状态指标（如血压、心率、体重等）
-- **用药记录**：药物名称、剂量、用法等
-- **疾病状况**：诊断、病史、症状等
-- **用户偏好**：饮食偏好、用药偏好、治疗态度、生活经济情况等**与医疗相关的偏好**
+### Category classification (category)
+- **Check results**: Check values or results (such as blood sugar, urine ketones, CT results, etc.)
+- **Physiological indicators**: Physical status indicators (such as blood pressure, heart rate, weight, etc.)
+- **Medication records**: drug name, dosage, usage, etc.
+- **Disease Status**: diagnosis, medical history, symptoms, etc.
+- **User preferences**: dietary preferences, medication preferences, treatment attitudes, living and economic conditions, etc. **Medical-related preferences**
 
-### ⚠️ 知识点过滤规则（非常重要）
+### ⚠️ Knowledge point filtering rules (very important)
 
-**必须记录的信息：**
-- 任何具体的医学指标或检查数值
-- 药物名称、剂量、服用方式、过敏史
-- 明确的诊断结果或疾病史
-- 与医疗相关的偏好（如：对某类药物的偏好、饮食禁忌、经济考量等）
-- 可能影响用药或治疗方案的生活习惯（如：酗酒、作息紊乱等）
+**Information that must be recorded:**
+- Any specific medical indicators or test values
+- Drug name, dosage, administration method, allergy history
+- A clear diagnosis or disease history
+- Medical-related preferences (such as preferences for certain types of drugs, dietary taboos, economic considerations, etc.)
+- Lifestyle habits that may affect medication or treatment plans (such as alcoholism, disordered work and rest, etc.)
 
-**不要记录的信息（过滤掉）：**
-- 无关紧要的日常生活琐事
-- 泛泛的情绪表达（除非与病情相关）
-- 与医疗决策无关的生活细节
-- 常识性或过于笼统的健康观念
+**Information not to be logged (filtered out):**
+- trivial daily life matters
+- General expression of emotion (unless related to illness)
+- Details of life that are irrelevant to medical decisions
+- Common sense or overly general health concepts**Judgment principle: Is this information likely to affect the AI ​​doctor’s medication recommendations or treatment plans? If not, it will not be recorded. **
 
-**判断原则：该信息是否可能影响AI医生的用药建议或治疗方案？如果不会，则不记录。**
+### Key item naming (name)
+- Use 1-4 words to summarize the core items, such as: "blood sugar", "insulin", "allergy history"
 
-### 关键项命名（name）
-- 用1-4个字概括核心项，如："血糖"、"胰岛素"、"过敏史"
+### Content excerpt (content)
+- Concise and accurate, including specific values, time, and degree
+- Example: ✓ "Blood sugar 12.3mmol/L 2 hours after meal" ✗ "Blood sugar is high"
 
-### 内容摘录（content）
-- 简洁准确，包含具体数值、时间、程度
-- 示例：✓ "餐后2小时血糖12.3mmol/L" ✗ "血糖偏高"
+### trap_score rating (0.0-1.0)
+- High score (0.7-1.0): specific values, medication history, allergy history, time-sensitive information
+- Moderate (0.4-0.6): General symptom description
+- Low score (0.0-0.3): general description, common sense information
 
-### trap_score 评分（0.0-1.0）
-- 高分(0.7-1.0)：具体数值、用药史、过敏史、时间敏感信息
-- 中等(0.4-0.6)：一般症状描述
-- 低分(0.0-0.3)：笼统描述、常识性信息
+## ⚠️ JSON format strict requirements
+1. Directly output pure JSON without markdown code block tags
+2. Do not add description text before and after JSON
+3. knowledge_points must be an array, **cannot be empty** (at least 1 per session)
+4. trap_score must be a number, not a string
+5. Only output new and non-repetitive knowledge points
 
-## ⚠️ JSON 格式严格要求
-1. 直接输出纯 JSON，不要有 markdown 代码块标记
-2. 不要在 JSON 前后添加说明文字
-3. knowledge_points 必须是数组，**不能为空**（每个session至少1个）
-4. trap_score 必须是数字，不是字符串
-5. 只输出新的、不重复的知识点
-
-## 输出格式
+## Output format
 {{
     "knowledge_points": [
         {{
-            "category": "检查结果",
-            "name": "尿酮",
-            "content": "尿酮体弱阳性(+)",
+            "category": "Check results",
+            "name": "urine",
+            "content": "Urine ketone frailty positive (+)",
             "trap_score": 0.8
         }},
         {{
-            "category": "检查结果",
-            "name": "血糖",
-            "content": "餐后2小时血糖12.3mmol/L",
+            "category": "Check results",
+            "name": "blood sugar",
+            "content": "Blood sugar 2 hours after meal 12.3mmol/L",
             "trap_score": 0.85
         }}
     ]
-}}
-"""
+}}"""
 
 
 # Historical knowledge points format template (used by service layer)

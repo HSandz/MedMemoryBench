@@ -9,7 +9,7 @@ from .prompts_judge import JUDGE_TEMPLATES
 
 
 SYSTEM_MESSAGES: Dict[str, str] = {
-    "medmemorybench": "你是患者的个性化医疗助手，能够准确记忆患者的完整病史。请基于记忆中的患者信息进行推理回复，语气亲切专业，回答直接，避免冗长解释和套话。",
+    "medmemorybench": "You are your patient's personalized medical assistant, able to accurately memorize their complete medical history. Please make an inference reply based on the patient information in your memory, use a friendly and professional tone, answer directly, and avoid lengthy explanations and clichés.",
     "medmemorybench_en": "You are the patient's personalized medical assistant, capable of accurately memorizing the patient's complete medical history. Please reason and respond based on patient information in memory, maintaining a warm yet professional tone, answering directly, and avoiding lengthy explanations and boilerplate.",
     "locomo": "You are a helpful assistant that can read the context and memorize it for future retrieval.",
 }
@@ -32,9 +32,9 @@ METHOD_TYPE_MAPPING: Dict[str, str] = {
 
 MEMORY_SOURCE_DESCRIPTIONS: Dict[str, Dict[str, str]] = {
     "medmemorybench": {
-        "long_context": "之前记忆的对话内容",
-        "rag": "检索到的相关对话记录",
-        "agentic": "记忆库中的相关信息",
+        "long_context": "Previously memorized conversation content",
+        "rag": "Retrieved related conversation records",
+        "agentic": "Relevant information in the memory bank",
     },
     "medmemorybench_en": {
         "long_context": "the previously memorized dialogue content",

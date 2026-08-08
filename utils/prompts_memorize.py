@@ -5,15 +5,15 @@ from typing import Dict
 MEMORIZE_TEMPLATES: Dict[str, str] = {
 
     # MedMemoryBench
-    "medmemorybench_long_context_memorize": """以下是一段医疗对话记录，请仔细阅读并记忆其中的关键信息：
+    "medmemorybench_long_context_memorize": """The following is a medical conversation record. Please read it carefully and remember the key information:
 
 {context}""",
 
-    "medmemorybench_rag_memorize": """以下是一段医疗对话记录，请仔细阅读并记忆其中的关键信息：
+    "medmemorybench_rag_memorize": """The following is a medical conversation record. Please read it carefully and remember the key information:
 
 {context}""",
 
-    "medmemorybench_agentic_memorize": """以下是一段医疗对话记录，请仔细阅读并记忆其中的关键信息：
+    "medmemorybench_agentic_memorize": """The following is a medical conversation record. Please read it carefully and remember the key information:
 
 {context}""",
 
