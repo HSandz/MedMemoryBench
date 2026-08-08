@@ -1,0 +1,86 @@
+[project]
+name = "remem"
+version = "0.1.0"
+description = "ReMEM: A brain-inspired retrieval-augmented generation system with episodic memory"
+authors = [
+    {name = "Yiheng Shu"},
+    {name = "Padmaja Jonnalagedda"},
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nano_vectordb==0.0.4.3",
+    "networkx==3.4.2",
+    "numpy==1.26.4",
+    "openai>=1.0.0",
+    "protobuf>=5.26.0,<6.0.0",
+    "pydantic==2.10.4",
+    "python_igraph==0.11.8",
+    "scipy==1.14.1",
+    "sentence_transformers==3.3.1",
+    "tenacity==8.5.0",
+    "tiktoken==0.7.0",
+    "torch==2.6.0",
+    "tqdm==4.66.6",
+    "vllm==0.8.5post1",
+    "transformers==4.51.1",
+    "nest_asyncio",
+    "dspy==2.5.29",
+    "einops",
+    "pandas",
+    "regex",
+    "nltk",
+    "backoff",
+    "bm25s",
+    "evaluate>=0.4.3",
+    "datasets>=2.20.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311', 'py312']
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | build
+  | dist
+  | \.eggs
+  | outputs
+)/
+'''
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "outputs",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "E402",  # module level import not at top (some scripts need path manipulation)
+    "E722",  # bare except (common in research code for robustness)
+    "E731",  # lambda assignment (sometimes clearer)
+    "F401",  # unused import (may be used in __init__ for public API)
+    "F841",  # unused variable (common in exploratory/research code)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["remem"]

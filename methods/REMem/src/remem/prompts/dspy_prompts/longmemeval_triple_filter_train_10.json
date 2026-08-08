@@ -1,0 +1,412 @@
+[
+  {
+    "question": "What degree did I graduate with?",
+    "fact_before_filter": [
+      [
+        "user",
+        "graduated with",
+        "degree in business administration"
+      ],
+      [
+        "user",
+        "earned degree",
+        "business administration"
+      ],
+      [
+        "degree in business administration",
+        "helped with",
+        "new role"
+      ],
+      [
+        "graduation",
+        "occurred before",
+        "new role"
+      ],
+      [
+        "business administration degree",
+        "provides foundation for",
+        "new role"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "user",
+        "graduated with",
+        "degree in business administration"
+      ],
+      [
+        "user",
+        "earned degree",
+        "business administration"
+      ],
+      [
+        "degree in business administration",
+        "helped with",
+        "new role"
+      ],
+      [
+        "business administration degree",
+        "provides foundation for",
+        "new role"
+      ]
+    ]
+  },
+  {
+    "question": "What color did I repaint my bedroom walls?",
+    "fact_before_filter": [
+      [
+        "bedroom walls",
+        "new color",
+        "lighter shade of gray"
+      ],
+      [
+        "bedroom walls",
+        "color",
+        "lighter shade of gray"
+      ],
+      [
+        "user",
+        "repainted",
+        "bedroom walls"
+      ],
+      [
+        "repainting",
+        "effect",
+        "brighter room feel"
+      ],
+      [
+        "repainting",
+        "temporal context",
+        "recently"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "bedroom walls",
+        "new color",
+        "lighter shade of gray"
+      ],
+      [
+        "bedroom walls",
+        "color",
+        "lighter shade of gray"
+      ]
+    ]
+  },
+  {
+    "question": "What brand are my favorite running shoes?",
+    "fact_before_filter": [
+      [
+        "running shoes",
+        "brand",
+        "nike"
+      ],
+      [
+        "asics",
+        "specializes in",
+        "running shoes"
+      ],
+      [
+        "asics",
+        "specializes in",
+        "running apparel"
+      ],
+      [
+        "current nike shoes",
+        "purpose",
+        "daily 5k runs"
+      ],
+      [
+        "nike running shoes",
+        "have",
+        "similar features"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "running shoes",
+        "brand",
+        "nike"
+      ],
+      [
+        "current nike shoes",
+        "purpose",
+        "daily 5k runs"
+      ]
+    ]
+  },
+  {
+    "question": "Where did I attend my cousin's wedding?",
+    "fact_before_filter": [
+      [
+        "cousin s wedding",
+        "location",
+        "grand ballroom"
+      ],
+      [
+        "user s mom",
+        "attended",
+        "cousin s wedding"
+      ],
+      [
+        "cousin s wedding",
+        "occurred before",
+        "current conversation"
+      ],
+      [
+        "user",
+        "attended",
+        "cousin s wedding"
+      ],
+      [
+        "user s mom",
+        "appeared at",
+        "cousin s wedding"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "cousin s wedding",
+        "location",
+        "grand ballroom"
+      ]
+    ]
+  },
+  {
+    "question": "Where did I complete my Bachelor's degree in Computer Science?",
+    "fact_before_filter": [
+      [
+        "user",
+        "completed undergrad in",
+        "cs"
+      ],
+      [
+        "cs",
+        "field of study",
+        "undergrad"
+      ],
+      [
+        "completion of undergrad",
+        "institution",
+        "ucla"
+      ],
+      [
+        "university of california  berkeley",
+        "has strong reputation in",
+        "computer science"
+      ],
+      [
+        "university of california  berkeley ms ds",
+        "covers courses from",
+        "computer science"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "completion of undergrad",
+        "institution",
+        "ucla"
+      ]
+    ]
+  },
+  {
+    "question": "Where did I buy my new bookshelf from?",
+    "fact_before_filter": [
+      [
+        "new bookshelf",
+        "source",
+        "ikea"
+      ],
+      [
+        "user",
+        "purchased from",
+        "ikea"
+      ],
+      [
+        "books",
+        "stored on",
+        "new bookshelf"
+      ],
+      [
+        "new bookshelf",
+        "purpose",
+        "organize books"
+      ],
+      [
+        "user",
+        "purchased",
+        "new bookshelf"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "new bookshelf",
+        "source",
+        "ikea"
+      ]
+    ]
+  },
+  {
+    "question": "Where did I go on a week-long trip with my family?",
+    "fact_before_filter": [
+      [
+        "planned hunting trip",
+        "scheduled for",
+        "next week"
+      ],
+      [
+        "solo beach trip",
+        "relative date",
+        "about a month after mountain trip"
+      ],
+      [
+        "solo hunting trip",
+        "time",
+        "next week"
+      ],
+      [
+        "trip",
+        "has option",
+        "family travel"
+      ],
+      [
+        "solo beach trip",
+        "duration",
+        "a few days"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "trip",
+        "has option",
+        "family travel"
+      ]
+    ]
+  },
+  {
+    "question": "How long was I in Japan for?",
+    "fact_before_filter": [
+      [
+        "trip to japan",
+        "occurred",
+        "a few months ago"
+      ],
+      [
+        "trip to japan",
+        "time",
+        "a few months ago"
+      ],
+      [
+        "trip to japan",
+        "time",
+        "past  no specific date"
+      ],
+      [
+        "visit to japan",
+        "occurred before",
+        "visit to other parts of asia"
+      ],
+      [
+        "visit to japan",
+        "includes",
+        "visit to kyoto"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "trip to japan",
+        "occurred",
+        "a few months ago"
+      ],
+      [
+        "trip to japan",
+        "time",
+        "a few months ago"
+      ],
+      [
+        "trip to japan",
+        "time",
+        "past  no specific date"
+      ]
+    ]
+  },
+  {
+    "question": "Where did I attend the Imagine Dragons concert?",
+    "fact_before_filter": [
+      [
+        "imagine dragons concert",
+        "location",
+        "xfinity center"
+      ],
+      [
+        "jonas brothers concert",
+        "occurred after",
+        "imagine dragons concert"
+      ],
+      [
+        "user",
+        "attended",
+        "imagine dragons concert"
+      ],
+      [
+        "user",
+        "attended concert",
+        "imagine dragons"
+      ],
+      [
+        "imagine dragons concert",
+        "occurred before",
+        "jonas brothers concert"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "imagine dragons concert",
+        "location",
+        "xfinity center"
+      ]
+    ]
+  },
+  {
+    "question": "How much screen time have I been averaging on Instagram per day?",
+    "fact_before_filter": [
+      [
+        "average screen time",
+        "duration",
+        "2 weeks"
+      ],
+      [
+        "your time on instagram feature",
+        "allows setting",
+        "daily time limit"
+      ],
+      [
+        "reducing screen time",
+        "results in",
+        "healthier relationship with instagram"
+      ],
+      [
+        "instagram s built in features",
+        "include",
+        "your time on instagram feature"
+      ],
+      [
+        "user",
+        "has screen time",
+        "2 hours per day"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "your time on instagram feature",
+        "allows setting",
+        "daily time limit"
+      ],
+      [
+        "user",
+        "has screen time",
+        "2 hours per day"
+      ]
+    ]
+  }
+]

@@ -1,0 +1,497 @@
+[
+  {
+    "question": "What size is my new Samsung TV?",
+    "fact_before_filter": [
+      [
+        "user",
+        "set up",
+        "samsung 55 inch 4k smart tv"
+      ],
+      [
+        "user",
+        "set up",
+        "new smart tv"
+      ],
+      [
+        "smart tv setup",
+        "occurred on",
+        "saturday"
+      ],
+      [
+        "user",
+        "owns",
+        "new tv"
+      ],
+      [
+        "user",
+        "has",
+        "new tv"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "user",
+        "set up",
+        "samsung 55 inch 4k smart tv"
+      ]
+    ]
+  },
+  {
+    "question": "What book am I currently reading?",
+    "fact_before_filter": [
+      [
+        "reader",
+        "is reading",
+        "the seven husbands of evelyn hugo"
+      ],
+      [
+        "user",
+        "is reading",
+        "the seven husbands of evelyn hugo"
+      ],
+      [
+        "user",
+        "considers reading",
+        "book"
+      ],
+      [
+        "reading schedule",
+        "is part of",
+        "book club"
+      ],
+      [
+        "reading preferences",
+        "influence",
+        "book discovery"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "reader",
+        "is reading",
+        "the seven husbands of evelyn hugo"
+      ],
+      [
+        "user",
+        "is reading",
+        "the seven husbands of evelyn hugo"
+      ]
+    ]
+  },
+  {
+    "question": "What is my ethnicity?",
+    "fact_before_filter": [
+      [
+        "user",
+        "has ethnicity",
+        "mixed"
+      ],
+      [
+        "user",
+        "has ethnicity",
+        "italian"
+      ],
+      [
+        "mixed ethnicity",
+        "includes",
+        "italian"
+      ],
+      [
+        "mixed ethnicity",
+        "includes",
+        "irish"
+      ],
+      [
+        "user",
+        "has ethnicity",
+        "irish"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "user",
+        "has ethnicity",
+        "mixed"
+      ],
+      [
+        "user",
+        "has ethnicity",
+        "italian"
+      ],
+      [
+        "mixed ethnicity",
+        "includes",
+        "italian"
+      ],
+      [
+        "mixed ethnicity",
+        "includes",
+        "irish"
+      ],
+      [
+        "user",
+        "has ethnicity",
+        "irish"
+      ]
+    ]
+  },
+  {
+    "question": "How many projects have I led or am currently leading?",
+    "fact_before_filter": [
+      [
+        "leadership and management",
+        "includes",
+        "project management"
+      ],
+      [
+        "innovation pipeline",
+        "has metric",
+        "number of projects"
+      ],
+      [
+        "marketing research class project",
+        "involved",
+        "leading data analysis team"
+      ],
+      [
+        "community",
+        "involved in",
+        "projects"
+      ],
+      [
+        "applying new skills",
+        "relates to",
+        "current projects"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "leadership and management",
+        "includes",
+        "project management"
+      ],
+      [
+        "innovation pipeline",
+        "has metric",
+        "number of projects"
+      ],
+      [
+        "marketing research class project",
+        "involved",
+        "leading data analysis team"
+      ]
+    ]
+  },
+  {
+    "question": "How many model kits have I worked on or bought?",
+    "fact_before_filter": [
+      [
+        "model kits",
+        "acquired at",
+        "model show"
+      ],
+      [
+        "69 camaro kit",
+        "has scale",
+        "1 24"
+      ],
+      [
+        "user",
+        "completed",
+        "tamiya 1 48 scale spitfire mk v model kit"
+      ],
+      [
+        "user",
+        "completed model kit",
+        "revell f 15 eagle"
+      ],
+      [
+        "completion of tamiya 1 48 scale spitfire mk v model kit",
+        "time",
+        "recently"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "user",
+        "completed",
+        "tamiya 1 48 scale spitfire mk v model kit"
+      ],
+      [
+        "user",
+        "completed model kit",
+        "revell f 15 eagle"
+      ],
+      [
+        "completion of tamiya 1 48 scale spitfire mk v model kit",
+        "time",
+        "recently"
+      ]
+    ]
+  },
+  {
+    "question": "How many plants did I acquire in the last month?",
+    "fact_before_filter": [
+      [
+        "peace lily acquisition",
+        "occurred with",
+        "succulent acquisition"
+      ],
+      [
+        "getting snake plant",
+        "time elapsed",
+        "1 month"
+      ],
+      [
+        "addition of new plants",
+        "time",
+        "recently"
+      ],
+      [
+        "peace lily and succulent plant purchase",
+        "location",
+        "nursery"
+      ],
+      [
+        "user",
+        "acquired",
+        "peace lily"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "peace lily acquisition",
+        "occurred with",
+        "succulent acquisition"
+      ],
+      [
+        "getting snake plant",
+        "time elapsed",
+        "1 month"
+      ],
+      [
+        "addition of new plants",
+        "time",
+        "recently"
+      ],
+      [
+        "peace lily and succulent plant purchase",
+        "location",
+        "nursery"
+      ],
+      [
+        "user",
+        "acquired",
+        "peace lily"
+      ]
+    ]
+  },
+  {
+    "question": "How much more did I spend on accommodations per night in Hawaii compared to Tokyo?",
+    "fact_before_filter": [
+      [
+        "hostel in tokyo",
+        "cost",
+        "around  30 per night"
+      ],
+      [
+        "capsule hotels",
+        "cost",
+        "2 000 to  5 000 per night"
+      ],
+      [
+        "capsule hotels",
+        "equivalent to",
+        "18  45 usd per night"
+      ],
+      [
+        "dormitories",
+        "cost",
+        "2 000 to  5 000 per night"
+      ],
+      [
+        "hostels in japan",
+        "offer",
+        "affordable accommodation"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "hostel in tokyo",
+        "cost",
+        "around  30 per night"
+      ],
+      [
+        "capsule hotels",
+        "cost",
+        "2 000 to  5 000 per night"
+      ],
+      [
+        "capsule hotels",
+        "equivalent to",
+        "18  45 usd per night"
+      ],
+      [
+        "dormitories",
+        "cost",
+        "2 000 to  5 000 per night"
+      ],
+      [
+        "hostels in japan",
+        "offer",
+        "affordable accommodation"
+      ]
+    ]
+  },
+  {
+    "question": "How many fitness classes do I attend in a typical week?",
+    "fact_before_filter": [
+      [
+        "fitness class or workout group",
+        "provides",
+        "motivation boost"
+      ],
+      [
+        "weightlifting classes",
+        "frequency",
+        "not specified"
+      ],
+      [
+        "user",
+        "attends",
+        "weightlifting classes"
+      ],
+      [
+        "user",
+        "attends",
+        "zumba classes"
+      ],
+      [
+        "user",
+        "attends",
+        "hip hop abs class"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "weightlifting classes",
+        "frequency",
+        "not specified"
+      ],
+      [
+        "user",
+        "attends",
+        "weightlifting classes"
+      ],
+      [
+        "user",
+        "attends",
+        "zumba classes"
+      ],
+      [
+        "user",
+        "attends",
+        "hip hop abs class"
+      ]
+    ]
+  },
+  {
+    "question": "How much money did I raise for charity in total?",
+    "fact_before_filter": [
+      [
+        "charity fitness challenge",
+        "raised amount",
+        "500"
+      ],
+      [
+        "charity fitness challenge",
+        "amount raised",
+        "500"
+      ],
+      [
+        "fundraising events",
+        "raise money",
+        "for charity run"
+      ],
+      [
+        "charity event",
+        "raised",
+        "2 000"
+      ],
+      [
+        "charity event for local animal shelter",
+        "raised",
+        "2 000"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "charity fitness challenge",
+        "raised amount",
+        "500"
+      ],
+      [
+        "charity fitness challenge",
+        "amount raised",
+        "500"
+      ],
+      [
+        "charity event",
+        "raised",
+        "2 000"
+      ],
+      [
+        "charity event for local animal shelter",
+        "raised",
+        "2 000"
+      ]
+    ]
+  },
+  {
+    "question": "How many kitchen items did I replace or fix?",
+    "fact_before_filter": [
+      [
+        "fixing kitchen shelves",
+        "results in",
+        "organization"
+      ],
+      [
+        "kitchen",
+        "feels",
+        "organized"
+      ],
+      [
+        "kitchen shelves",
+        "were fixed",
+        "by user"
+      ],
+      [
+        "organizing kitchen utensils",
+        "can be improved with",
+        "simple tips"
+      ],
+      [
+        "user",
+        "replaced",
+        "kitchen mat"
+      ]
+    ],
+    "fact_after_filter": [
+      [
+        "fixing kitchen shelves",
+        "results in",
+        "organization"
+      ],
+      [
+        "kitchen shelves",
+        "were fixed",
+        "by user"
+      ],
+      [
+        "user",
+        "replaced",
+        "kitchen mat"
+      ]
+    ]
+  }
+]

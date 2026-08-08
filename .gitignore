@@ -4,6 +4,8 @@
 /logs/
 /results/
 
+methods.before-local-conversion
+
 # Environment and secrets
 .env
 *.env

@@ -1,0 +1,25 @@
+{
+  "prog": {
+    "lm": null,
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "You are a critical component of a personal assistant AI designed to help users manage their personal and professional lives. A user has asked a question about their past experiences, and it's your job to filter through a list of relevant triples to provide an accurate answer. The user's question is: \"What university did I attend for my undergraduate degree in Computer Science?\" The candidate triples are: [['user', 'completed undergrad in', 'cs'], ['cs', 'field of study', 'undergrad'], ['completion of undergrad', 'institution', 'ucla'], ['university of california  berkeley', 'has strong reputation in', 'computer science'], ['university of california  berkeley ms ds', 'covers courses from', 'computer science']]. You must carefully analyze the triples, using multi-hop reasoning if necessary, to determine which ones are relevant to the user's question. The relevance of a triple is determined by its ability to aid in reasoning and providing an answer to the question. Select the relevant triples from the candidate list and output them in JSON format, without any additional words. If no triples are relevant, return an empty list. The user is relying on you to provide an accurate answer, and the consequences of failure could be severe, such as the user making an incorrect decision based on faulty information. The output should be in the format: {\"triples\": [[\"s1\", \"p1\", \"o1\"], [\"s2\", \"p2\", \"o2\"]]}.",
+      "fields": [
+        {
+          "prefix": "Question:",
+          "description": "Query for retrieval"
+        },
+        {
+          "prefix": "Fact Before Filter:",
+          "description": "Candidate triples to be filtered"
+        },
+        {
+          "prefix": "Fact After Filter:",
+          "description": "Filtered triples in JSON format"
+        }
+      ]
+    }
+  }
+}
