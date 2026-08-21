@@ -219,7 +219,7 @@ class MIRIXAgent(BaseAgent):
             "google": "google_ai",
             "gemini": "google_vertex",
             "vertex": "google_vertex",
-            "vertex_ai": "google_vertex",
+            "ai_studio": "google_ai",
         }
         return mapping.get(provider.lower(), "openai")
 

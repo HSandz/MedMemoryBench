@@ -11,6 +11,8 @@ class BaseLLMConfig(BaseConfig):
     model_name_or_path: str = Field(..., description="Model name or path")
     temperature: float = Field(default=0.7, description="Temperature for sampling")
     max_tokens: int = Field(default=8192, description="Maximum number of tokens to generate")
+    gemini_provider: str = Field(default="gemini", description="Gemini transport provider")
+    api_key: str | None = Field(default=None, description="Optional provider API key")
     top_p: float = Field(default=0.95, description="Top-p sampling parameter")
     top_k: int = Field(default=50, description="Top-k sampling parameter")
     remove_think_prefix: bool = Field(
@@ -159,7 +161,6 @@ class LLMConfigFactory(BaseConfig):
         "openai_new": OpenAIResponsesLLMConfig,
         "gemini": BaseLLMConfig,
         "vertex": BaseLLMConfig,
-        "vertex_ai": BaseLLMConfig,
     }
 
     @field_validator("backend")

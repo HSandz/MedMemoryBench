@@ -1,0 +1,12 @@
+method_name: long_context
+method_type: baseline
+description: Long Context Agent using Google AI Studio
+model:
+  provider: ai_studio
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_tokens: 2000
+build_config:
+  max_context_tokens: 100000
+  truncation_strategy: oldest_first
+retrieval_config: {}

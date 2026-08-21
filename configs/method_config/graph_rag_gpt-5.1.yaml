@@ -1,21 +1,18 @@
-# Graph RAG Agent Configuration
-
-method_name: "graph_rag"
-method_type: "rag"
-description: "Graph RAG Agent - Knowledge graph based RAG with concept extraction and graph traversal"
-
+method_name: graph_rag
+method_type: rag
+description: Graph RAG Agent - Knowledge graph based RAG with concept extraction and
+  graph traversal
 model:
-  provider: "openai"
-  name: "gpt-5.1"
-  temperature: 0.3
+  provider: openai
+  name: gpt-5.1
+  temperature: 0.0
   max_tokens: 10000
-
-agent_params:
+embedding:
+  provider: local
+  model: BAAI/bge-small-zh-v1.5
+build_config:
   top_k: 5
   chunk_size: 10240
   chunk_overlap: 200
   edges_threshold: 0.8
-
-embedding:
-  provider: "local"
-  model: "BAAI/bge-small-zh-v1.5"
+retrieval_config: {}

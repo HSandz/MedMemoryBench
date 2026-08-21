@@ -363,6 +363,7 @@ class LightMemAgent(BaseAgent):
         lightmem_temperature: float = 0.1,
         lightmem_max_tokens: int = 2000,
         lightmem_top_p: float = 0.1,
+        lightmem_buffer_max_tokens: int = 4096,
         # Token limits
         max_context_tokens: int = 120000,
         **kwargs,
@@ -387,6 +388,7 @@ class LightMemAgent(BaseAgent):
         self.lightmem_temperature = lightmem_temperature
         self.lightmem_max_tokens = lightmem_max_tokens
         self.lightmem_top_p = lightmem_top_p
+        self.lightmem_buffer_max_tokens = lightmem_buffer_max_tokens
         self.max_context_tokens = max_context_tokens
 
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -586,11 +588,13 @@ class LightMemAgent(BaseAgent):
 
         instance = self._LightMemory.from_config(config)
 
-        # Increase ShortMemBuffer threshold to reduce LLM API calls
-        # Default is 512, we increase to 4096 to batch more segments before extraction
         if hasattr(instance, 'shortmem_buffer_manager'):
-            instance.shortmem_buffer_manager.max_tokens = 4096
-            print(f"[LightMem] ShortMemBuffer max_tokens set to 4096")
+            buffer_max_tokens = getattr(self, "lightmem_buffer_max_tokens", 4096)
+            instance.shortmem_buffer_manager.max_tokens = buffer_max_tokens
+            print(
+                f"[LightMem] ShortMemBuffer max_tokens set to "
+                f"{buffer_max_tokens}"
+            )
 
         # Replace the manager with our tracked version
         instance.manager = TrackedMemoryManager(

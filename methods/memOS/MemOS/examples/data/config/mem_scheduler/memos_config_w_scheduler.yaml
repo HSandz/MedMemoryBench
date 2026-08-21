@@ -3,7 +3,7 @@ chat_model:
   backend: "huggingface_singleton"
   config:
     model_name_or_path: "Qwen/Qwen3-1.7B"
-    temperature: 0.1
+    temperature: 0.0
     remove_think_prefix: true
     max_tokens: 4096
 mem_reader:
@@ -13,7 +13,7 @@ mem_reader:
       backend: "huggingface_singleton"
       config:
         model_name_or_path: "Qwen/Qwen3-1.7B"
-        temperature: 0.1
+        temperature: 0.0
         remove_think_prefix: true
         max_tokens: 4096
     embedder:

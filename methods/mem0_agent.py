@@ -8,7 +8,13 @@ from typing import Optional, List, Dict, Any
 os.environ["MEM0_TELEMETRY"] = "false"
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
-from utils.llm_client import create_llm_client, format_messages, BaseLLMClient, get_usage_tracker
+from utils.llm_client import (
+    create_llm_client,
+    format_messages,
+    BaseLLMClient,
+    get_usage_tracker,
+    is_gemini_provider,
+)
 
 
 class Mem0Agent(BaseAgent):
@@ -47,7 +53,9 @@ class Mem0Agent(BaseAgent):
         self.max_question_tokens = int(kwargs.get("max_question_tokens", 4096))
 
         # API config
-        self._api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        self._api_key = api_key
+        if not is_gemini_provider(provider):
+            self._api_key = self._api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = (
             base_url
             or os.environ.get("BIGMODEL_BASE_URL")
@@ -165,16 +173,17 @@ class Mem0Agent(BaseAgent):
         print(f"[Mem0Agent DEBUG] Qdrant path: {qdrant_path}")
 
         # Build Mem0 config
-        use_vertex_gemini = self._provider.lower() in {"gemini", "vertex", "vertex_ai"}
+        use_gemini = is_gemini_provider(self._provider)
         mem0_config = {
             "llm": {
-                "provider": "gemini" if use_vertex_gemini else "openai",
+                "provider": "gemini" if use_gemini else "openai",
                 "config": {
                     "model": self.model,
                     "temperature": self.temperature,
                     "max_tokens": self.max_tokens,
                     "api_key": self._api_key,
                     "openai_base_url": self._base_url,
+                    "gemini_provider": self._provider,
                 }
             }
         }

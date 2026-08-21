@@ -1,25 +1,20 @@
-# Mem0 Agent Configuration with Gemini selected as the model.
-
-method_name: "mem0"
-method_type: "agentic_memory"
-description: "Mem0 Agent with Gemini model configuration"
-
+method_name: mem0
+method_type: agentic_memory
+description: Mem0 Agent with Gemini model configuration
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
-  max_completion_tokens: 10000
-
-agent_params:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
+embedding:
+  provider: local
+  model: BAAI/bge-small-zh-v1.5
+build_config:
   retrieve_num: 5
   chunk_size_tokens: 40960
   max_context_tokens: 128000
-
-embedding:
-  provider: "local"
-  model: "BAAI/bge-small-zh-v1.5"
-
-# Run this method against persona 1 only; all sessions remain available.
+retrieval_config: {}
 dataset_overrides:
-  persona_ids: [1]
+  persona_ids:
+  - 1
   max_sessions_per_persona: null

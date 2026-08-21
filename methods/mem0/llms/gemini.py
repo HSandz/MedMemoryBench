@@ -1,4 +1,4 @@
-"""Service-account-backed Gemini LLM for the vendored Mem0 runtime."""
+"""Gemini LLM for the vendored Mem0 runtime."""
 
 from typing import Dict, List, Optional
 
@@ -7,7 +7,7 @@ from methods.mem0.llms.base import LLMBase
 
 
 class GeminiLLM(LLMBase):
-    """Route Mem0 extraction requests through the managed Vertex client."""
+    """Route Mem0 extraction requests through the configured Gemini provider."""
 
     def __init__(self, config: Optional[BaseLlmConfig] = None):
         super().__init__(config)
@@ -15,10 +15,11 @@ class GeminiLLM(LLMBase):
 
         self.config.model = self.config.model or "gemini-2.5-flash"
         self.client = create_llm_client(
-            provider="gemini",
+            provider=self.config.gemini_provider,
             model=self.config.model,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            api_key=self.config.api_key,
         )
 
     def generate_response(

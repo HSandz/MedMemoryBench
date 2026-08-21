@@ -23,7 +23,7 @@ from utils.llm_client import LLMResponse, get_usage_tracker
 
 MANIFEST_VERSION = 2
 PREPARED_QUERY_METADATA_KEY = "prepared_query"
-DEFAULT_MIN_BATCH_REQUESTS = 4
+DEFAULT_MIN_BATCH_REQUESTS = 6
 TERMINAL_STATES = {
     "JOB_STATE_SUCCEEDED",
     "JOB_STATE_FAILED",
@@ -167,7 +167,8 @@ class BatchChatResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     status: str = ""
-    raw_response: Dict[str, Any] = field(default_factory=dict)
+    duration_seconds: float = 0.0
+    raw_response: Any = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -294,7 +295,9 @@ class VertexBatchClient:
         config_hash: str = "",
         poll_interval: int = 30,
         genai_client: Any = None,
+        direct_client: Any = None,
         storage_client: Any = None,
+        credential_client: Any = None,
         progress_callback: Optional[BatchProgressCallback] = None,
     ):
         self.model = model
@@ -308,7 +311,9 @@ class VertexBatchClient:
         self.config_hash = config_hash
         self.poll_interval = poll_interval
         self._genai_client = genai_client
+        self._direct_client = direct_client
         self._storage_client = storage_client
+        self._credential_client = credential_client
         self._progress_callback = progress_callback
 
     @classmethod
@@ -324,10 +329,14 @@ class VertexBatchClient:
         progress_callback: Optional[BatchProgressCallback] = None,
     ) -> "VertexBatchClient":
         """Create a batch transport from the repository's managed Gemini client."""
-        from utils.llm_client import GeminiEnterpriseClient
+        from utils.llm_client import GeminiHybridClient, GeminiVertexClient
 
-        if not isinstance(client, GeminiEnterpriseClient):
-            raise VertexBatchError("Vertex batch API requires provider: gemini, vertex, or vertex_ai.")
+        if isinstance(client, GeminiHybridClient):
+            client = client.vertex_client
+        if not isinstance(client, GeminiVertexClient):
+            raise VertexBatchError(
+                "Vertex batch API requires provider: vertex or gemini."
+            )
         configured_uri = gcs_uri or os.environ.get("GOOGLE_BATCH_GCS_URI")
         if not configured_uri:
             raise VertexBatchError(
@@ -347,7 +356,52 @@ class VertexBatchClient:
             # Batch jobs use a separate v1 client below while retaining this
             # exact service-account credential, project, and location.
             genai_client=None,
+            direct_client=client,
+            credential_client=client,
             progress_callback=progress_callback,
+        )
+
+    def _run_with_vertex_credentials(self, operation_name: str, operation):
+        """Run batch control operations through the Vertex account pool."""
+        if self._credential_client is None:
+            return operation(self.credentials, self.project)
+
+        def run_for_account(client, credentials, project):
+            self.credentials = credentials
+            self.project = project
+            return operation(credentials, project)
+
+        return self._credential_client._run_with_service_account_rotation(
+            run_for_account,
+            operation_name,
+        )
+
+    @staticmethod
+    def _new_storage_client(credentials: Any, project: str):
+        try:
+            from google.cloud import storage
+        except ImportError as exc:
+            raise ImportError(
+                "Vertex batch support requires google-cloud-storage. "
+                "Install dependencies with: pip install -r requirements.txt"
+            ) from exc
+        return storage.Client(project=project, credentials=credentials)
+
+    def _new_batch_genai_client(self, credentials: Any, project: str):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise ImportError(
+                "Vertex batch support requires google-genai. "
+                "Install dependencies with: pip install -r requirements.txt"
+            ) from exc
+        return genai.Client(
+            enterprise=True,
+            credentials=credentials,
+            project=project,
+            location=self.location,
+            http_options=types.HttpOptions(api_version="v1"),
         )
 
     def _progress(self, message: str) -> None:
@@ -444,6 +498,22 @@ class VertexBatchClient:
                 return BatchChatRequest.from_manifest_dict(request)
         return None
 
+    def get_saved_requests(self, stage: str) -> List[BatchChatRequest]:
+        """Return every request already bound to a submitted stage."""
+        manifest = self._load_manifest()
+        job_entry = manifest.get("jobs", {}).get(stage)
+        if not isinstance(job_entry, dict):
+            return []
+        return [
+            BatchChatRequest.from_manifest_dict(request)
+            for request in job_entry.get("requests", [])
+        ]
+
+    def has_stage(self, stage: str) -> bool:
+        """Return whether the manifest already contains ``stage``."""
+        manifest = self._load_manifest()
+        return isinstance(manifest.get("jobs", {}).get(stage), dict)
+
     def _save_manifest(self, manifest: Dict[str, Any]) -> None:
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest["updated_at"] = _utc_now()
@@ -464,10 +534,18 @@ class VertexBatchClient:
         self._progress(
             f"Uploading {len(body.encode('utf-8')):,} bytes of JSONL to {uri}."
         )
-        self.storage_client.bucket(bucket_name).blob(object_name).upload_from_string(
-            body,
-            content_type="application/jsonl; charset=utf-8",
-        )
+        def upload(credentials, project):
+            storage_client = (
+                self._storage_client
+                if self._storage_client is not None
+                else self._new_storage_client(credentials, project)
+            )
+            storage_client.bucket(bucket_name).blob(object_name).upload_from_string(
+                body,
+                content_type="application/jsonl; charset=utf-8",
+            )
+
+        self._run_with_vertex_credentials("batch input upload", upload)
         self._progress(f"Input upload completed: {uri}.")
         return len(body.encode("utf-8"))
 
@@ -493,11 +571,19 @@ class VertexBatchClient:
         self._progress(
             f"Stage '{stage}': creating Vertex job for model {self.model}."
         )
-        job = self.genai_client.batches.create(
-            model=self.model,
-            src=input_uri,
-            config=types.CreateBatchJobConfig(dest=output_uri),
-        )
+        def create_job(credentials, project):
+            genai_client = (
+                self._genai_client
+                if self._genai_client is not None
+                else self._new_batch_genai_client(credentials, project)
+            )
+            return genai_client.batches.create(
+                model=self.model,
+                src=input_uri,
+                config=types.CreateBatchJobConfig(dest=output_uri),
+            )
+
+        job = self._run_with_vertex_credentials("batch job submission", create_job)
         state = _state_name(getattr(job, "state", None)) or "unknown"
         self._progress(
             f"Stage '{stage}': submitted {job.name} (state: {state}; "
@@ -507,6 +593,7 @@ class VertexBatchClient:
             "stage": stage,
             "job_name": job.name,
             "state": state,
+            "project": self.project,
             "input_uri": input_uri,
             "output_uri": output_uri,
             "submitted_at": _utc_now(),
@@ -515,11 +602,82 @@ class VertexBatchClient:
             "responses": {},
         }
 
-    def _get_job(self, job_name: str):
-        return self.genai_client.batches.get(name=job_name)
+    def _run_direct(
+        self,
+        stage: str,
+        requests: List[BatchChatRequest],
+    ) -> Dict[str, BatchChatResponse]:
+        """Run a small stage through the normal real-time Vertex AI client."""
+        if self._direct_client is None:
+            raise VertexBatchError("Direct Vertex AI fallback is unavailable.")
+
+        self._progress(
+            f"Stage '{stage}': only {len(requests):,} request(s); "
+            "using direct Vertex AI calls instead of creating a batch job."
+        )
+        responses: Dict[str, BatchChatResponse] = {}
+        for request in requests:
+            kwargs: Dict[str, Any] = {}
+            if request.response_format is not None:
+                kwargs["response_format"] = request.response_format
+                response_schema = (
+                    request.response_format.get("response_json_schema")
+                    or request.response_format.get("response_schema")
+                )
+                if response_schema is not None:
+                    kwargs["response_json_schema"] = response_schema
+
+            get_usage_tracker().set_phase(request.phase)
+            started_at = time.perf_counter()
+            try:
+                response = self._direct_client.chat(
+                    request.messages,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    **kwargs,
+                )
+                responses[request.request_id] = BatchChatResponse(
+                    request_id=request.request_id,
+                    content=response.content,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    duration_seconds=time.perf_counter() - started_at,
+                    raw_response=response.raw_response,
+                )
+            except Exception as exc:
+                responses[request.request_id] = BatchChatResponse(
+                    request_id=request.request_id,
+                    status=f"{type(exc).__name__}: {exc}",
+                    duration_seconds=time.perf_counter() - started_at,
+                )
+
+        failed = sum(1 for response in responses.values() if response.status)
+        self._progress(
+            f"Stage '{stage}': completed {len(responses) - failed:,}/{len(requests):,} "
+            f"direct request(s); {failed:,} failed."
+        )
+        return responses
+
+    def _get_job(self, job_name: str, project: Optional[str] = None):
+        if (
+            self._credential_client is not None
+            and project
+            and hasattr(self._credential_client, "_select_project")
+        ):
+            self._credential_client._select_project(project)
+
+        def get_job(credentials, project):
+            genai_client = (
+                self._genai_client
+                if self._genai_client is not None
+                else self._new_batch_genai_client(credentials, project)
+            )
+            return genai_client.batches.get(name=job_name)
+
+        return self._run_with_vertex_credentials("batch job polling", get_job)
 
     def _wait_for_job(self, job_entry: Dict[str, Any]):
-        job = self._get_job(job_entry["job_name"])
+        job = self._get_job(job_entry["job_name"], job_entry.get("project"))
         state = _state_name(getattr(job, "state", None))
         attempts = 0
         self._progress(
@@ -529,12 +687,14 @@ class VertexBatchClient:
         while state not in TERMINAL_STATES:
             time.sleep(self.poll_interval)
             attempts += 1
-            job = self._get_job(job_entry["job_name"])
-            state = _state_name(getattr(job, "state", None))
-            self._progress(
-                f"Stage '{job_entry['stage']}': poll {attempts}; "
-                f"{job_entry['job_name']} is {state or 'unknown'}."
-            )
+            job = self._get_job(job_entry["job_name"], job_entry.get("project"))
+            polled_state = _state_name(getattr(job, "state", None))
+            if polled_state != state:
+                self._progress(
+                    f"Stage '{job_entry['stage']}': poll {attempts}; "
+                    f"{job_entry['job_name']} is {polled_state or 'unknown'}."
+                )
+            state = polled_state
         job_entry["state"] = state
         job_entry["completed_at"] = _utc_now()
         self._progress(
@@ -544,13 +704,26 @@ class VertexBatchClient:
 
     def _list_output_rows(self, output_uri: str) -> Iterable[Dict[str, Any]]:
         bucket_name, prefix = _parse_gcs_uri(output_uri)
-        for blob in self.storage_client.list_blobs(bucket_name, prefix=prefix):
-            if not blob.name.endswith(".jsonl"):
-                continue
-            text = blob.download_as_text(encoding="utf-8")
-            for line in text.splitlines():
-                if line.strip():
-                    yield json.loads(line)
+
+        def download_rows(credentials, project):
+            storage_client = (
+                self._storage_client
+                if self._storage_client is not None
+                else self._new_storage_client(credentials, project)
+            )
+            rows = []
+            for blob in storage_client.list_blobs(bucket_name, prefix=prefix):
+                if not blob.name.endswith(".jsonl"):
+                    continue
+                text = blob.download_as_text(encoding="utf-8")
+                rows.extend(
+                    json.loads(line)
+                    for line in text.splitlines()
+                    if line.strip()
+                )
+            return rows
+
+        yield from self._run_with_vertex_credentials("batch output download", download_rows)
 
     @staticmethod
     def _request_correlation_key(request: Dict[str, Any]) -> str:
@@ -626,6 +799,11 @@ class VertexBatchClient:
         )
 
     def _collect(self, job_entry: Dict[str, Any]) -> Dict[str, BatchChatResponse]:
+        if self._credential_client is not None and hasattr(
+            self._credential_client,
+            "_select_project",
+        ):
+            self._credential_client._select_project(job_entry.get("project"))
         requests = [
             BatchChatRequest.from_manifest_dict(request)
             for request in job_entry["requests"]
@@ -679,7 +857,7 @@ class VertexBatchClient:
         return hashlib.sha256(encoded).hexdigest()
 
     def _wait_or_raise_pending(self, stage: str, job_entry: Dict[str, Any], manifest: Dict[str, Any]):
-        job = self._get_job(job_entry["job_name"])
+        job = self._get_job(job_entry["job_name"], job_entry.get("project"))
         job_entry["state"] = _state_name(getattr(job, "state", None))
         if job_entry["state"] in TERMINAL_STATES:
             self._progress(
@@ -714,10 +892,12 @@ class VertexBatchClient:
         stage: str,
         requests: List[BatchChatRequest],
     ) -> Dict[str, BatchChatResponse]:
-        """Submit or collect one deterministic stage.
+        """Run one deterministic stage through direct or batch Vertex AI.
 
-        In submit-only mode this raises :class:`VertexBatchPending`.  The same
-        stage and manifest can be passed on a later ``--resume`` invocation.
+        New stages with fewer than ``min_batch_requests()`` requests use the
+        normal real-time client. Existing batch manifests always resume their
+        submitted job. In submit-only batch mode this raises
+        :class:`VertexBatchPending` for later ``--resume`` collection.
         """
         if not requests:
             return {}
@@ -726,8 +906,16 @@ class VertexBatchClient:
         manifest = self._load_manifest()
         jobs = manifest.setdefault("jobs", {})
         job_entry = jobs.get(stage)
+        if (
+            job_entry is None
+            and not should_use_batch(len(requests))
+            and self._direct_client is not None
+        ):
+            return self._run_direct(stage, requests)
+
         if job_entry is None:
             job_entry = self._submit(stage, requests, manifest["run_id"])
+            manifest["project"] = self.project
             jobs[stage] = job_entry
             self._save_manifest(manifest)
         elif job_entry.get("request_fingerprint") != self._request_fingerprint(requests):
@@ -754,7 +942,15 @@ class VertexBatchClient:
             responses.update(self._collect(retry_entry))
 
         unresolved = self._unresolved_requests(requests, responses)
+        direct_response_ids = set()
         while unresolved and len(retries) < 3:
+            if not should_use_batch(len(unresolved)) and self._direct_client is not None:
+                direct_responses = self._run_direct(f"{stage}-retry-direct", unresolved)
+                responses.update(direct_responses)
+                direct_response_ids.update(direct_responses)
+                unresolved = self._unresolved_requests(requests, responses)
+                break
+
             retry_stage = f"{stage}-retry-{len(retries) + 1}"
             self._progress(
                 f"Stage '{stage}': retrying {len(unresolved):,} incomplete request(s) "
@@ -765,6 +961,7 @@ class VertexBatchClient:
                 "stage": retry_stage,
                 "job_name": retry_job["job_name"],
                 "state": retry_job["state"],
+                "project": retry_job["project"],
                 "input_uri": retry_job["input_uri"],
                 "output_uri": retry_job["output_uri"],
                 "submitted_at": retry_job["submitted_at"],
@@ -801,6 +998,8 @@ class VertexBatchClient:
         # Attribute completed model tokens to their original evaluator phase.
         by_id = {request.request_id: request for request in requests}
         for request_id, response in responses.items():
+            if request_id in direct_response_ids:
+                continue
             request = by_id.get(request_id)
             if request is not None:
                 get_usage_tracker().set_phase(request.phase)

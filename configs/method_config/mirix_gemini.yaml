@@ -1,16 +1,17 @@
-# MIRIX Agent Configuration with Gemini selected as the model.
-
-method_name: "mirix"
-method_type: "agentic_memory"
-description: "MIRIX with Gemini model configuration"
-
+method_name: mirix
+method_type: agentic_memory
+description: MIRIX with Gemini model configuration
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
-  max_completion_tokens: 10000
-
-agent_params:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
+embedding:
+  provider: local
+  model: bge-small-zh-v1.5
+  model_path: BAAI/bge-small-zh-v1.5
+  dim: 512
+build_config:
   retrieve_num: 2
   memorize_chunk_tokens: 10240
   memorize_chunk_overlap_tokens: 200
@@ -21,9 +22,4 @@ agent_params:
   max_question_tokens: 4096
   use_native_query: false
   embedding_device: null
-
-embedding:
-  provider: "local"
-  model: "bge-small-zh-v1.5"
-  model_path: "BAAI/bge-small-zh-v1.5"
-  dim: 512
+retrieval_config: {}

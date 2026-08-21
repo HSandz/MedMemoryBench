@@ -1,4 +1,4 @@
-"""Gemini Enterprise LLM adapter for the vendored MemOS runtime."""
+"""Gemini LLM adapter for the vendored MemOS runtime."""
 
 from collections.abc import Generator
 
@@ -7,17 +7,18 @@ from memos.llms.base import BaseLLM
 
 
 class GeminiLLM(BaseLLM):
-    """Use MedMemoryBench's service-account-backed Gemini client."""
+    """Use MedMemoryBench's configured Gemini client."""
 
     def __init__(self, config: BaseLLMConfig):
         from utils.llm_client import create_llm_client
 
         self.config = config
         self.client = create_llm_client(
-            provider="gemini",
+            provider=config.gemini_provider,
             model=config.model_name_or_path,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
+            api_key=config.api_key,
         )
 
     def generate(self, messages, **kwargs) -> str:

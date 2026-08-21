@@ -16,6 +16,7 @@ class BaseLlmConfig(ABC):
         model: Optional[Union[str, Dict]] = None,
         temperature: float = 0.1,
         api_key: Optional[str] = None,
+        gemini_provider: str = "gemini",
         max_tokens: int = 2000,
         top_p: float = 0.1,
         top_k: int = 1,
@@ -92,6 +93,7 @@ class BaseLlmConfig(ABC):
         self.model = model
         self.temperature = temperature
         self.api_key = api_key
+        self.gemini_provider = gemini_provider
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.top_k = top_k

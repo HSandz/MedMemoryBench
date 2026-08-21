@@ -1,20 +1,17 @@
-# BM25 RAG Agent Configuration using Gemini Enterprise Agent Platform.
-
-method_name: "bm25_rag"
-method_type: "rag"
-description: "BM25 RAG Agent using Gemini Enterprise Agent Platform"
-
+method_name: bm25_rag
+method_type: rag
+description: BM25 RAG Agent using hybrid Gemini provider
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
-  max_completion_tokens: 10000
-
-agent_params:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
+build_config:
   top_k: 5
   k1: 1.5
   b: 0.75
-  language: "en"  # auto / zh / en
+  language: en
   chunk_size: 512
   chunk_overlap: 50
   max_context_tokens: 100000
+retrieval_config: {}

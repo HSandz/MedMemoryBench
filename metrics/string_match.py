@@ -167,3 +167,76 @@ class OptionMatchMetric(BaseMetric):
                 "metric": self.NAME,
             }
         )
+
+
+class MQFixMetric(OptionMatchMetric):
+    """Multiple-choice metric with partial credit and the original MQ result."""
+
+    NAME = "mq_fix"
+
+    def compute(
+        self,
+        query_id: str,
+        query_type: str,
+        model_output: str,
+        expected_answers: List[str],
+        question: str = "",
+        answers_data: List[dict] = None,
+        **kwargs
+    ) -> MetricResult:
+        original_result = OptionMatchMetric().compute(
+            query_id=query_id,
+            query_type=query_type,
+            model_output=model_output,
+            expected_answers=expected_answers,
+            question=question,
+            answers_data=answers_data,
+            **kwargs,
+        )
+
+        selected_options = set(original_result.details["selected_options"])
+        correct_options = set(original_result.details["correct_options"])
+        right_count = len(selected_options & correct_options)
+        wrong_count = len(selected_options - correct_options)
+        expected_count = len(correct_options)
+        score = max(
+            0.0,
+            (right_count - wrong_count) / expected_count,
+        ) if expected_count else 0.0
+
+        result = MetricResult(
+            query_id=query_id,
+            query_type=query_type,
+            score=score,
+            is_correct=original_result.is_correct,
+            model_output=model_output,
+            expected_answer=original_result.expected_answer,
+            question=question,
+            details={
+                "selected_options": sorted(selected_options),
+                "correct_options": sorted(correct_options),
+                "right_count": right_count,
+                "wrong_count": wrong_count,
+                "expected_count": expected_count,
+                "metric": self.NAME,
+            },
+        )
+        result.details["metrics"] = {
+            "MQ": {
+                "metric": original_result.details["metric"],
+                "score": original_result.score,
+                "is_correct": original_result.is_correct,
+                "details": original_result.details,
+            },
+            "MQ_fix": {
+                "metric": self.NAME,
+                "score": result.score,
+                "is_correct": result.is_correct,
+                "details": {
+                    "right_count": right_count,
+                    "wrong_count": wrong_count,
+                    "expected_count": expected_count,
+                },
+            },
+        }
+        return result

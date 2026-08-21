@@ -17,6 +17,49 @@ except ImportError:
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
+AMEM_BUILD_CONFIG_KEYS = {
+    "amem_backend", "amem_model", "amem_embedding_model", "amem_evo_threshold",
+    "amem_max_tokens", "amem_chunk_size_tokens", "amem_original_evolution",
+    "amem_typed_relations", "amem_relation_candidate_count",
+    "amem_relation_temperature", "amem_temporal_state", "amem_provenance",
+    "amem_temperature", "amem_retry_temperature", "amem_connectivity_temperature",
+    "amem_build_max_context_tokens", "amem_temporal_transition_min_confidence",
+}
+
+AMEM_RETRIEVAL_CONFIG_KEYS = {
+    "retrieve_num", "amem_max_context_tokens", "amem_query_keywords",
+    "amem_expand_links", "amem_typed_retrieval", "amem_typed_expansion_count",
+    "amem_expand_related", "amem_relation_min_confidence",
+    "amem_temporal_retrieval", "amem_temporal_ordering",
+    "amem_temporal_expansion_count", "amem_provenance_retrieval",
+    "amem_provenance_max_evidence", "amem_provenance_inject_raw_text",
+}
+
+
+def _split_legacy_amem_params(
+    params: Dict[str, Any],
+    *,
+    include_temporal_state: bool,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Preserve legacy AMEM behavior while assigning each setting an owner."""
+    build_config = {
+        key: value for key, value in params.items() if key in AMEM_BUILD_CONFIG_KEYS
+    }
+    retrieval_config = {
+        key: value for key, value in params.items() if key not in AMEM_BUILD_CONFIG_KEYS
+    }
+    if "amem_max_context_tokens" in params:
+        build_config.setdefault(
+            "amem_build_max_context_tokens",
+            params["amem_max_context_tokens"],
+        )
+    if include_temporal_state and "amem_relation_min_confidence" in params:
+        build_config.setdefault(
+            "amem_temporal_transition_min_confidence",
+            params["amem_relation_min_confidence"],
+        )
+    return build_config, retrieval_config
+
 
 @dataclass
 class APIConfig:
@@ -33,6 +76,7 @@ class APIConfig:
     azure_deployment: str = ""
 
     anthropic_api_key: str = ""
+    google_ai_studio_api_keys: str = ""
 
     default_llm_model: str = "gpt-4o-mini"
     default_embedding_model: str = "text-embedding-3-small"
@@ -41,7 +85,12 @@ class APIConfig:
     judge_model: str = ""
     judge_provider: str = "openai"
     judge_api_key: str = ""
+    judge_api_keys: str = ""
     judge_base_url: str = ""
+    judge_temperature: float = 1.0
+    judge_client_max_tokens: int = 10000
+    judge_max_tokens: int = 500
+    judge_mcd_max_tokens: int = 2000
 
     @property
     def use_azure(self) -> bool:
@@ -60,10 +109,26 @@ class APIConfig:
         return self.judge_provider
 
     def get_judge_api_key(self) -> str:
+        provider = self.get_judge_provider().lower()
+        if provider in {"ai_studio", "gemini"}:
+            return self.judge_api_keys or self.judge_api_key or self.google_ai_studio_api_keys
+        if provider == "vertex":
+            return self.judge_api_key
         return self.judge_api_key or self.openai_api_key
 
     def get_judge_base_url(self) -> str:
         return self.judge_base_url or self.openai_base_url
+
+    def get_judge_temperature(self) -> float:
+        return self.judge_temperature
+
+    def get_judge_client_max_tokens(self) -> int:
+        return self.judge_client_max_tokens
+
+    def get_judge_max_tokens(self, query_type: Optional[str] = None) -> int:
+        if query_type == "multi_hop_clinical_deduction":
+            return self.judge_mcd_max_tokens
+        return self.judge_max_tokens
 
 
 def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
@@ -97,13 +162,24 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
         azure_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", ""),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        google_ai_studio_api_keys=(
+            os.getenv("GOOGLE_AI_STUDIO_API_KEYS", "")
+            or os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+            or os.getenv("GEMINI_API_KEY", "")
+        ),
         default_llm_model=os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
         default_embedding_model=os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-3-small"),
         embedding_provider=os.getenv("EMBEDDING_PROVIDER", "openai"),
         judge_model=os.getenv("JUDGE_MODEL", ""),
         judge_provider=os.getenv("JUDGE_PROVIDER", "openai"),
         judge_api_key=os.getenv("JUDGE_API_KEY", ""),
+        judge_api_keys=os.getenv("JUDGE_API_KEYS", ""),
         judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
+        judge_temperature=float(os.getenv("JUDGE_TEMPERATURE", "1.0")),
+        judge_client_max_tokens=int(os.getenv("JUDGE_CLIENT_MAX_TOKENS", "10000")),
+        judge_max_tokens=int(os.getenv("JUDGE_MAX_TOKENS", "500")),
+        judge_mcd_max_tokens=int(os.getenv("JUDGE_MCD_MAX_TOKENS", "2000")),
     )
 
 
@@ -140,6 +216,8 @@ class MethodConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     embedding: Optional[EmbeddingConfig] = None
     memorize_model: Optional[ModelConfig] = None  # Optional separate model for memorize phase
+    build_config: Dict[str, Any] = field(default_factory=dict)
+    retrieval_config: Dict[str, Any] = field(default_factory=dict)
     agent_params: Dict[str, Any] = field(default_factory=dict)
 
     # Raw config (preserve all fields)
@@ -204,18 +282,98 @@ class MethodConfig:
                 base_url=mem_data.get("base_url"),
             )
 
-        # Resolve relative paths in agent_params against PROJECT_ROOT
-        raw_agent_params = data.get("agent_params", {})
+        # New configs separate snapshot/build semantics from query behavior.
+        # Legacy agent_params remain accepted and are treated as one combined view.
+        raw_build_config = data.get("build_config", {})
+        raw_retrieval_config = data.get("retrieval_config", {})
+        legacy_agent_params = data.get("agent_params", {})
+        if not isinstance(raw_build_config, dict):
+            raise ValueError("build_config must be a mapping")
+        if not isinstance(raw_retrieval_config, dict):
+            raise ValueError("retrieval_config must be a mapping")
+        if not isinstance(legacy_agent_params, dict):
+            raise ValueError("agent_params must be a mapping")
+
+        is_amem = str(data.get("method_name", "")).lower().startswith("amem")
+        legacy_amem_only = bool(legacy_agent_params) and not (
+            "build_config" in data or "retrieval_config" in data
+        )
+        if is_amem:
+            misplaced_build = sorted(set(raw_build_config) & AMEM_RETRIEVAL_CONFIG_KEYS)
+            misplaced_retrieval = sorted(
+                set(raw_retrieval_config) & AMEM_BUILD_CONFIG_KEYS
+            )
+            duplicated = sorted(set(raw_build_config) & set(raw_retrieval_config))
+            if misplaced_build or misplaced_retrieval or duplicated:
+                problems = []
+                if misplaced_build:
+                    problems.append(
+                        "retrieval settings in build_config: "
+                        + ", ".join(misplaced_build)
+                    )
+                if misplaced_retrieval:
+                    problems.append(
+                        "build settings in retrieval_config: "
+                        + ", ".join(misplaced_retrieval)
+                    )
+                if duplicated:
+                    problems.append(
+                        "settings declared in both sections: " + ", ".join(duplicated)
+                    )
+                raise ValueError("Invalid AMEM configuration: " + "; ".join(problems))
+
+            legacy_build, legacy_retrieval = _split_legacy_amem_params(
+                legacy_agent_params,
+                include_temporal_state=(
+                    str(data.get("method_name", "")).lower() == "amem_test"
+                ),
+            )
+            build_config = {**legacy_build, **raw_build_config}
+            retrieval_config = {**legacy_retrieval, **raw_retrieval_config}
+            if legacy_amem_only and model_config.provider.lower() in {
+                "gemini", "vertex", "ai_studio"
+            }:
+                # Historical adapters replaced AMEM's configured controller with
+                # the top-level Gemini transport/model during construction.
+                build_config["amem_backend"] = model_config.provider.lower()
+                build_config["amem_model"] = model_config.name
+        elif legacy_agent_params and not (
+            "build_config" in data or "retrieval_config" in data
+        ):
+            build_config = dict(legacy_agent_params)
+            retrieval_config = {}
+        else:
+            build_config = {**legacy_agent_params, **raw_build_config}
+            retrieval_config = dict(raw_retrieval_config)
+        merged_agent_params = {**build_config, **retrieval_config}
+
+        # Resolve relative paths against PROJECT_ROOT in both config sections.
         _path_keys = {
-            "amem_embedding_model", "embedding_model_path", "model_path",
+            "embedding_model_path", "model_path",
             "working_dir", "q2q_project_path",
         }
-        resolved_agent_params = {}
-        for k, v in raw_agent_params.items():
-            if k in _path_keys and isinstance(v, str) and v and not os.path.isabs(v):
-                resolved_agent_params[k] = str(PROJECT_ROOT / v)
-            else:
-                resolved_agent_params[k] = v
+        def resolve_paths(params: Dict[str, Any]) -> Dict[str, Any]:
+            resolved = {}
+            for k, v in params.items():
+                is_explicit_amem_path = (
+                    k == "amem_embedding_model"
+                    and isinstance(v, str)
+                    and v.startswith(("./", "models/"))
+                )
+                if (
+                    (k in _path_keys or is_explicit_amem_path)
+                    and isinstance(v, str)
+                    and v
+                    and not os.path.isabs(v)
+                ):
+                    resolved[k] = str(PROJECT_ROOT / v)
+                else:
+                    resolved[k] = v
+            return resolved
+
+        build_config = resolve_paths(build_config)
+        retrieval_config = resolve_paths(retrieval_config)
+        merged_agent_params = {**build_config, **retrieval_config}
 
         return cls(
             method_name=data.get("method_name", "unknown"),
@@ -224,9 +382,23 @@ class MethodConfig:
             model=model_config,
             embedding=embedding_config,
             memorize_model=memorize_model_config,
-            agent_params=resolved_agent_params,
+            build_config=build_config,
+            retrieval_config=retrieval_config,
+            agent_params=merged_agent_params,
             raw_config=data,
         )
+
+    def snapshot_build_config(self) -> Dict[str, Any]:
+        """Return only method settings that affect a serialized memory snapshot."""
+        if "build_config" in self.raw_config or self.build_config:
+            return dict(self.build_config)
+        return dict(self.agent_params)
+
+    def query_config(self) -> Dict[str, Any]:
+        """Return only method settings that affect retrieval/query execution."""
+        if self.retrieval_config:
+            return dict(self.retrieval_config)
+        return {}
 
 
 @dataclass
@@ -302,6 +474,101 @@ class DatasetConfig:
         )
 
 
+def method_config_from_snapshot(snapshot: Dict[str, Any]) -> MethodConfig:
+    """Reconstruct a method config from a run_config.json snapshot."""
+    if not isinstance(snapshot, dict):
+        raise ValueError("Stored method configuration must be a JSON object")
+
+    raw_config = snapshot.get("raw_config")
+    if not isinstance(raw_config, dict):
+        raise ValueError(
+            "Stored method configuration is missing raw_config; "
+            "this run cannot be queried without its original configuration"
+        )
+
+    config = MethodConfig.from_dict(raw_config)
+    # Preserve resolved paths and effective values captured at run startup.
+    if isinstance(snapshot.get("build_config"), dict):
+        config.build_config = dict(snapshot["build_config"])
+    if isinstance(snapshot.get("retrieval_config"), dict):
+        config.retrieval_config = dict(snapshot["retrieval_config"])
+    if config.method_name.lower().startswith("amem"):
+        legacy_query_values = {
+            **(
+                snapshot.get("agent_params", {})
+                if isinstance(snapshot.get("agent_params"), dict)
+                else {}
+            ),
+            **config.retrieval_config,
+        }
+        if "amem_build_max_context_tokens" not in config.build_config:
+            context_budget = legacy_query_values.get("amem_max_context_tokens")
+            if context_budget is not None:
+                config.build_config["amem_build_max_context_tokens"] = context_budget
+        if (
+            config.method_name.lower() == "amem_test"
+            and "amem_temporal_transition_min_confidence" not in config.build_config
+        ):
+            transition_threshold = legacy_query_values.get(
+                "amem_relation_min_confidence"
+            )
+            if transition_threshold is not None:
+                config.build_config[
+                    "amem_temporal_transition_min_confidence"
+                ] = transition_threshold
+    if isinstance(snapshot.get("agent_params"), dict):
+        config.agent_params = dict(snapshot["agent_params"])
+    else:
+        config.agent_params = {**config.build_config, **config.retrieval_config}
+    return config
+
+
+def dataset_config_from_snapshot(snapshot: Dict[str, Any]) -> DatasetConfig:
+    """Reconstruct an effective dataset config from a run_config.json snapshot."""
+    if not isinstance(snapshot, dict):
+        raise ValueError("Stored dataset configuration must be a JSON object")
+
+    raw_config = snapshot.get("raw_config")
+    if not isinstance(raw_config, dict):
+        raise ValueError(
+            "Stored dataset configuration is missing raw_config; "
+            "this run cannot be queried without its original configuration"
+        )
+
+    config = DatasetConfig.from_dict(raw_config)
+    for field_name in (
+        "dataset_name",
+        "description",
+        "language",
+        "data_root_dir",
+        "data_files",
+        "evaluation_mode",
+        "persona_ids",
+        "max_personas",
+        "max_sessions_per_persona",
+        "evaluation_interval",
+        "inject_noise",
+        "save_intermediate",
+        "save_retrieved_context",
+    ):
+        if field_name in snapshot:
+            setattr(config, field_name, snapshot[field_name])
+
+    stored_query_types = snapshot.get("query_types")
+    if isinstance(stored_query_types, list):
+        config.query_types = [
+            QueryTypeConfig(
+                name=item.get("name", ""),
+                abbr=item.get("abbr", ""),
+                metric=item.get("metric", "exact_match"),
+                description=item.get("description", ""),
+            )
+            for item in stored_query_types
+            if isinstance(item, dict)
+        ]
+    return config
+
+
 class ConfigLoader:
     """Configuration loader."""
 
@@ -328,7 +595,11 @@ class ConfigLoader:
         if config_name in self._method_configs:
             return self._method_configs[config_name]
 
-        config_path = self.method_config_dir / f"{config_name}.yaml"
+        requested_path = Path(config_name)
+        if requested_path.exists() and requested_path.is_file():
+            config_path = requested_path.resolve()
+        else:
+            config_path = self.method_config_dir / f"{config_name}.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"Method config file not found: {config_path}")
 

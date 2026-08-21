@@ -51,13 +51,16 @@ def get_eval_logger(
     method_name: str,
     dataset_name: str,
     log_dir: Optional[Path] = None,
+    log_filename: Optional[str] = None,
 ) -> logging.Logger:
     """Get evaluation logger."""
     if log_dir is None:
         log_dir = PROJECT_ROOT / "logs"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"eval_{method_name}_{dataset_name}_{timestamp}.log"
+    log_file = log_dir / (
+        log_filename or f"eval_{method_name}_{dataset_name}_{timestamp}.log"
+    )
 
     logger_name = f"eval.{method_name}.{dataset_name}"
     return setup_logger(logger_name, log_file=log_file)

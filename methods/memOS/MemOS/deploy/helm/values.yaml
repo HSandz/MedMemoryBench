@@ -31,7 +31,7 @@ memos:
     ASYNC_MODE: "sync"
     MOS_TOP_K: "50"
     MOS_CHAT_MODEL: "gpt-4o-mini"
-    MOS_CHAT_TEMPERATURE: "0.8"
+    MOS_CHAT_TEMPERATURE: "0.0"
     MOS_MAX_TOKENS: "2048"
     MOS_TOP_P: "0.9"
     MOS_CHAT_MODEL_PROVIDER: "openai"

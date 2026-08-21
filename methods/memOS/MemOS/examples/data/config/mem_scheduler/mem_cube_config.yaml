@@ -7,7 +7,7 @@ text_mem:
       backend: "huggingface_singleton"
       config:
         model_name_or_path: "Qwen/Qwen3-0.6B"
-        temperature: 0.1
+        temperature: 0.0
         max_tokens: 1024
 act_mem:
   backend: "kv_cache"
@@ -17,5 +17,5 @@ act_mem:
       backend: "huggingface_singleton"
       config:
         model_name_or_path: "Qwen/Qwen3-0.6B"
-        temperature: 0.8
+        temperature: 0.0
         max_tokens: 1024

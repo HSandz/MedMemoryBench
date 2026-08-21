@@ -17,6 +17,7 @@ from utils.llm_client import (
     LLMRetryExhaustedError,
     create_llm_client,
     get_usage_tracker,
+    is_vertex_batch_provider,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ class LettaAgent(BaseAgent):
         super().__init__(model, temperature, max_tokens, **kwargs)
 
         self.provider = provider
-        self._uses_vertex_gemini = provider.lower() in {"gemini", "vertex", "vertex_ai"}
+        self._uses_vertex_gemini = is_vertex_batch_provider(provider)
         self.api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = (
             base_url
@@ -95,7 +96,7 @@ class LettaAgent(BaseAgent):
         self._vertex_client = None
         if self._uses_vertex_gemini:
             self._vertex_client = create_llm_client(
-                provider=provider,
+                provider="vertex",
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,

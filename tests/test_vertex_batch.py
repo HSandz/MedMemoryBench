@@ -11,7 +11,7 @@ import pytest
 from metrics.llm_judge import LLMJudgeMCDMetric, LLMJudgeMetric
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
 from src.evaluator import Evaluator
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import LLMResponse, get_usage_tracker
 from utils.vertex_batch import (
     BatchChatRequest,
     PREPARED_QUERY_METADATA_KEY,
@@ -105,6 +105,22 @@ class _GenAI:
         self.batches = batches
 
 
+class _DirectClient:
+    def __init__(self):
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        text = messages[-1]["content"]
+        return LLMResponse(
+            content=f"direct-{text}",
+            input_tokens=5,
+            output_tokens=2,
+            model="gemini-2.5-flash",
+            raw_response={"transport": "direct"},
+        )
+
+
 def _client(
     tmp_path: Path,
     batches: _Batches,
@@ -112,6 +128,7 @@ def _client(
     *,
     wait: bool = True,
     progress_callback=None,
+    direct_client=None,
 ):
     return VertexBatchClient(
         model="gemini-2.5-flash",
@@ -123,6 +140,7 @@ def _client(
         wait=wait,
         config_hash="config-hash",
         genai_client=_GenAI(batches),
+        direct_client=direct_client,
         storage_client=storage,
         progress_callback=progress_callback,
     )
@@ -137,6 +155,50 @@ def _request(request_id: str, text: str = None) -> BatchChatRequest:
         response_format={"type": "json_object"},
         phase="query",
     )
+
+
+def test_batch_control_operations_use_vertex_credential_pool(tmp_path):
+    attempts = []
+
+    class CredentialPool:
+        def _run_with_service_account_rotation(self, operation, operation_name):
+            for project in ("project-one", "project-two"):
+                try:
+                    return operation(None, object(), project)
+                except PermissionError:
+                    continue
+            raise AssertionError("credential pool was exhausted")
+
+    class Batches:
+        def __init__(self, project):
+            self.project = project
+
+        def get(self, *, name):
+            attempts.append((self.project, name))
+            if self.project == "project-one":
+                raise PermissionError("permission denied")
+            return SimpleNamespace(name=name, state="JOB_STATE_SUCCEEDED")
+
+    client = VertexBatchClient(
+        model="gemini-2.5-flash",
+        project="project-one",
+        location="global",
+        credentials=object(),
+        gcs_uri="gs://private-bucket/evaluation-batch",
+        manifest_path=tmp_path / "batch_manifest.json",
+        wait=True,
+        credential_client=CredentialPool(),
+    )
+    client._new_batch_genai_client = lambda credentials, project: _GenAI(Batches(project))
+
+    job = client._get_job("projects/test/locations/global/batchPredictionJobs/1")
+
+    assert job.state == "JOB_STATE_SUCCEEDED"
+    assert attempts == [
+        ("project-one", "projects/test/locations/global/batchPredictionJobs/1"),
+        ("project-two", "projects/test/locations/global/batchPredictionJobs/1"),
+    ]
+    assert client.project == "project-two"
 
 
 def test_jsonl_mapping_and_output_parsing(tmp_path):
@@ -186,6 +248,8 @@ def test_json_schema_mapping_and_saved_request_restore(tmp_path):
     assert restored is not None
     assert restored.messages == request.messages
     assert restored.metadata == request.metadata
+    assert client.has_stage("concepts") is True
+    assert [item.request_id for item in client.get_saved_requests("concepts")] == ["structured"]
 
 
 def test_progress_callback_reports_submission_and_collection(tmp_path):
@@ -204,7 +268,7 @@ def test_progress_callback_reports_submission_and_collection(tmp_path):
     assert "finalized 1/1 request(s)" in joined
 
 
-def test_progress_callback_reports_each_wait_poll(tmp_path):
+def test_progress_callback_reports_only_poll_state_changes(tmp_path):
     class PollingBatches(_Batches):
         def __init__(self, storage):
             super().__init__(storage)
@@ -217,7 +281,9 @@ def test_progress_callback_reports_each_wait_poll(tmp_path):
 
         def get(self, *, name: str):
             self.get_calls += 1
-            if self.get_calls >= 3:
+            if self.get_calls in {4, 5}:
+                self.states[name] = "JOB_STATE_QUEUED"
+            elif self.get_calls >= 6:
                 self.states[name] = "JOB_STATE_SUCCEEDED"
             return super().get(name=name)
 
@@ -230,8 +296,12 @@ def test_progress_callback_reports_each_wait_poll(tmp_path):
     client.run_stage("query-unit-1", [_request("opaque-1")])
 
     joined = "\n".join(progress)
+    poll_messages = [message for message in progress if ": poll " in message]
     assert "polling every 0s" in joined
-    assert "poll 1; jobs/1 is JOB_STATE_SUCCEEDED" in joined
+    assert poll_messages == [
+        "[Vertex Batch] Stage 'query-unit-1': poll 2; jobs/1 is JOB_STATE_QUEUED.",
+        "[Vertex Batch] Stage 'query-unit-1': poll 4; jobs/1 is JOB_STATE_SUCCEEDED.",
+    ]
 
 
 def test_empty_stage_is_cloud_free(tmp_path):
@@ -242,6 +312,74 @@ def test_empty_stage_is_cloud_free(tmp_path):
     assert client.run_stage("unused", []) == {}
     assert batches.created == []
     assert storage.uploads == {}
+
+
+def test_small_stage_uses_direct_vertex_calls(tmp_path, monkeypatch):
+    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
+    storage = _Storage()
+    batches = _Batches(storage)
+    direct_client = _DirectClient()
+    progress = []
+    client = _client(
+        tmp_path,
+        batches,
+        storage,
+        direct_client=direct_client,
+        progress_callback=progress.append,
+    )
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    requests = [_request(f"request-{index}") for index in range(5)]
+    requests[0].response_format["response_schema"] = schema
+
+    responses = client.run_stage("small-stage", requests)
+
+    assert batches.created == []
+    assert storage.uploads == {}
+    assert not (tmp_path / "batch_manifest.json").exists()
+    assert len(direct_client.calls) == 5
+    assert direct_client.calls[0][1] == {
+        "temperature": 0.2,
+        "max_tokens": 55,
+        "response_format": requests[0].response_format,
+        "response_json_schema": schema,
+    }
+    assert responses["request-0"].content == "direct-request-0"
+    assert any("using direct Vertex AI calls" in message for message in progress)
+
+
+def test_six_requests_create_a_batch_job(tmp_path, monkeypatch):
+    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
+    storage = _Storage()
+    batches = _Batches(storage)
+    direct_client = _DirectClient()
+    client = _client(tmp_path, batches, storage, direct_client=direct_client)
+
+    responses = client.run_stage(
+        "batch-stage",
+        [_request(f"request-{index}") for index in range(6)],
+    )
+
+    assert len(batches.created) == 1
+    assert direct_client.calls == []
+    assert len(responses) == 6
+
+
+def test_small_batch_retry_uses_direct_vertex_calls(tmp_path, monkeypatch):
+    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
+    storage = _Storage()
+    batches = _Batches(storage, partial_first_job=True)
+    direct_client = _DirectClient()
+    client = _client(tmp_path, batches, storage, direct_client=direct_client)
+
+    responses = client.run_stage(
+        "partial-stage",
+        [_request(f"request-{index}") for index in range(6)],
+    )
+
+    assert len(batches.created) == 1
+    assert len(direct_client.calls) == 5
+    assert len(responses) == 6
+    assert responses["request-5"].content == "direct-request-5"
 
 
 @pytest.mark.parametrize("method_name", ["amem", "mem0", "memos", "memrl", "mirix"])

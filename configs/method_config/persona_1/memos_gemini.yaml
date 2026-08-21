@@ -1,36 +1,30 @@
-# MemOS Agent Configuration with Gemini selected as the model.
-
-method_name: "memos"
-method_type: "agentic_memory"
-description: "MemOS with Gemini Enterprise Agent Platform final-answer generation"
-
+method_name: memos
+method_type: agentic_memory
+description: MemOS with hybrid Gemini provider final-answer generation
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
-  max_completion_tokens: 10000
-
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
 embedding:
-  provider: "local"
-  model: "BAAI/bge-small-zh-v1.5"
-  model_path: "BAAI/bge-small-zh-v1.5"
-
-agent_params:
+  provider: local
+  model: BAAI/bge-small-zh-v1.5
+  model_path: BAAI/bge-small-zh-v1.5
+build_config:
   retrieve_num: 5
-  # The vendored MemOS memory engine currently accepts OpenAI-compatible LLMs.
-  memos_backend: "gemini"
-  memos_model: "gemini-2.5-flash"
-  text_mem_type: "general_text"
-  embedding_model: "BAAI/bge-small-zh-v1.5"
-  embedding_model_path: "BAAI/bge-small-zh-v1.5"
+  memos_backend: gemini
+  memos_model: gemini-2.5-flash
+  text_mem_type: general_text
+  embedding_model: BAAI/bge-small-zh-v1.5
+  embedding_model_path: BAAI/bge-small-zh-v1.5
   embedding_dim: 512
-  embedding_provider: "local"
+  embedding_provider: local
   max_input_tokens: 40960
   max_question_tokens: 10000
   max_context_tokens: 128000
   max_memory_tokens: 80000
-
-# Run this method against persona 1 only; all sessions remain available.
+retrieval_config: {}
 dataset_overrides:
-  persona_ids: [1]
+  persona_ids:
+  - 1
   max_sessions_per_persona: null

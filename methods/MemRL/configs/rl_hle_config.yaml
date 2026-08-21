@@ -4,7 +4,7 @@ llm:
   api_key: "sk-REPLACE_ME"
   base_url: "https://api.openai.com/v1"
   model: "gemini-3-pro"
-  temperature: 0.6
+  temperature: 0.0
   max_tokens: 65536
 
 # Embedding provider configuration  

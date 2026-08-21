@@ -1,19 +1,16 @@
-# Long-context baseline using Gemini Enterprise Agent Platform (formerly Vertex AI).
-method_name: "long_context"
-method_type: "baseline"
-description: "Long Context Agent using Gemini through Google Agent Platform"
-
+method_name: long_context
+method_type: baseline
+description: Long Context Agent using hybrid Gemini rotation
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
   max_completion_tokens: 8192
-
-agent_params:
+build_config:
   max_context_tokens: 100000
-  truncation_strategy: "oldest_first"
-
-# Run this method against persona 1 only; all sessions remain available.
+  truncation_strategy: oldest_first
+retrieval_config: {}
 dataset_overrides:
-  persona_ids: [1]
+  persona_ids:
+  - 1
   max_sessions_per_persona: null

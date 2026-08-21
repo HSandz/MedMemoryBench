@@ -22,6 +22,7 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
+from utils.llm_client import LLMAPIError, get_usage_tracker
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
     EVOLUTION_DECISION_PROMPT,
@@ -48,9 +49,16 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
         def wrapper(*args, **kwargs):
             last_exc = None
             for attempt in range(max_retries + 1):
+                tracker = get_usage_tracker()
+                successful_calls_before = tracker.current_successful_calls()
+                tracker.record_attempt()
                 try:
-                    return func(*args, **kwargs)
+                    result = func(*args, **kwargs)
+                    if tracker.current_successful_calls() == successful_calls_before:
+                        tracker.record_success_without_usage()
+                    return result
                 except Exception as e:
+                    tracker.record_failure()
                     last_exc = e
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -58,6 +66,7 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                             "LLM call %s failed (attempt %d/%d): %s — retrying in %.1fs",
                             func.__name__, attempt + 1, max_retries + 1, e, delay,
                         )
+                        tracker.record_retry()
                         time.sleep(delay)
             logger.error("LLM call %s failed after %d attempts: %s",
                          func.__name__, max_retries + 1, last_exc)
@@ -74,16 +83,25 @@ class RobustBaseLLMController(ABC):
     """Base class for robust LLM controllers (no JSON schema dependency)."""
 
     SYSTEM_MESSAGE = "Follow the format specified in the prompt exactly. Do not add extra commentary."
+    default_temperature = 0.7
+    retry_temperature = 0.3
+    connectivity_temperature = 0.0
+
+    def _resolve_temperature(self, temperature: Optional[float]) -> float:
+        return self.default_temperature if temperature is None else temperature
 
     @abstractmethod
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         """Get a plain-text completion from the LLM."""
         pass
 
     def check_connectivity(self):
         """Send a test call to verify the backend is reachable."""
         try:
-            response = self.get_completion("Reply with exactly one word: READY", temperature=0.0)
+            response = self.get_completion(
+                "Reply with exactly one word: READY",
+                temperature=self.connectivity_temperature,
+            )
             if not response or not response.strip():
                 raise ConnectionError("Empty response from LLM backend")
             logger.info("LLM connectivity check passed (response: %s)", response.strip()[:50])
@@ -138,7 +156,7 @@ class RobustOpenAIController(RobustBaseLLMController):
             logger.debug("Failed to record usage: %s", e)
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         start_time = time.time()
         params = {
             "model": self.model,
@@ -146,7 +164,7 @@ class RobustOpenAIController(RobustBaseLLMController):
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": temperature,
+            "temperature": self._resolve_temperature(temperature),
         }
         if self._use_max_completion_tokens():
             params["max_completion_tokens"] = self.max_tokens
@@ -166,23 +184,24 @@ class RobustGeminiController(RobustBaseLLMController):
         model: str = "gemini-2.5-flash",
         max_tokens: int = 1000,
         provider: str = "gemini",
+        temperature: float = 0.7,
     ):
         from utils.llm_client import create_llm_client
 
         self.client = create_llm_client(
             provider=provider,
             model=model,
-            temperature=0.7,
+            temperature=temperature,
             max_tokens=max_tokens,
         )
 
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         response = self.client.chat(
             [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt},
             ],
-            temperature=temperature,
+            temperature=self._resolve_temperature(temperature),
         )
         return response.content
 
@@ -190,11 +209,12 @@ class RobustGeminiController(RobustBaseLLMController):
 class RobustOllamaController(RobustBaseLLMController):
     """Direct Ollama library controller (no LiteLLM proxy)."""
 
-    def __init__(self, model: str = "llama2"):
+    def __init__(self, model: str = "llama2", max_tokens: int = 1000):
         self.model = model
+        self.max_tokens = max_tokens
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         try:
             from ollama import chat
         except ImportError:
@@ -205,7 +225,10 @@ class RobustOllamaController(RobustBaseLLMController):
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt}
             ],
-            options={"temperature": temperature},
+            options={
+                "temperature": self._resolve_temperature(temperature),
+                "num_predict": self.max_tokens,
+            },
         )
         return response["message"]["content"]
 
@@ -213,19 +236,21 @@ class RobustOllamaController(RobustBaseLLMController):
 class RobustSGLangController(RobustBaseLLMController):
     def __init__(self, model: str = "llama2",
                  sglang_host: str = "http://localhost",
-                 sglang_port: int = 30000):
+                 sglang_port: int = 30000,
+                 max_tokens: int = 1000):
         import requests as _requests
         self._requests = _requests
         self.model = model
+        self.max_tokens = max_tokens
         self.base_url = f"{sglang_host}:{sglang_port}"
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         payload = {
             "text": prompt,
             "sampling_params": {
-                "temperature": temperature,
-                "max_new_tokens": 1000,
+                "temperature": self._resolve_temperature(temperature),
+                "max_new_tokens": self.max_tokens,
             }
         }
         response = self._requests.post(
@@ -253,14 +278,14 @@ class RobustVLLMController(RobustBaseLLMController):
         self.base_url = f"{vllm_host}:{vllm_port}"
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": temperature,
+            "temperature": self._resolve_temperature(temperature),
             "max_tokens": self.max_tokens,
         }
         response = self._requests.post(
@@ -278,22 +303,24 @@ class RobustLiteLLMController(RobustBaseLLMController):
     """LiteLLM controller for universal LLM access (Ollama, SGLang, etc.)."""
 
     def __init__(self, model: str, api_base: Optional[str] = None,
-                 api_key: Optional[str] = None):
+                 api_key: Optional[str] = None, max_tokens: int = 1000):
         from litellm import completion as _completion
         self._completion = _completion
         self.model = model
         self.api_base = api_base
         self.api_key = api_key or "EMPTY"
+        self.max_tokens = max_tokens
 
     @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
+    def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
         completion_args = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": temperature,
+            "temperature": self._resolve_temperature(temperature),
+            "max_tokens": self.max_tokens,
         }
         if self.api_base:
             completion_args["api_base"] = self.api_base
@@ -312,13 +339,19 @@ class RobustLLMController:
     """Factory that selects the right robust LLM controller."""
 
     def __init__(self,
-                 backend: Literal["openai", "gemini", "vertex", "vertex_ai", "ollama", "sglang", "vllm"] = "sglang",
+                 backend: Literal[
+                     "openai", "gemini", "vertex", "ai_studio",
+                     "ollama", "sglang", "vllm"
+                 ] = "sglang",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
                  max_tokens: int = 1000,
+                 temperature: float = 0.7,
+                 retry_temperature: float = 0.3,
+                 connectivity_temperature: float = 0.0,
                  check_connection: bool = False,
                  usage_tracker: Optional[Any] = None):
         if backend == "openai":
@@ -326,18 +359,24 @@ class RobustLLMController:
                 model, api_key=api_key, api_base=api_base,
                 max_tokens=max_tokens, usage_tracker=usage_tracker
             )
-        elif backend in {"gemini", "vertex", "vertex_ai"}:
+        elif backend in {"gemini", "vertex", "ai_studio"}:
             self.llm = RobustGeminiController(
-                model, max_tokens=max_tokens, provider=backend
+                model, max_tokens=max_tokens, provider=backend, temperature=temperature
             )
         elif backend == "ollama":
-            self.llm = RobustOllamaController(model)
+            self.llm = RobustOllamaController(model, max_tokens=max_tokens)
         elif backend == "sglang":
-            self.llm = RobustSGLangController(model, sglang_host, sglang_port)
+            self.llm = RobustSGLangController(
+                model, sglang_host, sglang_port, max_tokens=max_tokens
+            )
         elif backend == "vllm":
             self.llm = RobustVLLMController(model, sglang_host, sglang_port, max_tokens=max_tokens)
         else:
             raise ValueError("Unsupported LLM backend")
+
+        self.llm.default_temperature = temperature
+        self.llm.retry_temperature = retry_temperature
+        self.llm.connectivity_temperature = connectivity_temperature
 
         if check_connection:
             self.llm.check_connectivity()
@@ -405,6 +444,11 @@ class RobustMemoryNote:
     @staticmethod
     def analyze_content(content: str, llm_controller: RobustLLMController) -> Dict:
         """Analyze content using plain-text prompt + section-marker parsing."""
+        with get_usage_tracker().scope("amem.base.note_analysis"):
+            return RobustMemoryNote._analyze_content(content, llm_controller)
+
+    @staticmethod
+    def _analyze_content(content: str, llm_controller: RobustLLMController) -> Dict:
         prompt = ANALYZE_CONTENT_PROMPT.format(content=content)
         try:
             response = llm_controller.llm.get_completion(prompt)
@@ -414,7 +458,9 @@ class RobustMemoryNote:
             if not analysis["keywords"]:
                 logger.info("Keywords empty after initial parse — retrying with focused prompt")
                 retry_prompt = FOCUSED_KEYWORDS_PROMPT.format(content=content)
-                retry_response = llm_controller.llm.get_completion(retry_prompt, temperature=0.3)
+                retry_response = llm_controller.llm.get_completion(
+                    retry_prompt, temperature=llm_controller.llm.retry_temperature
+                )
                 from llm_text_parsers import _parse_list_items
                 analysis["keywords"] = _parse_list_items(retry_response)
 
@@ -423,6 +469,8 @@ class RobustMemoryNote:
             return analysis
 
         except Exception as e:
+            if isinstance(e, LLMAPIError):
+                raise
             logger.error("Error analyzing content: %s", e)
             # Graceful degradation: heuristic keywords/context
             from llm_text_parsers import _heuristic_keywords, _heuristic_context
@@ -450,6 +498,9 @@ class RobustAgenticMemorySystem:
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
                  max_tokens: int = 1000,
+                 temperature: float = 0.7,
+                 retry_temperature: float = 0.3,
+                 connectivity_temperature: float = 0.0,
                  max_context_chars: int = 100000,
                  check_connection: bool = False,
                  usage_tracker: Optional[Any] = None):
@@ -458,7 +509,9 @@ class RobustAgenticMemorySystem:
         self.retriever = SimpleEmbeddingRetriever(model_name)
         self.llm_controller = RobustLLMController(
             llm_backend, llm_model, api_key, api_base,
-            sglang_host, sglang_port, max_tokens, check_connection,
+            sglang_host, sglang_port, max_tokens,
+            temperature, retry_temperature, connectivity_temperature,
+            check_connection,
             usage_tracker=usage_tracker,
         )
         self.evo_cnt = 0
@@ -478,12 +531,13 @@ class RobustAgenticMemorySystem:
         )
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        self.retriever.add_documents([
-            "content:" + note.content +
-            " context:" + note.context +
-            " keywords: " + ", ".join(note.keywords) +
-            " tags: " + ", ".join(note.tags)
-        ])
+        with get_usage_tracker().scope("amem.embedding.index"):
+            self.retriever.add_documents([
+                "content:" + note.content +
+                " context:" + note.context +
+                " keywords: " + ", ".join(note.keywords) +
+                " tags: " + ", ".join(note.tags)
+            ])
         if evo_label:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
@@ -492,6 +546,10 @@ class RobustAgenticMemorySystem:
 
     def consolidate_memories(self):
         """Re-initialize the retriever with current memory state."""
+        with get_usage_tracker().scope("amem.embedding.consolidation"):
+            self._consolidate_memories()
+
+    def _consolidate_memories(self):
         try:
             model_name = self.retriever.model.get_config_dict()['model_name']
         except (AttributeError, KeyError):
@@ -568,6 +626,10 @@ class RobustAgenticMemorySystem:
           2. Strengthen details (skip if no strengthen)
           3. Update neighbors (skip if no update)
         """
+        with get_usage_tracker().scope("amem.original_evolution"):
+            return self._process_memory(note)
+
+    def _process_memory(self, note: RobustMemoryNote) -> tuple:
         neighbor_memory, indices = self.find_related_memories(note.content, k=5)
 
         if len(indices) == 0:
@@ -647,5 +709,7 @@ class RobustAgenticMemorySystem:
             return True, note
 
         except Exception as e:
+            if isinstance(e, LLMAPIError):
+                raise
             logger.error("Evolution failed for note %s: %s — storing without evolution", note.id, e)
             return False, note

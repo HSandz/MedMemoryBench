@@ -20,6 +20,7 @@ from utils.llm_client import (
     format_messages,
     BaseLLMClient,
     get_usage_tracker,
+    is_gemini_provider,
     LLMResponse,
 )
 from utils.vertex_batch import (
@@ -43,6 +44,12 @@ class TrackedLLMProvider:
         self,
         llm_client: BaseLLMClient,
         model_name: str,
+        default_temperature: float = 0.7,
+        default_max_tokens: Optional[int] = None,
+        keyword_temperature: float = 0.0,
+        keyword_max_tokens: int = 100,
+        script_temperature: float = 0.7,
+        script_max_tokens: int = 500,
     ):
         """Initialize tracked LLM provider.
 
@@ -52,6 +59,12 @@ class TrackedLLMProvider:
         """
         self._client = llm_client
         self._model_name = model_name
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.keyword_temperature = keyword_temperature
+        self.keyword_max_tokens = keyword_max_tokens
+        self.script_temperature = script_temperature
+        self.script_max_tokens = script_max_tokens
 
         # Statistics for reporting
         self._call_count = 0
@@ -70,8 +83,12 @@ class TrackedLLMProvider:
             Generated response text
         """
         # Extract parameters
-        temperature = kwargs.get("temperature", 0.7)
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+        temperature = kwargs.get("temperature", self.default_temperature)
+        max_tokens = (
+            kwargs.get("max_tokens")
+            or kwargs.get("max_completion_tokens")
+            or self.default_max_tokens
+        )
 
         # Call tracked client
         response = self._client.chat(
@@ -113,7 +130,11 @@ Text: {text}
 Keywords:"""
 
         messages = [{"role": "user", "content": prompt}]
-        response = self.generate(messages, temperature=0, max_tokens=100)
+        response = self.generate(
+            messages,
+            temperature=self.keyword_temperature,
+            max_tokens=self.keyword_max_tokens,
+        )
 
         # Parse keywords from response
         keywords_text = response.strip()
@@ -137,7 +158,11 @@ Keywords:"""
             High-level script representation
         """
         messages = self.prepare_script_messages(trajectory)
-        return self.generate(messages, temperature=0.7, max_tokens=500)
+        return self.generate(
+            messages,
+            temperature=self.script_temperature,
+            max_tokens=self.script_max_tokens,
+        )
 
     @staticmethod
     def prepare_script_messages(trajectory: str) -> List[Dict[str, str]]:
@@ -294,6 +319,14 @@ class MemRLAgent(BaseAgent):
         query_memory_item_tokens: int = 300,
         query_memory_context_tokens: int = 1800,
         max_concurrent_api_calls: int = 4,
+        memrl_keyword_temperature: float = 0.0,
+        memrl_keyword_max_tokens: int = 100,
+        memrl_script_temperature: float = 0.7,
+        memrl_script_max_tokens: int = 500,
+        memrl_reflection_temperature: float = 0.3,
+        memrl_reflection_max_tokens: Optional[int] = None,
+        memrl_extractor_temperature: float = 0.0,
+        memrl_extractor_max_tokens: int = 4096,
         # Embedding configuration
         embedding_model: str = "all-MiniLM-L6-v2",
         embedding_provider: str = "local",
@@ -329,6 +362,14 @@ class MemRLAgent(BaseAgent):
         self.query_memory_item_tokens = query_memory_item_tokens
         self.query_memory_context_tokens = query_memory_context_tokens
         self.max_concurrent_api_calls = max_concurrent_api_calls
+        self.memrl_keyword_temperature = memrl_keyword_temperature
+        self.memrl_keyword_max_tokens = memrl_keyword_max_tokens
+        self.memrl_script_temperature = memrl_script_temperature
+        self.memrl_script_max_tokens = memrl_script_max_tokens
+        self.memrl_reflection_temperature = memrl_reflection_temperature
+        self.memrl_reflection_max_tokens = memrl_reflection_max_tokens
+        self.memrl_extractor_temperature = memrl_extractor_temperature
+        self.memrl_extractor_max_tokens = memrl_extractor_max_tokens
 
         # Token limits
         self.max_input_tokens = int(kwargs.get("max_input_tokens", 8000))
@@ -356,11 +397,13 @@ class MemRLAgent(BaseAgent):
         self.weight_q = weight_q
 
         # API configuration
-        self._api_key = (
-            api_key
-            or os.environ.get("BIGMODEL_API_KEY")
-            or os.environ.get("OPENAI_API_KEY", "")
-        )
+        self._api_key = api_key
+        if not is_gemini_provider(provider):
+            self._api_key = (
+                self._api_key
+                or os.environ.get("BIGMODEL_API_KEY")
+                or os.environ.get("OPENAI_API_KEY", "")
+            )
         self._base_url = (
             base_url
             or os.environ.get("BIGMODEL_BASE_URL")
@@ -424,7 +467,7 @@ class MemRLAgent(BaseAgent):
     def _create_mos_config(self) -> str:
         """Create a temporary MemOS configuration file."""
         self._temp_dir = tempfile.mkdtemp(prefix="memrl_agent_")
-        use_vertex_gemini = self._provider.lower() in {"gemini", "vertex", "vertex_ai"}
+        use_gemini = is_gemini_provider(self._provider)
         llm_config = {
             "model_name_or_path": self.model,
             "temperature": self.temperature,
@@ -432,10 +475,13 @@ class MemRLAgent(BaseAgent):
         }
         extractor_config = {
             "model_name_or_path": self.model,
-            "temperature": 0.0,
-            "max_tokens": 4096,
+            "temperature": self.memrl_extractor_temperature,
+            "max_tokens": self.memrl_extractor_max_tokens,
         }
-        if not use_vertex_gemini:
+        if use_gemini:
+            llm_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
+            extractor_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
+        else:
             llm_config.update({"api_key": self._api_key, "api_base": self._base_url})
             extractor_config.update({"api_key": self._api_key, "api_base": self._base_url})
 
@@ -466,14 +512,14 @@ class MemRLAgent(BaseAgent):
                 }
             },
             "chat_model": {
-                "backend": "gemini" if use_vertex_gemini else "openai",
+                "backend": "gemini" if use_gemini else "openai",
                 "config": llm_config,
             },
             "mem_reader": {
                 "backend": "simple_struct",
                 "config": {
                     "llm": {
-                        "backend": "gemini" if use_vertex_gemini else "openai",
+                        "backend": "gemini" if use_gemini else "openai",
                         "config": extractor_config,
                     },
                     "embedder": embedder_config,
@@ -514,7 +560,15 @@ class MemRLAgent(BaseAgent):
         self._tracked_llm = TrackedLLMProvider(
             llm_client=self._llm_client,
             model_name=self.model,
+            default_temperature=self.temperature,
+            default_max_tokens=self.max_tokens,
+            keyword_temperature=self.memrl_keyword_temperature,
+            keyword_max_tokens=self.memrl_keyword_max_tokens,
+            script_temperature=self.memrl_script_temperature,
+            script_max_tokens=self.memrl_script_max_tokens,
         )
+        self._tracked_llm.reflection_temperature = self.memrl_reflection_temperature
+        self._tracked_llm.reflection_max_tokens = self.memrl_reflection_max_tokens
 
         # Initialize embedding provider
         if self.embedding_provider == "local":
@@ -619,9 +673,8 @@ class MemRLAgent(BaseAgent):
                 BatchChatRequest(
                     request_id=request_id,
                     messages=self._tracked_llm.prepare_script_messages(chunk),
-                    # These are the constants in TrackedLLMProvider.generate_script.
-                    temperature=0.7,
-                    max_tokens=500,
+                    temperature=getattr(self, "memrl_script_temperature", 0.7),
+                    max_tokens=getattr(self, "memrl_script_max_tokens", 500),
                     phase="memorize",
                     metadata={"chunk_index": index, "stage": stage},
                 )

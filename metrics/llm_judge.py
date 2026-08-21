@@ -6,6 +6,8 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from .base import BaseMetric, MetricResult
+from .string_match import StringContainMetric
+from utils.llm_client import InvalidLLMResponseError, is_gemini_provider, with_retry
 from utils.templates import get_prompt_manager
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,10 @@ class LLMJudge:
     def __init__(self, dataset: str = "medmemorybench", client=None,
                  judge_model: str = None, judge_provider: str = None,
                  judge_api_key: str = None, judge_base_url: str = None,
+                 judge_temperature: float = None,
+                 judge_client_max_tokens: int = None,
+                 judge_max_tokens: int = None,
+                 judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._client = client
         self._initialized = False
@@ -28,6 +34,38 @@ class LLMJudge:
         self._active_judge_provider: Optional[str] = None
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
+        self._judge_temperature = judge_temperature
+        self._judge_client_max_tokens = judge_client_max_tokens
+        self._judge_max_tokens = judge_max_tokens
+        self._judge_mcd_max_tokens = judge_mcd_max_tokens
+
+    def _settings(self) -> Dict[str, Any]:
+        """Resolve judge generation settings from explicit values or `.env`."""
+        from src.config import get_api_config
+
+        api_config = get_api_config()
+        return {
+            "temperature": (
+                self._judge_temperature
+                if self._judge_temperature is not None
+                else api_config.get_judge_temperature()
+            ),
+            "client_max_tokens": (
+                self._judge_client_max_tokens
+                if self._judge_client_max_tokens is not None
+                else api_config.get_judge_client_max_tokens()
+            ),
+            "max_tokens": (
+                self._judge_max_tokens
+                if self._judge_max_tokens is not None
+                else api_config.get_judge_max_tokens()
+            ),
+            "mcd_max_tokens": (
+                self._judge_mcd_max_tokens
+                if self._judge_mcd_max_tokens is not None
+                else api_config.get_judge_max_tokens("multi_hop_clinical_deduction")
+            ),
+        }
 
     def _ensure_client(self):
         if not self._initialized:
@@ -46,8 +84,8 @@ class LLMJudge:
                 self._client = create_llm_client(
                     provider=provider,
                     model=model,
-                    temperature=1.0,
-                    max_tokens=10000,
+                    temperature=self._settings()["temperature"],
+                    max_tokens=self._settings()["client_max_tokens"],
                     api_key=api_key,
                     base_url=base_url,
                 )
@@ -98,35 +136,34 @@ class LLMJudge:
 
         return None
 
-    def _call_llm(self, prompt: str, max_tokens: int = 500) -> Optional[Dict[str, Any]]:
+    @with_retry()
+    def _call_llm(self, prompt: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
         self._ensure_client()
+        settings = self._settings()
+
+        request = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": settings["temperature"],
+            "max_tokens": max_tokens if max_tokens is not None else settings["max_tokens"],
+        }
+        # Gemini guarantees a JSON MIME response for judge prompts.
+        if is_gemini_provider(self._active_judge_provider):
+            request["response_format"] = {"type": "json_object"}
+        response = self._client.chat(**request)
+        result_text = response.content.strip()
 
         try:
-            request = {
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-            }
-            # Gemini guarantees a JSON MIME response for judge prompts.
-            if self._active_judge_provider in {"gemini", "vertex", "vertex_ai"}:
-                request["response_format"] = {"type": "json_object"}
-            response = self._client.chat(**request)
-            result_text = response.content.strip()
+            return json.loads(result_text)
+        except json.JSONDecodeError:
+            pass
 
-            # First try direct JSON parsing
-            try:
-                return json.loads(result_text)
-            except json.JSONDecodeError:
-                pass
+        result = self._extract_json_from_text(result_text)
+        if result is not None:
+            return result
 
-            # Use bracket-matching extraction for nested JSON structures
-            result = self._extract_json_from_text(result_text)
-            if result is not None:
-                return result
-
-            logger.warning(f"[LLMJudge] Failed to extract JSON from response: {result_text[:200]}...")
-        except Exception as e:
-            print(f"[LLMJudge] API call failed: {e}")
-        return None
+        raise InvalidLLMResponseError(
+            "LLM judge returned a response that could not be parsed as JSON."
+        )
 
     def _is_empty_output(self, model_output: str) -> bool:
         return not model_output or not model_output.strip()
@@ -134,9 +171,13 @@ class LLMJudge:
     def get_batch_client(self):
         """Return the managed Gemini client after lazy initialization."""
         self._ensure_client()
-        from utils.llm_client import GeminiEnterpriseClient
+        from utils.llm_client import GeminiHybridClient, GeminiVertexClient
 
-        return self._client if isinstance(self._client, GeminiEnterpriseClient) else None
+        return (
+            self._client
+            if isinstance(self._client, (GeminiVertexClient, GeminiHybridClient))
+            else None
+        )
 
     def prepare_batch_prompt(
         self,
@@ -174,7 +215,12 @@ class LLMJudge:
                 explanation=explanation,
                 metadata_info=metadata_info,
             )
-            return {"prompt": prompt, "max_tokens": 500, "query_type": query_type}
+            return {
+                "prompt": prompt,
+                "temperature": self._settings()["temperature"],
+                "max_tokens": self._settings()["max_tokens"],
+                "query_type": query_type,
+            }
 
         if query_type == "multi_hop_clinical_deduction":
             reasoning_chain = (metadata or {}).get("reasoning_chain", [])
@@ -206,11 +252,19 @@ class LLMJudge:
                 hop_count=hop_count,
                 reasoning_pattern=reasoning_pattern,
             )
-            return {"prompt": prompt, "max_tokens": 2000, "query_type": query_type}
+            return {
+                "prompt": prompt,
+                "temperature": self._settings()["temperature"],
+                "max_tokens": self._settings()["mcd_max_tokens"],
+                "query_type": query_type,
+            }
 
-        effective_type = query_type if query_type in {
-            "temporal_localization", "state_update", "locomo_open_domain"
-        } else "state_update"
+        if query_type in {"entity_exact_match", "entity_exact_match_judge"}:
+            effective_type = "entity_exact_match"
+        elif query_type in {"temporal_localization", "state_update", "locomo_open_domain"}:
+            effective_type = query_type
+        else:
+            effective_type = "state_update"
         prompt = self._prompt_manager.format_judge(
             query_type=effective_type,
             question=question,
@@ -218,7 +272,12 @@ class LLMJudge:
             expected_answer=expected_answer,
             explanation=explanation,
         )
-        return {"prompt": prompt, "max_tokens": 500, "query_type": query_type}
+        return {
+            "prompt": prompt,
+            "temperature": self._settings()["temperature"],
+            "max_tokens": self._settings()["max_tokens"],
+            "query_type": query_type,
+        }
 
     @staticmethod
     def _empty_batch_result(query_type: str) -> Dict[str, Any]:
@@ -236,7 +295,9 @@ class LLMJudge:
         except json.JSONDecodeError:
             parsed = self._extract_json_from_text(result_text)
         if not parsed:
-            return self._empty_batch_result(payload["query_type"]) | {"reason": "Judge failed"}
+            raise InvalidLLMResponseError(
+                "Batch LLM judge returned a response that could not be parsed as JSON."
+            )
 
         if payload["query_type"] != "multi_hop_clinical_deduction":
             is_correct = bool(parsed.get("is_correct", False))
@@ -311,6 +372,35 @@ class LLMJudge:
 
         prompt = self._prompt_manager.format_judge(
             query_type="state_update",
+            question=question,
+            model_output=model_output,
+            expected_answer=expected_answer,
+            explanation=explanation,
+        )
+
+        result = self._call_llm(prompt)
+        if result:
+            is_correct = result.get("is_correct", False)
+            return {
+                "is_correct": is_correct,
+                "score": 1.0 if is_correct else 0.0,
+                "reason": result.get("reason", ""),
+            }
+        return {"is_correct": False, "score": 0.0, "reason": "Judge failed"}
+
+    def judge_entity_exact_match(
+        self,
+        question: str,
+        model_output: str,
+        expected_answer: str,
+        explanation: str = "",
+    ) -> Dict[str, Any]:
+        if self._is_empty_output(model_output):
+            logger.warning("[LLMJudge] Empty model output for entity_exact_match")
+            return {"is_correct": False, "score": 0.0, "reason": EMPTY_OUTPUT_REASON}
+
+        prompt = self._prompt_manager.format_judge(
+            query_type="entity_exact_match",
             question=question,
             model_output=model_output,
             expected_answer=expected_answer,
@@ -439,7 +529,7 @@ Node {node_id}:
             reasoning_pattern=reasoning_pattern,
         )
 
-        result = self._call_llm(prompt, max_tokens=2000)
+        result = self._call_llm(prompt, max_tokens=self._settings()["mcd_max_tokens"])
         if result:
             is_correct = result.get("is_correct", False)
             ncr_score = result.get("ncr_score", 0.0)
@@ -525,11 +615,17 @@ class LLMJudgeMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
+                 judge_temperature: float = None, judge_client_max_tokens: int = None,
+                 judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
+        self._judge_temperature = judge_temperature
+        self._judge_client_max_tokens = judge_client_max_tokens
+        self._judge_max_tokens = judge_max_tokens
+        self._judge_mcd_max_tokens = judge_mcd_max_tokens
         self._language = language
         self._judge: Optional[LLMJudge] = None
 
@@ -541,6 +637,10 @@ class LLMJudgeMetric(BaseMetric):
                 judge_model=self._judge_model,
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
+                judge_temperature=self._judge_temperature,
+                judge_client_max_tokens=self._judge_client_max_tokens,
+                judge_max_tokens=self._judge_max_tokens,
+                judge_mcd_max_tokens=self._judge_mcd_max_tokens,
                 language=self._language,
             )
         return self._judge
@@ -567,6 +667,10 @@ class LLMJudgeMetric(BaseMetric):
 
         if query_type == "temporal_localization":
             result = self.judge.judge_temporal_localization(
+                question, model_output, expected_answer, explanation
+            )
+        elif query_type in {"entity_exact_match", "entity_exact_match_judge"}:
+            result = self.judge.judge_entity_exact_match(
                 question, model_output, expected_answer, explanation
             )
         elif query_type == "state_update":
@@ -628,6 +732,7 @@ class LLMJudgeMetric(BaseMetric):
             "query_type": query_type,
             "model_output": model_output,
             "expected_answer": expected_answer,
+            "expected_answers": expected_answers,
             "question": question,
             "explanation": explanation,
             "judge_payload": self.judge.prepare_batch_prompt(
@@ -653,6 +758,74 @@ class LLMJudgeMetric(BaseMetric):
         )
 
 
+class EEMJudgeMetric(LLMJudgeMetric):
+    """Run the original EEM metric and the LLM judge for the same query."""
+
+    NAME = "eem_judge"
+
+    @staticmethod
+    def _with_original_eem(
+        result: MetricResult,
+        original_result: MetricResult,
+    ) -> MetricResult:
+        result.details["metrics"] = {
+            "EEM": {
+                "metric": "string_contain",
+                "score": original_result.score,
+                "is_correct": original_result.is_correct,
+                "details": original_result.details,
+            },
+            "EEM_judge": {
+                "metric": EEMJudgeMetric.NAME,
+                "score": result.score,
+                "is_correct": result.is_correct,
+                "details": {
+                    "judge_reason": result.details.get("judge_reason", ""),
+                },
+            },
+        }
+        return result
+
+    def compute(
+        self,
+        query_id: str,
+        query_type: str,
+        model_output: str,
+        expected_answers: List[str],
+        question: str = "",
+        **kwargs,
+    ) -> MetricResult:
+        result = super().compute(
+            query_id=query_id,
+            query_type=query_type,
+            model_output=model_output,
+            expected_answers=expected_answers,
+            question=question,
+            **kwargs,
+        )
+        original_result = StringContainMetric().compute(
+            query_id=query_id,
+            query_type=query_type,
+            model_output=model_output,
+            expected_answers=expected_answers,
+            question=question,
+        )
+        return self._with_original_eem(result, original_result)
+
+    def finalize_batch(self, prepared: Dict[str, Any], result_text: str) -> MetricResult:
+        result = super().finalize_batch(prepared, result_text)
+        original_result = StringContainMetric().compute(
+            query_id=prepared["query_id"],
+            query_type=prepared["query_type"],
+            model_output=prepared["model_output"],
+            expected_answers=prepared.get(
+                "expected_answers", [prepared["expected_answer"]]
+            ),
+            question=prepared["question"],
+        )
+        return self._with_original_eem(result, original_result)
+
+
 class LLMJudgeMCDMetric(BaseMetric):
     """LLM Judge metric for multi-hop clinical deduction (MCD) with NCR/CRC/CC scoring."""
 
@@ -660,11 +833,17 @@ class LLMJudgeMCDMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
+                 judge_temperature: float = None, judge_client_max_tokens: int = None,
+                 judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
+        self._judge_temperature = judge_temperature
+        self._judge_client_max_tokens = judge_client_max_tokens
+        self._judge_max_tokens = judge_max_tokens
+        self._judge_mcd_max_tokens = judge_mcd_max_tokens
         self._language = language
         self._judge: Optional[LLMJudge] = None
 
@@ -676,6 +855,10 @@ class LLMJudgeMCDMetric(BaseMetric):
                 judge_model=self._judge_model,
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
+                judge_temperature=self._judge_temperature,
+                judge_client_max_tokens=self._judge_client_max_tokens,
+                judge_max_tokens=self._judge_max_tokens,
+                judge_mcd_max_tokens=self._judge_mcd_max_tokens,
                 language=self._language,
             )
         return self._judge

@@ -7,7 +7,7 @@
 methods.before-local-conversion
 
 # Environment and secrets
-.env
+.*
 *.env
 !.env.example
 
@@ -54,6 +54,18 @@ env/
 /requirements_frozen.txt
 /tests/*
 !/tests/test_vertex_batch.py
+!/tests/test_amem_fix_agent.py
+!/tests/test_gemini_retry.py
+!/tests/test_google_ai_studio.py
+!/tests/test_api_failure_separation.py
+!/tests/test_combined_batch_queries.py
+!/tests/test_amem_test_agent.py
+!/tests/test_rejudge.py
+!/tests/test_force_resume.py
+!/tests/test_amem_staged_memory.py
+!/tests/test_build_feature_metrics.py
+!/tests/test_run_directory_layout.py
+!/tests/test_llm_configuration.py
 /docker/
 /.serena/
 /.spec-workflow/

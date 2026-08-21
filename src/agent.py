@@ -5,7 +5,11 @@ from typing import Callable, Dict, Any, Optional, List
 
 from src.config import MethodConfig, DatasetConfig, get_api_config
 from methods.base import MemoryBuildResult, AgentResponse
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import (
+    get_usage_tracker,
+    is_gemini_provider,
+    is_vertex_batch_provider,
+)
 
 
 class AgentManager:
@@ -14,6 +18,8 @@ class AgentManager:
         "long_context": ("methods.long_context", "LongContextAgent"),
         "embedding_rag": ("methods.embedding_rag", "EmbeddingRAGAgent"),
         "bm25_rag": ("methods.bm25_rag", "BM25RAGAgent"),
+        "amem_fix": ("methods.amem_fix_agent", "AMemFixAgent"),
+        "amem_test": ("methods.amem_test_agent", "AMemTestAgent"),
         "amem": ("methods.amem_agent", "AMemAgent"),
         "letta": ("methods.letta_agent", "LettaAgent"),
         "memos": ("methods.memos_agent", "MemOSAgent"),
@@ -82,7 +88,14 @@ class AgentManager:
 
     def _build_agent_params(self, method_key: str) -> Dict[str, Any]:
         model_config = self.method_config.model
-        agent_params = self.method_config.agent_params or {}
+        # Merge sections only at the adapter boundary; snapshot identity keeps
+        # build and retrieval ownership separate.
+        agent_params = {
+            **(self.method_config.build_config or {}),
+            **(self.method_config.retrieval_config or {}),
+        }
+        if not agent_params:
+            agent_params = self.method_config.agent_params or {}
         env_embedding_model = os.environ.get("DEFAULT_EMBEDDING_MODEL")
         env_embedding_provider = os.environ.get("EMBEDDING_PROVIDER", "").lower()
         use_env_embedding = bool(
@@ -98,15 +111,16 @@ class AgentManager:
 
         effective_max_tokens = model_config.max_completion_tokens or model_config.max_tokens
 
+        api_key = model_config.api_key
+        if not is_gemini_provider(model_config.provider):
+            api_key = api_key or self._api_config.openai_api_key
+
         params = {
             "model": model_config.name,
             "temperature": model_config.temperature,
             "max_tokens": effective_max_tokens,
             "provider": model_config.provider,
-            "api_key": (
-                model_config.api_key
-                or self._api_config.openai_api_key
-            ),
+            "api_key": api_key,
             "base_url": (
                 model_config.base_url
                 or self._api_config.openai_base_url
@@ -115,7 +129,7 @@ class AgentManager:
 
         if (
             self._batch_api
-            and model_config.provider.lower() in {"gemini", "vertex", "vertex_ai"}
+            and is_vertex_batch_provider(model_config.provider)
             and method_key in {"lightmem", "remem", "graph_rag", "memrl"}
         ):
             params.update({
@@ -169,6 +183,94 @@ class AgentManager:
                 if self.method_config.embedding.model_path:
                     params["embedding_model_path"] = self.method_config.embedding.model_path
 
+        elif method_key == "amem_fix":
+            params.update({
+                "retrieve_num": agent_params.get("retrieve_num", 10),
+                "amem_backend": agent_params.get("amem_backend", "openai"),
+                "amem_model": agent_params.get("amem_model", model_config.name),
+                "amem_embedding_model": agent_params.get(
+                    "amem_embedding_model", "all-MiniLM-L6-v2"
+                ),
+                "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
+                "amem_max_tokens": agent_params.get("amem_max_tokens", 1000),
+                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
+                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
+                "amem_build_max_context_tokens": agent_params.get(
+                    "amem_build_max_context_tokens", 200000
+                ),
+                "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
+                "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
+                "amem_query_keywords": agent_params.get("amem_query_keywords", True),
+                "amem_expand_links": agent_params.get("amem_expand_links", True),
+            })
+
+        elif method_key == "amem_test":
+            params.update({
+                "retrieve_num": agent_params.get("retrieve_num", 10),
+                "amem_backend": agent_params.get("amem_backend", "openai"),
+                "amem_model": agent_params.get("amem_model", model_config.name),
+                "amem_embedding_model": agent_params.get(
+                    "amem_embedding_model", "all-MiniLM-L6-v2"
+                ),
+                "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
+                "amem_max_tokens": agent_params.get("amem_max_tokens", 1000),
+                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
+                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
+                "amem_build_max_context_tokens": agent_params.get(
+                    "amem_build_max_context_tokens", 200000
+                ),
+                "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
+                "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
+                "amem_query_keywords": agent_params.get("amem_query_keywords", True),
+                "amem_expand_links": agent_params.get("amem_expand_links", True),
+                "amem_original_evolution": agent_params.get(
+                    "amem_original_evolution", True
+                ),
+                "amem_typed_relations": agent_params.get("amem_typed_relations", True),
+                "amem_typed_retrieval": agent_params.get(
+                    "amem_typed_retrieval",
+                    bool(agent_params.get("amem_typed_relations", True)),
+                ),
+                "amem_relation_candidate_count": agent_params.get(
+                    "amem_relation_candidate_count", 5
+                ),
+                "amem_typed_expansion_count": agent_params.get(
+                    "amem_typed_expansion_count", 5
+                ),
+                "amem_expand_related": agent_params.get("amem_expand_related", False),
+                "amem_relation_min_confidence": agent_params.get(
+                    "amem_relation_min_confidence", 0.5
+                ),
+                "amem_relation_temperature": agent_params.get("amem_relation_temperature", 0.2),
+                "amem_temporal_transition_min_confidence": agent_params.get(
+                    "amem_temporal_transition_min_confidence", 0.5
+                ),
+                "amem_temporal_state": agent_params.get("amem_temporal_state", False),
+                "amem_temporal_retrieval": agent_params.get(
+                    "amem_temporal_retrieval",
+                    bool(agent_params.get("amem_temporal_state", False)),
+                ),
+                "amem_temporal_ordering": agent_params.get(
+                    "amem_temporal_ordering", True
+                ),
+                "amem_temporal_expansion_count": agent_params.get(
+                    "amem_temporal_expansion_count", 5
+                ),
+                "amem_provenance": agent_params.get("amem_provenance", False),
+                "amem_provenance_retrieval": agent_params.get(
+                    "amem_provenance_retrieval",
+                    bool(agent_params.get("amem_provenance", False)),
+                ),
+                "amem_provenance_max_evidence": agent_params.get(
+                    "amem_provenance_max_evidence", 10
+                ),
+                "amem_provenance_inject_raw_text": agent_params.get(
+                    "amem_provenance_inject_raw_text", False
+                ),
+            })
+
         elif method_key == "amem":
             params.update({
                 "retrieve_num": agent_params.get("retrieve_num", 5),
@@ -181,6 +283,12 @@ class AgentManager:
                 ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
                 "amem_max_tokens": agent_params.get("amem_max_tokens"),
+                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
+                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
+                "amem_build_max_context_tokens": agent_params.get(
+                    "amem_build_max_context_tokens", 200000
+                ),
                 "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
                 "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
             })
@@ -222,6 +330,8 @@ class AgentManager:
                 "retrieve_num": agent_params.get("retrieve_num", 5),
                 "memos_backend": agent_params.get("memos_backend", "openai"),
                 "memos_model": agent_params.get("memos_model", model_config.name),
+                "memos_temperature": agent_params.get("memos_temperature", 0.0),
+                "memos_max_tokens": agent_params.get("memos_max_tokens", 4096),
                 "text_mem_type": agent_params.get("text_mem_type", "general_text"),
                 "embedding_dim": agent_params.get("embedding_dim"),
                 "observability_search": agent_params.get("observability_search", True),
@@ -284,6 +394,14 @@ class AgentManager:
                 "query_memory_item_tokens": agent_params.get("query_memory_item_tokens", 300),
                 "query_memory_context_tokens": agent_params.get("query_memory_context_tokens", 1800),
                 "max_concurrent_api_calls": agent_params.get("max_concurrent_api_calls", 4),
+                "memrl_keyword_temperature": agent_params.get("memrl_keyword_temperature", 0.0),
+                "memrl_keyword_max_tokens": agent_params.get("memrl_keyword_max_tokens", 100),
+                "memrl_script_temperature": agent_params.get("memrl_script_temperature", 0.7),
+                "memrl_script_max_tokens": agent_params.get("memrl_script_max_tokens", 500),
+                "memrl_reflection_temperature": agent_params.get("memrl_reflection_temperature", 0.3),
+                "memrl_reflection_max_tokens": agent_params.get("memrl_reflection_max_tokens"),
+                "memrl_extractor_temperature": agent_params.get("memrl_extractor_temperature", 0.0),
+                "memrl_extractor_max_tokens": agent_params.get("memrl_extractor_max_tokens", 4096),
                 # Strategy configuration
                 "build_strategy": agent_params.get("build_strategy", "proceduralization"),
                 "retrieve_strategy": agent_params.get("retrieve_strategy", "query"),
@@ -363,6 +481,7 @@ class AgentManager:
                 "lightmem_temperature": agent_params.get("lightmem_temperature", 0.1),
                 "lightmem_max_tokens": agent_params.get("lightmem_max_tokens", 2000),
                 "lightmem_top_p": agent_params.get("lightmem_top_p", 0.1),
+                "lightmem_buffer_max_tokens": agent_params.get("lightmem_buffer_max_tokens", 4096),
                 # Token limits
                 "max_context_tokens": agent_params.get("max_context_tokens", 120000),
             })
@@ -517,9 +636,13 @@ class AgentManager:
             self._agent.set_context_id(context_id)
 
         if memorizing:
-            return self._handle_memorize(message, is_last_session=is_last_session)
+            return self._handle_memorize(
+                message,
+                is_last_session=is_last_session,
+                **kwargs,
+            )
         else:
-            return self._handle_query(message)
+            return self._handle_query(message, **kwargs)
 
     def supports_batch_queries(self) -> bool:
         """Return whether this adapter can separate retrieval from final generation."""
@@ -527,10 +650,36 @@ class AgentManager:
         if callable(adapter_support) and not adapter_support():
             return False
         return bool(
-            self.method_config.model.provider.lower() in {"gemini", "vertex", "vertex_ai"}
+            is_vertex_batch_provider(self.method_config.model.provider)
             and hasattr(self._agent, "prepare_batch_query")
             and hasattr(self._agent, "finalize_batch_query")
         )
+
+    def supports_memory_snapshots(self) -> bool:
+        """Return whether the adapter can persist exact retrieval state."""
+        support = getattr(self._agent, "supports_memory_snapshots", None)
+        return bool(callable(support) and support())
+
+    def export_memory_state(self, context_id: Optional[int] = None) -> Dict[str, Any]:
+        """Export the active adapter's retrieval state."""
+        if not self.supports_memory_snapshots():
+            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
+        if context_id is not None:
+            self.set_context_id(context_id)
+        return self._agent.export_memory_state(context_id=context_id)
+
+    def import_memory_state(
+        self,
+        state: Dict[str, Any],
+        context_id: Optional[int] = None,
+    ) -> None:
+        """Restore the active adapter's retrieval state."""
+        if not self.supports_memory_snapshots():
+            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
+        self._agent.import_memory_state(state, context_id=context_id)
+        resolved_context_id = state.get("context_id") if context_id is None else context_id
+        if resolved_context_id is not None:
+            self._context_id = int(resolved_context_id)
 
     def get_batch_llm_client(self):
         """Expose the managed client only for the evaluator's batch transport."""
@@ -549,6 +698,47 @@ class AgentManager:
         get_usage_tracker().set_phase("query")
         return self._agent.prepare_batch_query(message, **kwargs)
 
+    def supports_staged_queries(self) -> bool:
+        """Return whether retrieval and final generation can run separately."""
+        return bool(
+            hasattr(self._agent, "prepare_batch_query")
+            and hasattr(self._agent, "finalize_batch_query")
+            and getattr(self._agent, "_llm_client", None) is not None
+        )
+
+    def prepare_query(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Run retrieval and freeze the exact final-answer request."""
+        if not self.supports_staged_queries():
+            raise RuntimeError(f"{self.method_name} does not support staged queries")
+        context_id = kwargs.pop("context_id", None)
+        if context_id is not None and context_id != self._context_id:
+            self.set_context_id(context_id)
+        get_usage_tracker().set_phase("query")
+        from utils.templates import get_template_manager
+        template_manager = get_template_manager(self.dataset_config.dataset_name)
+        system_message = template_manager.get_system_message()
+        started_at = time.time()
+        prepared = self._agent.prepare_batch_query(
+            message,
+            system_message=system_message,
+            **kwargs,
+        )
+        return {"prepared": prepared, "started_at": started_at}
+
+    def answer_prepared_query(self, staged_query: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate from a frozen retrieval request and preserve legacy timing."""
+        if not self.supports_staged_queries():
+            raise RuntimeError(f"{self.method_name} does not support staged queries")
+        prepared = staged_query["prepared"]
+        response = self._agent._llm_client.chat(prepared["messages"])
+        finalized = self._agent.finalize_batch_query(prepared, response.content)
+        return {
+            "output": finalized.output,
+            "query_time": time.time() - staged_query["started_at"],
+            "retrieved_count": finalized.retrieved_count,
+            "retrieved_memories": finalized.retrieved_memories,
+        }
+
     def finalize_batch_query(
         self,
         prepared: Dict[str, Any],
@@ -563,11 +753,20 @@ class AgentManager:
             record_usage(response, input_tokens, output_tokens)
         return response
 
-    def _handle_memorize(self, message: str, is_last_session: bool = False) -> MemoryBuildResult:
+    def _handle_memorize(
+        self,
+        message: str,
+        is_last_session: bool = False,
+        **kwargs,
+    ) -> MemoryBuildResult:
         get_usage_tracker().set_phase("memorize")
         start_time = time.time()
 
-        result = self._agent.memorize(message, is_last_session=is_last_session)
+        result = self._agent.memorize(
+            message,
+            is_last_session=is_last_session,
+            **kwargs,
+        )
 
         memory_time = time.time() - start_time
 
@@ -599,7 +798,7 @@ class AgentManager:
             time_cost=memory_time,
         )
 
-    def _handle_query(self, message: str) -> Dict[str, Any]:
+    def _handle_query(self, message: str, **kwargs) -> Dict[str, Any]:
         get_usage_tracker().set_phase("query")
         from utils.templates import get_template_manager
         template_manager = get_template_manager(self.dataset_config.dataset_name)
@@ -607,7 +806,11 @@ class AgentManager:
 
         start_time = time.time()
 
-        response = self._agent.query(message, system_message=system_message)
+        response = self._agent.query(
+            message,
+            system_message=system_message,
+            **kwargs,
+        )
 
         query_time = time.time() - start_time
 

@@ -329,7 +329,7 @@ model:
   provider: "openai"
   name: "gpt-5.1"
   temperature: 0.3
-  max_completion_tokens: 100000
+  max_completion_tokens: 200000
 
 agent_params:
   top_k: 5                          # 检索文档数
@@ -371,15 +371,48 @@ query_types:
 
 ## 📄 输出格式
 
-评测结果保存在 `outputs/<方法>_<模型>/` 目录下：
+完整运行和记忆构建运行按启动时间隔离。显式选择记忆运行的查询重跑会嵌套在
+该记忆来源目录下：
 
 ```
 outputs/
-└── bm25_rag_gpt-5.1/
-    ├── eval_medmemorybench_20260330_181703.json    # 详细结果（JSON）
-    ├── report_medmemorybench_20260330_181703.txt   # 可读报告
-    └── memory_builds_20260330_181703.json          # 记忆构建日志
+└── amem_gemini-2.5-flash/
+    └── 20260814_093138/
+        ├── run_config.json
+        ├── evaluation.log
+        ├── memory/
+        ├── batch/
+        ├── checkpoints/
+        ├── *_memory_build.json
+        └── query_runs/
+            └── 20260814_223919/
+                ├── run_config.json
+                ├── evaluation.log
+                ├── memory_source.json
+                ├── batch/
+                ├── checkpoints/
+                ├── *_result.json
+                └── *_query_answer.json
 ```
+
+`run_config.json` 会保存脱敏后的完整方法、数据集、裁判模型、阶段、批处理和
+恢复设置。MedMemoryBench 上的 AMem 可以拆分记忆构建和查询阶段：
+
+```bash
+python main.py -m persona_1/amem_gemini -d medmemorybench --stage memory
+python main.py -m persona_1/amem_gemini -d medmemorybench --stage query
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS
+```
+
+查询阶段默认选择最新且配置兼容的完整记忆运行，并写入 `memory_source.json`
+固定来源。显式指定统一目录结构中的记忆运行时，`-m` 和 `-d` 可以省略：
+CLI 会从该运行的 `run_config.json` 读取有效配置，验证完整的记忆清单，并在
+`query_runs/<查询启动时间戳>/` 中记录推断来源。查询阶段不会重新读取当前的
+YAML，因此后续修改配置文件不会使已有记忆运行失效。重复运行查询命令会创建
+新的子目录，因此日志、批处理状态和报告不会覆盖之前的查询。`--resume` 会
+继续使用同一个未完成查询子目录。
+旧版记忆目录无法推断这些值，因此仍需显式指定 `-m` 和 `-d`。旧产物可先通过
+`scripts/migrate_run_artifacts.py --dry-run` 审核，再用 `--apply` 迁移。
 
 ## 📝 引用
 

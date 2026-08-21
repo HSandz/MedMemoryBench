@@ -1,23 +1,18 @@
-# HippoRAG 2 configuration using Gemini Enterprise Agent Platform.
-
-method_name: "hipporag"
-method_type: "graph_rag"
-description: "HippoRAG 2 using Gemini Enterprise Agent Platform"
-
+method_name: hipporag
+method_type: graph_rag
+description: HippoRAG 2 using hybrid Gemini provider
 model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-  temperature: 0.3
-  max_completion_tokens: 10000
-
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
 embedding:
-  provider: "local"
-  model: "BAAI/bge-small-zh-v1.5"
-  model_path: "BAAI/bge-small-zh-v1.5"
+  provider: local
+  model: BAAI/bge-small-zh-v1.5
+  model_path: BAAI/bge-small-zh-v1.5
   dim: 512
-
-agent_params:
-  openie_mode: "online"
+build_config:
+  openie_mode: online
   is_directed_graph: false
   synonymy_edge_sim_threshold: 0.8
   synonymy_edge_topk: 2047
@@ -35,3 +30,4 @@ agent_params:
   embedding_max_seq_len: 512
   max_input_tokens: 20000
   max_context_tokens: 120000
+retrieval_config: {}

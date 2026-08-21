@@ -441,6 +441,7 @@ Answer:"""
         messages = self._build_llm_messages(retrieved_context, question)
         return {
             "messages": messages,
+            "context_id": self._context_id,
             "retrieved_context": retrieved_context,
             "query_id": query_id,
             "sub_dataset": sub_dataset,
@@ -460,7 +461,7 @@ Answer:"""
         if prepared["query_id"] is not None:
             self._save_retrieval_context(
                 query_id=prepared["query_id"],
-                context_id=self._context_id,
+                context_id=prepared.get("context_id", self._context_id),
                 sub_dataset=prepared["sub_dataset"],
                 retrieved_context=prepared["retrieved_context"],
                 response=content,

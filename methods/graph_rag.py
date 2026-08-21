@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import networkx as nx
 import numpy as np
 from dotenv import load_dotenv
-from pydantic import Field, BaseModel
+from pydantic import Field, BaseModel, PrivateAttr
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 import tiktoken
@@ -35,6 +35,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
 from utils.llm_client import (
     EmptyGeminiResponseError,
+    GeminiVertexClient,
     create_llm_client,
     get_usage_tracker,
     run_with_gemini_retry,
@@ -90,34 +91,56 @@ def _get_embeddings(embedding_model: str = None):
     return OpenAIEmbeddings(**kwargs)
 
 
+class _RotatingVertexChatModel(ChatGoogleGenerativeAI):
+    """Route LangChain Vertex calls through the shared service-account pool."""
+
+    _rotation_client: GeminiVertexClient = PrivateAttr()
+    _account_models: Dict[int, ChatGoogleGenerativeAI] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, rotation_client: GeminiVertexClient, **model_kwargs):
+        first_account = rotation_client._vertex_accounts[0]
+        super().__init__(
+            credentials=first_account[1],
+            project=first_account[2],
+            **model_kwargs,
+        )
+        self._rotation_client = rotation_client
+        self._account_models = {
+            id(credentials): ChatGoogleGenerativeAI(
+                credentials=credentials,
+                project=project,
+                **model_kwargs,
+            )
+            for _, credentials, project, _ in rotation_client._vertex_accounts
+        }
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return self._rotation_client._run_with_service_account_rotation(
+            lambda client, credentials, project: self._account_models[id(credentials)]._generate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            ),
+            "GraphRAG LangChain call",
+        )
+
+
 def _get_chat_model(model_name: str, temperature: float = 0.7, max_tokens: int = 100, callbacks=None):
     """Create Chat model instance with provider auto-detection."""
     model_lower = model_name.lower()
 
     if 'gemini' in model_lower:
-        from google.oauth2 import service_account
-
-        credential_file = Path(
-            os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
-            or Path(__file__).resolve().parent.parent / "service-account.json"
+        rotation_client = GeminiVertexClient(
+            model=model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
-        if not credential_file.is_file():
-            raise FileNotFoundError(
-                f"Gemini service-account file not found: {credential_file}"
-            )
-        credentials = service_account.Credentials.from_service_account_file(
-            str(credential_file),
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        if not credentials.project_id:
-            raise ValueError("Gemini service-account file does not contain a project_id")
-
-        # vertexai=True routes requests to Vertex AI instead of the Gemini Developer API.
-        return ChatGoogleGenerativeAI(
+        # vertexai=True routes requests to Vertex AI instead of the Developer API.
+        return _RotatingVertexChatModel(
+            rotation_client=rotation_client,
             vertexai=True,
-            project=credentials.project_id,
-            location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
-            credentials=credentials,
+            location=rotation_client.location,
             temperature=temperature,
             model=model_name,
             max_tokens=max_tokens,

@@ -6,10 +6,13 @@ from .llm_client import (
     OpenAIClient,
     AzureOpenAIClient,
     AnthropicClient,
-    GeminiEnterpriseClient,
+    GeminiVertexClient,
+    GeminiAIStudioClient,
+    GeminiHybridClient,
     LLMResponse,
     create_llm_client,
     format_messages,
+    get_google_service_account_files,
 )
 from .templates import TemplateManager, get_template_manager
 
@@ -23,10 +26,13 @@ __all__ = [
     "OpenAIClient",
     "AzureOpenAIClient",
     "AnthropicClient",
-    "GeminiEnterpriseClient",
+    "GeminiVertexClient",
+    "GeminiAIStudioClient",
+    "GeminiHybridClient",
     "LLMResponse",
     "create_llm_client",
     "format_messages",
+    "get_google_service_account_files",
     # Templates
     "TemplateManager",
     "get_template_manager",

@@ -28,6 +28,7 @@ METHOD_TYPE_MAPPING: Dict[str, str] = {
     "letta": "agentic",
     "cognee": "agentic",
     "q2q": "agentic",
+    "amem_fix": "agentic",
 }
 
 MEMORY_SOURCE_DESCRIPTIONS: Dict[str, Dict[str, str]] = {

@@ -1,0 +1,45 @@
+method_name: amem_test
+method_type: agentic_memory
+description: 'A-MEM experimental ablation: typed relations plus provenance'
+model:
+  provider: vertex
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 2000
+build_config:
+  amem_backend: vertex
+  amem_model: gemini-2.5-flash
+  amem_embedding_model: all-MiniLM-L6-v2
+  amem_evo_threshold: 100
+  amem_max_tokens: 1000
+  amem_chunk_size_tokens: 10240
+  amem_build_max_context_tokens: 200000
+  amem_original_evolution: false
+  amem_typed_relations: true
+  amem_relation_candidate_count: 5
+  amem_temporal_state: true
+  amem_provenance: false
+  amem_relation_temperature: 0.0
+  amem_temporal_transition_min_confidence: 0.5
+  amem_temperature: 0.0
+  amem_retry_temperature: 0.0
+  amem_connectivity_temperature: 0.0
+retrieval_config:
+  retrieve_num: 10
+  amem_max_context_tokens: 200000
+  amem_query_keywords: true
+  amem_expand_links: false
+  amem_typed_retrieval: true
+  amem_typed_expansion_count: 10
+  amem_expand_related: false
+  amem_relation_min_confidence: 0.5
+  amem_temporal_expansion_count: 5
+  amem_temporal_retrieval: true
+  amem_provenance_max_evidence: 10
+  amem_provenance_retrieval: false
+  amem_provenance_inject_raw_text: false
+  amem_temporal_ordering: true
+dataset_overrides:
+  persona_ids:
+  - 1
+  max_sessions_per_persona: 50

@@ -1,15 +1,13 @@
-# Zep Agent Configuration
-
-method_name: "zep"
-method_type: "agentic_memory"
-description: "Zep Agent - Cloud-based knowledge graph memory service with Facts/Entities/Episodes retrieval"
-
+method_name: zep
+method_type: agentic_memory
+description: Zep Agent - Cloud-based knowledge graph memory service with Facts/Entities/Episodes
+  retrieval
 model:
-  provider: "openai"
-  name: "gpt-5.1-chat"
-  temperature: 1.0
-  max_completion_tokens: 100000
-
-agent_params:
+  provider: openai
+  name: gpt-5.1-chat
+  temperature: 0.0
+  max_completion_tokens: 200000
+build_config:
   retrieve_num: 5
   chunk_size: 512
+retrieval_config: {}
