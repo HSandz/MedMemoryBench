@@ -113,7 +113,14 @@ class AgentManager:
 
         api_key = model_config.api_key
         if not is_gemini_provider(model_config.provider):
-            api_key = api_key or self._api_config.openai_api_key
+            if model_config.provider.lower() == "modal":
+                api_key = api_key or self._api_config.modal_api_key
+            else:
+                api_key = api_key or self._api_config.openai_api_key
+
+        configured_base_url = self._api_config.openai_base_url
+        if model_config.provider.lower() == "modal":
+            configured_base_url = self._api_config.modal_base_url
 
         params = {
             "model": model_config.name,
@@ -123,7 +130,7 @@ class AgentManager:
             "api_key": api_key,
             "base_url": (
                 model_config.base_url
-                or self._api_config.openai_base_url
+                or configured_base_url
             ),
         }
 

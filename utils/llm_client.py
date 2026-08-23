@@ -932,6 +932,29 @@ class OpenAIClient(BaseLLMClient):
         get_usage_tracker().record(llm_response)
         return llm_response
 
+class ModalClient(OpenAIClient):
+    """OpenAI-compatible client for a Modal-hosted vLLM server."""
+
+    def __init__(
+        self,
+        model: str = "Qwen3-30B-A3B-Instruct-2507-AWQ",
+        temperature: float = 1.0,
+        max_tokens: int = 2000,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key
+            or os.environ.get("MODAL_API_KEY")
+            or os.environ.get("MODAL_PROXY_TOKEN"),
+            base_url=base_url or os.environ.get("MODAL_BASE_URL"),
+            **kwargs,
+        )
+
 
 class AzureOpenAIClient(BaseLLMClient):
     """Azure OpenAI client."""
@@ -1951,6 +1974,7 @@ def create_llm_client(
     """Create LLM client."""
     provider_map = {
         "openai": OpenAIClient,
+        "modal": ModalClient,
         "azure": AzureOpenAIClient,
         "anthropic": AnthropicClient,
         VERTEX_GEMINI_PROVIDER: GeminiVertexClient,
@@ -1988,6 +2012,7 @@ __all__ = [
     "BaseLLMClient",
     # Client implementations
     "OpenAIClient",
+    "ModalClient",
     "AzureOpenAIClient",
     "AnthropicClient",
     "BaseGeminiClient",

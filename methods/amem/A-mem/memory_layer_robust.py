@@ -352,7 +352,7 @@ class RobustLLMController:
 
     def __init__(self,
                  backend: Literal[
-                     "openai", "gemini", "vertex", "ai_studio",
+                     "openai", "modal", "gemini", "vertex", "ai_studio",
                      "ollama", "sglang", "vllm"
                  ] = "sglang",
                  model: str = "gpt-4",
@@ -366,7 +366,14 @@ class RobustLLMController:
                  connectivity_temperature: float = 0.0,
                  check_connection: bool = False,
                  usage_tracker: Optional[Any] = None):
-        if backend == "openai":
+        if backend in {"openai", "modal"}:
+            if backend == "modal":
+                api_key = (
+                    api_key
+                    or os.getenv("MODAL_API_KEY")
+                    or os.getenv("MODAL_PROXY_TOKEN")
+                )
+                api_base = api_base or os.getenv("MODAL_BASE_URL")
             self.llm = RobustOpenAIController(
                 model, api_key=api_key, api_base=api_base,
                 max_tokens=max_tokens, usage_tracker=usage_tracker

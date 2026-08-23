@@ -82,6 +82,9 @@ class APIConfig:
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
 
+    modal_api_key: str = ""
+    modal_base_url: str = ""
+
     bigmodel_api_key: str = ""
     bigmodel_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
 
@@ -115,7 +118,7 @@ class APIConfig:
     def is_configured(self) -> bool:
         if self.use_azure:
             return True
-        return bool(self.openai_api_key)
+        return bool(self.openai_api_key or self.modal_api_key)
 
     def get_judge_model(self) -> str:
         return self.judge_model or self.default_llm_model
@@ -129,9 +132,13 @@ class APIConfig:
             return self.judge_api_keys or self.judge_api_key or self.google_ai_studio_api_keys
         if provider == "vertex":
             return self.judge_api_key
+        if provider == "modal":
+            return self.judge_api_key or self.modal_api_key
         return self.judge_api_key or self.openai_api_key
 
     def get_judge_base_url(self) -> str:
+        if self.get_judge_provider().lower() == "modal":
+            return self.judge_base_url or self.modal_base_url
         return self.judge_base_url or self.openai_base_url
 
     def get_judge_temperature(self) -> float:
@@ -156,6 +163,8 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    modal_api_key = os.getenv("MODAL_API_KEY", "") or os.getenv("MODAL_PROXY_TOKEN", "")
+    modal_base_url = os.getenv("MODAL_BASE_URL", "")
     bigmodel_api_key = os.getenv("BIGMODEL_API_KEY", "")
     bigmodel_base_url = os.getenv("BIGMODEL_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 
@@ -170,6 +179,8 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
     return APIConfig(
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url,
+        modal_api_key=modal_api_key,
+        modal_base_url=modal_base_url,
         bigmodel_api_key=bigmodel_api_key,
         bigmodel_base_url=bigmodel_base_url,
         azure_api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),

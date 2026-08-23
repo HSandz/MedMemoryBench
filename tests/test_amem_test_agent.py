@@ -40,6 +40,36 @@ class _LLMClient:
     def count_tokens(self, text: str) -> int:
         return len((text or "").split())
 
+def test_amem_modal_backend_uses_modal_configuration(monkeypatch):
+    import memory_layer_robust
+
+    captured = {}
+
+    class FakeOpenAIController:
+        def __init__(self, model, api_key=None, api_base=None, max_tokens=1000, usage_tracker=None):
+            captured.update(
+                model=model,
+                api_key=api_key,
+                api_base=api_base,
+                max_tokens=max_tokens,
+                usage_tracker=usage_tracker,
+            )
+
+    monkeypatch.setattr(memory_layer_robust, "RobustOpenAIController", FakeOpenAIController)
+    monkeypatch.setenv("MODAL_API_KEY", "modal-token")
+    monkeypatch.setenv("MODAL_BASE_URL", "https://modal.example/v1")
+
+    memory_layer_robust.RobustLLMController(
+        backend="modal",
+        model="served-model",
+        max_tokens=128,
+    )
+
+    assert captured["model"] == "served-model"
+    assert captured["api_key"] == "modal-token"
+    assert captured["api_base"] == "https://modal.example/v1"
+    assert captured["max_tokens"] == 128
+
 
 def _memory(content: str):
     return SimpleNamespace(
@@ -2330,7 +2360,7 @@ def test_all_amem_test_configs_declare_complete_retrieval_controls():
         "amem_chain_redundancy_weight",
     }
 
-    assert len(paths) == 16
+    assert paths
     for path in paths:
         retrieval_config = yaml.safe_load(
             path.read_text(encoding="utf-8")

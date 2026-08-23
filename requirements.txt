@@ -17,6 +17,7 @@ httpx>=0.24.0
 google-genai>=2.16.0,<3.0.0      # Shared SDK for Vertex AI and Google AI Studio
 google-auth>=2.0.0               # Service-account credentials for Gemini Enterprise
 google-cloud-storage>=2.18.0     # GCS JSONL staging for Vertex batch jobs
+modal
 
 # --------------- Data Generation (generation/) ---------------
 fastapi>=0.109.0

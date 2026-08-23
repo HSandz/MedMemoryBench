@@ -4,6 +4,7 @@ from .logger import setup_logger, get_logger, get_eval_logger
 from .llm_client import (
     BaseLLMClient,
     OpenAIClient,
+    ModalClient,
     AzureOpenAIClient,
     AnthropicClient,
     GeminiVertexClient,
@@ -24,6 +25,7 @@ __all__ = [
     # LLM Client
     "BaseLLMClient",
     "OpenAIClient",
+    "ModalClient",
     "AzureOpenAIClient",
     "AnthropicClient",
     "GeminiVertexClient",

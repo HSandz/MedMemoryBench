@@ -66,6 +66,7 @@ env/
 !/tests/test_build_feature_metrics.py
 !/tests/test_run_directory_layout.py
 !/tests/test_llm_configuration.py
+!/tests/test_modal_provider.py
 /docker/
 /.serena/
 /.spec-workflow/

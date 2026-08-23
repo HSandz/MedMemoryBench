@@ -35,6 +35,44 @@ EMBEDDING_PROVIDER=local
 
 Gemini provider names are `vertex`, `ai_studio`, and hybrid `gemini`. Zep additionally needs `ZEP_API_KEY`; MIRIX may need PostgreSQL/Redis services.
 
+### Modal-hosted vLLM
+
+The `modal` provider uses the same OpenAI-compatible client and shared retry and
+usage tracking as `openai`. Install Modal separately from the benchmark
+environment, then deploy the bundled server:
+
+See [`docs/MODAL_GUIDE.md`](MODAL_GUIDE.md) for the complete deployment guide,
+including how to create a Proxy Token and determine `MODAL_API_KEY` and
+`MODAL_BASE_URL`. Deployment uses `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET`; no browser or interactive CLI authentication is required.
+
+```bash
+uv pip install modal
+modal deploy scripts/modal_vllm_server.py
+```
+
+The deployment defaults to
+`ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ`, an L40S GPU, and a 32,768-token
+model context. Override `MODAL_GPU`, `MODAL_VLLM_MODEL`,
+`MODAL_VLLM_SERVED_MODEL`, or `MODAL_VLLM_MAX_MODEL_LEN` before deployment when
+the selected GPU or model requires different settings. The deployment caches
+Hugging Face and vLLM artifacts in Modal Volumes.
+
+Configure a method model with `provider: modal`, or set the equivalent
+environment variables for a method that accepts provider settings:
+
+```env
+MODAL_API_KEY=wk-<id>.ws-<secret>
+MODAL_BASE_URL=https://<workspace>--<app>-server.<region>.modal.direct/v1
+```
+
+Use the Modal Proxy Token as `MODAL_API_KEY`; do not put it in a committed YAML
+file. The base URL must include `/v1`. Modal Servers can return HTTP 503 while
+scaling from zero, so leave the shared retry settings enabled and expect the
+first request to include the cold-start latency. Modal Servers use proxy
+authentication by default; keep `unauthenticated=True` out of the deployment
+unless the endpoint is intentionally public.
+
 ## Run Commands
 
 ```bash
