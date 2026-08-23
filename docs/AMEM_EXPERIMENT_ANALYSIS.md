@@ -4,6 +4,14 @@
 
 Current experiments do not prove a repeatable accuracy gain from Typed Relations, Temporal State, or Provenance. Provenance is reliable as an audit feature; Temporal State is promising but noisy; typed retrieval remains sensitive to stochastic construction and query generation.
 
+## Current Completed Run Families
+
+The latest completed hybrid-retrieval, graph-ranking, and chain-selection runs are consolidated in [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md). That report includes the three recent build roots, all 35 fixed-snapshot child query runs, exact child paths, per-query-type counts, and the 49-query coverage caveat.
+
+The strongest recent descriptive group was the frozen typed snapshot with hybrid retrieval and `typed_ppr` without chain selection: `0.657 ± 0.015` accuracy and `0.678 ± 0.009` average score across five children. Adding the current chain selector reduced these repeated means to `0.641 ± 0.044` and `0.648 ± 0.041`; its MCD binary count increased from `1/20` to `3/20`, while the MCD composite mean decreased from `0.158` to `0.138`. These results do not establish a causal gain or harm because retrieval-query generation, answer generation, and judging remain stochastic.
+
+The recent results extend, rather than replace, the historical comparisons below. Do not compare these 49-query groups directly with the historical 97-query raw `amem` result, and do not treat the separate fixed-BFS build as a matched ablation.
+
 ## Key Results
 
 The main comparison uses Persona 1, 50 sessions, 788 notes, and 49 scored queries. These runs are not fully causal because providers, independently rebuilt memories, expansion budgets, and generation temperatures differ.
@@ -49,6 +57,11 @@ Original A-MEM evolution is more expensive and retrieves a larger context throug
 6. Fix question-stem-only temporal parsing, add direct timestamp retrieval, filter irrelevant expansions, and validate `SUPERSEDE` transitions more strictly.
 
 ## Source Artifacts
+
+- Consolidated recent run results: `docs/AMEM_COMPLETED_RUNS_RESULTS_20260823.md`
+- Hybrid/graph/chain root and children: `outputs/amem_test_gemini-2.5-flash/20260822_115258`
+- Earlier all-feature policy root and children: `outputs/amem_test_gemini-2.5-flash/20260821_023755`
+- Separate fixed-BFS root and children: `outputs/amem_test_gemini-2.5-flash/20260822_181747`
 
 - Reference `amem_fix`: `outputs/amem_fix_gemini-2.5-flash/20260812_112716`
 - Typed-only fixed snapshot: `outputs/amem_test_gemini-2.5-flash/20260813_143538`

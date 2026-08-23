@@ -6,6 +6,8 @@ Primary artifact: `outputs/amem_test_gemini-2.5-flash/20260821_023755`
 
 > **Scope notice:** this report audits query-policy variation on one all-feature memory build. It should not be used as the primary evidence for construction-feature effects. For the six independent 2026-08-16–17 builds, see [`AMEM_INDEPENDENT_BUILD_AUDIT_AND_RESEARCH_ROADMAP_20260822.md`](AMEM_INDEPENDENT_BUILD_AUDIT_AND_RESEARCH_ROADMAP_20260822.md).
 
+> **Forward reference:** the later hybrid/`typed_ppr`, fixed-BFS, and chain-selection run families are indexed in [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md).
+
 Scope: the repository's `amem`, `amem_fix`, and `amem_test` implementations; all documentation under `docs/`; the source memory build; the root evaluation; all 20 fixed-snapshot query runs; persisted retrieval, answer, judge, usage, batch, and audit records; related local memory systems; and relevant long-term-memory and retrieval literature.
 
 ## Executive assessment

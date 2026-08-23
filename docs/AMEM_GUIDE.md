@@ -51,6 +51,8 @@ retrieval_config:
 
 ## Build Metrics and Feature Reports
 
+For the completed hybrid-retrieval, graph-ranking, and chain-selection run matrix, see [A-MEM Completed Run Results](AMEM_COMPLETED_RUNS_RESULTS_20260823.md). It links each policy group to its frozen build root, child `query_runs/`, coverage, and aggregate/per-query-type outcomes. The detailed selector interpretation is in [A-MEM Chain-Selection Audit](AMEM_CHAIN_SELECTION_AUDIT_20260823.md).
+
 Every new A-MEM build records report-ready `feature_configuration`, `build_metrics`, and `memory_size` objects. The combination ID comes from the actual build flags rather than the configuration filename, so independently run ablations and custom combinations remain comparable. Metrics include build wall time, provider-reported input/output tokens, successful calls, attempted calls, failed attempts, retries, LLM latency, operation counts, direct wall time for each instrumented operation, and serialized memory footprint.
 
 The operation breakdown groups construction work under `base`, `original_evolution`, `typed_relations`, `temporal_state`, `provenance`, and `embedding`. The total run cost remains authoritative when features interact: provenance can create a different number of base notes, for example, and temporal transitions normally depend on typed-relation inference. Use combination totals for end-to-end comparisons and the feature/operation breakdown for direct attribution.

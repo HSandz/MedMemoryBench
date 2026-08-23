@@ -15,6 +15,8 @@ Scope: the six independently constructed Persona 1 memory snapshots, their root 
 
 This report supersedes the build-feature interpretation in `AMEM_NEXT_EXPERIMENTS_REPORT.md`. It complements rather than replaces `AMEM_DEEP_AUDIT_AND_RESEARCH_ROADMAP_20260821.md`, which analyzes query policies on one later all-feature snapshot.
 
+For the later completed hybrid-retrieval, graph-ranking, fixed-BFS, and chain-selection run matrix, see [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md).
+
 ## Executive assessment
 
 The 2026-08-16–17 artifacts are the primary evidence for comparing construction variants of this repository's experimental `amem_test` adapter. They are not a replication of the A-MEM paper's original evaluator or a direct estimate of the paper's reported method. Each root has its own five-unit memory build, build ID, configuration hash, embedding sidecars, graph realization, and root query execution. The child directories then reload that root's serialized snapshot and repeat the query pipeline.

@@ -8,6 +8,8 @@ chain-enabled query run `query_runs/20260823_113111`, including serializers,
 memory snapshots, batch manifests, result files, query-answer files, logs,
 and checkpoint implementation.
 
+The complete recent run-family results and child-run index are in [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md).
+
 ## Verdict
 
 The repository saves **substantially more diagnostic information than a typical

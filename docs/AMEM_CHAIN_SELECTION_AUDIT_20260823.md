@@ -6,6 +6,8 @@ Date: 2026-08-23
 
 This audit examines the query-only experiment rooted at `outputs/amem_test_gemini-2.5-flash/20260822_115258`: the active `amem`, `amem_fix`, and `amem_test` paths; the typed-memory selector; the MCD judge; and all ten saved child runs and retrieval audits.
 
+For the consolidated index of this family and the related 2026-08-21 and 2026-08-23 run groups, see [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md).
+
 **Conclusion:** `amem_chain_selection` is implemented, invoked, audited, and compared on one fixed snapshot. It does **not** demonstrate an improvement in multi-hop clinical deduction (MCD) or overall quality. Chain-enabled runs increase observed binary MCD correctness from `1/20` to `3/20`, but lower mean MCD composite score from `0.158` to `0.138`. Overall mean accuracy and score also decline slightly. Query-generation, answer-generation, and judging remain stochastic, so these results do not prove harm—but they provide no evidence of benefit.
 
 The main limitation is not an execution failure. The current policy is principally a **30-note relevance reranker with some connected pairs**, not a sparse, question-specific, directed causal-chain selector. It preserves all ten semantic seeds, replaces only `1.68/30` of the top-30 fused candidates on average, and leaves a mean of `6.30` disconnected components despite its preferred maximum of three.

@@ -122,6 +122,8 @@ Do not change build flags, the internal AMEM model, embedding/chunk settings, bu
 
 ## Verification
 
+The current completed-run comparison is maintained in [A-MEM Completed Run Results](AMEM_COMPLETED_RUNS_RESULTS_20260823.md). Use it together with [A-MEM Chain-Selection Audit](AMEM_CHAIN_SELECTION_AUDIT_20260823.md) when interpreting `typed_ppr`, hybrid retrieval, fixed BFS, or chain-selection results; the reported runs cover 49 queries rather than the full 97-query dataset.
+
 ```bash
 python -m pytest tests/test_amem_fix_agent.py tests/test_amem_test_agent.py tests/test_amem_staged_memory.py tests/test_build_feature_metrics.py
 python main.py -m amem_fix_gemini -d medmemorybench --dry-run

@@ -4,6 +4,8 @@ Date: 2026-08-18
 
 > **Historical report:** this document predates the independent-build reanalysis. For the primary audit of the six 2026-08-16–17 feature-specific builds and their child query runs, see [`AMEM_INDEPENDENT_BUILD_AUDIT_AND_RESEARCH_ROADMAP_20260822.md`](AMEM_INDEPENDENT_BUILD_AUDIT_AND_RESEARCH_ROADMAP_20260822.md). For the complementary query-policy audit on one later all-feature snapshot, see [`AMEM_DEEP_AUDIT_AND_RESEARCH_ROADMAP_20260821.md`](AMEM_DEEP_AUDIT_AND_RESEARCH_ROADMAP_20260821.md).
 
+For the current index of completed 2026-08-21–23 hybrid, graph-ranking, and chain-selection results, see [`AMEM_COMPLETED_RUNS_RESULTS_20260823.md`](AMEM_COMPLETED_RUNS_RESULTS_20260823.md).
+
 Scope: the repository adapters named `amem`, `amem_fix`, and `amem_test`; their vendored A-MEM layers; MedMemoryBench memory/query artifacts; feature-flag runs; and the active plus standalone LoCoMo integrations.
 
 ## Executive conclusion
