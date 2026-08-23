@@ -28,6 +28,7 @@ class TokenUsage:
     operation_count: int = 0
     total_latency: float = 0.0
     wall_time: float = 0.0
+    failure_duration_seconds: float = 0.0
 
     def add(self, input_tokens: int, output_tokens: int, latency: float) -> None:
         self.input_tokens += input_tokens
@@ -54,6 +55,9 @@ class TokenUsage:
     def add_wall_time(self, duration: float) -> None:
         self.wall_time += max(float(duration), 0.0)
 
+    def add_failure_duration(self, duration: float) -> None:
+        self.failure_duration_seconds += max(float(duration), 0.0)
+
     def merge(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
@@ -65,6 +69,7 @@ class TokenUsage:
         self.operation_count += other.operation_count
         self.total_latency += other.total_latency
         self.wall_time += other.wall_time
+        self.failure_duration_seconds += other.failure_duration_seconds
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,6 +85,7 @@ class TokenUsage:
             "total_latency": round(self.total_latency, 3),
             "avg_latency": round(self.total_latency / self.call_count, 3) if self.call_count > 0 else 0,
             "wall_time": round(self.wall_time, 6),
+            "failure_duration_seconds": round(self.failure_duration_seconds, 6),
         }
 
     @classmethod
@@ -106,6 +112,9 @@ class TokenUsage:
             operation_count=int(value.get("operation_count", 0) or 0),
             total_latency=float(value.get("total_latency", 0.0) or 0.0),
             wall_time=float(value.get("wall_time", 0.0) or 0.0),
+            failure_duration_seconds=float(
+                value.get("failure_duration_seconds", 0.0) or 0.0
+            ),
         )
 
     def subtract(self, other: "TokenUsage") -> "TokenUsage":
@@ -120,6 +129,10 @@ class TokenUsage:
             operation_count=max(self.operation_count - other.operation_count, 0),
             total_latency=max(self.total_latency - other.total_latency, 0.0),
             wall_time=max(self.wall_time - other.wall_time, 0.0),
+            failure_duration_seconds=max(
+                self.failure_duration_seconds - other.failure_duration_seconds,
+                0.0,
+            ),
         )
 
 
@@ -143,6 +156,9 @@ class LLMUsageTracker:
         )
         self._current_operation: ContextVar[str] = ContextVar(
             "llm_usage_operation", default="unscoped"
+        )
+        self._current_failure_duration: ContextVar[float] = ContextVar(
+            "llm_failure_duration", default=0.0
         )
         self._lock = threading.RLock()
 
@@ -181,6 +197,18 @@ class LLMUsageTracker:
         with self._lock:
             self._phase_bucket().add_failure()
             self._operation_bucket().add_failure()
+
+    def record_failure_duration(self, duration: float) -> None:
+        duration = max(float(duration), 0.0)
+        with self._lock:
+            self._phase_bucket().add_failure_duration(duration)
+            self._operation_bucket().add_failure_duration(duration)
+        self._current_failure_duration.set(
+            self._current_failure_duration.get() + duration
+        )
+
+    def current_failure_duration(self) -> float:
+        return self._current_failure_duration.get()
 
     def record_retry(self) -> None:
         with self._lock:
@@ -221,6 +249,7 @@ class LLMUsageTracker:
             self._operation_usage = {}
         self._current_phase.set("unknown")
         self._current_operation.set("unscoped")
+        self._current_failure_duration.set(0.0)
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -320,6 +349,7 @@ def diff_usage_stats(
                 delta.operation_count,
                 delta.total_latency,
                 delta.wall_time,
+                delta.failure_duration_seconds,
             )):
                 operation_deltas.setdefault(str(phase), {})[str(operation)] = delta
 
@@ -587,6 +617,23 @@ def _get_retry_delay(min_delay: float, max_delay: float) -> float:
     import random
     return random.uniform(min_delay, max_delay)
 
+def _record_untracked_failure_duration(
+    tracker: LLMUsageTracker,
+    failure_duration_before: float,
+    started_at: float,
+) -> None:
+    """Record elapsed failure time unless an inner client already measured it."""
+    if tracker.current_failure_duration() == failure_duration_before:
+        tracker.record_failure_duration(time.perf_counter() - started_at)
+
+def _sleep_after_failure(delay: float) -> None:
+    """Sleep before a retry and account for the actual failure-induced wait."""
+    started_at = time.perf_counter()
+    try:
+        time.sleep(delay)
+    finally:
+        get_usage_tracker().record_failure_duration(time.perf_counter() - started_at)
+
 
 def _log_retry_attempt(
     attempt: int,
@@ -633,6 +680,8 @@ def with_retry(
             while True:
                 tracker = get_usage_tracker()
                 successful_calls_before = tracker.current_successful_calls()
+                failure_duration_before = tracker.current_failure_duration()
+                attempt_started_at = time.perf_counter()
                 tracker.record_attempt()
                 try:
                     result = func(*args, **kwargs)
@@ -641,6 +690,11 @@ def with_retry(
                     return result
                 except Exception as exc:
                     tracker.record_failure()
+                    _record_untracked_failure_duration(
+                        tracker,
+                        failure_duration_before,
+                        attempt_started_at,
+                    )
                     total_attempts += 1
                     is_retryable, reason = _is_retryable_exception(exc)
 
@@ -684,7 +738,7 @@ def with_retry(
                         failure_type=failure_type,
                     )
                     tracker.record_retry()
-                    time.sleep(delay)
+                    _sleep_after_failure(delay)
 
         return wrapper
     return decorator
@@ -1037,6 +1091,7 @@ class BaseGeminiClient(BaseLLMClient):
         from google.genai import types
 
         start_time = time.time()
+        attempt_started_at = time.perf_counter()
         system_messages = []
         contents = []
         for message in messages:
@@ -1085,6 +1140,7 @@ class BaseGeminiClient(BaseLLMClient):
             )
         except Exception:
             tracker.record_failure()
+            tracker.record_failure_duration(time.perf_counter() - attempt_started_at)
             raise
         latency = time.time() - start_time
         content = getattr(response, "text", "") or ""
@@ -1096,11 +1152,13 @@ class BaseGeminiClient(BaseLLMClient):
             is_blocked = block_reason and "UNSPECIFIED" not in block_reason.upper()
             if "SAFETY" in finish_reason.upper() or is_blocked:
                 tracker.record_failure()
+                tracker.record_failure_duration(time.perf_counter() - attempt_started_at)
                 raise LLMAPIError(
                     "Gemini returned no text because the response was blocked "
                     f"(finish_reason={finish_reason or 'unknown'})."
                 )
             tracker.record_failure()
+            tracker.record_failure_duration(time.perf_counter() - attempt_started_at)
             raise EmptyGeminiResponseError(
                 "Gemini returned an empty response without a blocking reason."
             )
@@ -1109,6 +1167,7 @@ class BaseGeminiClient(BaseLLMClient):
                 json.loads(content)
             except (json.JSONDecodeError, TypeError) as exc:
                 tracker.record_failure()
+                tracker.record_failure_duration(time.perf_counter() - attempt_started_at)
                 raise InvalidLLMResponseError(
                     "Gemini returned malformed JSON for a structured response."
                 ) from exc
@@ -1327,11 +1386,19 @@ class GeminiVertexClient(BaseGeminiClient):
 
         while exhausted_accounts < len(self._vertex_accounts):
             account_index, credential_file, credentials, project, client = self._active_account()
+            tracker = get_usage_tracker()
+            failure_duration_before = tracker.current_failure_duration()
+            attempt_started_at = time.perf_counter()
             try:
                 result = operation(client, credentials, project)
                 self._record_account_success(account_index)
                 return result
             except Exception as exc:
+                _record_untracked_failure_duration(
+                    tracker,
+                    failure_duration_before,
+                    attempt_started_at,
+                )
                 total_attempts += 1
                 last_exception = exc
                 retryable, reason = _is_vertex_service_account_retryable(exc)
@@ -1385,7 +1452,7 @@ class GeminiVertexClient(BaseGeminiClient):
                     failure_type=failure_type,
                 )
                 get_usage_tracker().record_retry()
-                time.sleep(delay)
+                _sleep_after_failure(delay)
 
         raise LLMRetryExhaustedError(
             "Vertex call failed after trying every configured service account",
@@ -1560,6 +1627,9 @@ class GeminiAIStudioClient(BaseGeminiClient):
 
         while exhausted_keys < len(self._clients):
             key_index, client = self._active_client()
+            tracker = get_usage_tracker()
+            failure_duration_before = tracker.current_failure_duration()
+            attempt_started_at = time.perf_counter()
             try:
                 response = self._chat_once(
                     messages,
@@ -1571,6 +1641,11 @@ class GeminiAIStudioClient(BaseGeminiClient):
                 self._record_success(key_index)
                 return response
             except Exception as exc:
+                _record_untracked_failure_duration(
+                    tracker,
+                    failure_duration_before,
+                    attempt_started_at,
+                )
                 total_attempts += 1
                 last_exception = exc
                 retryable, reason = _is_google_ai_studio_retryable(exc)
@@ -1620,7 +1695,7 @@ class GeminiAIStudioClient(BaseGeminiClient):
                     failure_type=failure_type,
                 )
                 get_usage_tracker().record_retry()
-                time.sleep(delay)
+                _sleep_after_failure(delay)
 
         raise LLMRetryExhaustedError(
             "Google AI Studio call failed after trying every configured API key",
@@ -1791,6 +1866,9 @@ class GeminiHybridClient(BaseGeminiClient):
 
         while exhausted_transports < len(self._transports):
             transport_index, transport_name, client = self._active_transport_client()
+            tracker = get_usage_tracker()
+            failure_duration_before = tracker.current_failure_duration()
+            attempt_started_at = time.perf_counter()
             try:
                 response = self._chat_once(
                     messages,
@@ -1802,6 +1880,11 @@ class GeminiHybridClient(BaseGeminiClient):
                 self._record_transport_success(transport_index)
                 return response
             except Exception as exc:
+                _record_untracked_failure_duration(
+                    tracker,
+                    failure_duration_before,
+                    attempt_started_at,
+                )
                 total_attempts += 1
                 last_exception = exc
                 retryable, reason = _is_google_ai_studio_retryable(exc)
@@ -1848,7 +1931,7 @@ class GeminiHybridClient(BaseGeminiClient):
                     failure_type=failure_type,
                 )
                 get_usage_tracker().record_retry()
-                time.sleep(delay)
+                _sleep_after_failure(delay)
 
         raise LLMRetryExhaustedError(
             "Gemini call failed after trying Vertex and every AI Studio API key",

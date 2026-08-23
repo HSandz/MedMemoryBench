@@ -51,6 +51,8 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
             for attempt in range(max_retries + 1):
                 tracker = get_usage_tracker()
                 successful_calls_before = tracker.current_successful_calls()
+                failure_duration_before = tracker.current_failure_duration()
+                attempt_started_at = time.perf_counter()
                 tracker.record_attempt()
                 try:
                     result = func(*args, **kwargs)
@@ -59,6 +61,10 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                     return result
                 except Exception as e:
                     tracker.record_failure()
+                    if tracker.current_failure_duration() == failure_duration_before:
+                        tracker.record_failure_duration(
+                            time.perf_counter() - attempt_started_at
+                        )
                     last_exc = e
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
@@ -67,7 +73,13 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                             func.__name__, attempt + 1, max_retries + 1, e, delay,
                         )
                         tracker.record_retry()
-                        time.sleep(delay)
+                        sleep_started_at = time.perf_counter()
+                        try:
+                            time.sleep(delay)
+                        finally:
+                            tracker.record_failure_duration(
+                                time.perf_counter() - sleep_started_at
+                            )
             logger.error("LLM call %s failed after %d attempts: %s",
                          func.__name__, max_retries + 1, last_exc)
             raise last_exc

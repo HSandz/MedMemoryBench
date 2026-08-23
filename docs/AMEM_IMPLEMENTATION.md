@@ -8,7 +8,7 @@ This is the concise, code-oriented guide to the A-MEM integrations in MedMemoryB
 |---|---|
 | `methods/amem_agent.py` | Shared adapter, embedding retriever setup, query answering, and snapshot serialization. |
 | `methods/amem_fix_agent.py` | Paper-aligned atomic-note and linked-retrieval flow (`amem_fix`). |
-| `methods/amem_test_agent.py` | Experimental typed-relation, temporal-state, and provenance flow (`amem_test`). |
+| `methods/amem_test_agent.py` | Experimental typed-relation, temporal-state, provenance, and chain-selection flow (`amem_test`). |
 | `methods/amem/A-mem/memory_layer_robust.py` | Active plain-text LLM memory layer used by `amem` and `amem_fix`. |
 | `methods/amem/A-mem/memory_layer_typed.py` | Experimental layer used by `amem_test`. |
 | `configs/method_config/*amem*.yaml` | Method and persona-specific configurations. |
@@ -23,7 +23,7 @@ The older `memory_layer.py` and standalone scripts in `methods/amem/A-mem/` supp
 3. During memorization, input is split at `amem_chunk_size_tokens` and passed to `add_note()`.
 4. A-MEM analyzes each note, extracts metadata, and may evolve neighboring notes. The robust layer can make up to three conditional calls: evolution decision, strengthening, and neighbor update. `amem_evo_threshold` controls retriever consolidation.
 5. At query time, the adapter retrieves semantic seeds, formats the notes into the answer prompt, and records retrieval metadata. `amem_fix` optionally generates keyword queries and expands untyped links.
-6. `amem_test` can expand typed relations, select temporal states, and attach provenance evidence before final prompt construction. Typed-relation inference occurs during memory construction; query-time retrieval is local after optional keyword generation. Vertex batch applies to eligible final-answer generation.
+6. `amem_test` can fuse deterministic hybrid candidate ranks, apply a configurable graph-ranking policy, select temporal states, optionally select chain-preserving evidence under the final prompt budget, and attach provenance evidence before final prompt construction. Typed-relation inference occurs during memory construction; query-time ranking and selection are local after optional keyword generation. Vertex batch applies to eligible final-answer generation.
 
 Memory snapshots contain notes, retriever corpus/embeddings, IDs, configuration, and feature audits. Query-stage runs can reuse a completed memory snapshot with `--memory-run`; imports reject incompatible state.
 
@@ -43,9 +43,40 @@ Append requires independent evaluation mode and an A-MEM method. The target uses
 |---|---|---|
 | `amem` | Raw token-bounded chunks passed directly to `add_note()`. | Direct semantic retrieval. |
 | `amem_fix` | One timestamped atomic note per dialogue turn; structured `memory_items` are preferred. | Keyword query -> semantic seeds -> one-hop untyped link expansion. |
-| `amem_test` | Atomic notes plus optional typed relation/provenance metadata; original evolution is configurable. | `amem_fix` retrieval, then typed expansion and optional temporal/provenance context. |
+| `amem_test` | Atomic notes plus optional typed relation/provenance metadata; original evolution is configurable. | Dense or hybrid seeds, selectable graph ranking, optional temporal expansion, chain-preserving evidence selection, then provenance context. |
 
 Typed relation labels are `SUPPORT`, `REFINE`, `SUPERSEDE`, `CONFLICT`, and `RELATED`. Temporal state is derived from typed transitions and therefore requires `amem_typed_relations: true`. Provenance creates stable source evidence records; `amem_provenance_inject_raw_text` optionally adds selected source turns to the answer prompt.
+
+### Experimental retrieval policies
+
+`amem_hybrid_retrieval: true` replaces dense-only seeds with weighted reciprocal-rank fusion over dense similarity, BM25, deterministic query-to-note token overlap, direct source-timestamp match, stored temporal-state match, and graph proximity. `amem_hybrid_*_weight: 0` disables an individual channel. `amem_hybrid_candidate_count` bounds each channel's candidate pool; `retrieve_num` remains the final seed count. The default `amem_hybrid_retrieval: false` preserves dense seeds.
+
+`amem_graph_ranking_mode` selects the graph policy:
+
+| Value | Behavior |
+|---|---|
+| `none` | Keep seeds only; omit typed relation expansion and typed relation prompt context. |
+| `fixed_bfs` | Preserve the existing bounded typed BFS (default). |
+| `untyped_ppr` | Personalized PageRank over enabled ordinary and typed edges with unit edge weights; omit typed relation labels from the prompt. |
+| `typed_ppr` | Personalized PageRank weighted by relation type, confidence, direction, temporal compatibility, and deterministic query intent. Requires `amem_typed_retrieval: true`. |
+
+PageRank uses `amem_graph_alpha`, `amem_graph_iterations`, and `amem_graph_tolerance`. Per-relation weights use `amem_graph_{supersede,conflict,refine,support,related}_weight`. `amem_expand_links`, `amem_typed_retrieval`, `amem_expand_related`, and `amem_relation_min_confidence` still gate which edges are eligible. Hybrid channel rankings, RRF contributions, seed scores, graph scores, convergence, and selected IDs are written to the retrieval audit.
+
+### Chain-preserving evidence selection
+
+`amem_chain_selection: true` enables a deterministic query-time stage after graph and temporal retrieval but before final relation/provenance formatting. It fuses retrieval, hybrid, graph, and dense rankings with RRF before limiting the pool to `amem_chain_candidate_count`; no source ranking or upstream ID is mandatory. The selector builds an undirected evidence graph from the ordinary and typed edges allowed by the existing retrieval switches. It then identifies lexical IDF facets, direct timestamp facets, available temporal-state facets, and general operations such as change, comparison, conflict, refinement, support/causal connection, and enumeration from the raw question.
+
+Selection maximizes the configured utility
+
+$$
+U(S)=\omega_r Rel(S)+\omega_c Cov(S)+\omega_g Conn(S)+\omega_p Path(S)+\omega_t Temp(S)-\omega_d Red(S).
+$$
+
+`Rel` combines max-calibrated fusion, hybrid, and graph scores; `Cov` rewards distinct question facets; `Conn` is an accumulated maximum-spanning-forest reward with a soft excess-component penalty; `Path` rewards complete paths of at most `amem_chain_max_hops`; `Temp` rewards direct date matches and, only when temporal retrieval is active, stored state/transition compatibility; and `Red` is bounded average lexical, embedding, and source-evidence duplication. Greedy actions are either one memory or one complete path, ranked by marginal utility per added memory. `amem_chain_max_hops` is clamped to 3; path traversal keeps the eight strongest eligible neighbors per memory and at most 100 ranked path actions to bound dense-graph work. `amem_chain_max_groups` is the preferred number of disconnected evidence components, not a hard rejection limit. All ties follow stable fused rank.
+
+The selector aims for `amem_chain_evidence_count` final memories while respecting `amem_chain_candidate_count`, complete-path atomicity, and the exact prompt budget. It does not preserve upstream IDs by rule and does not stop merely because a bounded objective term has saturated. If a target-sized set is feasible, each accepted action must leave enough exact formatted budget for a deterministic cheapest-singleton completion, preventing one expensive high-ranked note from consuming the budget needed to reach the target. The token callback formats every proposal exactly as the answer prompt will see it, including eligible relation labels, temporal state, provenance headers/raw evidence, and note metadata. The budget is the remaining `amem_max_context_tokens` after the system message, question, output allowance, and the existing 200-token reserve. Enabled selection is not followed by context truncation; selection stops below the target only when the target is not feasible and no remaining action fits.
+
+The selector uses only the raw question and stored memory state. It receives any temporal target already resolved by the normal temporal-retrieval stage; an unresolved relative date without concrete bounds does not match every timestamped note. It does not receive benchmark query types, reference answers, gold evidence, or scoring metadata. Its retrieval audit is stored under `extra.chain_selection` and includes candidate/selected IDs, paths, facets, per-candidate scores, evidence-graph edges, utility components, exact selected tokens, greedy steps, and rejection reasons.
 
 ## Configuration
 
@@ -70,9 +101,22 @@ build_config:
 retrieval_config:
   retrieve_num: 10
   amem_max_context_tokens: 200000
+  amem_hybrid_retrieval: false
+  amem_graph_ranking_mode: fixed_bfs
+  amem_chain_selection: false
+  amem_chain_candidate_count: 50
+  amem_chain_evidence_count: 30
+  amem_chain_max_hops: 2
+  amem_chain_max_groups: 3
+  amem_chain_relevance_weight: 1.0
+  amem_chain_coverage_weight: 1.0
+  amem_chain_connectivity_weight: 0.35
+  amem_chain_path_weight: 0.75
+  amem_chain_temporal_weight: 0.5
+  amem_chain_redundancy_weight: 0.25
 ```
 
-Use `amem_fix_*` for the paper-aligned baseline and `amem_test_*` for experiments. Treat every experimental feature flag as authoritative: similarly named `amem_test2_*` files may intentionally represent different combinations. Build-time temporal transitions use `amem_temporal_transition_min_confidence`; query-time graph filtering uses `amem_relation_min_confidence`. Expansion counts, temporal ordering, provenance injection, keyword use, and retrieval context budgets can change without rebuilding.
+Use `amem_fix_*` for the paper-aligned baseline and `amem_test_*` for experiments. Treat every experimental feature flag as authoritative: similarly named `amem_test2_*` files may intentionally represent different combinations. Build-time temporal transitions use `amem_temporal_transition_min_confidence`; query-time graph filtering uses `amem_relation_min_confidence`. Hybrid weights, graph mode/ranking parameters, chain-selection controls, expansion counts, temporal ordering, provenance injection, keyword use, and retrieval context budgets can change without rebuilding. Most shipped configurations disable chain selection; individual experiment configs may enable it explicitly.
 
 Do not change build flags, the internal AMEM model, embedding/chunk settings, build prompt budget, or temporal transition threshold when loading a snapshot. Keep stable memory IDs, audit fields, and source evidence intact because resume, rejudge, and analysis depend on them.
 

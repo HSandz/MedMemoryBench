@@ -102,6 +102,29 @@ def test_empty_gemini_response_is_retried(monkeypatch):
     assert llm_client.run_with_gemini_retry(operation) == "complete"
     assert len(attempts) == 2
 
+def test_successful_retry_records_failed_attempt_and_wait_duration(monkeypatch):
+    timestamps = iter((10.0, 12.0, 12.0, 17.0, 17.0))
+    monkeypatch.setattr(llm_client.time, "perf_counter", lambda: next(timestamps))
+    monkeypatch.setattr(llm_client.time, "sleep", lambda delay: None)
+    tracker = llm_client.get_usage_tracker()
+    tracker.reset()
+
+    attempts = []
+
+    @llm_client.with_retry(
+        max_retries=2,
+        retry_min_delay=5.0,
+        retry_max_delay=5.0,
+    )
+    def operation():
+        attempts.append(None)
+        if len(attempts) == 1:
+            raise ResourceExhausted("429 quota exceeded")
+        return "complete"
+
+    assert operation() == "complete"
+    assert tracker.get_stats()["total"]["failure_duration_seconds"] == 7.0
+
 
 def test_retry_budgets_and_backoff_are_separate_by_failure_type(monkeypatch):
     failures = [

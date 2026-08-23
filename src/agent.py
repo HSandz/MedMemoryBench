@@ -269,6 +269,89 @@ class AgentManager:
                 "amem_provenance_inject_raw_text": agent_params.get(
                     "amem_provenance_inject_raw_text", False
                 ),
+                "amem_hybrid_retrieval": agent_params.get(
+                    "amem_hybrid_retrieval", False
+                ),
+                "amem_hybrid_candidate_count": agent_params.get(
+                    "amem_hybrid_candidate_count", 50
+                ),
+                "amem_hybrid_rrf_k": agent_params.get("amem_hybrid_rrf_k", 60.0),
+                "amem_hybrid_dense_weight": agent_params.get(
+                    "amem_hybrid_dense_weight", 1.0
+                ),
+                "amem_hybrid_bm25_weight": agent_params.get(
+                    "amem_hybrid_bm25_weight", 1.0
+                ),
+                "amem_hybrid_entity_weight": agent_params.get(
+                    "amem_hybrid_entity_weight", 1.0
+                ),
+                "amem_hybrid_timestamp_weight": agent_params.get(
+                    "amem_hybrid_timestamp_weight", 1.0
+                ),
+                "amem_hybrid_state_weight": agent_params.get(
+                    "amem_hybrid_state_weight", 1.0
+                ),
+                "amem_hybrid_graph_weight": agent_params.get(
+                    "amem_hybrid_graph_weight", 1.0
+                ),
+                "amem_graph_ranking_mode": agent_params.get(
+                    "amem_graph_ranking_mode", "fixed_bfs"
+                ),
+                "amem_graph_alpha": agent_params.get("amem_graph_alpha", 0.85),
+                "amem_graph_iterations": agent_params.get(
+                    "amem_graph_iterations", 20
+                ),
+                "amem_graph_tolerance": agent_params.get(
+                    "amem_graph_tolerance", 1e-6
+                ),
+                "amem_graph_supersede_weight": agent_params.get(
+                    "amem_graph_supersede_weight", 1.25
+                ),
+                "amem_graph_conflict_weight": agent_params.get(
+                    "amem_graph_conflict_weight", 0.75
+                ),
+                "amem_graph_refine_weight": agent_params.get(
+                    "amem_graph_refine_weight", 1.15
+                ),
+                "amem_graph_support_weight": agent_params.get(
+                    "amem_graph_support_weight", 1.0
+                ),
+                "amem_graph_related_weight": agent_params.get(
+                    "amem_graph_related_weight", 0.5
+                ),
+                "amem_chain_selection": agent_params.get(
+                    "amem_chain_selection", False
+                ),
+                "amem_chain_candidate_count": agent_params.get(
+                    "amem_chain_candidate_count", 50
+                ),
+                "amem_chain_evidence_count": agent_params.get(
+                    "amem_chain_evidence_count", 30
+                ),
+                "amem_chain_max_hops": agent_params.get(
+                    "amem_chain_max_hops", 2
+                ),
+                "amem_chain_max_groups": agent_params.get(
+                    "amem_chain_max_groups", 3
+                ),
+                "amem_chain_relevance_weight": agent_params.get(
+                    "amem_chain_relevance_weight", 1.0
+                ),
+                "amem_chain_coverage_weight": agent_params.get(
+                    "amem_chain_coverage_weight", 1.0
+                ),
+                "amem_chain_connectivity_weight": agent_params.get(
+                    "amem_chain_connectivity_weight", 0.35
+                ),
+                "amem_chain_path_weight": agent_params.get(
+                    "amem_chain_path_weight", 0.75
+                ),
+                "amem_chain_temporal_weight": agent_params.get(
+                    "amem_chain_temporal_weight", 0.5
+                ),
+                "amem_chain_redundancy_weight": agent_params.get(
+                    "amem_chain_redundancy_weight", 0.25
+                ),
             })
 
         elif method_key == "amem":

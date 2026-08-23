@@ -455,10 +455,17 @@ class MedMemoryBenchEvaluator:
     @staticmethod
     def _run_api_call(operation, *args, **kwargs):
         """Attach elapsed time to an API exception without changing its type."""
+        tracker = get_usage_tracker()
+        failure_duration_before = tracker.current_failure_duration()
         started_at = time.perf_counter()
         try:
             return operation(*args, **kwargs)
         except LLMAPIError as error:
+            elapsed = time.perf_counter() - started_at
+            tracked_failure_duration = max(
+                tracker.current_failure_duration() - failure_duration_before,
+                0.0,
+            )
             previous_duration = getattr(
                 error,
                 "_medmemorybench_api_duration_seconds",
@@ -466,7 +473,7 @@ class MedMemoryBenchEvaluator:
             )
             error._medmemorybench_api_duration_seconds = (
                 max(float(previous_duration), 0.0)
-                + time.perf_counter() - started_at
+                + max(elapsed - tracked_failure_duration, 0.0)
             )
             raise
 
@@ -2962,6 +2969,7 @@ class MedMemoryBenchEvaluator:
         build_metrics = self._build_metrics_report()
 
         llm_usage = get_usage_tracker().get_stats()
+        retry_failure_duration = self._retry_failure_duration(llm_usage)
         failed_query_ids = set()
         for failure in self._api_failures:
             if failure.get("query_id"):
@@ -3018,7 +3026,7 @@ class MedMemoryBenchEvaluator:
                 "llm_usage": llm_usage,
                 "evaluation_coverage": evaluation_coverage,
                 "api_failures": self._api_failures,
-                "api_failure_duration_seconds": self._api_failure_duration_seconds,
+                "api_failure_duration_seconds": retry_failure_duration,
             }
         )
 
@@ -3047,6 +3055,13 @@ class MedMemoryBenchEvaluator:
             )
 
         return report
+
+    def _retry_failure_duration(self, llm_usage: Dict[str, Any]) -> float:
+        """Return recovered retry time plus terminal API failure time."""
+        recovered_retry_duration = float(
+            llm_usage.get("total", {}).get("failure_duration_seconds", 0.0) or 0.0
+        )
+        return recovered_retry_duration + self._api_failure_duration_seconds
 
     def _expected_query_count(self) -> int:
         """Return coverage denominator for the units selected by this run."""

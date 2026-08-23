@@ -105,6 +105,8 @@ Without `--batch-wait`, resume the submitted job with `--resume --batch-api`. Ba
 
 Runs are organized as `outputs/<method-model>/<timestamp>/`, with `run_config.json`, `evaluation.log`, memory artifacts, checkpoints, and query answers. Explicit query reruns and append runs are nested under the source run's `query_runs/`.
 
+Result JSON files report `duration_seconds` as total evaluation wall time. `true_duration_seconds` subtracts measured failed API-attempt time and retry waits, including failures that later recover and terminal API failures; successful API-call time remains included. The matching `llm_usage` totals expose the measured retry/error time as `failure_duration_seconds`.
+
 - Missing API credentials: check `.env` and the provider named in the method YAML.
 - Missing embedding model: use a valid local path or allow the configured Hugging Face model to download.
 - Stale or incompatible resume: use the original method/dataset config and inspect `run_config.json`; do not overwrite a completed run.

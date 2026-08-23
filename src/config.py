@@ -33,6 +33,21 @@ AMEM_RETRIEVAL_CONFIG_KEYS = {
     "amem_temporal_retrieval", "amem_temporal_ordering",
     "amem_temporal_expansion_count", "amem_provenance_retrieval",
     "amem_provenance_max_evidence", "amem_provenance_inject_raw_text",
+    "amem_hybrid_retrieval", "amem_hybrid_candidate_count",
+    "amem_hybrid_rrf_k", "amem_hybrid_dense_weight",
+    "amem_hybrid_bm25_weight", "amem_hybrid_entity_weight",
+    "amem_hybrid_timestamp_weight", "amem_hybrid_state_weight",
+    "amem_hybrid_graph_weight", "amem_graph_ranking_mode",
+    "amem_graph_alpha", "amem_graph_iterations", "amem_graph_tolerance",
+    "amem_graph_supersede_weight", "amem_graph_conflict_weight",
+    "amem_graph_refine_weight", "amem_graph_support_weight",
+    "amem_graph_related_weight",
+    "amem_chain_selection", "amem_chain_candidate_count",
+    "amem_chain_evidence_count",
+    "amem_chain_max_hops", "amem_chain_max_groups",
+    "amem_chain_relevance_weight", "amem_chain_coverage_weight",
+    "amem_chain_connectivity_weight", "amem_chain_path_weight",
+    "amem_chain_temporal_weight", "amem_chain_redundancy_weight",
 }
 
 

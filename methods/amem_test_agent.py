@@ -15,6 +15,8 @@ from utils.llm_client import format_messages, get_usage_tracker
 
 logger = logging.getLogger(__name__)
 
+GRAPH_RANKING_MODES = frozenset({"none", "fixed_bfs", "untyped_ppr", "typed_ppr"})
+
 
 class AMemTestAgent(AMemFixAgent):
     """A-MEM experiment that adds stable-ID typed relation construction/retrieval."""
@@ -44,6 +46,35 @@ class AMemTestAgent(AMemFixAgent):
         amem_provenance_retrieval: Optional[bool] = None,
         amem_provenance_max_evidence: int = 10,
         amem_provenance_inject_raw_text: bool = False,
+        amem_hybrid_retrieval: bool = False,
+        amem_hybrid_candidate_count: int = 50,
+        amem_hybrid_rrf_k: float = 60.0,
+        amem_hybrid_dense_weight: float = 1.0,
+        amem_hybrid_bm25_weight: float = 1.0,
+        amem_hybrid_entity_weight: float = 1.0,
+        amem_hybrid_timestamp_weight: float = 1.0,
+        amem_hybrid_state_weight: float = 1.0,
+        amem_hybrid_graph_weight: float = 1.0,
+        amem_graph_ranking_mode: str = "fixed_bfs",
+        amem_graph_alpha: float = 0.85,
+        amem_graph_iterations: int = 20,
+        amem_graph_tolerance: float = 1e-6,
+        amem_graph_supersede_weight: float = 1.25,
+        amem_graph_conflict_weight: float = 0.75,
+        amem_graph_refine_weight: float = 1.15,
+        amem_graph_support_weight: float = 1.0,
+        amem_graph_related_weight: float = 0.5,
+        amem_chain_selection: bool = False,
+        amem_chain_candidate_count: int = 50,
+        amem_chain_evidence_count: int = 30,
+        amem_chain_max_hops: int = 2,
+        amem_chain_max_groups: int = 3,
+        amem_chain_relevance_weight: float = 1.0,
+        amem_chain_coverage_weight: float = 1.0,
+        amem_chain_connectivity_weight: float = 0.35,
+        amem_chain_path_weight: float = 0.75,
+        amem_chain_temporal_weight: float = 0.5,
+        amem_chain_redundancy_weight: float = 0.25,
         **kwargs,
     ):
         self.amem_original_evolution = bool(amem_original_evolution)
@@ -67,6 +98,54 @@ class AMemTestAgent(AMemFixAgent):
             else bool(amem_provenance_retrieval)
         )
         self.amem_provenance_inject_raw_text = bool(amem_provenance_inject_raw_text)
+        self.amem_hybrid_retrieval = bool(amem_hybrid_retrieval)
+        self.amem_hybrid_candidate_count = max(1, int(amem_hybrid_candidate_count))
+        self.amem_hybrid_rrf_k = max(0.0, float(amem_hybrid_rrf_k))
+        self.amem_hybrid_channel_weights = {
+            "dense": max(0.0, float(amem_hybrid_dense_weight)),
+            "bm25": max(0.0, float(amem_hybrid_bm25_weight)),
+            "entity_attribute": max(0.0, float(amem_hybrid_entity_weight)),
+            "timestamp": max(0.0, float(amem_hybrid_timestamp_weight)),
+            "state": max(0.0, float(amem_hybrid_state_weight)),
+            "graph": max(0.0, float(amem_hybrid_graph_weight)),
+        }
+        graph_ranking_mode = str(amem_graph_ranking_mode).strip().lower()
+        if graph_ranking_mode not in GRAPH_RANKING_MODES:
+            raise ValueError(
+                "amem_graph_ranking_mode must be one of: "
+                + ", ".join(sorted(GRAPH_RANKING_MODES))
+            )
+        if graph_ranking_mode == "typed_ppr" and not (
+            self.amem_typed_relations and self.amem_typed_retrieval
+        ):
+            raise ValueError(
+                "amem_graph_ranking_mode=typed_ppr requires "
+                "amem_typed_relations=true and amem_typed_retrieval=true"
+            )
+        self.amem_graph_ranking_mode = graph_ranking_mode
+        self.amem_graph_alpha = max(0.0, min(0.999999, float(amem_graph_alpha)))
+        self.amem_graph_iterations = max(1, int(amem_graph_iterations))
+        self.amem_graph_tolerance = max(0.0, float(amem_graph_tolerance))
+        self.amem_graph_relation_weights = {
+            "SUPERSEDE": max(0.0, float(amem_graph_supersede_weight)),
+            "CONFLICT": max(0.0, float(amem_graph_conflict_weight)),
+            "REFINE": max(0.0, float(amem_graph_refine_weight)),
+            "SUPPORT": max(0.0, float(amem_graph_support_weight)),
+            "RELATED": max(0.0, float(amem_graph_related_weight)),
+        }
+        self.amem_chain_selection = bool(amem_chain_selection)
+        self.amem_chain_candidate_count = max(1, int(amem_chain_candidate_count))
+        self.amem_chain_evidence_count = max(1, int(amem_chain_evidence_count))
+        self.amem_chain_max_hops = min(3, max(1, int(amem_chain_max_hops)))
+        self.amem_chain_max_groups = max(1, int(amem_chain_max_groups))
+        self.amem_chain_weights = {
+            "relevance": max(0.0, float(amem_chain_relevance_weight)),
+            "coverage": max(0.0, float(amem_chain_coverage_weight)),
+            "connectivity": max(0.0, float(amem_chain_connectivity_weight)),
+            "path": max(0.0, float(amem_chain_path_weight)),
+            "temporal": max(0.0, float(amem_chain_temporal_weight)),
+            "redundancy": max(0.0, float(amem_chain_redundancy_weight)),
+        }
         if self.amem_temporal_state and not self.amem_typed_relations:
             raise ValueError(
                 "amem_temporal_state requires amem_typed_relations=true because "
@@ -522,10 +601,12 @@ class AMemTestAgent(AMemFixAgent):
         temporal_query: Optional[Dict[str, Any]] = None,
         temporal_expansion_ids: Optional[Sequence[str]] = None,
         evidence_records: Optional[Sequence[Dict[str, Any]]] = None,
+        chain_candidate_ids: Optional[Sequence[str]] = None,
     ) -> str:
         aliases = {memory_id: f"M{position + 1}" for position, memory_id in enumerate(final_ids)}
         expansion_ids = {item["added_memory_id"] for item in expansions}
         temporal_expansion_set = set(temporal_expansion_ids or [])
+        chain_candidate_set = set(chain_candidate_ids or [])
         memory_positions = {
             memory_id: position
             for position, memory_id in enumerate(memory_system.memories.keys())
@@ -614,6 +695,8 @@ class AMemTestAgent(AMemFixAgent):
                 origin = "temporal/state expansion"
             elif memory_id in expansion_ids:
                 origin = "typed expansion"
+            elif memory_id in chain_candidate_set:
+                origin = "chain-selection candidate"
             else:
                 origin = "A-MEM link expansion"
             memory_index = memory_positions[memory_id]
@@ -692,10 +775,17 @@ class AMemTestAgent(AMemFixAgent):
             getattr(self, "amem_provenance_retrieval", provenance_available)
         ) and provenance_available
         temporal_ordering = bool(getattr(self, "amem_temporal_ordering", True))
+        graph_ranking_mode = getattr(self, "amem_graph_ranking_mode", "fixed_bfs")
+        advanced_retrieval = bool(
+            getattr(self, "amem_hybrid_retrieval", False)
+            or graph_ranking_mode != "fixed_bfs"
+            or getattr(self, "amem_chain_selection", False)
+        )
         if (
             not typed_retrieval
             and not temporal_retrieval
             and not provenance_retrieval
+            and not advanced_retrieval
         ):
             prepared = super().prepare_batch_query(question, system_message=system_message, **kwargs)
             memory_system = self._get_memory_system(self._get_context_id())
@@ -745,19 +835,86 @@ class AMemTestAgent(AMemFixAgent):
         memory_system = self._get_memory_system(context_id)
         raw_question = str(kwargs.get("raw_question") or question).strip()
         retrieval_query = self._generate_retrieval_query(raw_question, memory_system)
-        _, direct_indices, amem_fix_indices, base_records = self._retrieve_with_links(
-            memory_system,
-            retrieval_query,
-        )
         memory_ids = list(memory_system.memories.keys())
         memory_index_by_id = {
             memory_id: index for index, memory_id in enumerate(memory_ids)
         }
-        seed_ids = [memory_ids[index] for index in direct_indices if 0 <= index < len(memory_ids)]
-        amem_fix_ids = [
-            memory_ids[index] for index in amem_fix_indices if 0 <= index < len(memory_ids)
-        ]
-        if typed_retrieval:
+        hybrid_result: Dict[str, Any] = {
+            "selected_memory_ids": [],
+            "seed_scores": {},
+            "channel_rankings": {},
+            "memory_scores": [],
+        }
+        if getattr(self, "amem_hybrid_retrieval", False):
+            hybrid_result = memory_system.hybrid_candidate_retrieval(
+                retrieval_query,
+                raw_question,
+                k=self.retrieve_num,
+                candidate_count=self.amem_hybrid_candidate_count,
+                rrf_k=self.amem_hybrid_rrf_k,
+                channel_weights=self.amem_hybrid_channel_weights,
+                min_confidence=self.amem_relation_min_confidence,
+                include_related=self.amem_expand_related,
+                use_typed_relations=typed_retrieval,
+                use_ordinary_links=self.amem_expand_links,
+            )
+            seed_ids = list(hybrid_result["selected_memory_ids"])
+            direct_indices = [memory_index_by_id[memory_id] for memory_id in seed_ids]
+            amem_fix_ids = list(seed_ids)
+            amem_fix_indices = list(direct_indices)
+            base_records: List[Dict[str, Any]] = []
+        else:
+            _, direct_indices, amem_fix_indices, base_records = self._retrieve_with_links(
+                memory_system,
+                retrieval_query,
+            )
+            seed_ids = [
+                memory_ids[index]
+                for index in direct_indices
+                if 0 <= index < len(memory_ids)
+            ]
+            amem_fix_ids = [
+                memory_ids[index]
+                for index in amem_fix_indices
+                if 0 <= index < len(memory_ids)
+            ]
+            if graph_ranking_mode != "fixed_bfs":
+                amem_fix_ids = list(seed_ids)
+                amem_fix_indices = list(direct_indices)
+
+        seed_scores = dict(hybrid_result.get("seed_scores", {}))
+        if not seed_scores and seed_ids:
+            seed_scores = {
+                memory_id: 1.0 / len(seed_ids)
+                for memory_id in seed_ids
+            }
+        graph_result: Dict[str, Any] = {
+            "selected_memory_ids": list(amem_fix_ids),
+            "expanded_memories": [],
+            "scores": {},
+            "iterations_run": 0,
+            "converged": True,
+        }
+        if graph_ranking_mode in {"untyped_ppr", "typed_ppr"}:
+            graph_result = memory_system.query_conditioned_graph_rank(
+                seed_scores,
+                raw_question,
+                mode=graph_ranking_mode,
+                expansion_budget=self.amem_typed_expansion_count,
+                alpha=self.amem_graph_alpha,
+                iterations=self.amem_graph_iterations,
+                tolerance=self.amem_graph_tolerance,
+                relation_weights=self.amem_graph_relation_weights,
+                min_confidence=self.amem_relation_min_confidence,
+                include_related=self.amem_expand_related,
+                use_typed_relations=typed_retrieval,
+                use_ordinary_links=self.amem_expand_links,
+            )
+            final_ids = graph_result["selected_memory_ids"]
+            expansions = graph_result["expanded_memories"]
+        elif graph_ranking_mode == "none":
+            final_ids, expansions = list(seed_ids), []
+        elif typed_retrieval:
             final_ids, expansions = memory_system.expand_typed_relations(
                 amem_fix_ids,
                 expansion_budget=self.amem_typed_expansion_count,
@@ -783,10 +940,154 @@ class AMemTestAgent(AMemFixAgent):
             )
             final_ids = temporal_result["selected_memory_ids"]
 
+        typed_context_enabled = typed_retrieval and graph_ranking_mode in {
+            "fixed_bfs", "typed_ppr"
+        }
+        system_tokens = self._llm_client.count_tokens(system_message) if system_message else 0
+        question_tokens = self._llm_client.count_tokens(question)
+        max_memory_tokens = max(
+            self.amem_max_context_tokens
+            - system_tokens
+            - question_tokens
+            - self.max_tokens
+            - 200,
+            0,
+        )
+        chain_selection_audit: Dict[str, Any] = {
+            "enabled": False,
+            "candidate_memory_ids": list(final_ids),
+            "selected_memory_ids": list(final_ids),
+            "token_budget": max_memory_tokens,
+        }
+        if getattr(self, "amem_chain_selection", False):
+            pre_chain_ids = set(final_ids)
+            dense_chain_indices = self._normalize_indices(
+                memory_system.retriever.search(
+                    retrieval_query, self.amem_chain_candidate_count
+                )
+            )
+            chain_candidate_ids = list(dict.fromkeys(
+                list(final_ids)
+                + [
+                    item["memory_id"]
+                    for item in hybrid_result.get("memory_scores", [])
+                ]
+                + list(graph_result.get("scores", {}))
+                + [
+                    memory_ids[index]
+                    for index in dense_chain_indices
+                    if 0 <= index < len(memory_ids)
+                ]
+            ))
+            dense_chain_ids = [
+                memory_ids[index]
+                for index in dense_chain_indices
+                if 0 <= index < len(memory_ids)
+            ]
+            hybrid_chain_ids = [
+                item["memory_id"]
+                for item in hybrid_result.get("memory_scores", [])
+            ]
+            graph_chain_ids = sorted(
+                graph_result.get("scores", {}),
+                key=lambda memory_id: (
+                    -float(graph_result["scores"][memory_id]),
+                    memory_index_by_id[memory_id],
+                ),
+            )
+            chain_only_candidate_ids = [
+                memory_id
+                for memory_id in chain_candidate_ids
+                if memory_id not in pre_chain_ids
+            ]
+            temporal_expansion_ids_for_cost = {
+                item["added_memory_id"]
+                for item in temporal_result["expanded_memories"]
+            }
+
+            def formatted_chain_context(selected_ids: Sequence[str]) -> str:
+                selected = list(selected_ids)
+                selected_relations = memory_system.relations_among(
+                    selected,
+                    min_confidence=self.amem_relation_min_confidence,
+                ) if typed_context_enabled else []
+                selected_evidence = self._provenance_context_records(
+                    memory_system, selected
+                )
+                selected_expansions = [
+                    item for item in expansions
+                    if item.get("added_memory_id") in selected
+                ]
+                return self._format_relation_context(
+                    memory_system,
+                    selected,
+                    [memory_id for memory_id in seed_ids if memory_id in selected],
+                    selected_expansions,
+                    selected_relations,
+                    typed_enabled=typed_context_enabled,
+                    temporal_enabled=temporal_retrieval,
+                    temporal_query=temporal_result["query"],
+                    temporal_expansion_ids=[
+                        memory_id
+                        for memory_id in selected
+                        if memory_id in temporal_expansion_ids_for_cost
+                    ],
+                    evidence_records=selected_evidence,
+                    chain_candidate_ids=chain_only_candidate_ids,
+                ) if selected else ""
+
+            hybrid_chain_scores = {
+                item["memory_id"]: float(item.get("fused_score", 0.0))
+                for item in hybrid_result.get("memory_scores", [])
+            }
+            graph_chain_scores = {
+                memory_id: float(score)
+                for memory_id, score in graph_result.get("scores", {}).items()
+            }
+            chain_selection_audit = memory_system.select_chain_preserving_evidence(
+                chain_candidate_ids,
+                raw_question,
+                candidate_rankings={
+                    "retrieval": list(final_ids),
+                    "hybrid": hybrid_chain_ids,
+                    "graph": graph_chain_ids,
+                    "dense": dense_chain_ids,
+                },
+                hybrid_scores=hybrid_chain_scores,
+                graph_scores=graph_chain_scores,
+                token_budget=max_memory_tokens,
+                token_cost=lambda selected: self._llm_client.count_tokens(
+                    formatted_chain_context(selected)
+                ),
+                candidate_count=self.amem_chain_candidate_count,
+                evidence_count=getattr(self, "amem_chain_evidence_count", 30),
+                max_hops=self.amem_chain_max_hops,
+                max_groups=self.amem_chain_max_groups,
+                relevance_weight=self.amem_chain_weights["relevance"],
+                coverage_weight=self.amem_chain_weights["coverage"],
+                connectivity_weight=self.amem_chain_weights["connectivity"],
+                path_weight=self.amem_chain_weights["path"],
+                temporal_weight=self.amem_chain_weights["temporal"],
+                redundancy_weight=self.amem_chain_weights["redundancy"],
+                relation_weights=self.amem_graph_relation_weights,
+                min_confidence=self.amem_relation_min_confidence,
+                include_related=self.amem_expand_related,
+                use_typed_relations=typed_retrieval,
+                use_ordinary_links=self.amem_expand_links,
+                temporal_state_enabled=temporal_retrieval,
+                temporal_query=temporal_result["query"],
+            )
+            chain_selection_audit["enabled"] = True
+            final_ids = list(chain_selection_audit["selected_memory_ids"])
+            expansions = [
+                item for item in expansions
+                if item.get("added_memory_id") in set(final_ids)
+            ]
+
         relations = memory_system.relations_among(
             final_ids,
             min_confidence=self.amem_relation_min_confidence,
-        ) if typed_retrieval else []
+        ) if typed_context_enabled else []
         evidence_records = self._provenance_context_records(memory_system, final_ids)
         temporal_expansion_ids = [
             item["added_memory_id"]
@@ -798,28 +1099,26 @@ class AMemTestAgent(AMemFixAgent):
             seed_ids,
             expansions,
             relations,
-            typed_enabled=typed_retrieval,
+            typed_enabled=typed_context_enabled,
             temporal_enabled=temporal_retrieval,
             temporal_query=temporal_result["query"],
             temporal_expansion_ids=temporal_expansion_ids,
             evidence_records=evidence_records,
+            chain_candidate_ids=(
+                chain_only_candidate_ids
+                if getattr(self, "amem_chain_selection", False) else None
+            ),
         ) if final_ids else ""
-
-        system_tokens = self._llm_client.count_tokens(system_message) if system_message else 0
-        question_tokens = self._llm_client.count_tokens(question)
-        max_memory_tokens = max(
-            self.amem_max_context_tokens
-            - system_tokens
-            - question_tokens
-            - self.max_tokens
-            - 200,
-            0,
-        )
-        if relation_context:
+        if relation_context and not getattr(self, "amem_chain_selection", False):
             relation_context = self._truncate_to_token_limit(relation_context, max_memory_tokens)
         full_question = f"{relation_context}\n\n{question}" if relation_context.strip() else question
 
         expansion_by_id = {item["added_memory_id"]: item for item in expansions}
+        hybrid_score_by_id = {
+            item["memory_id"]: item
+            for item in hybrid_result.get("memory_scores", [])
+        }
+        graph_scores = graph_result.get("scores", {})
         temporal_expansion_by_id = {
             item["added_memory_id"]: item
             for item in temporal_result["expanded_memories"]
@@ -849,6 +1148,8 @@ class AMemTestAgent(AMemFixAgent):
                 "memory_id": memory_id,
                 "semantic_seed": memory_id in seed_set,
                 "amem_fix_retrieval": memory_id in amem_fix_ids,
+                "hybrid_retrieval": hybrid_score_by_id.get(memory_id),
+                "graph_score": graph_scores.get(memory_id),
                 "typed_expansion": expansion_by_id.get(memory_id),
                 "typed_relations": [
                     relation
@@ -870,7 +1171,22 @@ class AMemTestAgent(AMemFixAgent):
             retrieved_memories.append(record)
         retrieval_audit = {
             "semantic_seed_ids": seed_ids,
+            "seed_scores": seed_scores,
             "amem_fix_memory_ids": amem_fix_ids,
+            "hybrid_retrieval_enabled": getattr(
+                self, "amem_hybrid_retrieval", False
+            ),
+            "hybrid_channel_weights": getattr(
+                self, "amem_hybrid_channel_weights", {}
+            ),
+            "hybrid_channel_rankings": hybrid_result.get("channel_rankings", {}),
+            "hybrid_memory_scores": hybrid_result.get("memory_scores", []),
+            "graph_ranking_mode": graph_ranking_mode,
+            "graph_ranking_scores": graph_scores,
+            "graph_iterations_run": graph_result.get("iterations_run", 0),
+            "graph_converged": graph_result.get("converged", True),
+            "graph_temporal_query": graph_result.get("temporal_query", {}),
+            "chain_selection": chain_selection_audit,
             "expanded_memories": expansions,
             "final_memory_ids": final_ids,
             "total_retrieved_count": len(final_ids),
@@ -904,9 +1220,12 @@ class AMemTestAgent(AMemFixAgent):
         if retrieved_memories:
             retrieved_memories[0]["retrieval_audit"] = retrieval_audit
         logger.info(
-            "Experimental retrieval context=%d seeds=%s typed_expansions=%s "
+            "Experimental retrieval context=%d hybrid=%s graph=%s seeds=%s "
+            "graph_expansions=%s "
             "temporal_expansions=%s evidence=%s final=%s relations=%d",
             context_id,
+            getattr(self, "amem_hybrid_retrieval", False),
+            graph_ranking_mode,
             seed_ids,
             [item["added_memory_id"] for item in expansions],
             temporal_expansion_ids,
@@ -938,6 +1257,13 @@ class AMemTestAgent(AMemFixAgent):
                 ),
                 "amem_provenance_inject_raw_text": getattr(
                     self, "amem_provenance_inject_raw_text", False
+                ),
+                "amem_hybrid_retrieval": getattr(
+                    self, "amem_hybrid_retrieval", False
+                ),
+                "amem_graph_ranking_mode": graph_ranking_mode,
+                "amem_chain_selection": getattr(
+                    self, "amem_chain_selection", False
                 ),
                 "raw_question": raw_question,
                 "retrieval_query": retrieval_query,
@@ -980,5 +1306,36 @@ class AMemTestAgent(AMemFixAgent):
             "amem_provenance_inject_raw_text": getattr(
                 self, "amem_provenance_inject_raw_text", False
             ),
+            "amem_hybrid_retrieval": getattr(
+                self, "amem_hybrid_retrieval", False
+            ),
+            "amem_hybrid_candidate_count": getattr(
+                self, "amem_hybrid_candidate_count", 50
+            ),
+            "amem_hybrid_rrf_k": getattr(self, "amem_hybrid_rrf_k", 60.0),
+            "amem_hybrid_channel_weights": getattr(
+                self, "amem_hybrid_channel_weights", {}
+            ),
+            "amem_graph_ranking_mode": getattr(
+                self, "amem_graph_ranking_mode", "fixed_bfs"
+            ),
+            "amem_graph_alpha": getattr(self, "amem_graph_alpha", 0.85),
+            "amem_graph_iterations": getattr(self, "amem_graph_iterations", 20),
+            "amem_graph_tolerance": getattr(
+                self, "amem_graph_tolerance", 1e-6
+            ),
+            "amem_graph_relation_weights": getattr(
+                self, "amem_graph_relation_weights", {}
+            ),
+            "amem_chain_selection": getattr(self, "amem_chain_selection", False),
+            "amem_chain_candidate_count": getattr(
+                self, "amem_chain_candidate_count", 50
+            ),
+            "amem_chain_evidence_count": getattr(
+                self, "amem_chain_evidence_count", 30
+            ),
+            "amem_chain_max_hops": getattr(self, "amem_chain_max_hops", 2),
+            "amem_chain_max_groups": getattr(self, "amem_chain_max_groups", 3),
+            "amem_chain_weights": getattr(self, "amem_chain_weights", {}),
         })
         return info

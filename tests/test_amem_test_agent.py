@@ -725,6 +725,141 @@ def test_typed_expansion_traverses_incoming_edges_with_budget_and_confidence():
     assert "topic" in selected_related
     assert "weak" not in selected_related
 
+def test_hybrid_candidate_retrieval_fuses_deterministic_channels():
+    system = _experimental_system(temporal=False)
+    system.memories["dense"] = _timestamped_memory(
+        "general nutrition note", "2024-01-01"
+    )
+    system.memories["match"] = _timestamped_memory(
+        "metformin medication dose", "2024-02-10"
+    )
+    system.memories["other"] = _timestamped_memory(
+        "blood pressure reading", "2024-03-01"
+    )
+    system.retriever = SimpleNamespace(search=lambda query, k: [0, 1, 2])
+    weights = {
+        "dense": 0.25,
+        "bm25": 1.0,
+        "entity_attribute": 1.0,
+        "timestamp": 1.0,
+        "state": 0.0,
+        "graph": 0.0,
+    }
+
+    first = system.hybrid_candidate_retrieval(
+        "metformin medication",
+        "Which medication was used in February 2024?",
+        k=2,
+        candidate_count=3,
+        rrf_k=60.0,
+        channel_weights=weights,
+        use_typed_relations=False,
+        use_ordinary_links=False,
+    )
+    second = system.hybrid_candidate_retrieval(
+        "metformin medication",
+        "Which medication was used in February 2024?",
+        k=2,
+        candidate_count=3,
+        rrf_k=60.0,
+        channel_weights=weights,
+        use_typed_relations=False,
+        use_ordinary_links=False,
+    )
+
+    assert first == second
+    assert first["selected_memory_ids"][0] == "match"
+    assert first["channel_rankings"]["dense"][0] == "dense"
+    assert first["channel_rankings"]["bm25"][0] == "match"
+    assert first["channel_rankings"]["timestamp"] == ["match"]
+    assert first["memory_scores"][0]["ranks"] == {
+        "dense": 2,
+        "bm25": 1,
+        "entity_attribute": 1,
+        "timestamp": 1,
+    }
+    assert sum(first["seed_scores"].values()) == pytest.approx(1.0)
+
+def test_query_conditioned_typed_ppr_prefers_current_superseder():
+    system = _experimental_system()
+    system.memories["old"] = _timestamped_memory("old treatment", "2024-01-01")
+    system.memories["new"] = _timestamped_memory("current treatment", "2024-02-01")
+    system.memories["detail"] = _timestamped_memory("supporting detail", "2024-02-02")
+    system.add_typed_relation(_edge("new", "old", "SUPERSEDE"))
+    system.add_typed_relation(_edge("detail", "old", "SUPPORT"))
+    relation_weights = {
+        "SUPERSEDE": 1.25,
+        "CONFLICT": 0.75,
+        "REFINE": 1.15,
+        "SUPPORT": 1.0,
+        "RELATED": 0.5,
+    }
+
+    untyped = system.query_conditioned_graph_rank(
+        {"old": 1.0},
+        "What is the current treatment now?",
+        mode="untyped_ppr",
+        expansion_budget=2,
+        alpha=0.85,
+        iterations=100,
+        tolerance=1e-12,
+        relation_weights=relation_weights,
+    )
+    typed = system.query_conditioned_graph_rank(
+        {"old": 1.0},
+        "What is the current treatment now?",
+        mode="typed_ppr",
+        expansion_budget=2,
+        alpha=0.85,
+        iterations=300,
+        tolerance=1e-12,
+        relation_weights=relation_weights,
+    )
+
+    assert untyped["scores"]["new"] == pytest.approx(untyped["scores"]["detail"])
+    assert typed["scores"]["new"] > typed["scores"]["detail"]
+    assert typed["expanded_memories"][0]["added_memory_id"] == "new"
+    assert typed["temporal_query"]["intent"] == "current"
+    assert typed["converged"] is True
+
+def test_query_conditioned_graph_rank_rejects_unknown_mode():
+    system = _empty_system()
+    system.memories["seed"] = _memory("seed")
+
+    with pytest.raises(ValueError, match="Unsupported graph ranking mode"):
+        system.query_conditioned_graph_rank(
+            {"seed": 1.0},
+            "question",
+            mode="unknown",
+            expansion_budget=1,
+            alpha=0.85,
+            iterations=20,
+            tolerance=1e-6,
+            relation_weights={},
+        )
+
+def test_typed_ppr_weights_relation_type_from_query_intent():
+    system = _experimental_system(temporal=False)
+    for memory_id in ("seed", "conflict", "detail"):
+        system.memories[memory_id] = _memory(memory_id)
+    system.add_typed_relation(_edge("conflict", "seed", "CONFLICT"))
+    system.add_typed_relation(_edge("detail", "seed", "REFINE"))
+    relation_weights = {relation_type: 1.0 for relation_type in RELATION_TYPES}
+
+    result = system.query_conditioned_graph_rank(
+        {"seed": 1.0},
+        "Which statements conflict or contradict each other?",
+        mode="typed_ppr",
+        expansion_budget=2,
+        alpha=0.85,
+        iterations=200,
+        tolerance=1e-9,
+        relation_weights=relation_weights,
+    )
+
+    assert result["scores"]["conflict"] > result["scores"]["detail"]
+    assert result["temporal_query"]["relation_intents"] == ["conflict"]
+
 
 def test_typed_add_note_stores_memory_when_relation_inference_fails(monkeypatch):
     class _Note:
@@ -1264,6 +1399,505 @@ def test_retrieval_switches_disable_built_features_without_rebuilding():
     assert "[Temporal State / Validity]" not in context
     assert "[Immutable Source Evidence]" not in context
 
+@pytest.mark.parametrize(
+    "graph_mode, expected_ids, typed_context",
+    [
+        ("none", ["old"], False),
+        ("fixed_bfs", ["old", "new"], True),
+        ("untyped_ppr", ["old", "new"], False),
+        ("typed_ppr", ["old", "new"], True),
+    ],
+)
+def test_query_pipeline_supports_all_graph_ranking_modes(
+    graph_mode,
+    expected_ids,
+    typed_context,
+):
+    system = _experimental_system()
+    system.memories["old"] = _timestamped_memory("old state", "2024-01-01")
+    system.memories["new"] = _timestamped_memory("new current state", "2024-02-01")
+    system.add_typed_relation(_edge("new", "old", "SUPERSEDE"))
+    system.retriever = SimpleNamespace(search=lambda query, k: [0])
+    system.llm_controller = SimpleNamespace(llm=SimpleNamespace())
+
+    agent = object.__new__(AMemTestAgent)
+    agent._context_id = 3
+    agent.retrieve_num = 1
+    agent.amem_query_keywords = False
+    agent.amem_expand_links = False
+    agent.amem_typed_relations = True
+    agent.amem_typed_retrieval = True
+    agent.amem_typed_expansion_count = 1
+    agent.amem_expand_related = False
+    agent.amem_relation_min_confidence = 0.5
+    agent.amem_temporal_state = True
+    agent.amem_temporal_retrieval = False
+    agent.amem_temporal_ordering = False
+    agent.amem_provenance = False
+    agent.amem_provenance_retrieval = False
+    agent.amem_hybrid_retrieval = False
+    agent.amem_graph_ranking_mode = graph_mode
+    agent.amem_graph_alpha = 0.85
+    agent.amem_graph_iterations = 100
+    agent.amem_graph_tolerance = 1e-12
+    agent.amem_graph_relation_weights = {
+        "SUPERSEDE": 1.25,
+        "CONFLICT": 0.75,
+        "REFINE": 1.15,
+        "SUPPORT": 1.0,
+        "RELATED": 0.5,
+    }
+    agent.amem_max_context_tokens = 2000
+    agent.max_tokens = 100
+    agent._tokenizer = _Tokenizer()
+    agent._llm_client = _LLMClient()
+    agent._get_memory_system = lambda context_id: system
+
+    prepared = agent.prepare_batch_query(
+        "formatted question",
+        system_message="system",
+        raw_question="What is the current state now?",
+    )
+
+    assert prepared["extra"]["graph_ranking_mode"] == graph_mode
+    assert prepared["extra"]["final_memory_ids"] == expected_ids
+    context = prepared["messages"][-1]["content"]
+    assert ("[Typed Memory Relations]" in context) is typed_context
+
+def test_hybrid_retrieval_audit_records_rrf_channels_and_scores():
+    system = _experimental_system(temporal=False)
+    system.memories["dense"] = _memory("general note")
+    system.memories["match"] = _memory("metformin medication")
+    system.retriever = SimpleNamespace(search=lambda query, k: [0, 1])
+    system.llm_controller = SimpleNamespace(llm=SimpleNamespace())
+
+    agent = object.__new__(AMemTestAgent)
+    agent._context_id = 3
+    agent.retrieve_num = 1
+    agent.amem_query_keywords = False
+    agent.amem_expand_links = False
+    agent.amem_typed_relations = False
+    agent.amem_typed_retrieval = False
+    agent.amem_typed_expansion_count = 0
+    agent.amem_expand_related = False
+    agent.amem_relation_min_confidence = 0.5
+    agent.amem_temporal_state = False
+    agent.amem_temporal_retrieval = False
+    agent.amem_provenance = False
+    agent.amem_provenance_retrieval = False
+    agent.amem_hybrid_retrieval = True
+    agent.amem_hybrid_candidate_count = 2
+    agent.amem_hybrid_rrf_k = 60.0
+    agent.amem_hybrid_channel_weights = {
+        "dense": 0.1,
+        "bm25": 1.0,
+        "entity_attribute": 1.0,
+        "timestamp": 0.0,
+        "state": 0.0,
+        "graph": 0.0,
+    }
+    agent.amem_graph_ranking_mode = "none"
+    agent.amem_max_context_tokens = 2000
+    agent.max_tokens = 100
+    agent._tokenizer = _Tokenizer()
+    agent._llm_client = _LLMClient()
+    agent._get_memory_system = lambda context_id: system
+
+    prepared = agent.prepare_batch_query(
+        "formatted question",
+        system_message="system",
+        raw_question="Which metformin medication?",
+    )
+
+    assert prepared["extra"]["final_memory_ids"] == ["match"]
+    assert prepared["extra"]["hybrid_channel_rankings"]["dense"] == [
+        "dense", "match"
+    ]
+    assert prepared["extra"]["hybrid_channel_rankings"]["bm25"] == ["match"]
+    assert prepared["retrieved_memories"][0]["hybrid_retrieval"]["ranks"] == {
+        "dense": 2,
+        "bm25": 1,
+        "entity_attribute": 1,
+    }
+    assert "[Typed Memory Relations]" not in prepared["messages"][-1]["content"]
+
+def test_chain_selector_adds_complete_path_atomically_with_exact_budget():
+    system = _experimental_system(temporal=False)
+    system.memories["start"] = _memory("alpha finding")
+    system.memories["bridge"] = _memory("intermediate supporting evidence")
+    system.memories["end"] = _memory("gamma outcome")
+    system.add_typed_relation(_edge("bridge", "start", "SUPPORT"))
+    system.add_typed_relation(_edge("end", "bridge", "SUPPORT"))
+
+    selected = system.select_chain_preserving_evidence(
+        ["start", "bridge", "end"],
+        "How did alpha lead to gamma?",
+        token_budget=30,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        max_hops=2,
+        max_groups=1,
+        relevance_weight=0.0,
+        coverage_weight=0.0,
+        connectivity_weight=0.0,
+        path_weight=1.0,
+        temporal_weight=0.0,
+        redundancy_weight=0.0,
+    )
+    too_small = system.select_chain_preserving_evidence(
+        ["start", "bridge", "end"],
+        "How did alpha lead to gamma?",
+        token_budget=29,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        max_hops=2,
+        max_groups=1,
+        relevance_weight=0.0,
+        coverage_weight=0.0,
+        connectivity_weight=0.0,
+        path_weight=1.0,
+        temporal_weight=0.0,
+        redundancy_weight=0.0,
+    )
+
+    assert selected["selected_memory_ids"] == ["start", "bridge", "end"]
+    assert selected["selected_tokens"] == 30
+    assert selected["selection_steps"][0]["action_type"] == "path"
+    assert selected["selection_steps"][0]["added_memory_ids"] == [
+        "start", "bridge", "end"
+    ]
+    assert too_small["selected_memory_ids"] == ["start", "bridge"]
+    assert too_small["selected_tokens"] == 20
+    assert too_small["selection_steps"][0]["action_type"] == "path"
+    assert "end" not in too_small["selection_steps"][0]["added_memory_ids"]
+
+def test_chain_selector_transition_coverage_requires_both_edge_endpoints():
+    system = _experimental_system(temporal=False)
+    system.memories["old"] = _memory("old treatment")
+    system.memories["new"] = _memory("new treatment")
+    system.add_typed_relation(_edge("new", "old", "SUPERSEDE"))
+
+    result = system.select_chain_preserving_evidence(
+        ["old", "new"],
+        "What changed?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        max_hops=1,
+        max_groups=1,
+        relevance_weight=0.0,
+        coverage_weight=1.0,
+        connectivity_weight=0.0,
+        path_weight=0.0,
+        temporal_weight=0.0,
+        redundancy_weight=0.0,
+    )
+    singleton = system.select_chain_preserving_evidence(
+        ["old", "new"],
+        "What changed?",
+        token_budget=10,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        max_hops=1,
+        max_groups=1,
+        relevance_weight=0.0,
+        coverage_weight=1.0,
+        connectivity_weight=0.0,
+        path_weight=0.0,
+        temporal_weight=0.0,
+        redundancy_weight=0.0,
+    )
+
+    assert result["selected_memory_ids"] == ["old", "new"]
+    assert result["utility"]["coverage"] > singleton["utility"]["coverage"]
+    assert singleton["utility"]["coverage"] < result["utility"]["coverage"]
+    assert len(singleton["selected_memory_ids"]) == 1
+    assert "transition" in result["question_facets"]["structural"]
+
+def test_chain_selector_reaches_general_evidence_target_without_forced_ids():
+    system = _experimental_system(temporal=False)
+    candidate_ids = [f"memory-{index}" for index in range(40)]
+    for index, memory_id in enumerate(candidate_ids):
+        system.memories[memory_id] = _memory(
+            f"clinical evidence item {index}"
+        )
+
+    result = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "Which clinical evidence is relevant?",
+        candidate_rankings={
+            "upstream": candidate_ids[:20],
+            "dense": list(reversed(candidate_ids[20:])),
+        },
+        token_budget=300,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        candidate_count=40,
+        evidence_count=30,
+        max_groups=1,
+        redundancy_weight=1.0,
+    )
+
+    assert len(result["selected_memory_ids"]) == 30
+    assert result["selected_tokens"] == 300
+    assert result["target_evidence_count"] == 30
+    assert any(
+        memory_id not in candidate_ids[:20]
+        for memory_id in result["selected_memory_ids"]
+    )
+    assert {item["reason"] for item in result["rejected_candidates"]} == {
+        "evidence_count"
+    }
+
+def test_chain_selector_uses_soft_group_preference_not_hard_rejection():
+    system = _experimental_system(temporal=False)
+    candidate_ids = [f"memory-{index}" for index in range(5)]
+    for memory_id in candidate_ids:
+        system.memories[memory_id] = _memory(memory_id)
+
+    result = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "List the relevant memories",
+        token_budget=50,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        evidence_count=5,
+        max_groups=1,
+    )
+
+    assert result["selected_memory_ids"] == candidate_ids
+    assert result["utility"]["component_count"] == 5
+    assert result["utility"]["group_penalty"] > 0.0
+
+def test_chain_selector_gates_temporal_state_and_matches_direct_dates():
+    system = _experimental_system(temporal=False)
+    system.memories["old"] = _timestamped_memory("old note", "2024-01-05")
+    system.memories["new"] = _timestamped_memory("new note", "2024-02-05")
+
+    historical = system.select_chain_preserving_evidence(
+        ["old", "new"],
+        "What happened previously?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        evidence_count=2,
+        temporal_weight=1.0,
+        temporal_state_enabled=False,
+    )
+    dated = system.select_chain_preserving_evidence(
+        ["old", "new"],
+        "What happened on 2024-01-05?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        evidence_count=2,
+        temporal_weight=1.0,
+        temporal_state_enabled=False,
+    )
+
+    assert "historical_state" not in historical["question_facets"]["structural"]
+    assert historical["utility"]["temporal"] == 0.0
+    assert dated["candidate_scores"]["old"]["facet_matches"]["target_time"] == 1.0
+    assert dated["candidate_scores"]["new"]["facet_matches"]["target_time"] == 0.0
+    assert dated["utility"]["temporal"] == 1.0
+
+def test_chain_selector_fuses_channels_before_candidate_limit():
+    system = _experimental_system(temporal=False)
+    candidate_ids = [f"memory-{index}" for index in range(8)]
+    for memory_id in candidate_ids:
+        system.memories[memory_id] = _memory(memory_id)
+
+    result = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "memory evidence",
+        candidate_rankings={
+            "upstream": candidate_ids[:4],
+            "dense": candidate_ids[4:],
+        },
+        token_budget=40,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        candidate_count=4,
+        evidence_count=4,
+    )
+
+    assert set(result["candidate_memory_ids"]) != set(candidate_ids[:4])
+    assert any(
+        memory_id in candidate_ids[4:]
+        for memory_id in result["candidate_memory_ids"]
+    )
+
+def test_chain_selector_reserves_budget_for_feasible_evidence_target():
+    system = _experimental_system(temporal=False)
+    candidate_ids = ["large", "small-a", "small-b", "small-c"]
+    for memory_id in candidate_ids:
+        system.memories[memory_id] = _memory(memory_id)
+    costs = {"large": 25, "small-a": 10, "small-b": 10, "small-c": 10}
+
+    result = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "large evidence",
+        candidate_rankings={"dense": candidate_ids},
+        token_budget=30,
+        token_cost=lambda memory_ids: sum(costs[item] for item in memory_ids),
+        candidate_count=4,
+        evidence_count=3,
+    )
+
+    assert result["selected_memory_ids"] == ["small-a", "small-b", "small-c"]
+    assert result["selected_tokens"] == 30
+
+def test_chain_selector_requires_resolved_bounds_for_relative_dates():
+    system = _experimental_system(temporal=False)
+    system.memories["january"] = _timestamped_memory(
+        "January evidence", "2024-01-05"
+    )
+    system.memories["march"] = _timestamped_memory(
+        "March evidence", "2024-03-05"
+    )
+    unresolved_query = detect_temporal_query("What happened two months ago?")
+    unresolved_query["intent"] = "time_specific"
+
+    unresolved = system.select_chain_preserving_evidence(
+        ["january", "march"],
+        "What happened two months ago?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        evidence_count=2,
+        temporal_state_enabled=False,
+        temporal_query=unresolved_query,
+    )
+    resolved_query = detect_temporal_query("What happened two months ago?")
+    resolved_query["intent"] = "time_specific"
+    resolved_query["target"].update({
+        "start": "2024-01-01T00:00:00",
+        "end": "2024-02-01T00:00:00",
+    })
+    resolved = system.select_chain_preserving_evidence(
+        ["january", "march"],
+        "What happened two months ago?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        evidence_count=2,
+        temporal_state_enabled=False,
+        temporal_query=resolved_query,
+    )
+
+    assert unresolved["candidate_scores"]["january"]["facet_matches"][
+        "target_time"
+    ] == 0.0
+    assert unresolved["candidate_scores"]["march"]["facet_matches"][
+        "target_time"
+    ] == 0.0
+    assert resolved["candidate_scores"]["january"]["facet_matches"][
+        "target_time"
+    ] == 1.0
+    assert resolved["candidate_scores"]["march"]["facet_matches"][
+        "target_time"
+    ] == 0.0
+
+def test_chain_selector_uses_all_bounded_candidates_as_path_anchors():
+    system = _experimental_system(temporal=False)
+    candidate_ids = [f"memory-{index}" for index in range(9)]
+    for index, memory_id in enumerate(candidate_ids):
+        content = "alpha finding" if index == 0 else f"unrelated note {index}"
+        if index == 8:
+            content = "gamma outcome"
+        system.memories[memory_id] = _memory(content)
+    system.add_typed_relation(_edge("memory-8", "memory-0", "SUPPORT"))
+
+    result = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "How did alpha lead to gamma?",
+        token_budget=20,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+        candidate_count=9,
+        max_hops=1,
+        max_groups=1,
+        relevance_weight=0.0,
+        coverage_weight=0.0,
+        connectivity_weight=0.0,
+        path_weight=1.0,
+        temporal_weight=0.0,
+        redundancy_weight=0.0,
+    )
+    empty = system.select_chain_preserving_evidence(
+        candidate_ids,
+        "How did alpha lead to gamma?",
+        token_budget=0,
+        token_cost=lambda memory_ids: len(memory_ids) * 10,
+    )
+
+    assert result["selected_memory_ids"] == ["memory-0", "memory-8"]
+    assert result["selection_steps"][0]["action_type"] == "path"
+    assert empty["evidence_graph_edges"] == []
+
+def test_query_pipeline_chain_selection_widens_candidates_and_preserves_path():
+    system = _experimental_system(temporal=False)
+    system.memories["start"] = _memory("alpha finding")
+    system.memories["bridge"] = _memory("intermediate supporting evidence")
+    system.memories["end"] = _memory("gamma outcome")
+    system.add_typed_relation(_edge("bridge", "start", "SUPPORT"))
+    system.add_typed_relation(_edge("end", "bridge", "SUPPORT"))
+    system.retriever = SimpleNamespace(
+        search=lambda query, k: list(range(min(k, len(system.memories))))
+    )
+    system.llm_controller = SimpleNamespace(llm=SimpleNamespace())
+
+    agent = object.__new__(AMemTestAgent)
+    agent._context_id = 3
+    agent.retrieve_num = 1
+    agent.amem_query_keywords = False
+    agent.amem_expand_links = False
+    agent.amem_typed_relations = True
+    agent.amem_typed_retrieval = True
+    agent.amem_typed_expansion_count = 0
+    agent.amem_expand_related = False
+    agent.amem_relation_min_confidence = 0.5
+    agent.amem_temporal_state = False
+    agent.amem_temporal_retrieval = False
+    agent.amem_temporal_ordering = False
+    agent.amem_provenance = False
+    agent.amem_provenance_retrieval = False
+    agent.amem_hybrid_retrieval = False
+    agent.amem_graph_ranking_mode = "fixed_bfs"
+    agent.amem_graph_relation_weights = {
+        "SUPERSEDE": 1.25,
+        "CONFLICT": 0.75,
+        "REFINE": 1.15,
+        "SUPPORT": 1.0,
+        "RELATED": 0.5,
+    }
+    agent.amem_chain_selection = True
+    agent.amem_chain_candidate_count = 3
+    agent.amem_chain_max_hops = 2
+    agent.amem_chain_max_groups = 1
+    agent.amem_chain_weights = {
+        "relevance": 0.0,
+        "coverage": 0.0,
+        "connectivity": 0.0,
+        "path": 1.0,
+        "temporal": 0.0,
+        "redundancy": 0.0,
+    }
+    agent.amem_max_context_tokens = 2000
+    agent.max_tokens = 100
+    agent._tokenizer = _Tokenizer()
+    agent._llm_client = _LLMClient()
+    agent._get_memory_system = lambda context_id: system
+
+    prepared = agent.prepare_batch_query(
+        "formatted question",
+        system_message="system",
+        raw_question="How did alpha lead to gamma?",
+    )
+
+    audit = prepared["extra"]["chain_selection"]
+    context = prepared["extra"]["relation_aware_context"]
+    assert audit["enabled"] is True
+    assert audit["candidate_memory_ids"] == ["start", "bridge", "end"]
+    assert audit["selected_memory_ids"] == ["start", "bridge", "end"]
+    assert audit["selected_tokens"] == agent._llm_client.count_tokens(context)
+    assert audit["selected_tokens"] <= audit["token_budget"]
+    assert prepared["extra"]["final_memory_ids"] == [
+        "start", "bridge", "end"
+    ]
+    assert "id=bridge | chain-selection candidate" in context
+    assert "id=end | chain-selection candidate" in context
+    assert "M2 --SUPPORT" in context
+    assert "M3 --SUPPORT" in context
+
 
 def test_retrieval_config_does_not_change_build_snapshot_hash():
     base = {
@@ -1281,6 +1915,9 @@ def test_retrieval_config_does_not_change_build_snapshot_hash():
             "amem_temporal_retrieval": True,
             "amem_provenance_retrieval": True,
             "amem_temporal_ordering": True,
+            "amem_hybrid_retrieval": False,
+            "amem_graph_ranking_mode": "fixed_bfs",
+            "amem_chain_selection": False,
         },
     }
     ablated = {**base, "retrieval_config": {
@@ -1289,6 +1926,9 @@ def test_retrieval_config_does_not_change_build_snapshot_hash():
         "amem_temporal_retrieval": False,
         "amem_provenance_retrieval": False,
         "amem_temporal_ordering": False,
+        "amem_hybrid_retrieval": True,
+        "amem_graph_ranking_mode": "typed_ppr",
+        "amem_chain_selection": True,
     }}
     dataset = DatasetConfig(dataset_name="test")
 
@@ -1410,6 +2050,8 @@ def test_amem_test_registration_creation_and_baseline_mapping(monkeypatch):
             "amem_original_evolution": False,
             "amem_typed_relations": False,
             "amem_typed_expansion_count": 7,
+            "amem_hybrid_retrieval": True,
+            "amem_graph_ranking_mode": "none",
         },
     })
     manager.dataset_config = DatasetConfig(dataset_name="medmemorybench")
@@ -1424,6 +2066,19 @@ def test_amem_test_registration_creation_and_baseline_mapping(monkeypatch):
     assert captured["amem_original_evolution"] is False
     assert captured["amem_typed_relations"] is False
     assert captured["amem_typed_expansion_count"] == 7
+    assert captured["amem_hybrid_retrieval"] is True
+    assert captured["amem_graph_ranking_mode"] == "none"
+    assert captured["amem_chain_selection"] is False
+    assert captured["amem_chain_candidate_count"] == 50
+    assert captured["amem_chain_evidence_count"] == 30
+    assert captured["amem_chain_max_hops"] == 2
+    assert captured["amem_chain_max_groups"] == 3
+    assert captured["amem_chain_relevance_weight"] == 1.0
+    assert captured["amem_chain_coverage_weight"] == 1.0
+    assert captured["amem_chain_connectivity_weight"] == 0.35
+    assert captured["amem_chain_path_weight"] == 0.75
+    assert captured["amem_chain_temporal_weight"] == 0.5
+    assert captured["amem_chain_redundancy_weight"] == 0.25
     assert captured["amem_temporal_state"] is False
     assert captured["amem_temporal_expansion_count"] == 5
     assert captured["amem_provenance"] is False
@@ -1432,6 +2087,35 @@ def test_amem_test_registration_creation_and_baseline_mapping(monkeypatch):
     assert captured["retrieve_num"] == 10
     assert captured["amem_query_keywords"] is True
     assert captured["amem_expand_links"] is True
+
+def test_invalid_graph_ranking_configuration_is_rejected():
+    with pytest.raises(ValueError, match="amem_graph_ranking_mode must be one of"):
+        AMemTestAgent.__init__(
+            object.__new__(AMemTestAgent),
+            model="mock",
+            amem_graph_ranking_mode="invalid",
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="requires amem_typed_relations=true and amem_typed_retrieval=true",
+    ):
+        AMemTestAgent.__init__(
+            object.__new__(AMemTestAgent),
+            model="mock",
+            amem_typed_relations=True,
+            amem_typed_retrieval=False,
+            amem_graph_ranking_mode="typed_ppr",
+        )
+
+    with pytest.raises(ValueError, match="requires amem_typed_relations=true"):
+        AMemTestAgent.__init__(
+            object.__new__(AMemTestAgent),
+            model="mock",
+            amem_typed_relations=False,
+            amem_typed_retrieval=True,
+            amem_graph_ranking_mode="typed_ppr",
+        )
 
 
 def test_amem_fix_and_amem_test_initialize_with_mocked_dependencies(monkeypatch):
@@ -1588,6 +2272,75 @@ def test_amem_test_configs_load(config_name, enabled):
     assert config.agent_params["amem_query_keywords"] is True
     assert config.agent_params["amem_expand_links"] is True
     assert config.agent_params["amem_original_evolution"] is True
+    if config_name == "amem_test_gemini":
+        assert config.retrieval_config["amem_hybrid_retrieval"] is False
+        assert config.retrieval_config["amem_graph_ranking_mode"] == "fixed_bfs"
+        assert config.retrieval_config["amem_hybrid_graph_weight"] == 1.0
+    assert isinstance(config.retrieval_config["amem_chain_selection"], bool)
+    assert config.retrieval_config["amem_chain_candidate_count"] == 50
+    assert config.retrieval_config["amem_chain_evidence_count"] == 30
+
+def test_all_amem_test_configs_declare_complete_retrieval_controls():
+    config_root = Path("configs/method_config")
+    paths = sorted(config_root.glob("amem_test*.yaml"))
+    paths.extend(sorted((config_root / "persona_1").glob("amem_test*.yaml")))
+    expected_keys = {
+        "retrieve_num",
+        "amem_max_context_tokens",
+        "amem_query_keywords",
+        "amem_expand_links",
+        "amem_typed_retrieval",
+        "amem_typed_expansion_count",
+        "amem_expand_related",
+        "amem_relation_min_confidence",
+        "amem_temporal_expansion_count",
+        "amem_temporal_retrieval",
+        "amem_provenance_max_evidence",
+        "amem_provenance_retrieval",
+        "amem_provenance_inject_raw_text",
+        "amem_temporal_ordering",
+        "amem_hybrid_retrieval",
+        "amem_hybrid_candidate_count",
+        "amem_hybrid_rrf_k",
+        "amem_hybrid_dense_weight",
+        "amem_hybrid_bm25_weight",
+        "amem_hybrid_entity_weight",
+        "amem_hybrid_timestamp_weight",
+        "amem_hybrid_state_weight",
+        "amem_hybrid_graph_weight",
+        "amem_graph_ranking_mode",
+        "amem_graph_alpha",
+        "amem_graph_iterations",
+        "amem_graph_tolerance",
+        "amem_graph_supersede_weight",
+        "amem_graph_conflict_weight",
+        "amem_graph_refine_weight",
+        "amem_graph_support_weight",
+        "amem_graph_related_weight",
+        "amem_chain_selection",
+        "amem_chain_candidate_count",
+        "amem_chain_evidence_count",
+        "amem_chain_max_hops",
+        "amem_chain_max_groups",
+        "amem_chain_relevance_weight",
+        "amem_chain_coverage_weight",
+        "amem_chain_connectivity_weight",
+        "amem_chain_path_weight",
+        "amem_chain_temporal_weight",
+        "amem_chain_redundancy_weight",
+    }
+
+    assert len(paths) == 16
+    for path in paths:
+        retrieval_config = yaml.safe_load(
+            path.read_text(encoding="utf-8")
+        )["retrieval_config"]
+        assert set(retrieval_config) == expected_keys, path
+        assert isinstance(retrieval_config["amem_hybrid_retrieval"], bool), path
+        assert retrieval_config["amem_graph_ranking_mode"] in {
+            "none", "fixed_bfs", "untyped_ppr", "typed_ppr"
+        }, path
+        assert isinstance(retrieval_config.get("amem_chain_selection"), bool), path
 
 
 def test_all_amem_test_configs_declare_explicit_original_evolution_mode():
@@ -1603,11 +2356,11 @@ def test_all_amem_test_configs_declare_explicit_original_evolution_mode():
         assert isinstance(build_config["amem_original_evolution"], bool), path
 
 
-def test_persona_amem_test2_gemini_keeps_original_evolution_enabled():
+def test_persona_amem_test2_gemini_disables_original_evolution():
     path = Path("configs/method_config/persona_1/amem_test2_gemini.yaml")
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    assert config["build_config"]["amem_original_evolution"] is True
+    assert config["build_config"]["amem_original_evolution"] is False
 
 
 @pytest.mark.parametrize(

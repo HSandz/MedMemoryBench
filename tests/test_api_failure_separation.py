@@ -161,6 +161,27 @@ def test_true_duration_subtracts_measured_api_failure_time(tmp_path):
     assert result_data["duration_seconds"] == 10.0
     assert result_data["true_duration_seconds"] == 7.5
 
+def test_true_duration_subtracts_recovered_retry_time():
+    report = EvaluationReport(
+        method_name="method",
+        model_name="model",
+        dataset_name="medmemorybench",
+        start_time="start",
+        end_time="end",
+        duration_seconds=10.0,
+        summary={"total": 1},
+        metadata={"api_failure_duration_seconds": 3.0},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 7.0
+
+def test_report_failure_duration_combines_recovered_and_terminal_failures():
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator._api_failure_duration_seconds = 2.5
+    llm_usage = {"total": {"failure_duration_seconds": 4.5}}
+
+    assert evaluator._retry_failure_duration(llm_usage) == 7.0
+
 
 def test_api_call_timer_attaches_failed_operation_duration(monkeypatch):
     evaluator_module = __import__(

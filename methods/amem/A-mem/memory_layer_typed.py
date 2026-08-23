@@ -6,9 +6,13 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import re
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+from rank_bm25 import BM25Okapi
 
 from memory_layer_robust import RobustAgenticMemorySystem, RobustMemoryNote
 from utils.llm_client import get_usage_tracker
@@ -25,6 +29,22 @@ RELATION_PRIORITY = {
     "SUPPORT": 3,
     "RELATED": 4,
 }
+DEFAULT_GRAPH_RELATION_WEIGHTS = {
+    "SUPERSEDE": 1.25,
+    "CONFLICT": 0.75,
+    "REFINE": 1.15,
+    "SUPPORT": 1.0,
+    "RELATED": 0.5,
+}
+
+_RETRIEVAL_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "before", "by",
+    "did", "do", "does", "for", "from", "had", "has", "have", "he",
+    "her", "his", "how", "i", "in", "is", "it", "me", "my", "of",
+    "on", "or", "our", "she", "that", "the", "their", "them", "they",
+    "this", "to", "user", "was", "were", "what", "when", "where",
+    "which", "who", "why", "with", "you", "your",
+})
 
 _MONTH_NAMES = {
     "january": 1,
@@ -263,6 +283,21 @@ def detect_temporal_query(question: str) -> Dict[str, Any]:
         "relative_reference": relative_reference,
     }
 
+def detect_graph_query_intents(question: str) -> List[str]:
+    """Detect deterministic relation preferences for query-conditioned diffusion."""
+    lowered = str(question or "").lower()
+    intents = []
+    patterns = {
+        "causal": r"\b(?:why|cause[ds]?|because|led to|result(?:ed)? in|reason)\b",
+        "conflict": r"\b(?:conflict|contradict|inconsistent|disagree|different)\b",
+        "detail": r"\b(?:detail|specific|exact|precise|clarify|refine)\b",
+        "change": r"\b(?:change[ds]?|changed|transition|before and after|replace[ds]?)\b",
+    }
+    for intent, pattern in patterns.items():
+        if re.search(pattern, lowered):
+            intents.append(intent)
+    return intents
+
 
 def _clamp_confidence(value: Any) -> float:
     try:
@@ -274,6 +309,16 @@ def _clamp_confidence(value: Any) -> float:
         return max(0.0, min(1.0, number))
     except (TypeError, ValueError):
         return 0.5
+
+def _retrieval_tokens(value: Any) -> List[str]:
+    return [
+        token
+        for token in re.findall(
+            r"[a-z0-9]+|[\u3400-\u9fff]", str(value or "").lower()
+        )
+        if (len(token) > 1 or "\u3400" <= token <= "\u9fff")
+        and token not in _RETRIEVAL_STOPWORDS
+    ]
 
 
 def _normalize_prediction(item: Any, candidate_count: int) -> Optional[Dict[str, Any]]:
@@ -1053,6 +1098,1419 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
                 if len(expansions) >= budget:
                     break
         return selected_ids, expansions
+
+    def _memory_search_text(self, memory_id: str) -> str:
+        memory = self.memories[memory_id]
+        return " ".join([
+            str(getattr(memory, "content", "")),
+            str(getattr(memory, "context", "")),
+            " ".join(str(item) for item in getattr(memory, "keywords", [])),
+            " ".join(str(item) for item in getattr(memory, "tags", [])),
+        ])
+
+    def _ordinary_neighbor_ids(self, memory_id: str) -> List[str]:
+        memory_ids = list(self.memories.keys())
+        memory = self.memories.get(memory_id)
+        if memory is None:
+            return []
+        neighbors = []
+        for link in getattr(memory, "links", []):
+            if isinstance(link, str) and link in self.memories:
+                neighbor_id = link
+            else:
+                try:
+                    index = int(link)
+                except (TypeError, ValueError):
+                    continue
+                if index < 0 or index >= len(memory_ids):
+                    continue
+                neighbor_id = memory_ids[index]
+            if neighbor_id != memory_id and neighbor_id not in neighbors:
+                neighbors.append(neighbor_id)
+        return neighbors
+
+    def _graph_proximity_ranking(
+        self,
+        seed_ids: Sequence[str],
+        *,
+        min_confidence: float,
+        include_related: bool,
+        use_typed_relations: bool,
+        use_ordinary_links: bool,
+    ) -> List[str]:
+        allowed_types = set(DEFAULT_EXPANSION_TYPES)
+        if include_related:
+            allowed_types.add("RELATED")
+        threshold = _clamp_confidence(min_confidence)
+        seed_positions = {
+            memory_id: position
+            for position, memory_id in enumerate(seed_ids)
+            if memory_id in self.memories
+        }
+        distances = {memory_id: 0 for memory_id in seed_positions}
+        origins = dict(seed_positions)
+        queue = deque(seed_positions)
+        while queue:
+            current_id = queue.popleft()
+            typed_neighbors = []
+            if use_typed_relations:
+                for edge in self._memory_edges(current_id):
+                    if edge["relation_type"] not in allowed_types:
+                        continue
+                    if float(edge.get("confidence", 0.0)) < threshold:
+                        continue
+                    typed_neighbors.append(
+                        edge["target_id"]
+                        if edge["source_id"] == current_id
+                        else edge["source_id"]
+                    )
+            ordinary_neighbors = (
+                self._ordinary_neighbor_ids(current_id) if use_ordinary_links else []
+            )
+            for neighbor_id in ordinary_neighbors + typed_neighbors:
+                candidate = (distances[current_id] + 1, origins[current_id])
+                previous = (
+                    distances.get(neighbor_id, math.inf),
+                    origins.get(neighbor_id, math.inf),
+                )
+                if candidate >= previous:
+                    continue
+                distances[neighbor_id], origins[neighbor_id] = candidate
+                queue.append(neighbor_id)
+        return [
+            memory_id
+            for memory_id in sorted(
+                distances,
+                key=lambda item: (
+                    distances[item],
+                    origins[item],
+                    list(self.memories).index(item),
+                ),
+            )
+            if distances[memory_id] > 0
+        ]
+
+    def hybrid_candidate_retrieval(
+        self,
+        query: str,
+        raw_question: str,
+        *,
+        k: int,
+        candidate_count: int,
+        rrf_k: float,
+        channel_weights: Mapping[str, float],
+        min_confidence: float = 0.5,
+        include_related: bool = False,
+        use_typed_relations: bool = True,
+        use_ordinary_links: bool = True,
+    ) -> Dict[str, Any]:
+        """Fuse deterministic candidate rankings with weighted reciprocal rank."""
+        memory_ids = list(self.memories.keys())
+        if not memory_ids or k <= 0:
+            return {
+                "selected_memory_ids": [],
+                "seed_scores": {},
+                "channel_rankings": {},
+                "memory_scores": [],
+            }
+
+        pool_size = min(len(memory_ids), max(int(candidate_count), int(k)))
+        weights = {
+            str(name): max(0.0, float(value))
+            for name, value in channel_weights.items()
+        }
+        rankings: Dict[str, List[str]] = {}
+
+        dense_indices = self._normalize_indices(self.retriever.search(query, pool_size))
+        dense_ids = [
+            memory_ids[index]
+            for index in dense_indices
+            if 0 <= index < len(memory_ids)
+        ]
+        rankings["dense"] = list(dict.fromkeys(dense_ids))
+
+        tokenized_corpus = [
+            _retrieval_tokens(self._memory_search_text(memory_id))
+            for memory_id in memory_ids
+        ]
+        query_tokens = _retrieval_tokens(query)
+        if query_tokens and any(tokenized_corpus):
+            bm25_scores = BM25Okapi(tokenized_corpus).get_scores(query_tokens)
+            query_token_set = set(query_tokens)
+            ranked = sorted(
+                (
+                    index
+                    for index, document_tokens in enumerate(tokenized_corpus)
+                    if query_token_set.intersection(document_tokens)
+                ),
+                key=lambda index: (-float(bm25_scores[index]), index),
+            )
+            rankings["bm25"] = [
+                memory_ids[index]
+                for index in ranked[:pool_size]
+            ]
+        else:
+            rankings["bm25"] = []
+
+        raw_tokens = set(_retrieval_tokens(raw_question))
+        overlap_scores = []
+        for position, memory_id in enumerate(memory_ids):
+            memory = self.memories[memory_id]
+            metadata_tokens = set(_retrieval_tokens(" ".join([
+                str(getattr(memory, "context", "")),
+                " ".join(str(item) for item in getattr(memory, "keywords", [])),
+                " ".join(str(item) for item in getattr(memory, "tags", [])),
+                str(getattr(memory, "content", "")),
+            ])))
+            overlap = raw_tokens & metadata_tokens
+            if overlap:
+                overlap_scores.append((sum(len(token) for token in overlap), position, memory_id))
+        rankings["entity_attribute"] = [
+            memory_id
+            for _, _, memory_id in sorted(
+                overlap_scores,
+                key=lambda item: (-item[0], item[1]),
+            )[:pool_size]
+        ]
+
+        temporal_query = detect_temporal_query(raw_question)
+        target = temporal_query["target"]
+        timestamp_matches = []
+        state_matches = []
+        for position, memory_id in enumerate(memory_ids):
+            memory = self.memories[memory_id]
+            state = self.get_temporal_state(memory_id)
+            if not state:
+                state = self._initial_temporal_state(
+                    getattr(memory, "source_timestamp", None)
+                    or getattr(memory, "timestamp", None)
+                )
+            source_timestamp = _parse_timestamp(
+                getattr(memory, "source_timestamp", None)
+                or getattr(memory, "timestamp", None)
+            )
+            target_start = _parse_timestamp(target.get("start"))
+            target_end = _parse_timestamp(target.get("end"))
+            if source_timestamp is not None and target.get("raw"):
+                direct_match = (
+                    target_start is not None
+                    and target_end is not None
+                    and target_start <= source_timestamp < target_end
+                )
+                if target_start is None or target_end is None:
+                    direct_match = (
+                        (target.get("year") is None or source_timestamp.year == target["year"])
+                        and (
+                            target.get("month") is None
+                            or source_timestamp.month == target["month"]
+                        )
+                    )
+                if direct_match:
+                    timestamp_matches.append(memory_id)
+            if getattr(self, "temporal_state_enabled", False):
+                priority = self._temporal_priority(
+                    memory_id,
+                    temporal_query["intent"],
+                    target,
+                    position,
+                )
+                if temporal_query["intent"] != "none" and priority[0] == 0:
+                    state_matches.append((priority, memory_id))
+        rankings["timestamp"] = timestamp_matches[:pool_size]
+        state_candidate_ids = set(
+            memory_id
+            for channel in ("dense", "bm25", "entity_attribute", "timestamp")
+            for memory_id in rankings[channel]
+        )
+        rankings["state"] = [
+            memory_id
+            for _, memory_id in sorted(state_matches, key=lambda item: item[0])[:pool_size]
+            if memory_id in state_candidate_ids
+        ]
+        graph_seed_ids = list(dict.fromkeys(
+            memory_id
+            for channel in (
+                "dense", "bm25", "entity_attribute", "timestamp", "state"
+            )
+            for memory_id in rankings[channel][:max(1, k)]
+        ))
+        rankings["graph"] = self._graph_proximity_ranking(
+            graph_seed_ids,
+            min_confidence=min_confidence,
+            include_related=include_related,
+            use_typed_relations=use_typed_relations,
+            use_ordinary_links=use_ordinary_links,
+        )[:pool_size]
+
+        fused_scores = {memory_id: 0.0 for memory_id in memory_ids}
+        ranks_by_memory: Dict[str, Dict[str, int]] = {
+            memory_id: {} for memory_id in memory_ids
+        }
+        contributions: Dict[str, Dict[str, float]] = {
+            memory_id: {} for memory_id in memory_ids
+        }
+        denominator_offset = max(0.0, float(rrf_k))
+        for channel, ranking in rankings.items():
+            weight = weights.get(channel, 0.0)
+            if weight <= 0.0:
+                continue
+            for rank, memory_id in enumerate(ranking, start=1):
+                contribution = weight / (denominator_offset + rank)
+                fused_scores[memory_id] += contribution
+                ranks_by_memory[memory_id][channel] = rank
+                contributions[memory_id][channel] = contribution
+
+        positions = {memory_id: position for position, memory_id in enumerate(memory_ids)}
+        ranked_ids = sorted(
+            memory_ids,
+            key=lambda memory_id: (-fused_scores[memory_id], positions[memory_id]),
+        )
+        selected_ids = [
+            memory_id for memory_id in ranked_ids if fused_scores[memory_id] > 0.0
+        ][:min(k, len(memory_ids))]
+        total = sum(fused_scores[memory_id] for memory_id in selected_ids)
+        seed_scores = {
+            memory_id: (
+                fused_scores[memory_id] / total
+                if total > 0.0 else 1.0 / len(selected_ids)
+            )
+            for memory_id in selected_ids
+        }
+        return {
+            "selected_memory_ids": selected_ids,
+            "seed_scores": seed_scores,
+            "channel_rankings": rankings,
+            "memory_scores": [
+                {
+                    "memory_id": memory_id,
+                    "fused_score": fused_scores[memory_id],
+                    "normalized_seed_score": seed_scores.get(memory_id, 0.0),
+                    "ranks": ranks_by_memory[memory_id],
+                    "contributions": contributions[memory_id],
+                }
+                for memory_id in ranked_ids
+                if fused_scores[memory_id] > 0.0
+            ],
+            "temporal_query": temporal_query,
+        }
+
+    def _temporal_transition_weight(
+        self,
+        memory_id: str,
+        temporal_query: Dict[str, Any],
+    ) -> float:
+        if not getattr(self, "temporal_state_enabled", False):
+            return 1.0
+        intent = temporal_query.get("intent", "none")
+        if intent == "none":
+            return 1.0
+        memory = self.memories[memory_id]
+        state = self.get_temporal_state(memory_id)
+        if not state:
+            state = self._initial_temporal_state(
+                getattr(memory, "source_timestamp", None)
+                or getattr(memory, "timestamp", None)
+            )
+        if intent == "current":
+            return 1.25 if state.get("status") == "current" else 0.5
+        if intent == "historical":
+            return 1.25 if state.get("historical") else 0.5
+        if intent == "time_specific":
+            return 1.25 if self._time_specific_match(
+                state, temporal_query.get("target", {})
+            ) else 0.5
+        if intent == "change":
+            participates = bool(state.get("superseded_by") or state.get("supersedes"))
+            return 1.25 if participates else 0.75
+        return 1.0
+
+    def _graph_adjacency(
+        self,
+        *,
+        mode: str,
+        temporal_query: Dict[str, Any],
+        relation_weights: Mapping[str, float],
+        min_confidence: float,
+        include_related: bool,
+        use_typed_relations: bool,
+        use_ordinary_links: bool,
+    ) -> Dict[str, Dict[str, float]]:
+        adjacency: Dict[str, Dict[str, float]] = {
+            memory_id: {} for memory_id in self.memories
+        }
+
+        def add_neighbor(source_id: str, target_id: str, weight: float) -> None:
+            if source_id == target_id or weight <= 0.0:
+                return
+            previous = adjacency[source_id].get(target_id, 0.0)
+            adjacency[source_id][target_id] = previous + weight
+
+        if use_ordinary_links:
+            for memory_id in self.memories:
+                for neighbor_id in self._ordinary_neighbor_ids(memory_id):
+                    add_neighbor(memory_id, neighbor_id, 1.0)
+                    add_neighbor(neighbor_id, memory_id, 1.0)
+
+        threshold = _clamp_confidence(min_confidence)
+        relation_intents = set(temporal_query.get("relation_intents", []))
+        allowed_types = set(DEFAULT_EXPANSION_TYPES)
+        if include_related:
+            allowed_types.add("RELATED")
+        for edge in self.typed_relations if use_typed_relations else []:
+            relation_type = edge.get("relation_type")
+            confidence = float(edge.get("confidence", 0.0))
+            if relation_type not in allowed_types or confidence < threshold:
+                continue
+            source_id = edge["source_id"]
+            target_id = edge["target_id"]
+            if mode == "untyped_ppr":
+                add_neighbor(source_id, target_id, 1.0)
+                add_neighbor(target_id, source_id, 1.0)
+                continue
+
+            base_weight = max(0.0, float(relation_weights.get(relation_type, 0.0)))
+            if base_weight <= 0.0:
+                continue
+            outgoing_weight = base_weight * confidence
+            incoming_weight = base_weight * confidence
+            intent = temporal_query.get("intent", "none")
+            if "causal" in relation_intents and relation_type in {"SUPPORT", "RELATED"}:
+                outgoing_weight *= 1.25
+                incoming_weight *= 1.25
+            if "conflict" in relation_intents and relation_type == "CONFLICT":
+                outgoing_weight *= 1.5
+                incoming_weight *= 1.5
+            if "detail" in relation_intents and relation_type == "REFINE":
+                outgoing_weight *= 1.35
+                incoming_weight *= 1.35
+            if "change" in relation_intents and relation_type in {
+                "SUPERSEDE", "REFINE", "CONFLICT"
+            }:
+                outgoing_weight *= 1.25
+                incoming_weight *= 1.25
+            if relation_type == "SUPERSEDE":
+                if intent == "current":
+                    outgoing_weight *= 0.5
+                    incoming_weight *= 1.5
+                elif intent in {"historical", "time_specific"}:
+                    outgoing_weight *= 1.5
+                    incoming_weight *= 0.75
+            elif intent == "change" and relation_type in {
+                "SUPERSEDE", "REFINE", "CONFLICT"
+            }:
+                outgoing_weight *= 1.25
+                incoming_weight *= 1.25
+            add_neighbor(
+                source_id,
+                target_id,
+                outgoing_weight
+                * self._temporal_transition_weight(target_id, temporal_query),
+            )
+            add_neighbor(
+                target_id,
+                source_id,
+                incoming_weight
+                * self._temporal_transition_weight(source_id, temporal_query),
+            )
+        return adjacency
+
+    def query_conditioned_graph_rank(
+        self,
+        seed_scores: Mapping[str, float],
+        raw_question: str,
+        *,
+        mode: str,
+        expansion_budget: int,
+        alpha: float,
+        iterations: int,
+        tolerance: float,
+        relation_weights: Mapping[str, float],
+        min_confidence: float = 0.5,
+        include_related: bool = False,
+        use_typed_relations: bool = True,
+        use_ordinary_links: bool = True,
+    ) -> Dict[str, Any]:
+        """Rank graph memories with personalized PageRank from query seeds."""
+        if mode not in {"untyped_ppr", "typed_ppr"}:
+            raise ValueError(f"Unsupported graph ranking mode: {mode}")
+        memory_ids = list(self.memories.keys())
+        positions = {memory_id: position for position, memory_id in enumerate(memory_ids)}
+        seeds = {
+            memory_id: max(0.0, float(score))
+            for memory_id, score in seed_scores.items()
+            if memory_id in self.memories
+        }
+        total_seed_score = sum(seeds.values())
+        if total_seed_score <= 0.0:
+            seeds = {
+                memory_id: 1.0
+                for memory_id in seed_scores
+                if memory_id in self.memories
+            }
+            total_seed_score = sum(seeds.values())
+        if total_seed_score <= 0.0:
+            return {
+                "selected_memory_ids": [],
+                "expanded_memories": [],
+                "scores": {},
+                "iterations_run": 0,
+                "converged": True,
+                "temporal_query": detect_temporal_query(raw_question),
+            }
+        restart = {
+            memory_id: seeds.get(memory_id, 0.0) / total_seed_score
+            for memory_id in memory_ids
+        }
+        temporal_query = detect_temporal_query(raw_question)
+        temporal_query["relation_intents"] = detect_graph_query_intents(raw_question)
+        adjacency = self._graph_adjacency(
+            mode=mode,
+            temporal_query=temporal_query,
+            relation_weights=relation_weights,
+            min_confidence=min_confidence,
+            include_related=include_related,
+            use_typed_relations=use_typed_relations,
+            use_ordinary_links=use_ordinary_links,
+        )
+        transition = {}
+        for source_id, neighbors in adjacency.items():
+            total_weight = sum(neighbors.values())
+            transition[source_id] = {
+                target_id: weight / total_weight
+                for target_id, weight in neighbors.items()
+            } if total_weight > 0.0 else {}
+
+        damping = max(0.0, min(0.999999, float(alpha)))
+        max_iterations = max(1, int(iterations))
+        convergence_tolerance = max(0.0, float(tolerance))
+        scores = dict(restart)
+        converged = False
+        iterations_run = 0
+        for iteration in range(max_iterations):
+            next_scores = {
+                memory_id: (1.0 - damping) * restart[memory_id]
+                for memory_id in memory_ids
+            }
+            dangling_mass = 0.0
+            for source_id, source_score in scores.items():
+                neighbors = transition[source_id]
+                if not neighbors:
+                    dangling_mass += source_score
+                    continue
+                for target_id, probability in neighbors.items():
+                    next_scores[target_id] += damping * source_score * probability
+            if dangling_mass:
+                for memory_id, restart_score in restart.items():
+                    next_scores[memory_id] += damping * dangling_mass * restart_score
+            delta = sum(
+                abs(next_scores[memory_id] - scores[memory_id])
+                for memory_id in memory_ids
+            )
+            scores = next_scores
+            iterations_run = iteration + 1
+            if delta <= convergence_tolerance:
+                converged = True
+                break
+
+        ranked_ids = sorted(
+            memory_ids,
+            key=lambda memory_id: (-scores[memory_id], positions[memory_id]),
+        )
+        seed_ids = set(seeds)
+        expansion_ids = [
+            memory_id
+            for memory_id in ranked_ids
+            if memory_id not in seed_ids and scores[memory_id] > 0.0
+        ][:max(0, int(expansion_budget))]
+        selected_set = seed_ids | set(expansion_ids)
+        selected_ids = [
+            memory_id for memory_id in ranked_ids if memory_id in selected_set
+        ]
+        return {
+            "selected_memory_ids": selected_ids,
+            "expanded_memories": [
+                {
+                    "added_memory_id": memory_id,
+                    "reason": mode,
+                    "graph_score": scores[memory_id],
+                }
+                for memory_id in expansion_ids
+            ],
+            "scores": {
+                memory_id: scores[memory_id]
+                for memory_id in ranked_ids
+                if scores[memory_id] > 0.0
+            },
+            "iterations_run": iterations_run,
+            "converged": converged,
+            "temporal_query": temporal_query,
+        }
+
+    def _chain_edge_weights(
+        self,
+        candidate_ids: Sequence[str],
+        raw_question: str,
+        *,
+        relation_weights: Mapping[str, float],
+        min_confidence: float,
+        include_related: bool,
+        use_typed_relations: bool,
+        use_ordinary_links: bool,
+    ) -> Tuple[Dict[Tuple[str, str], float], List[Dict[str, Any]]]:
+        candidate_set = set(candidate_ids)
+        positions = {memory_id: position for position, memory_id in enumerate(candidate_ids)}
+        edge_weights: Dict[Tuple[str, str], float] = {}
+        edge_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        def add_edge(
+            source_id: str,
+            target_id: str,
+            weight: float,
+            relation_type: str,
+            confidence: float,
+        ) -> None:
+            if (
+                source_id == target_id
+                or source_id not in candidate_set
+                or target_id not in candidate_set
+                or weight <= 0.0
+            ):
+                return
+            key = tuple(sorted(
+                (source_id, target_id),
+                key=lambda memory_id: positions[memory_id],
+            ))
+            bounded_weight = max(0.0, min(1.0, float(weight)))
+            if bounded_weight <= edge_weights.get(key, 0.0):
+                return
+            edge_weights[key] = bounded_weight
+            edge_records[key] = {
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation_type": relation_type,
+                "confidence": confidence,
+                "weight": bounded_weight,
+            }
+
+        if use_ordinary_links:
+            for memory_id in candidate_ids:
+                for neighbor_id in self._ordinary_neighbor_ids(memory_id):
+                    add_edge(memory_id, neighbor_id, 0.5, "ORDINARY_LINK", 1.0)
+
+        if use_typed_relations:
+            allowed_types = set(DEFAULT_EXPANSION_TYPES)
+            if include_related:
+                allowed_types.add("RELATED")
+            threshold = _clamp_confidence(min_confidence)
+            temporal_query = detect_temporal_query(raw_question)
+            relation_intents = set(detect_graph_query_intents(raw_question))
+            max_relation_weight = max(
+                [max(0.0, float(value)) for value in relation_weights.values()]
+                or [1.0]
+            )
+            for edge in self.typed_relations:
+                relation_type = str(edge.get("relation_type") or "")
+                confidence = float(edge.get("confidence", 0.0))
+                if relation_type not in allowed_types or confidence < threshold:
+                    continue
+                type_weight = max(
+                    0.0, float(relation_weights.get(relation_type, 0.0))
+                ) / max(max_relation_weight, 1e-12)
+                intent_weight = 1.0
+                if "conflict" in relation_intents and relation_type == "CONFLICT":
+                    intent_weight *= 1.25
+                if "detail" in relation_intents and relation_type == "REFINE":
+                    intent_weight *= 1.2
+                if "change" in relation_intents and relation_type in {
+                    "SUPERSEDE", "REFINE", "CONFLICT"
+                }:
+                    intent_weight *= 1.2
+                if "causal" in relation_intents and relation_type == "SUPPORT":
+                    intent_weight *= 1.1
+                temporal_weight = 1.0
+                if temporal_query["intent"] == "change" and relation_type in {
+                    "SUPERSEDE", "REFINE"
+                }:
+                    temporal_weight = 1.2
+                add_edge(
+                    str(edge["source_id"]),
+                    str(edge["target_id"]),
+                    confidence * type_weight * intent_weight * temporal_weight,
+                    relation_type,
+                    confidence,
+                )
+        return edge_weights, [
+            edge_records[key]
+            for key in sorted(
+                edge_records,
+                key=lambda item: (positions[item[0]], positions[item[1]]),
+            )
+        ]
+
+    def _chain_question_facets(
+        self,
+        raw_question: str,
+        candidate_ids: Sequence[str],
+        *,
+        temporal_state_enabled: bool,
+        temporal_query: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        question_tokens = list(dict.fromkeys(_retrieval_tokens(raw_question)))
+        document_tokens = {
+            memory_id: set(_retrieval_tokens(self._memory_search_text(memory_id)))
+            for memory_id in candidate_ids
+        }
+        lexical_weights = {}
+        for token in question_tokens:
+            document_frequency = sum(
+                token in tokens for tokens in document_tokens.values()
+            )
+            lexical_weights[token] = math.log(
+                (len(candidate_ids) + 1) / (document_frequency + 1)
+            ) + 1.0
+
+        temporal_query = copy.deepcopy(
+            temporal_query or detect_temporal_query(raw_question)
+        )
+        relation_intents = detect_graph_query_intents(raw_question)
+        structural = []
+        intent = temporal_query["intent"]
+        if intent == "current" and temporal_state_enabled:
+            structural.append("current_state")
+        elif intent == "historical" and temporal_state_enabled:
+            structural.append("historical_state")
+        elif intent == "time_specific":
+            structural.append("target_time")
+        elif intent == "change":
+            if temporal_state_enabled:
+                structural.extend(("earlier_state", "later_state"))
+            structural.append("transition")
+        for relation_intent in relation_intents:
+            structural.append(f"operation:{relation_intent}")
+        lowered = str(raw_question or "").lower()
+        if re.search(r"\b(?:compare|difference|versus|vs\.?|both)\b", lowered):
+            structural.append("operation:comparison")
+        if re.search(r"\b(?:list|what are|name all|all the)\b", lowered):
+            structural.append("operation:enumeration")
+
+        all_weights = dict(lexical_weights)
+        structural_weight = max(
+            sum(lexical_weights.values()) / max(len(lexical_weights), 1),
+            1.0,
+        )
+        for facet in structural:
+            all_weights[facet] = structural_weight
+        total_weight = sum(all_weights.values())
+        normalized_weights = {
+            facet: weight / total_weight
+            for facet, weight in all_weights.items()
+        } if total_weight > 0.0 else {}
+        return {
+            "lexical": question_tokens,
+            "structural": structural,
+            "weights": normalized_weights,
+            "temporal_query": temporal_query,
+            "relation_intents": relation_intents,
+            "document_tokens": document_tokens,
+            "temporal_state_enabled": temporal_state_enabled,
+        }
+
+    def _chain_facet_matches(
+        self,
+        candidate_ids: Sequence[str],
+        facets: Dict[str, Any],
+        edge_weights: Mapping[Tuple[str, str], float],
+        edge_records: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, float]]:
+        matches: Dict[str, Dict[str, float]] = {}
+        temporal_query = facets["temporal_query"]
+        target = temporal_query["target"]
+        for memory_id in candidate_ids:
+            memory = self.memories[memory_id]
+            memory_matches = {
+                token: 1.0
+                for token in facets["lexical"]
+                if token in facets["document_tokens"][memory_id]
+            }
+            state = (
+                self.get_temporal_state(memory_id)
+                if facets["temporal_state_enabled"] else {}
+            )
+            if "current_state" in facets["structural"]:
+                memory_matches["current_state"] = float(
+                    state.get("status") == "current"
+                )
+            if "historical_state" in facets["structural"]:
+                memory_matches["historical_state"] = float(
+                    bool(state.get("historical"))
+                    or state.get("status") == "superseded"
+                )
+            if "target_time" in facets["structural"]:
+                source_timestamp = _parse_timestamp(
+                    getattr(memory, "source_timestamp", None)
+                    or getattr(memory, "timestamp", None)
+                )
+                target_start = _parse_timestamp(target.get("start"))
+                target_end = _parse_timestamp(target.get("end"))
+                direct_match = bool(
+                    source_timestamp is not None
+                    and target_start is not None
+                    and target_end is not None
+                    and target_start <= source_timestamp < target_end
+                )
+                has_calendar_bound = bool(
+                    target.get("year") is not None
+                    or target.get("month") is not None
+                )
+                if (target_start is None or target_end is None) and has_calendar_bound:
+                    direct_match = bool(
+                        source_timestamp is not None
+                        and (
+                            target.get("year") is None
+                            or source_timestamp.year == target["year"]
+                        )
+                        and (
+                            target.get("month") is None
+                            or source_timestamp.month == target["month"]
+                        )
+                    )
+                memory_matches["target_time"] = float(direct_match)
+            if "earlier_state" in facets["structural"]:
+                memory_matches["earlier_state"] = float(
+                    bool(state.get("historical"))
+                    or state.get("status") == "superseded"
+                )
+            if "later_state" in facets["structural"]:
+                memory_matches["later_state"] = float(
+                    state.get("status") == "current"
+                )
+            if "transition" in facets["structural"]:
+                memory_matches["transition"] = 0.0
+            for relation_intent in facets["relation_intents"]:
+                compatible_types = {
+                    "conflict": {"CONFLICT"},
+                    "detail": {"REFINE"},
+                    "change": {"SUPERSEDE", "REFINE", "CONFLICT"},
+                    "causal": {"SUPPORT"},
+                }.get(relation_intent, set())
+                participates = any(
+                    memory_id in {edge["source_id"], edge["target_id"]}
+                    and edge.get("relation_type") in compatible_types
+                    for edge in edge_records
+                )
+                memory_matches[f"operation:{relation_intent}"] = float(participates)
+            if "operation:comparison" in facets["structural"]:
+                memory_matches["operation:comparison"] = float(
+                    bool(state.get("conflicts_with"))
+                    or bool(state.get("superseded_by"))
+                    or bool(state.get("supersedes"))
+                )
+            if "operation:enumeration" in facets["structural"]:
+                memory_matches["operation:enumeration"] = 1.0
+            matches[memory_id] = memory_matches
+        return matches
+
+    def _chain_short_paths(
+        self,
+        candidate_ids: Sequence[str],
+        relevance: Mapping[str, float],
+        facet_matches: Mapping[str, Mapping[str, float]],
+        edge_weights: Mapping[Tuple[str, str], float],
+        max_hops: int,
+    ) -> List[Dict[str, Any]]:
+        positions = {memory_id: position for position, memory_id in enumerate(candidate_ids)}
+        adjacency: Dict[str, List[Tuple[str, float]]] = {
+            memory_id: [] for memory_id in candidate_ids
+        }
+        for (source_id, target_id), weight in edge_weights.items():
+            adjacency[source_id].append((target_id, weight))
+            adjacency[target_id].append((source_id, weight))
+        for memory_id in adjacency:
+            adjacency[memory_id].sort(
+                key=lambda item: (-item[1], positions[item[0]])
+            )
+            adjacency[memory_id] = adjacency[memory_id][:8]
+
+        anchors = sorted(
+            candidate_ids,
+            key=lambda memory_id: (-relevance.get(memory_id, 0.0), positions[memory_id]),
+        )
+        paths = []
+        seen_paths = set()
+        hop_limit = min(3, max(1, int(max_hops)))
+        for source_position, source_id in enumerate(anchors):
+            source_facets = {
+                facet for facet, value in facet_matches[source_id].items() if value > 0.0
+            }
+            for target_id in anchors[source_position + 1:]:
+                target_facets = {
+                    facet for facet, value in facet_matches[target_id].items() if value > 0.0
+                }
+                if source_facets == target_facets and source_facets:
+                    continue
+                best_path = None
+                best_quality = -1.0
+                queue = deque([([source_id], [])])
+                while queue:
+                    path, weights = queue.popleft()
+                    current_id = path[-1]
+                    if len(path) - 1 >= hop_limit:
+                        continue
+                    for neighbor_id, edge_weight in adjacency[current_id]:
+                        if neighbor_id in path:
+                            continue
+                        next_path = path + [neighbor_id]
+                        next_weights = weights + [edge_weight]
+                        if neighbor_id == target_id:
+                            geometric_mean = math.prod(next_weights) ** (
+                                1.0 / len(next_weights)
+                            )
+                            quality = (
+                                math.sqrt(
+                                    relevance.get(source_id, 0.0)
+                                    * relevance.get(target_id, 0.0)
+                                )
+                                * geometric_mean
+                                / len(next_weights)
+                            )
+                            if quality > best_quality:
+                                best_quality = quality
+                                best_path = next_path
+                        else:
+                            queue.append((next_path, next_weights))
+                if best_path is None:
+                    continue
+                key = tuple(best_path)
+                reverse_key = tuple(reversed(best_path))
+                if key in seen_paths or reverse_key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                paths.append({"memory_ids": best_path, "quality": best_quality})
+        paths.sort(key=lambda item: (
+            -item["quality"],
+            len(item["memory_ids"]),
+            tuple(positions[memory_id] for memory_id in item["memory_ids"]),
+        ))
+        paths = paths[:100]
+        total_quality = sum(item["quality"] for item in paths)
+        for item in paths:
+            item["normalized_quality"] = (
+                item["quality"] / total_quality if total_quality > 0.0 else 0.0
+            )
+        return paths
+
+    def select_chain_preserving_evidence(
+        self,
+        candidate_ids: Sequence[str],
+        raw_question: str,
+        *,
+        candidate_rankings: Optional[Mapping[str, Sequence[str]]] = None,
+        hybrid_scores: Optional[Mapping[str, float]] = None,
+        graph_scores: Optional[Mapping[str, float]] = None,
+        token_budget: int,
+        token_cost: Callable[[Sequence[str]], int],
+        candidate_count: int = 50,
+        evidence_count: int = 30,
+        max_hops: int = 2,
+        max_groups: int = 3,
+        relevance_weight: float = 1.0,
+        coverage_weight: float = 1.0,
+        connectivity_weight: float = 0.35,
+        path_weight: float = 0.75,
+        temporal_weight: float = 0.5,
+        redundancy_weight: float = 0.25,
+        relation_weights: Optional[Mapping[str, float]] = None,
+        min_confidence: float = 0.5,
+        include_related: bool = False,
+        use_typed_relations: bool = True,
+        use_ordinary_links: bool = True,
+        temporal_state_enabled: bool = False,
+        temporal_query: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Select complete, connected evidence bundles under an exact token budget."""
+        rankings = {
+            str(channel): [
+                memory_id
+                for memory_id in dict.fromkeys(ranking)
+                if memory_id in self.memories
+            ]
+            for channel, ranking in (candidate_rankings or {}).items()
+        }
+        if not rankings:
+            rankings = {"candidates": list(dict.fromkeys(candidate_ids))}
+        ranking_rrf = {
+            memory_id: 0.0
+            for memory_id in dict.fromkeys(
+                list(candidate_ids)
+                + [memory_id for ranking in rankings.values() for memory_id in ranking]
+            )
+            if memory_id in self.memories
+        }
+        ranking_positions: Dict[str, Dict[str, int]] = {
+            memory_id: {} for memory_id in ranking_rrf
+        }
+        for channel, ranking in rankings.items():
+            for rank, memory_id in enumerate(ranking, start=1):
+                if memory_id not in ranking_rrf:
+                    continue
+                ranking_rrf[memory_id] += 1.0 / (60.0 + rank)
+                ranking_positions[memory_id][channel] = rank
+        insertion_positions = {
+            memory_id: position
+            for position, memory_id in enumerate(ranking_rrf)
+        }
+        ordered_candidates = sorted(
+            ranking_rrf,
+            key=lambda memory_id: (
+                -ranking_rrf[memory_id], insertion_positions[memory_id]
+            ),
+        )[:max(1, int(candidate_count))]
+        positions = {
+            memory_id: position for position, memory_id in enumerate(ordered_candidates)
+        }
+        budget = max(0, int(token_budget))
+        target_count = min(
+            len(ordered_candidates), max(1, int(evidence_count))
+        )
+        if not ordered_candidates or budget <= 0:
+            return {
+                "candidate_memory_ids": ordered_candidates,
+                "selected_memory_ids": [],
+                "selected_paths": [],
+                "question_facets": {},
+                "candidate_scores": {},
+                "evidence_graph_edges": [],
+                "utility": {},
+                "token_budget": budget,
+                "target_evidence_count": target_count,
+                "selected_tokens": 0,
+                "selection_steps": [],
+                "rejected_candidates": [
+                    {"memory_id": memory_id, "reason": "no_token_budget"}
+                    for memory_id in ordered_candidates
+                ],
+            }
+
+        def normalize_scores(scores: Mapping[str, float]) -> Dict[str, float]:
+            positive = {
+                memory_id: max(0.0, float(scores.get(memory_id, 0.0)))
+                for memory_id in ordered_candidates
+            }
+            maximum = max(positive.values(), default=0.0)
+            return {
+                memory_id: value / maximum
+                for memory_id, value in positive.items()
+            } if maximum > 0.0 else {}
+
+        normalized_hybrid = normalize_scores(hybrid_scores or {})
+        normalized_graph = normalize_scores(graph_scores or {})
+        normalized_fusion = normalize_scores(ranking_rrf)
+        relevance = {
+            memory_id: (
+                0.6 * normalized_fusion.get(memory_id, 0.0)
+                + 0.25 * normalized_hybrid.get(memory_id, 0.0)
+                + 0.15 * normalized_graph.get(memory_id, 0.0)
+            )
+            for memory_id in ordered_candidates
+        }
+
+        edge_weights, edge_records = self._chain_edge_weights(
+            ordered_candidates,
+            raw_question,
+            relation_weights=relation_weights or DEFAULT_GRAPH_RELATION_WEIGHTS,
+            min_confidence=min_confidence,
+            include_related=include_related,
+            use_typed_relations=use_typed_relations,
+            use_ordinary_links=use_ordinary_links,
+        )
+        facets = self._chain_question_facets(
+            raw_question,
+            ordered_candidates,
+            temporal_state_enabled=temporal_state_enabled,
+            temporal_query=temporal_query,
+        )
+        facet_matches = self._chain_facet_matches(
+            ordered_candidates, facets, edge_weights, edge_records
+        )
+        paths = self._chain_short_paths(
+            ordered_candidates,
+            relevance,
+            facet_matches,
+            edge_weights,
+            max_hops,
+        )
+
+        embeddings = getattr(getattr(self, "retriever", None), "embeddings", None)
+        memory_positions = {
+            memory_id: position for position, memory_id in enumerate(self.memories)
+        }
+
+        def cosine_similarity(first_id: str, second_id: str) -> float:
+            if embeddings is None:
+                return 0.0
+            try:
+                first = embeddings[memory_positions[first_id]]
+                second = embeddings[memory_positions[second_id]]
+                dot = sum(float(a) * float(b) for a, b in zip(first, second))
+                first_norm = math.sqrt(sum(float(value) ** 2 for value in first))
+                second_norm = math.sqrt(sum(float(value) ** 2 for value in second))
+                if first_norm <= 0.0 or second_norm <= 0.0:
+                    return 0.0
+                return max(0.0, min(1.0, dot / (first_norm * second_norm)))
+            except (IndexError, KeyError, TypeError, ValueError):
+                return 0.0
+
+        relation_pairs = set(edge_weights)
+        redundancy_cache: Dict[Tuple[str, str], float] = {}
+
+        def pair_redundancy(first_id: str, second_id: str) -> float:
+            cache_key = tuple(sorted(
+                (first_id, second_id), key=lambda memory_id: positions[memory_id]
+            ))
+            if cache_key in redundancy_cache:
+                return redundancy_cache[cache_key]
+            first_tokens = facets["document_tokens"][first_id]
+            second_tokens = facets["document_tokens"][second_id]
+            lexical = len(first_tokens & second_tokens) / max(
+                len(first_tokens | second_tokens), 1
+            )
+            first_memory = self.memories[first_id]
+            second_memory = self.memories[second_id]
+            first_evidence = set(
+                getattr(first_memory, "provenance", {}).get("evidence_ids", [])
+            )
+            second_evidence = set(
+                getattr(second_memory, "provenance", {}).get("evidence_ids", [])
+            )
+            provenance = (
+                len(first_evidence & second_evidence)
+                / max(len(first_evidence | second_evidence), 1)
+                if first_evidence or second_evidence else 0.0
+            )
+            relation_adjustment = 0.25 if cache_key in relation_pairs else 1.0
+            result = min(
+                1.0,
+                0.5 * provenance
+                + relation_adjustment * (
+                    0.3 * cosine_similarity(first_id, second_id)
+                    + 0.2 * lexical
+                ),
+            )
+            redundancy_cache[cache_key] = result
+            return result
+
+        def connected_components(selected: Set[str]) -> int:
+            if not selected:
+                return 0
+            remaining = set(selected)
+            components = 0
+            while remaining:
+                components += 1
+                queue = [remaining.pop()]
+                while queue:
+                    current_id = queue.pop()
+                    neighbors = {
+                        target_id if source_id == current_id else source_id
+                        for source_id, target_id in edge_weights
+                        if current_id in {source_id, target_id}
+                    }
+                    for neighbor_id in neighbors & remaining:
+                        remaining.remove(neighbor_id)
+                        queue.append(neighbor_id)
+            return components
+
+        def maximum_spanning_forest(selected: Set[str]) -> float:
+            if len(selected) <= 1:
+                return 0.0
+            parent = {memory_id: memory_id for memory_id in selected}
+
+            def find(memory_id: str) -> str:
+                while parent[memory_id] != memory_id:
+                    parent[memory_id] = parent[parent[memory_id]]
+                    memory_id = parent[memory_id]
+                return memory_id
+
+            total = 0.0
+            eligible_edges = sorted(
+                (
+                    (weight, source_id, target_id)
+                    for (source_id, target_id), weight in edge_weights.items()
+                    if source_id in selected and target_id in selected
+                ),
+                key=lambda item: (-item[0], positions[item[1]], positions[item[2]]),
+            )
+            for weight, source_id, target_id in eligible_edges:
+                source_root = find(source_id)
+                target_root = find(target_id)
+                if source_root == target_root:
+                    continue
+                parent[target_root] = source_root
+                total += weight
+            return total / max(target_count - 1, 1)
+
+        def temporal_utility(selected: Set[str]) -> float:
+            intent = facets["temporal_query"]["intent"]
+            if intent == "none" or not selected:
+                return 0.0
+            if not temporal_state_enabled:
+                if intent != "time_specific":
+                    return 0.0
+                return max(
+                    (
+                        facet_matches[memory_id].get("target_time", 0.0)
+                        for memory_id in selected
+                    ),
+                    default=0.0,
+                )
+            if intent == "change":
+                best = 0.0
+                for edge in edge_records:
+                    if (
+                        edge["source_id"] in selected
+                        and edge["target_id"] in selected
+                        and edge["relation_type"] in {"SUPERSEDE", "REFINE", "CONFLICT"}
+                    ):
+                        best = max(best, float(edge["weight"]))
+                return best
+            facet = {
+                "current": "current_state",
+                "historical": "historical_state",
+                "time_specific": "target_time",
+            }.get(intent)
+            return max(
+                (facet_matches[memory_id].get(facet, 0.0) for memory_id in selected),
+                default=0.0,
+            )
+
+        def utility(selected: Set[str]) -> Dict[str, float]:
+            selected_in_order = [
+                memory_id for memory_id in ordered_candidates if memory_id in selected
+            ]
+            relevance_score = sum(
+                relevance[memory_id] for memory_id in selected_in_order
+            )
+            coverage_score = 0.0
+            for facet, weight in facets["weights"].items():
+                if facet == "transition":
+                    covered = any(
+                        edge["source_id"] in selected
+                        and edge["target_id"] in selected
+                        and edge["relation_type"] in {
+                            "SUPERSEDE", "REFINE", "CONFLICT"
+                        }
+                        for edge in edge_records
+                    )
+                    facet_coverage = float(covered)
+                else:
+                    facet_coverage = min(
+                        1.0,
+                        sum(
+                            facet_matches[memory_id].get(facet, 0.0)
+                            for memory_id in selected_in_order
+                        ),
+                    )
+                coverage_score += weight * facet_coverage
+            connectivity_score = maximum_spanning_forest(selected)
+            path_score = sum(
+                path["normalized_quality"]
+                for path in paths
+                if set(path["memory_ids"]).issubset(selected)
+            )
+            temporal_score = temporal_utility(selected)
+            pairs = [
+                (first_id, second_id)
+                for first_position, first_id in enumerate(selected_in_order)
+                for second_id in selected_in_order[first_position + 1:]
+            ]
+            redundancy_score = sum(pair_redundancy(*pair) for pair in pairs)
+            if pairs:
+                redundancy_score /= len(pairs)
+            component_count = connected_components(selected)
+            excess_groups = max(0, component_count - max(1, int(max_groups)))
+            group_penalty = excess_groups / max(target_count, 1)
+            total = (
+                max(0.0, float(relevance_weight)) * relevance_score
+                + max(0.0, float(coverage_weight)) * coverage_score
+                + max(0.0, float(connectivity_weight)) * (
+                    connectivity_score - group_penalty
+                )
+                + max(0.0, float(path_weight)) * path_score
+                + max(0.0, float(temporal_weight)) * temporal_score
+                - max(0.0, float(redundancy_weight)) * redundancy_score
+            )
+            return {
+                "relevance": relevance_score,
+                "coverage": coverage_score,
+                "connectivity": connectivity_score,
+                "path": path_score,
+                "temporal": temporal_score,
+                "redundancy": redundancy_score,
+                "component_count": component_count,
+                "group_penalty": group_penalty,
+                "total": total,
+            }
+
+        actions = [
+            {"type": "memory", "memory_ids": [memory_id], "quality": relevance[memory_id]}
+            for memory_id in ordered_candidates
+        ] + [
+            {"type": "path", **path} for path in paths
+        ]
+        selected: Set[str] = set()
+        current_utility = utility(selected)
+        current_tokens = 0
+        selection_steps = []
+        singleton_token_costs = {
+            memory_id: int(token_cost([memory_id]))
+            for memory_id in ordered_candidates
+        }
+        cheapest_target_ids = sorted(
+            ordered_candidates,
+            key=lambda memory_id: (
+                singleton_token_costs[memory_id], positions[memory_id]
+            ),
+        )[:target_count]
+        cheapest_target_ids.sort(key=lambda memory_id: positions[memory_id])
+        target_feasible = bool(
+            len(cheapest_target_ids) == target_count
+            and int(token_cost(cheapest_target_ids)) <= budget
+        )
+
+        def preserves_target_feasibility(proposed: Set[str]) -> bool:
+            if not target_feasible or len(proposed) >= target_count:
+                return True
+            completion_count = target_count - len(proposed)
+            completion = sorted(
+                (
+                    memory_id
+                    for memory_id in ordered_candidates
+                    if memory_id not in proposed
+                ),
+                key=lambda memory_id: (
+                    singleton_token_costs[memory_id], positions[memory_id]
+                ),
+            )[:completion_count]
+            if len(completion) < completion_count:
+                return False
+            completed = proposed | set(completion)
+            completed_order = [
+                memory_id
+                for memory_id in ordered_candidates
+                if memory_id in completed
+            ]
+            return int(token_cost(completed_order)) <= budget
+
+        while len(selected) < target_count:
+            ranked_proposals = []
+            for action_position, action in enumerate(actions):
+                additions = set(action["memory_ids"]) - selected
+                if not additions:
+                    continue
+                proposed = selected | additions
+                if len(proposed) > target_count:
+                    continue
+                proposed_order = [
+                    memory_id for memory_id in ordered_candidates if memory_id in proposed
+                ]
+                proposed_utility = utility(proposed)
+                marginal = proposed_utility["total"] - current_utility["total"]
+                density = marginal / len(additions)
+                tie_key = (
+                    density,
+                    marginal,
+                    sum(relevance[memory_id] for memory_id in additions),
+                    -len(additions),
+                    -action_position,
+                )
+                ranked_proposals.append({
+                    "action": action,
+                    "additions": additions,
+                    "proposed": proposed,
+                    "proposed_order": proposed_order,
+                    "utility": proposed_utility,
+                    "marginal": marginal,
+                    "density": density,
+                    "tie_key": tie_key,
+                })
+            best = None
+            for proposal in sorted(
+                ranked_proposals, key=lambda item: item["tie_key"], reverse=True
+            ):
+                proposed_tokens = int(token_cost(proposal["proposed_order"]))
+                if (
+                    proposed_tokens <= budget
+                    and preserves_target_feasibility(proposal["proposed"])
+                ):
+                    best = proposal
+                    best["tokens"] = proposed_tokens
+                    break
+            if best is None:
+                break
+            selected = best["proposed"]
+            current_tokens = best["tokens"]
+            current_utility = best["utility"]
+            selection_steps.append({
+                "action_type": best["action"]["type"],
+                "added_memory_ids": [
+                    memory_id
+                    for memory_id in ordered_candidates
+                    if memory_id in best["additions"]
+                ],
+                "marginal_utility": best["marginal"],
+                "utility_per_added_memory": best["density"],
+                "selected_tokens": current_tokens,
+                "utility_after": dict(current_utility),
+            })
+
+        selected_ids = [
+            memory_id for memory_id in ordered_candidates if memory_id in selected
+        ]
+        selected_paths = [
+            path for path in paths if set(path["memory_ids"]).issubset(selected)
+        ]
+        rejected = []
+        for memory_id in ordered_candidates:
+            if memory_id in selected:
+                continue
+            proposed_ids = selected_ids + [memory_id]
+            proposed_ids.sort(key=lambda item: positions[item])
+            if len(selected_ids) >= target_count:
+                reason = "evidence_count"
+            elif int(token_cost(proposed_ids)) > budget:
+                reason = "token_budget"
+            else:
+                reason = "no_fitting_action"
+            rejected.append({"memory_id": memory_id, "reason": reason})
+        return {
+            "candidate_memory_ids": ordered_candidates,
+            "selected_memory_ids": selected_ids,
+            "selected_paths": selected_paths,
+            "question_facets": {
+                "lexical": facets["lexical"],
+                "structural": facets["structural"],
+                "weights": facets["weights"],
+                "temporal_query": facets["temporal_query"],
+                "relation_intents": facets["relation_intents"],
+            },
+            "candidate_scores": {
+                memory_id: {
+                    "relevance": relevance[memory_id],
+                    "hybrid": normalized_hybrid.get(memory_id, 0.0),
+                    "graph": normalized_graph.get(memory_id, 0.0),
+                    "fusion": normalized_fusion.get(memory_id, 0.0),
+                    "ranks": ranking_positions.get(memory_id, {}),
+                    "facet_matches": facet_matches[memory_id],
+                }
+                for memory_id in ordered_candidates
+            },
+            "evidence_graph_edges": edge_records,
+            "utility": current_utility,
+            "token_budget": budget,
+            "target_evidence_count": target_count,
+            "selected_tokens": current_tokens,
+            "selection_steps": selection_steps,
+            "rejected_candidates": rejected,
+        }
 
     def retrieve_with_typed_relations(
         self,
