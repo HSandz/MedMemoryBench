@@ -22,7 +22,7 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
-from utils.llm_client import LLMAPIError, get_usage_tracker
+from utils.llm_client import LLMAPIError, ModalModelNotReadyError, get_usage_tracker
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
     EVOLUTION_DECISION_PROMPT,
@@ -66,6 +66,8 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                             time.perf_counter() - attempt_started_at
                         )
                     last_exc = e
+                    if isinstance(e, ModalModelNotReadyError):
+                        break
                     if attempt < max_retries:
                         delay = base_delay * (2 ** attempt)
                         logger.warning(
@@ -132,6 +134,7 @@ class RobustOpenAIController(RobustBaseLLMController):
         api_base: Optional[str] = None,
         max_tokens: int = 1000,
         usage_tracker: Optional[Any] = None,
+        wait_for_model: bool = False,
     ):
         try:
             from openai import OpenAI
@@ -145,6 +148,10 @@ class RobustOpenAIController(RobustBaseLLMController):
         if api_key is None:
             raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
         self.client = OpenAI(api_key=api_key, base_url=api_base)
+        self._readiness_gate = None
+        if wait_for_model:
+            from utils.llm_client import OpenAIModelReadinessGate
+            self._readiness_gate = OpenAIModelReadinessGate(self.client, self.model)
 
     def _use_max_completion_tokens(self) -> bool:
         """Check if should use max_completion_tokens param (new models)."""
@@ -169,6 +176,8 @@ class RobustOpenAIController(RobustBaseLLMController):
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
+        if self._readiness_gate is not None:
+            self._readiness_gate.wait()
         start_time = time.time()
         params = {
             "model": self.model,
@@ -376,7 +385,8 @@ class RobustLLMController:
                 api_base = api_base or os.getenv("MODAL_BASE_URL")
             self.llm = RobustOpenAIController(
                 model, api_key=api_key, api_base=api_base,
-                max_tokens=max_tokens, usage_tracker=usage_tracker
+                max_tokens=max_tokens, usage_tracker=usage_tracker,
+                wait_for_model=backend == "modal",
             )
         elif backend in {"gemini", "vertex", "ai_studio"}:
             self.llm = RobustGeminiController(

@@ -51,6 +51,8 @@ Typed relation labels are `SUPPORT`, `REFINE`, `SUPERSEDE`, `CONFLICT`, and `REL
 
 `amem_hybrid_retrieval: true` replaces dense-only seeds with weighted reciprocal-rank fusion over dense similarity, BM25, deterministic query-to-note token overlap, direct source-timestamp match, stored temporal-state match, and graph proximity. `amem_hybrid_*_weight: 0` disables an individual channel. `amem_hybrid_candidate_count` bounds each channel's candidate pool; `retrieve_num` remains the final seed count. The default `amem_hybrid_retrieval: false` preserves dense seeds.
 
+`amem_regex_intent_conditioning` is a query-only ablation flag and defaults to `true`. With the default, `amem_test` applies its existing regex semantic heuristics for temporal intents (`current`, `historical`, `change`) and graph relation intents (`causal`, `conflict`, `detail`, `change`). With `false`, those question-derived multipliers and state preferences are disabled: graph ranking keeps configured relation-type weights and confidence, while explicit date/time parsing remains active for timestamp, validity, and temporal compatibility matching. The flag does not change memory construction or keyword rewriting.
+
 `amem_graph_ranking_mode` selects the graph policy:
 
 | Value | Behavior |
@@ -102,6 +104,7 @@ retrieval_config:
   retrieve_num: 10
   amem_max_context_tokens: 200000
   amem_hybrid_retrieval: false
+  amem_regex_intent_conditioning: true
   amem_graph_ranking_mode: fixed_bfs
   amem_chain_selection: false
   amem_chain_candidate_count: 50

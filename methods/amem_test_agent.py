@@ -29,6 +29,7 @@ class AMemTestAgent(AMemFixAgent):
         retrieve_num: int = AMemFixAgent.DEFAULT_RETRIEVE_NUM,
         amem_query_keywords: bool = True,
         amem_expand_links: bool = True,
+        amem_regex_intent_conditioning: bool = True,
         amem_original_evolution: bool = True,
         amem_typed_relations: bool = True,
         amem_typed_retrieval: Optional[bool] = None,
@@ -78,6 +79,7 @@ class AMemTestAgent(AMemFixAgent):
         **kwargs,
     ):
         self.amem_original_evolution = bool(amem_original_evolution)
+        self.amem_regex_intent_conditioning = bool(amem_regex_intent_conditioning)
         self.amem_typed_relations = bool(amem_typed_relations)
         self.amem_typed_retrieval = (
             self.amem_typed_relations
@@ -762,6 +764,9 @@ class AMemTestAgent(AMemFixAgent):
         system_message: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
+        regex_intent_conditioning = bool(
+            getattr(self, "amem_regex_intent_conditioning", True)
+        )
         typed_available = bool(getattr(self, "amem_typed_relations", False))
         typed_retrieval = bool(
             getattr(self, "amem_typed_retrieval", typed_available)
@@ -805,6 +810,9 @@ class AMemTestAgent(AMemFixAgent):
             prepared["extra"].update({
                 "method": "amem_test",
                 "amem_typed_relations": False,
+                "amem_regex_intent_conditioning": (
+                    regex_intent_conditioning
+                ),
                 "semantic_seed_ids": seed_ids,
                 "expanded_memories": [],
                 "final_memory_ids": final_ids,
@@ -814,12 +822,17 @@ class AMemTestAgent(AMemFixAgent):
                 "amem_provenance": False,
                 "amem_provenance_inject_raw_text": False,
                 "temporal_query": {"intent": "none", "target": {}},
+                "graph_relation_intents": [],
                 "temporal_expanded_memories": [],
                 "provenance_evidence": [],
             })
             if prepared["retrieved_memories"]:
                 prepared["retrieved_memories"][0]["retrieval_audit"] = {
                     "semantic_seed_ids": seed_ids,
+                    "regex_intent_conditioning": (
+                        regex_intent_conditioning
+                    ),
+                    "graph_relation_intents": [],
                     "expanded_memories": [],
                     "final_memory_ids": final_ids,
                     "total_retrieved_count": len(final_ids),
@@ -834,6 +847,11 @@ class AMemTestAgent(AMemFixAgent):
         context_id = self._get_context_id()
         memory_system = self._get_memory_system(context_id)
         raw_question = str(kwargs.get("raw_question") or question).strip()
+        query_intent_module = importlib.import_module("memory_layer_typed")
+        query_intent = query_intent_module.detect_query_intents(
+            raw_question,
+            semantic_intents_enabled=regex_intent_conditioning,
+        )
         retrieval_query = self._generate_retrieval_query(raw_question, memory_system)
         memory_ids = list(memory_system.memories.keys())
         memory_index_by_id = {
@@ -857,6 +875,7 @@ class AMemTestAgent(AMemFixAgent):
                 include_related=self.amem_expand_related,
                 use_typed_relations=typed_retrieval,
                 use_ordinary_links=self.amem_expand_links,
+                regex_intent_conditioning=regex_intent_conditioning,
             )
             seed_ids = list(hybrid_result["selected_memory_ids"])
             direct_indices = [memory_index_by_id[memory_id] for memory_id in seed_ids]
@@ -909,6 +928,7 @@ class AMemTestAgent(AMemFixAgent):
                 include_related=self.amem_expand_related,
                 use_typed_relations=typed_retrieval,
                 use_ordinary_links=self.amem_expand_links,
+                regex_intent_conditioning=regex_intent_conditioning,
             )
             final_ids = graph_result["selected_memory_ids"]
             expansions = graph_result["expanded_memories"]
@@ -925,7 +945,7 @@ class AMemTestAgent(AMemFixAgent):
             final_ids, expansions = list(amem_fix_ids), []
 
         temporal_result = {
-            "query": {"intent": "none", "target": {}},
+            "query": query_intent,
             "input_memory_ids": list(final_ids),
             "expanded_memories": [],
             "selected_memory_ids": list(final_ids),
@@ -937,8 +957,11 @@ class AMemTestAgent(AMemFixAgent):
                 raw_question,
                 expansion_budget=self.amem_temporal_expansion_count,
                 apply_ordering=temporal_ordering,
+                regex_intent_conditioning=regex_intent_conditioning,
             )
             final_ids = temporal_result["selected_memory_ids"]
+
+        graph_relation_intents = list(query_intent.get("relation_intents", []))
 
         typed_context_enabled = typed_retrieval and graph_ranking_mode in {
             "fixed_bfs", "typed_ppr"
@@ -1076,6 +1099,7 @@ class AMemTestAgent(AMemFixAgent):
                 use_ordinary_links=self.amem_expand_links,
                 temporal_state_enabled=temporal_retrieval,
                 temporal_query=temporal_result["query"],
+                regex_intent_conditioning=regex_intent_conditioning,
             )
             chain_selection_audit["enabled"] = True
             final_ids = list(chain_selection_audit["selected_memory_ids"])
@@ -1186,6 +1210,8 @@ class AMemTestAgent(AMemFixAgent):
             "graph_iterations_run": graph_result.get("iterations_run", 0),
             "graph_converged": graph_result.get("converged", True),
             "graph_temporal_query": graph_result.get("temporal_query", {}),
+            "regex_intent_conditioning": regex_intent_conditioning,
+            "graph_relation_intents": graph_relation_intents,
             "chain_selection": chain_selection_audit,
             "expanded_memories": expansions,
             "final_memory_ids": final_ids,
@@ -1241,6 +1267,9 @@ class AMemTestAgent(AMemFixAgent):
                 "method": "amem_test",
                 "context_id": context_id,
                 "amem_typed_relations": self.amem_typed_relations,
+                "amem_regex_intent_conditioning": (
+                    regex_intent_conditioning
+                ),
                 "amem_typed_retrieval": getattr(
                     self, "amem_typed_retrieval", False
                 ),
@@ -1279,6 +1308,9 @@ class AMemTestAgent(AMemFixAgent):
         info.update({
             "method": "amem_test",
             "amem_original_evolution": self.amem_original_evolution,
+            "amem_regex_intent_conditioning": getattr(
+                self, "amem_regex_intent_conditioning", True
+            ),
             "amem_typed_relations": self.amem_typed_relations,
             "amem_typed_retrieval": getattr(
                 self, "amem_typed_retrieval", False

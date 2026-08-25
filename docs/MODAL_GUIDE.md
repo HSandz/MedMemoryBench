@@ -27,35 +27,39 @@ You can override these defaults with the environment variables described below.
 From the repository root:
 
 ```bash
-uv pip install modal
+uv pip install modal python-dotenv
 ```
 
-Set the Modal account token as environment variables before running any Modal
-deployment command. These variables are used by the Modal CLI without browser
-login or interactive authentication:
+Add the Modal account token to the repository's uncommitted `.env` file. These
+variables let the Modal CLI deploy without browser login or interactive
+authentication:
 
-```bash
-export MODAL_TOKEN_ID=ak-<token-id>
-export MODAL_TOKEN_SECRET=as-<token-secret>
+```env
+MODAL_TOKEN_ID=ak-<token-id>
+MODAL_TOKEN_SECRET=as-<token-secret>
+HF_TOKEN=hf_<token>
 ```
 
-The Modal CLI does not automatically read the repository's `.env` file. Export
-only the two deployment variables explicitly:
+`HF_TOKEN` is optional for public models but enables authenticated Hugging Face
+Hub downloads with higher rate limits. A read token is sufficient unless the
+selected gated or private model requires additional access. The deployment
+passes it to the Server as an encrypted Modal runtime secret; it is not baked
+into the image. Keep it only in the uncommitted `.env` file.
+
+The bundled deployment script loads the repository-root `.env` before defining
+the Modal App. It therefore supplies both the Modal account token and all
+`MODAL_VLLM_*` deployment settings to this single command:
 
 ```bash
-export MODAL_TOKEN_ID="$(grep '^MODAL_TOKEN_ID=' .env | cut -d= -f2-)"
-export MODAL_TOKEN_SECRET="$(grep '^MODAL_TOKEN_SECRET=' .env | cut -d= -f2-)"
 modal deploy scripts/modal_vllm_server.py
 ```
 
-Do not use `source .env` if `MODAL_BASE_URL` still contains placeholders such
-as `<workspace>` or `<app>`; angle brackets are interpreted by Bash. Replace
-those placeholders with the real deployed URL after the first successful
-deployment.
+Existing shell variables take precedence over values in `.env`, so a one-off
+shell override still works. You do not need to `source .env`; placeholders such
+as `<workspace>` remain ordinary strings when parsed by `python-dotenv`.
 
-The deployment token must be present in the shell that runs `modal deploy`.
-`MODAL_API_KEY` is not a substitute: it is the inference Proxy Token used by
-clients after deployment.
+`MODAL_API_KEY` is not a substitute for the deployment account token: it is the
+inference Proxy Token used by clients after deployment.
 
 Modal account tokens use the `ak-` and `as-` prefixes. They are different from
 the `wk-` / `ws-` Proxy Token used later by benchmark requests. Do not confuse
@@ -74,10 +78,33 @@ vLLM downloads the model weights. Hugging Face and vLLM caches are stored in
 Modal Volumes so later container starts do not need to download everything
 again.
 
-The Server is configured with a five-minute idle `scaledown_window`. When no
-requests arrive for approximately five minutes, Modal scales the GPU container
-down; the next request starts a new container and may take longer while vLLM
-loads the model.
+Deployment temporarily sets `min_containers=1`, so Modal starts one GPU
+container immediately and vLLM downloads or loads the model without a separate
+`/models` request. After vLLM becomes ready and startup warmup completes, the
+container waits one full idle window and dynamically resets `min_containers` to
+zero. The Server can then scale to zero normally.
+
+The idle window defaults to 300 seconds. Because the temporary startup pin is
+not released until readiness and warmup finish, image startup and model download
+time do not consume this window. Override it before deployment with
+`MODAL_VLLM_SCALEDOWN_WINDOW_SECONDS`. The deploy command can still finish
+before model startup completes; follow the App logs when you need to observe
+readiness or the startup-pin release.
+
+Before its first completion request, the benchmark polls `/v1/models` until the
+configured model ID is advertised. This covers cold starts and rolling model
+replacements without sending completion requests to an old or initializing
+model. The default readiness timeout is 20 minutes with a five-second polling
+interval. Override them in `.env` when needed:
+
+```env
+MODAL_READY_TIMEOUT_SECONDS=1200
+MODAL_READY_POLL_SECONDS=5
+```
+
+If the requested model is still unavailable when the timeout expires, the run
+fails with the requested and currently advertised model IDs instead of issuing
+repeated completion requests that return HTTP 404.
 
 The deploy command prints a Server URL similar to:
 
@@ -97,35 +124,67 @@ OpenAI client appends the API path itself.
 
 ### Optional deployment overrides
 
-Set overrides before deploying:
+Put deployment values in `.env`, then deploy:
+
+```env
+MODAL_TOKEN_ID=ak-<token-id>
+MODAL_TOKEN_SECRET=as-<token-secret>
+HF_TOKEN=hf_<token>
+MODAL_APP_NAME=medmemorybench-vllm
+MODAL_GPU=L40S
+MODAL_VLLM_MODEL=cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+MODAL_VLLM_SERVED_MODEL=cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+MODAL_VLLM_MAX_MODEL_LEN=32768
+MODAL_VLLM_SCALEDOWN_WINDOW_SECONDS=300
+MODAL_VLLM_WARMUP=true
+MODAL_VLLM_WARMUP_PROMPT_LENGTHS=128,512,2048,8192
+MODAL_VLLM_WARMUP_MAX_TOKENS=32
+MODAL_VLLM_GPU_MEMORY_UTILIZATION=0.9
+```
+
+Do not set `MODAL_VLLM_MIN_CONTAINERS`. The deployment uses its own temporary
+startup pin and automatically restores the Server minimum to zero after the
+post-readiness idle window.
 
 ```bash
-export MODAL_APP_NAME=medmemorybench-vllm
-export MODAL_GPU=L40S
-export MODAL_VLLM_MODEL=RedHatAI/Qwen3.8-27B-INT4
-export MODAL_VLLM_SERVED_MODEL=RedHatAI/Qwen3.8-27B-INT4
-export MODAL_VLLM_MAX_MODEL_LEN=32768
 modal deploy scripts/modal_vllm_server.py
 ```
 
-These values are baked into the deployed container image. Always set them in
-the same shell immediately before `modal deploy`; changing them later does not
-change an already deployed App. After deployment, verify the exact model ID
+The selected non-secret settings are baked into the deployed container image.
+Changing `.env` later does not change an already deployed App; run the deploy
+command again to apply changes. After deployment, verify the exact model ID
 advertised by the Server:
 
 ```bash
+proxy=$(grep '^MODAL_API_KEY=' .env | cut -d= -f2-)
+base=$(grep '^MODAL_BASE_URL=' .env | cut -d= -f2-)
+
 curl --fail-with-body \
-  -H "Authorization: Bearer ${MODAL_API_KEY}" \
-  "${MODAL_BASE_URL}/models"
+  -H "Authorization: Bearer $proxy" \
+  "$base/models"
 ```
 
 Use the returned `data[].id` value exactly in the method YAML's `model.name` and
-`build_config.amem_model`. A successful `modal deploy` only confirms that the
-App was registered; the vLLM model is loaded when the Server starts.
+`build_config.amem_model`. With the temporary deployment startup pin, this
+request verifies readiness but is no longer required to trigger model loading.
 
 Use a shorter context when the selected model or GPU does not have enough VRAM.
 Changing the model can also require model-specific vLLM arguments; the bundled
-script is configured for the default model.
+script adds the Qwen3.8 model-card options automatically when the model ID
+contains `Qwen3.8`:
+
+- `--enable-auto-tool-choice`
+- `--tool-call-parser qwen3_coder`
+- `--reasoning-parser qwen3`
+- `--mm-encoder-tp-mode data`
+- `--gpu-memory-utilization 0.9` by default
+
+For Qwen3.8, startup warmup is enabled by default for 128, 512, 2,048, and
+8,192-token prompts. This compiles common Triton kernel shapes before external
+requests arrive and reduces first-request latency. Disable it with
+`MODAL_VLLM_WARMUP=false`, or change the lengths when your workload has a
+different prompt distribution. Warmup increases startup time; it does not
+change steady-state generation throughput.
 
 ## Create the API key
 
@@ -142,7 +201,7 @@ secret:
   Use the dashboard's token or API-token settings; the exact dashboard path
   can vary by workspace UI version.
 2. Copy the account token ID and token secret when Modal displays them.
-3. Set them for deployment as `MODAL_TOKEN_ID=ak-...` and
+3. Add them to `.env` as `MODAL_TOKEN_ID=ak-...` and
   `MODAL_TOKEN_SECRET=as-...`.
 4. If the workspace uses environments or RBAC, ensure the account token can
   deploy to the target environment.
@@ -246,9 +305,11 @@ curl --fail-with-body \
   }'
 ```
 
-The first request can return HTTP 503 while Modal starts a container and vLLM
-loads the model. Retry after the container becomes ready. MedMemoryBench's
-shared retry layer already retries transient 503 responses.
+The first request after a deployment can return HTTP 503 while vLLM finishes
+loading or warming the model. After the deploy-started container scales to zero,
+the next request starts a new container and includes cold-start latency. Retry
+after the container becomes ready. MedMemoryBench's shared retry layer already
+retries transient 503 responses.
 
 ## Troubleshooting
 
@@ -258,6 +319,7 @@ shared retry layer already retries transient 503 responses.
 | `403 Forbidden` | The workspace likely uses RBAC; allow the Proxy Token for the environment containing the App. |
 | `404 Not Found` | Confirm that `MODAL_BASE_URL` ends with `/v1` and does not include `/models` or `/chat/completions`. |
 | `503 Service Unavailable` | The Server is scaling from zero or vLLM is still loading. Retry and check the Modal App logs. |
+| Unauthenticated Hugging Face Hub warning | Add `HF_TOKEN=hf_...` to `.env` and redeploy so the token is attached as a Server runtime secret. |
 | vLLM startup timeout | Use a compatible GPU, reduce `MODAL_VLLM_MAX_MODEL_LEN`, or increase the deployment's startup timeout if the model needs more time. |
 | Model not found | Set the YAML `model.name` to the value passed as `MODAL_VLLM_SERVED_MODEL`. |
 

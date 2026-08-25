@@ -148,8 +148,11 @@ def _next_month(value: datetime) -> datetime:
     return datetime(value.year, value.month + 1, 1)
 
 
-def detect_temporal_query(question: str) -> Dict[str, Any]:
-    """Classify only the lightweight temporal intent needed for state retrieval."""
+def detect_temporal_query(
+    question: str,
+    semantic_intents_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Parse explicit time and optionally classify regex temporal intent."""
     text = str(question or "").strip()
     lowered = text.lower()
     target: Dict[str, Any] = {
@@ -181,39 +184,33 @@ def detect_temporal_query(question: str) -> Dict[str, Any]:
     else:
         month_pattern = "|".join(_MONTH_NAMES)
         month_match = re.search(
-            rf"\b({month_pattern})\b(?:\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?|,?\s+(\d{{4}}))?",
+            rf"\b({month_pattern})\b\s+(\d{{4}})\b",
             lowered,
         )
         if month_match:
             month = _MONTH_NAMES[month_match.group(1)]
-            day = int(month_match.group(2)) if month_match.group(2) else None
-            year_text = month_match.group(3) or month_match.group(4)
-            year = int(year_text) if year_text else None
+            year = int(month_match.group(2))
             target.update({
                 "raw": month_match.group(0),
                 "year": year,
                 "month": month,
-                "precision": "day" if day else "month",
+                "precision": "month",
             })
-            if year is not None:
-                try:
-                    start = datetime(year, month, day or 1)
-                    end = start + timedelta(days=1) if day else _next_month(start)
-                    target["start"] = start.isoformat()
-                    target["end"] = end.isoformat()
-                except ValueError:
-                    pass
+            start = datetime(year, month, 1)
+            target["start"] = start.isoformat()
+            target["end"] = _next_month(start).isoformat()
         else:
-            chinese_match = re.search(
-                r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月(?:\s*(\d{1,2})\s*[日号])?",
-                text,
+            month_match = re.search(
+                rf"\b({month_pattern})\b(?:\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?|,?\s+(\d{{4}}))?",
+                lowered,
             )
-            if chinese_match:
-                year = int(chinese_match.group(1)) if chinese_match.group(1) else None
-                month = int(chinese_match.group(2))
-                day = int(chinese_match.group(3)) if chinese_match.group(3) else None
+            if month_match:
+                month = _MONTH_NAMES[month_match.group(1)]
+                day = int(month_match.group(2)) if month_match.group(2) else None
+                year_text = month_match.group(3) or month_match.group(4)
+                year = int(year_text) if year_text else None
                 target.update({
-                    "raw": chinese_match.group(0),
+                    "raw": month_match.group(0),
                     "year": year,
                     "month": month,
                     "precision": "day" if day else "month",
@@ -227,16 +224,39 @@ def detect_temporal_query(question: str) -> Dict[str, Any]:
                     except ValueError:
                         pass
             else:
-                year_match = re.search(r"\b(19\d{2}|20\d{2}|21\d{2})\b", lowered)
-                if year_match:
-                    year = int(year_match.group(1))
+                chinese_match = re.search(
+                    r"(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月(?:\s*(\d{1,2})\s*[日号])?",
+                    text,
+                )
+                if chinese_match:
+                    year = int(chinese_match.group(1)) if chinese_match.group(1) else None
+                    month = int(chinese_match.group(2))
+                    day = int(chinese_match.group(3)) if chinese_match.group(3) else None
                     target.update({
-                        "raw": year_match.group(0),
-                        "start": datetime(year, 1, 1).isoformat(),
-                        "end": datetime(year + 1, 1, 1).isoformat(),
+                        "raw": chinese_match.group(0),
                         "year": year,
-                        "precision": "year",
+                        "month": month,
+                        "precision": "day" if day else "month",
                     })
+                    if year is not None:
+                        try:
+                            start = datetime(year, month, day or 1)
+                            end = start + timedelta(days=1) if day else _next_month(start)
+                            target["start"] = start.isoformat()
+                            target["end"] = end.isoformat()
+                        except ValueError:
+                            pass
+                else:
+                    year_match = re.search(r"\b(19\d{2}|20\d{2}|21\d{2})\b", lowered)
+                    if year_match:
+                        year = int(year_match.group(1))
+                        target.update({
+                            "raw": year_match.group(0),
+                            "start": datetime(year, 1, 1).isoformat(),
+                            "end": datetime(year + 1, 1, 1).isoformat(),
+                            "year": year,
+                            "precision": "year",
+                        })
 
     relative_match = re.search(
         r"\b(\d+)\s+(day|week|month|year)s?\s+(ago|before)\b",
@@ -266,16 +286,21 @@ def detect_temporal_query(question: str) -> Dict[str, Any]:
         r"\b(?:now|currently|current|latest|today|presently|at present|still)\b"
     )
 
-    if change_pattern.search(lowered) or re.search(r"变化|改变|变更|前后", text):
+    if semantic_intents_enabled and (
+        change_pattern.search(lowered) or re.search(r"变化|改变|变更|前后", text)
+    ):
         intent = "change"
     elif target["raw"] is not None:
         intent = "time_specific"
-    elif historical_pattern.search(lowered) or re.search(r"之前|以前|过去|曾经|原来|此前", text):
-        intent = "historical"
-    elif current_pattern.search(lowered) or re.search(r"现在|目前|如今|当前|最近", text):
-        intent = "current"
-    else:
+    elif not semantic_intents_enabled:
         intent = "none"
+    else:
+        if historical_pattern.search(lowered) or re.search(r"之前|以前|过去|曾经|原来|此前", text):
+            intent = "historical"
+        elif current_pattern.search(lowered) or re.search(r"现在|目前|如今|当前|最近", text):
+            intent = "current"
+        else:
+            intent = "none"
 
     return {
         "intent": intent,
@@ -283,8 +308,13 @@ def detect_temporal_query(question: str) -> Dict[str, Any]:
         "relative_reference": relative_reference,
     }
 
-def detect_graph_query_intents(question: str) -> List[str]:
+def detect_graph_query_intents(
+    question: str,
+    semantic_intents_enabled: bool = True,
+) -> List[str]:
     """Detect deterministic relation preferences for query-conditioned diffusion."""
+    if not semantic_intents_enabled:
+        return []
     lowered = str(question or "").lower()
     intents = []
     patterns = {
@@ -297,6 +327,21 @@ def detect_graph_query_intents(question: str) -> List[str]:
         if re.search(pattern, lowered):
             intents.append(intent)
     return intents
+
+def detect_query_intents(
+    question: str,
+    semantic_intents_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Return the shared temporal and graph query policy metadata."""
+    temporal_query = detect_temporal_query(
+        question,
+        semantic_intents_enabled=semantic_intents_enabled,
+    )
+    temporal_query["relation_intents"] = detect_graph_query_intents(
+        question,
+        semantic_intents_enabled=semantic_intents_enabled,
+    )
+    return temporal_query
 
 
 def _clamp_confidence(value: Any) -> float:
@@ -1137,6 +1182,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         include_related: bool,
         use_typed_relations: bool,
         use_ordinary_links: bool,
+        regex_intent_conditioning: bool = True,
     ) -> List[str]:
         allowed_types = set(DEFAULT_EXPANSION_TYPES)
         if include_related:
@@ -1203,6 +1249,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         include_related: bool = False,
         use_typed_relations: bool = True,
         use_ordinary_links: bool = True,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Any]:
         """Fuse deterministic candidate rankings with weighted reciprocal rank."""
         memory_ids = list(self.memories.keys())
@@ -1273,7 +1320,10 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             )[:pool_size]
         ]
 
-        temporal_query = detect_temporal_query(raw_question)
+        temporal_query = detect_query_intents(
+            raw_question,
+            semantic_intents_enabled=regex_intent_conditioning,
+        )
         target = temporal_query["target"]
         timestamp_matches = []
         state_matches = []
@@ -1434,6 +1484,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         include_related: bool,
         use_typed_relations: bool,
         use_ordinary_links: bool,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Dict[str, float]]:
         adjacency: Dict[str, Dict[str, float]] = {
             memory_id: {} for memory_id in self.memories
@@ -1452,7 +1503,10 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
                     add_neighbor(neighbor_id, memory_id, 1.0)
 
         threshold = _clamp_confidence(min_confidence)
-        relation_intents = set(temporal_query.get("relation_intents", []))
+        relation_intents = (
+            set(temporal_query.get("relation_intents", []))
+            if regex_intent_conditioning else set()
+        )
         allowed_types = set(DEFAULT_EXPANSION_TYPES)
         if include_related:
             allowed_types.add("RELATED")
@@ -1529,6 +1583,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         include_related: bool = False,
         use_typed_relations: bool = True,
         use_ordinary_links: bool = True,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Any]:
         """Rank graph memories with personalized PageRank from query seeds."""
         if mode not in {"untyped_ppr", "typed_ppr"}:
@@ -1555,14 +1610,19 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
                 "scores": {},
                 "iterations_run": 0,
                 "converged": True,
-                "temporal_query": detect_temporal_query(raw_question),
+                "temporal_query": detect_query_intents(
+                    raw_question,
+                    semantic_intents_enabled=regex_intent_conditioning,
+                ),
             }
         restart = {
             memory_id: seeds.get(memory_id, 0.0) / total_seed_score
             for memory_id in memory_ids
         }
-        temporal_query = detect_temporal_query(raw_question)
-        temporal_query["relation_intents"] = detect_graph_query_intents(raw_question)
+        temporal_query = detect_query_intents(
+            raw_question,
+            semantic_intents_enabled=regex_intent_conditioning,
+        )
         adjacency = self._graph_adjacency(
             mode=mode,
             temporal_query=temporal_query,
@@ -1571,6 +1631,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             include_related=include_related,
             use_typed_relations=use_typed_relations,
             use_ordinary_links=use_ordinary_links,
+            regex_intent_conditioning=regex_intent_conditioning,
         )
         transition = {}
         for source_id, neighbors in adjacency.items():
@@ -1656,6 +1717,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         include_related: bool,
         use_typed_relations: bool,
         use_ordinary_links: bool,
+        regex_intent_conditioning: bool = True,
     ) -> Tuple[Dict[Tuple[str, str], float], List[Dict[str, Any]]]:
         candidate_set = set(candidate_ids)
         positions = {memory_id: position for position, memory_id in enumerate(candidate_ids)}
@@ -1702,8 +1764,14 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             if include_related:
                 allowed_types.add("RELATED")
             threshold = _clamp_confidence(min_confidence)
-            temporal_query = detect_temporal_query(raw_question)
-            relation_intents = set(detect_graph_query_intents(raw_question))
+            temporal_query = detect_temporal_query(
+                raw_question,
+                semantic_intents_enabled=regex_intent_conditioning,
+            )
+            relation_intents = set(detect_graph_query_intents(
+                raw_question,
+                semantic_intents_enabled=regex_intent_conditioning,
+            ))
             max_relation_weight = max(
                 [max(0.0, float(value)) for value in relation_weights.values()]
                 or [1.0]
@@ -1754,6 +1822,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         *,
         temporal_state_enabled: bool,
         temporal_query: Optional[Mapping[str, Any]] = None,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Any]:
         question_tokens = list(dict.fromkeys(_retrieval_tokens(raw_question)))
         document_tokens = {
@@ -1769,10 +1838,14 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
                 (len(candidate_ids) + 1) / (document_frequency + 1)
             ) + 1.0
 
-        temporal_query = copy.deepcopy(
-            temporal_query or detect_temporal_query(raw_question)
+        temporal_query = copy.deepcopy(temporal_query or detect_temporal_query(
+            raw_question,
+            semantic_intents_enabled=regex_intent_conditioning,
+        ))
+        relation_intents = detect_graph_query_intents(
+            raw_question,
+            semantic_intents_enabled=regex_intent_conditioning,
         )
-        relation_intents = detect_graph_query_intents(raw_question)
         structural = []
         intent = temporal_query["intent"]
         if intent == "current" and temporal_state_enabled:
@@ -2026,6 +2099,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         use_ordinary_links: bool = True,
         temporal_state_enabled: bool = False,
         temporal_query: Optional[Mapping[str, Any]] = None,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Any]:
         """Select complete, connected evidence bundles under an exact token budget."""
         rankings = {
@@ -2122,12 +2196,14 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             include_related=include_related,
             use_typed_relations=use_typed_relations,
             use_ordinary_links=use_ordinary_links,
+            regex_intent_conditioning=regex_intent_conditioning,
         )
         facets = self._chain_question_facets(
             raw_question,
             ordered_candidates,
             temporal_state_enabled=temporal_state_enabled,
             temporal_query=temporal_query,
+            regex_intent_conditioning=regex_intent_conditioning,
         )
         facet_matches = self._chain_facet_matches(
             ordered_candidates, facets, edge_weights, edge_records
@@ -2680,9 +2756,13 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         question: str,
         expansion_budget: int = 5,
         apply_ordering: bool = True,
+        regex_intent_conditioning: bool = True,
     ) -> Dict[str, Any]:
         """Expand temporal evidence and optionally reorder it for the query intent."""
-        query = detect_temporal_query(question)
+        query = detect_temporal_query(
+            question,
+            semantic_intents_enabled=regex_intent_conditioning,
+        )
         intent = query["intent"]
         selected = [memory_id for memory_id in memory_ids if memory_id in self.memories]
         selected = list(dict.fromkeys(selected))

@@ -30,6 +30,29 @@ For `amem_test`, the important build switches are `amem_original_evolution`, `am
 
 For controlled retrieval experiments, set `amem_hybrid_retrieval`, `amem_graph_ranking_mode`, and `amem_chain_selection` under `retrieval_config`. Hybrid RRF channels have independent non-negative weights; zero disables a channel. `fixed_bfs`, `amem_hybrid_retrieval: false`, and `amem_chain_selection: false` preserve prior behavior. `typed_ppr` requires typed retrieval and weights transitions by relation type, confidence, direction, temporal compatibility, and deterministic query intent. These settings are query-only, so they can be crossed over compatible frozen snapshots without changing the build hash. Match `amem_max_context_tokens` when comparing policies.
 
+Use `amem_regex_intent_conditioning` to run the intent-free retrieval ablation:
+
+```yaml
+retrieval_config:
+  amem_regex_intent_conditioning: true  # existing regex-conditioned behavior
+```
+
+```yaml
+retrieval_config:
+  amem_regex_intent_conditioning: false  # intent-free graph/temporal semantics
+```
+
+When the flag is `false`, regex-derived causal/conflict/detail/change graph intents and current/historical/change temporal intents do not affect RRF state channels, typed-PPR adjacency, temporal ordering/expansion, or chain structural facets. Explicit targets such as `2025`, `2025-03`, and `March 2025` remain parsed and can still drive timestamp and validity matching. Typed PPR still uses configured relation weights multiplied by relation confidence, plus explicit temporal compatibility when a parsed target is available. Retrieval audits expose `regex_intent_conditioning`, `graph_relation_intents`, and the resulting `temporal_query`.
+
+The disabled-mode query flow is:
+
+```text
+raw question
+  -> keyword rewrite -> dense/BM25/entity overlap/timestamp/explicit-state channels
+  -> weighted RRF -> hybrid seeds -> typed PPR using relation weight x confidence
+  -> explicit-time temporal expansion/order (when enabled) -> optional chain selection
+```
+
 When enabled, chain selection runs after graph/temporal retrieval and before final provenance formatting. It fairly fuses retrieval, hybrid, graph, and dense rankings, limits the fused pool with `amem_chain_candidate_count`, and selects up to `amem_chain_evidence_count` memories; no upstream ID is forced into the result. It scores calibrated relevance, question-facet coverage, soft graph connectivity, complete short paths, available temporal compatibility, and bounded redundancy, then adds fitting singletons or complete paths by marginal utility per added memory. Path search is deterministically bounded: `amem_chain_max_hops` is clamped to 3, each memory keeps up to eight strongest path neighbors, and at most 100 path actions are retained. The exact final A-MEM context formatter supplies each proposal's token cost, so accepted evidence—including relation, temporal, provenance, raw-source, and note text—fits the remaining prompt budget without post-selection truncation. When a target-sized set fits, exact-cost completion reservation prevents an expensive early choice from making `amem_chain_evidence_count` unreachable. The process uses the raw question, any temporal target resolved by normal retrieval, and stored memory; unresolved relative dates do not match every timestamp. Benchmark query labels, expected answers, gold evidence, and scoring metadata are not inputs.
 
 ```yaml

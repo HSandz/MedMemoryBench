@@ -932,6 +932,68 @@ class OpenAIClient(BaseLLMClient):
         get_usage_tracker().record(llm_response)
         return llm_response
 
+class ModalModelNotReadyError(TimeoutError):
+    """Raised when a Modal endpoint does not advertise the requested model."""
+
+class OpenAIModelReadinessGate:
+    """Wait once for an OpenAI-compatible server to advertise a model."""
+
+    def __init__(self, client: Any, model: str):
+        self.client = client
+        self.model = model
+        self._ready = False
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return max(float(os.environ.get(name, default)), 0.0)
+        except (TypeError, ValueError):
+            return default
+
+    def wait(self) -> None:
+        if self._ready:
+            return
+        with self._lock:
+            if self._ready:
+                return
+
+            timeout = self._env_float("MODAL_READY_TIMEOUT_SECONDS", 20 * 60)
+            poll_interval = self._env_float("MODAL_READY_POLL_SECONDS", 5.0)
+            deadline = time.monotonic() + timeout
+            last_status = "the endpoint has not responded"
+            logger.info(
+                "Waiting for Modal model %s to become ready (timeout %.0fs)",
+                self.model,
+                timeout,
+            )
+            while True:
+                try:
+                    response = self.client.models.list()
+                    model_ids = {
+                        str(item.id)
+                        for item in getattr(response, "data", [])
+                        if getattr(item, "id", None)
+                    }
+                    if self.model in model_ids:
+                        self._ready = True
+                        logger.info("Modal model %s is ready", self.model)
+                        return
+                    last_status = (
+                        "available models: " + ", ".join(sorted(model_ids))
+                        if model_ids
+                        else "the endpoint returned no models"
+                    )
+                except Exception as exc:
+                    last_status = f"{type(exc).__name__}: {exc}"
+
+                if time.monotonic() >= deadline:
+                    raise ModalModelNotReadyError(
+                        f"Modal model {self.model!r} was not ready after "
+                        f"{timeout:.0f}s ({last_status})"
+                    )
+                time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.0)))
+
 class ModalClient(OpenAIClient):
     """OpenAI-compatible client for a Modal-hosted vLLM server."""
 
@@ -952,6 +1014,22 @@ class ModalClient(OpenAIClient):
             or os.environ.get("MODAL_API_KEY")
             or os.environ.get("MODAL_PROXY_TOKEN"),
             base_url=base_url or os.environ.get("MODAL_BASE_URL"),
+            **kwargs,
+        )
+        self._readiness_gate = OpenAIModelReadinessGate(self.client, self.model)
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> LLMResponse:
+        self._readiness_gate.wait()
+        return super().chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
             **kwargs,
         )
 
@@ -2023,6 +2101,7 @@ __all__ = [
     "LLMAPIError",
     "RetryableLLMAPIError",
     "LLMRetryExhaustedError",
+    "ModalModelNotReadyError",
     "EmptyLLMResponseError",
     "EmptyGeminiResponseError",
     "InvalidLLMResponseError",

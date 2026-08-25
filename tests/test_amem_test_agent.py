@@ -46,13 +46,22 @@ def test_amem_modal_backend_uses_modal_configuration(monkeypatch):
     captured = {}
 
     class FakeOpenAIController:
-        def __init__(self, model, api_key=None, api_base=None, max_tokens=1000, usage_tracker=None):
+        def __init__(
+            self,
+            model,
+            api_key=None,
+            api_base=None,
+            max_tokens=1000,
+            usage_tracker=None,
+            wait_for_model=False,
+        ):
             captured.update(
                 model=model,
                 api_key=api_key,
                 api_base=api_base,
                 max_tokens=max_tokens,
                 usage_tracker=usage_tracker,
+                wait_for_model=wait_for_model,
             )
 
     monkeypatch.setattr(memory_layer_robust, "RobustOpenAIController", FakeOpenAIController)
@@ -69,6 +78,7 @@ def test_amem_modal_backend_uses_modal_configuration(monkeypatch):
     assert captured["api_key"] == "modal-token"
     assert captured["api_base"] == "https://modal.example/v1"
     assert captured["max_tokens"] == 128
+    assert captured["wait_for_model"] is True
 
 
 def _memory(content: str):

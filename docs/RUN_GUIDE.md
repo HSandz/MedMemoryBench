@@ -47,16 +47,27 @@ including how to create a Proxy Token and determine `MODAL_API_KEY` and
 `MODAL_TOKEN_SECRET`; no browser or interactive CLI authentication is required.
 
 ```bash
-uv pip install modal
+uv pip install modal python-dotenv
 modal deploy scripts/modal_vllm_server.py
 ```
+
+The deployment script reads Modal account credentials and `MODAL_VLLM_*`
+settings directly from the repository-root `.env`. Existing shell variables
+take precedence, so exports are only needed for one-off overrides. Set the
+optional `HF_TOKEN` there to authenticate Hugging Face model downloads; the
+deployment injects it as a runtime secret rather than baking it into the image.
 
 The deployment defaults to
 `ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ`, an L40S GPU, and a 32,768-token
 model context. Override `MODAL_GPU`, `MODAL_VLLM_MODEL`,
-`MODAL_VLLM_SERVED_MODEL`, or `MODAL_VLLM_MAX_MODEL_LEN` before deployment when
-the selected GPU or model requires different settings. The deployment caches
-Hugging Face and vLLM artifacts in Modal Volumes.
+`MODAL_VLLM_SERVED_MODEL`, or `MODAL_VLLM_MAX_MODEL_LEN` in `.env` when the
+selected GPU or model requires different settings. The deployment caches
+Hugging Face and vLLM artifacts in Modal Volumes. It defaults to one minimum
+container during deployment, so `modal deploy` starts the GPU server without a
+separate wake-up request. After model readiness, it holds the container for the
+300-second idle window and then restores `min_containers=0`, allowing normal
+scale-to-zero. Set `MODAL_VLLM_SCALEDOWN_WINDOW_SECONDS` before deployment to
+change that post-readiness window.
 
 Configure a method model with `provider: modal`, or set the equivalent
 environment variables for a method that accepts provider settings:
@@ -68,10 +79,10 @@ MODAL_BASE_URL=https://<workspace>--<app>-server.<region>.modal.direct/v1
 
 Use the Modal Proxy Token as `MODAL_API_KEY`; do not put it in a committed YAML
 file. The base URL must include `/v1`. Modal Servers can return HTTP 503 while
-scaling from zero, so leave the shared retry settings enabled and expect the
-first request to include the cold-start latency. Modal Servers use proxy
-authentication by default; keep `unauthenticated=True` out of the deployment
-unless the endpoint is intentionally public.
+the model is starting or while scaling from zero, so leave the shared retry
+settings enabled. Modal Servers use proxy authentication by default; keep
+`unauthenticated=True` out of the deployment unless the endpoint is
+intentionally public.
 
 ## Run Commands
 

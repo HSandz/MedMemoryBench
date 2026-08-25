@@ -2,8 +2,8 @@ method_name: amem_test
 method_type: agentic_memory
 description: Typed-relation A-MEM without original evolution or untyped link retrieval
 model:
-  provider: vertex
-  name: gemini-2.5-flash
+  provider: modal
+  name: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
   temperature: 0.0
   max_completion_tokens: 2000
 build_config:
@@ -28,6 +28,7 @@ retrieval_config:
   retrieve_num: 10
   amem_max_context_tokens: 200000
   amem_query_keywords: true
+  amem_regex_intent_conditioning: false
   amem_expand_links: false
   amem_typed_retrieval: true
   amem_typed_expansion_count: 20
@@ -40,7 +41,7 @@ retrieval_config:
   amem_provenance_inject_raw_text: false
   amem_temporal_ordering: false
   # General query-only chain-preserving evidence selection.
-  amem_chain_selection: true
+  amem_chain_selection: false
   amem_chain_candidate_count: 50
   amem_chain_evidence_count: 30
   amem_chain_max_hops: 2
