@@ -27,6 +27,22 @@ The older `memory_layer.py` and standalone scripts in `methods/amem/A-mem/` supp
 
 Memory snapshots contain notes, retriever corpus/embeddings, IDs, configuration, and feature audits. Query-stage runs can reuse a completed memory snapshot with `--memory-run`; imports reject incompatible state.
 
+### Session retrieval-quality metrics
+
+When `method_name: amem_test` and `build_config.amem_note_level: session`, each stored note also carries its source session ID independently of optional provenance text/evidence retrieval. The ID is serialized with the note and copied to each retrieved-memory record as `source_session_id`, so retrieval scoring remains available when `amem_provenance` or `amem_provenance_retrieval` is disabled. Turn-level notes and retrieval records are unchanged.
+
+For each query, the evaluator deduplicates retrieved session IDs in retrieval order and gold session IDs from `source_key_points`. It computes:
+
+$$
+P=\frac{|R \cap G|}{|R|},\qquad
+Recall=\frac{|R \cap G|}{|G|},\qquad
+F1=\frac{2P\,Recall}{P+Recall}.
+$$
+
+It also reports TP/FP/FN, average precision over the ranked unique session IDs, reciprocal rank of the first relevant session, any-hit, and exact set match. An empty retrieval with valid gold IDs is a scored miss. Missing gold IDs or any retrieved note without a source session ID makes that query unavailable, preventing incomplete legacy metadata from being interpreted as a false retrieval miss.
+
+Per-query metrics and audit IDs are written to `query_answer.json` under `evaluation_details.metric_groups.retrieval_quality`. `result.json` writes aggregate macro averages, micro totals/precision/recall/F1, coverage, MAP, MRR, hit rate, exact-match rate, average predicted/gold session counts, and the same aggregate split by query type under `summary.metric_groups.retrieval_quality`. These diagnostics do not alter answer correctness, answer score, or `by_metric` scoring.
+
 ## Snapshot and Append Lifecycle
 
 Normal A-MEM memory builds publish one snapshot per evaluation unit under `<run>/memory/`. The manifest remains `building` until every expected unit has a snapshot, then becomes `complete`. Each snapshot records the source context, unit, build ID, config hash, memory construction time, and an integrity hash; embedding arrays are stored in adjacent `.embeddings.npy` sidecars.
@@ -43,7 +59,7 @@ Append requires independent evaluation mode and an A-MEM method. The target uses
 |---|---|---|
 | `amem` | Raw token-bounded chunks passed directly to `add_note()`. | Direct semantic retrieval. |
 | `amem_fix` | One timestamped atomic note per dialogue turn; structured `memory_items` are preferred. | Keyword query -> semantic seeds -> one-hop untyped link expansion. |
-| `amem_test` | Atomic notes plus optional typed relation/provenance metadata; original evolution is configurable. | Dense or hybrid seeds, selectable graph ranking, optional temporal expansion, chain-preserving evidence selection, then provenance context. |
+| `amem_test` | Configurable turn-level (default) or session-level notes plus optional typed relation/provenance metadata; original evolution is configurable. | Dense or hybrid seeds, selectable graph ranking, optional temporal expansion, chain-preserving evidence selection, then provenance context. |
 
 Typed relation labels are `SUPPORT`, `REFINE`, `SUPERSEDE`, `CONFLICT`, and `RELATED`. Temporal state is derived from typed transitions and therefore requires `amem_typed_relations: true`. Provenance creates stable source evidence records; `amem_provenance_inject_raw_text` optionally adds selected source turns to the answer prompt.
 
@@ -98,6 +114,7 @@ build_config:
   amem_evo_threshold: 100
   amem_max_tokens: 1000
   amem_chunk_size_tokens: 10240
+  amem_note_level: turn
   amem_build_max_context_tokens: 200000
 
 retrieval_config:
@@ -119,9 +136,9 @@ retrieval_config:
   amem_chain_redundancy_weight: 0.25
 ```
 
-Use `amem_fix_*` for the paper-aligned baseline and `amem_test_*` for experiments. Treat every experimental feature flag as authoritative: similarly named `amem_test2_*` files may intentionally represent different combinations. Build-time temporal transitions use `amem_temporal_transition_min_confidence`; query-time graph filtering uses `amem_relation_min_confidence`. Hybrid weights, graph mode/ranking parameters, chain-selection controls, expansion counts, temporal ordering, provenance injection, keyword use, and retrieval context budgets can change without rebuilding. Most shipped configurations disable chain selection; individual experiment configs may enable it explicitly.
+Use `amem_fix_*` for the paper-aligned baseline and `amem_test_*` for experiments. `amem_note_level` accepts only `turn` or `session` and defaults to `turn` when omitted. Session mode combines the same normalized speaker turns before the normal `add_note()` pipeline; it does not change note analysis, evolution, typed/temporal metadata, indexing, or retrieval. Session provenance describes the full session rather than an individual turn. Oversized sessions can still create multiple chunk parts. Treat every experimental feature flag as authoritative: similarly named `amem_test2_*` files may intentionally represent different combinations. Build-time temporal transitions use `amem_temporal_transition_min_confidence`; query-time graph filtering uses `amem_relation_min_confidence`. Hybrid weights, graph mode/ranking parameters, chain-selection controls, expansion counts, temporal ordering, provenance injection, keyword use, and retrieval context budgets can change without rebuilding. Most shipped configurations disable chain selection; individual experiment configs may enable it explicitly.
 
-Do not change build flags, the internal AMEM model, embedding/chunk settings, build prompt budget, or temporal transition threshold when loading a snapshot. Keep stable memory IDs, audit fields, and source evidence intact because resume, rejudge, and analysis depend on them.
+Do not change note level, build flags, the internal AMEM model, embedding/chunk settings, build prompt budget, or temporal transition threshold when loading a snapshot. New snapshots record the note level in their build state; legacy `amem_test` snapshots without it are treated as `turn`. Keep stable memory IDs, audit fields, and source evidence intact because resume, rejudge, and analysis depend on them.
 
 ## Verification
 

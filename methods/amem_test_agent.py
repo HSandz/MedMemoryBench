@@ -16,6 +16,7 @@ from utils.llm_client import format_messages, get_usage_tracker
 logger = logging.getLogger(__name__)
 
 GRAPH_RANKING_MODES = frozenset({"none", "fixed_bfs", "untyped_ppr", "typed_ppr"})
+NOTE_LEVELS = frozenset({"session", "turn"})
 
 
 class AMemTestAgent(AMemFixAgent):
@@ -30,6 +31,7 @@ class AMemTestAgent(AMemFixAgent):
         amem_query_keywords: bool = True,
         amem_expand_links: bool = True,
         amem_regex_intent_conditioning: bool = True,
+        amem_note_level: str = "turn",
         amem_original_evolution: bool = True,
         amem_typed_relations: bool = True,
         amem_typed_retrieval: Optional[bool] = None,
@@ -78,6 +80,13 @@ class AMemTestAgent(AMemFixAgent):
         amem_chain_redundancy_weight: float = 0.25,
         **kwargs,
     ):
+        note_level = str(amem_note_level).strip().lower()
+        if note_level not in NOTE_LEVELS:
+            raise ValueError(
+                "amem_note_level must be one of: "
+                + ", ".join(sorted(NOTE_LEVELS))
+            )
+        self.amem_note_level = note_level
         self.amem_original_evolution = bool(amem_original_evolution)
         self.amem_regex_intent_conditioning = bool(amem_regex_intent_conditioning)
         self.amem_typed_relations = bool(amem_typed_relations)
@@ -246,6 +255,15 @@ class AMemTestAgent(AMemFixAgent):
             max_context_chars=max_context_chars,
             check_connection=False,
             usage_tracker=get_usage_tracker(),
+            provider_routing=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "provider_routing"
+            ),
+            service_tier=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "service_tier"
+            ),
+            reasoning_effort=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "reasoning_effort"
+            ),
             original_evolution_enabled=self.amem_original_evolution,
             typed_relations_enabled=self.amem_typed_relations,
             temporal_state_enabled=self.amem_temporal_state,
@@ -273,6 +291,7 @@ class AMemTestAgent(AMemFixAgent):
     def _memory_state_config(self) -> Dict[str, Any]:
         config = super()._memory_state_config()
         config.update({
+            "note_level": getattr(self, "amem_note_level", "turn"),
             "original_evolution": getattr(self, "amem_original_evolution", True),
             "typed_relations": getattr(self, "amem_typed_relations", True),
             "relation_candidate_count": getattr(
@@ -294,6 +313,16 @@ class AMemTestAgent(AMemFixAgent):
     ) -> None:
         system_state = state.get("system_state", {})
         feature_state = state.get("experimental_features", {})
+        snapshot_note_level = str(
+            feature_state.get(
+                "note_level",
+                (state.get("config") or {}).get("note_level", "turn"),
+            )
+        ).strip().lower()
+        if snapshot_note_level != getattr(self, "amem_note_level", "turn"):
+            raise ValueError(
+                "A-MEM snapshot note level does not match the agent"
+            )
         snapshot_original_evolution = bool(
             feature_state.get(
                 "original_evolution",
@@ -340,7 +369,19 @@ class AMemTestAgent(AMemFixAgent):
             raise ValueError(
                 "A-MEM snapshot provenance flag does not match the agent"
             )
-        super().import_memory_state(state, context_id=context_id)
+        normalized_state = state
+        stored_config = state.get("config")
+        if (
+            isinstance(stored_config, dict)
+            and stored_config.get("config_version") == 2
+            and "note_level" not in stored_config
+            and snapshot_note_level == "turn"
+        ):
+            normalized_state = {
+                **state,
+                "config": {**stored_config, "note_level": "turn"},
+            }
+        super().import_memory_state(normalized_state, context_id=context_id)
         resolved_context_id = int(
             state["context_id"] if context_id is None else context_id
         )
@@ -379,6 +420,7 @@ class AMemTestAgent(AMemFixAgent):
                     getattr(memory_system, field_name)
                 )
         state["experimental_features"] = {
+            "note_level": getattr(self, "amem_note_level", "turn"),
             "original_evolution": self.amem_original_evolution,
             "typed_relations": self.amem_typed_relations,
             "temporal_state": self.amem_temporal_state,
@@ -388,6 +430,157 @@ class AMemTestAgent(AMemFixAgent):
             ),
         }
         return state
+
+    def _session_notes(
+        self,
+        text: str,
+        memory_items: Optional[Sequence[Dict[str, Any]]],
+        timestamp: Optional[str],
+    ) -> tuple[List[Dict[str, str]], int]:
+        """Combine the current turn-note inputs into one session-note input."""
+        turn_notes = self._atomic_notes(text, memory_items, timestamp)
+        if not turn_notes:
+            return [], 0
+        session_timestamp = str(timestamp or "").strip()
+        if not session_timestamp:
+            session_timestamp = next(
+                (
+                    str(note.get("timestamp") or "").strip()
+                    for note in turn_notes
+                    if str(note.get("timestamp") or "").strip()
+                ),
+                "",
+            )
+        return [{
+            "content": "\n".join(note["content"] for note in turn_notes),
+            "timestamp": session_timestamp,
+        }], len(turn_notes)
+
+    def _memorize_session(self, text: str, **kwargs) -> MemoryBuildResult:
+        """Create one A-MEM note input for the injected session."""
+        context_id = self._get_context_id()
+        memory_system = self._get_memory_system(context_id)
+        notes, turn_count = self._session_notes(
+            text,
+            memory_items=kwargs.get("memory_items"),
+            timestamp=kwargs.get("timestamp"),
+        )
+
+        note_ids: List[str] = []
+        memory_entries: List[Dict[str, Any]] = []
+        stored_notes: List[str] = []
+        for note_data in notes:
+            content = note_data["content"]
+            source_timestamp = note_data["timestamp"] or None
+            parts = self._split_text_into_chunks(
+                content, self.amem_chunk_size_tokens
+            )
+            for part_index, part in enumerate(parts):
+                note_id = str(memory_system.add_note(
+                    content=part,
+                    time=source_timestamp,
+                    source_session_id=kwargs.get("source_session_id"),
+                    source_session_index=kwargs.get("source_session_index"),
+                ))
+                note_ids.append(note_id)
+                stored_notes.append(part)
+                self._memory_chunks.append(part)
+                memory_entries.append({
+                    "event": "ADD",
+                    "memory": part[:400],
+                    "id": note_id,
+                    "session_index": kwargs.get("source_session_index"),
+                    "part_index": part_index,
+                    "timestamp": source_timestamp,
+                })
+
+        self._is_initialized = True
+        return MemoryBuildResult(
+            success=True,
+            method="amem_test",
+            action="add_session_notes_with_optional_typed_relations",
+            input_content=text,
+            stored_content="\n\n".join(stored_notes),
+            memory_entries=memory_entries,
+            all_passages=list(memory_entries),
+            chunk_count=len(self._memory_chunks),
+            extra={
+                "context_id": context_id,
+                "retrieve_num": self.retrieve_num,
+                "turns_received": turn_count,
+                "source_units_received": len(notes),
+                "notes_created": len(note_ids),
+                "note_ids": note_ids,
+                "inserted_count": len(note_ids),
+            },
+        )
+
+    def _provenance_session_notes(
+        self,
+        text: str,
+        memory_items: Optional[Sequence[Dict[str, Any]]],
+        timestamp: Optional[str],
+        **kwargs,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        turn_notes = self._provenance_atomic_notes(
+            text,
+            memory_items=memory_items,
+            timestamp=timestamp,
+            **kwargs,
+        )
+        if not turn_notes:
+            return [], 0
+
+        session_timestamp = str(timestamp or "").strip()
+        if not session_timestamp:
+            session_timestamp = next(
+                (
+                    str(note.get("timestamp") or "").strip()
+                    for note in turn_notes
+                    if str(note.get("timestamp") or "").strip()
+                ),
+                "",
+            )
+        if memory_items:
+            raw_lines = []
+            for note in turn_notes:
+                evidence = note["evidence"]
+                speaker = evidence.get("speaker") or "Unknown"
+                raw_line = f"{speaker}: {evidence.get('raw_text', '')}"
+                if evidence.get("blip_caption"):
+                    raw_line += f" Shared image: {evidence['blip_caption']}"
+                raw_lines.append(raw_line)
+            raw_session = "\n".join(raw_lines)
+        else:
+            raw_session = self._strip_memorize_wrapper(text)
+
+        first_evidence = turn_notes[0]["evidence"]
+        evidence = {
+            "raw_text": raw_session,
+            "source_context_id": self._get_context_id(),
+            "source_session_id": kwargs.get("source_session_id"),
+            "source_session_index": kwargs.get("source_session_index"),
+            "source_event_id": kwargs.get("source_event_id"),
+            "source_turn_id": None,
+            "source_timestamp": session_timestamp or None,
+            "speaker": None,
+            "role": None,
+            "blip_caption": None,
+            "source_text_scope": "source_session",
+        }
+        for field_name in (
+            "source_session_id",
+            "source_session_index",
+            "source_event_id",
+        ):
+            if evidence[field_name] is None:
+                evidence[field_name] = first_evidence.get(field_name)
+
+        return [{
+            "content": "\n".join(note["content"] for note in turn_notes),
+            "timestamp": session_timestamp,
+            "evidence": evidence,
+        }], len(turn_notes)
 
     def _provenance_atomic_notes(
         self,
@@ -469,50 +662,83 @@ class AMemTestAgent(AMemFixAgent):
         context_id = self._get_context_id()
         memory_system = self._get_memory_system(context_id)
         with get_usage_tracker().scope("amem.provenance.preprocessing"):
-            notes = self._provenance_atomic_notes(
-                text,
-                memory_items=kwargs.get("memory_items"),
-                timestamp=kwargs.get("timestamp"),
-                source_session_id=kwargs.get("source_session_id"),
-                source_session_index=kwargs.get("source_session_index"),
-                source_event_id=kwargs.get("source_event_id"),
-            )
+            if getattr(self, "amem_note_level", "turn") == "session":
+                notes, turn_count = self._provenance_session_notes(
+                    text,
+                    memory_items=kwargs.get("memory_items"),
+                    timestamp=kwargs.get("timestamp"),
+                    source_session_id=kwargs.get("source_session_id"),
+                    source_session_index=kwargs.get("source_session_index"),
+                    source_event_id=kwargs.get("source_event_id"),
+                )
+            else:
+                notes = self._provenance_atomic_notes(
+                    text,
+                    memory_items=kwargs.get("memory_items"),
+                    timestamp=kwargs.get("timestamp"),
+                    source_session_id=kwargs.get("source_session_id"),
+                    source_session_index=kwargs.get("source_session_index"),
+                    source_event_id=kwargs.get("source_event_id"),
+                )
+                turn_count = len(notes)
 
         note_ids: List[str] = []
         memory_entries: List[Dict[str, Any]] = []
         stored_notes: List[str] = []
-        for turn_index, note_data in enumerate(notes):
+        note_level = getattr(self, "amem_note_level", "turn")
+        for note_index, note_data in enumerate(notes):
             content = note_data["content"]
             source_timestamp = note_data["timestamp"] or None
             with get_usage_tracker().scope("amem.base.chunking"):
                 parts = self._split_text_into_chunks(content, self.amem_chunk_size_tokens)
             for part_index, part in enumerate(parts):
                 source_evidence = dict(note_data["evidence"])
-                source_evidence["source_text_scope"] = "source_turn"
+                source_evidence.setdefault(
+                    "source_text_scope",
+                    "source_session" if note_level == "session" else "source_turn",
+                )
+                add_note_kwargs = {
+                    "content": part,
+                    "time": source_timestamp,
+                    "source_timestamp": source_timestamp,
+                    "source_evidence": source_evidence,
+                    "provenance_part_index": part_index,
+                }
+                if note_level == "session":
+                    add_note_kwargs.update({
+                        "source_session_id": kwargs.get("source_session_id"),
+                        "source_session_index": kwargs.get("source_session_index"),
+                    })
                 note_id = str(memory_system.add_note(
-                    content=part,
-                    time=source_timestamp,
-                    source_timestamp=source_timestamp,
-                    source_evidence=source_evidence,
-                    provenance_part_index=part_index,
+                    **add_note_kwargs,
                 ))
                 note_ids.append(note_id)
                 stored_notes.append(part)
                 self._memory_chunks.append(part)
-                memory_entries.append({
+                memory_entry = {
                     "event": "ADD",
                     "memory": part[:400],
                     "id": note_id,
-                    "turn_index": turn_index,
                     "part_index": part_index,
                     "timestamp": source_timestamp,
-                })
+                }
+                if note_level == "session":
+                    memory_entry["session_index"] = kwargs.get(
+                        "source_session_index"
+                    )
+                else:
+                    memory_entry["turn_index"] = note_index
+                memory_entries.append(memory_entry)
 
         self._is_initialized = True
         return MemoryBuildResult(
             success=True,
             method="amem_test",
-            action="add_atomic_notes_with_optional_typed_relations",
+            action=(
+                "add_session_notes_with_optional_typed_relations"
+                if note_level == "session"
+                else "add_atomic_notes_with_optional_typed_relations"
+            ),
             input_content=text,
             stored_content="\n\n".join(stored_notes),
             memory_entries=memory_entries,
@@ -521,7 +747,8 @@ class AMemTestAgent(AMemFixAgent):
             extra={
                 "context_id": context_id,
                 "retrieve_num": self.retrieve_num,
-                "turns_received": len(notes),
+                "turns_received": turn_count,
+                "source_units_received": len(notes),
                 "notes_created": len(note_ids),
                 "note_ids": note_ids,
                 "inserted_count": len(note_ids),
@@ -529,14 +756,21 @@ class AMemTestAgent(AMemFixAgent):
         )
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
-        """Use atomic A-MEM notes and attach enabled experimental metadata."""
+        """Build turn- or session-level A-MEM notes with experimental metadata."""
         if getattr(self, "amem_provenance", False):
             result = self._memorize_with_provenance(text, **kwargs)
+        elif getattr(self, "amem_note_level", "turn") == "session":
+            result = self._memorize_session(text, **kwargs)
         else:
             result = super().memorize(text, **kwargs)
         result.method = "amem_test"
-        result.action = "add_atomic_notes_with_optional_typed_relations"
+        result.action = (
+            "add_session_notes_with_optional_typed_relations"
+            if getattr(self, "amem_note_level", "turn") == "session"
+            else "add_atomic_notes_with_optional_typed_relations"
+        )
         result.extra.update({
+            "amem_note_level": getattr(self, "amem_note_level", "turn"),
             "amem_original_evolution": self.amem_original_evolution,
             "amem_typed_relations": self.amem_typed_relations,
             "amem_temporal_state": getattr(self, "amem_temporal_state", False),
@@ -807,6 +1041,22 @@ class AMemTestAgent(AMemFixAgent):
                 for index in selected_indices
                 if 0 <= index < len(memory_ids)
             ]
+            if getattr(self, "amem_note_level", "turn") == "session":
+                for record in prepared["retrieved_memories"]:
+                    index = record.get("index")
+                    if not isinstance(index, int) or not (0 <= index < len(memory_ids)):
+                        continue
+                    memory_id = memory_ids[index]
+                    memory = memory_system.memories[memory_id]
+                    record.update({
+                        "memory_id": memory_id,
+                        "source_session_id": getattr(
+                            memory, "source_session_id", None
+                        ),
+                        "source_session_index": getattr(
+                            memory, "source_session_index", None
+                        ),
+                    })
             prepared["extra"].update({
                 "method": "amem_test",
                 "amem_typed_relations": False,
@@ -852,7 +1102,7 @@ class AMemTestAgent(AMemFixAgent):
             raw_question,
             semantic_intents_enabled=regex_intent_conditioning,
         )
-        retrieval_query = self._generate_retrieval_query(raw_question, memory_system)
+        retrieval_query = self._generate_retrieval_query(raw_question)
         memory_ids = list(memory_system.memories.keys())
         memory_index_by_id = {
             memory_id: index for index, memory_id in enumerate(memory_ids)
@@ -1192,6 +1442,15 @@ class AMemTestAgent(AMemFixAgent):
                     and item.get("raw_text_injected", True)
                 ],
             })
+            if getattr(self, "amem_note_level", "turn") == "session":
+                record.update({
+                    "source_session_id": getattr(
+                        memory, "source_session_id", None
+                    ),
+                    "source_session_index": getattr(
+                        memory, "source_session_index", None
+                    ),
+                })
             retrieved_memories.append(record)
         retrieval_audit = {
             "semantic_seed_ids": seed_ids,
@@ -1307,6 +1566,7 @@ class AMemTestAgent(AMemFixAgent):
         info = super().get_info()
         info.update({
             "method": "amem_test",
+            "amem_note_level": getattr(self, "amem_note_level", "turn"),
             "amem_original_evolution": self.amem_original_evolution,
             "amem_regex_intent_conditioning": getattr(
                 self, "amem_regex_intent_conditioning", True

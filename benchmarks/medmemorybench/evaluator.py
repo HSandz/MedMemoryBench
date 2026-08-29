@@ -21,7 +21,12 @@ from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery, M
 from benchmarks.base import EvaluationUnit
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.base import MetricResult as BaseMetricResult
+from metrics.retrieval_quality import (
+    RETRIEVAL_QUALITY_GROUP,
+    compute_session_retrieval_quality,
+)
 from utils.templates import get_prompt_manager
+from utils.batch_client import create_batch_client
 from utils.llm_client import (
     LLMAPIError,
     LLMRetryExhaustedError,
@@ -39,7 +44,6 @@ from utils.vertex_batch import (
     restore_prepared_query,
     scoped_manifest_path,
     snapshot_prepared_query,
-    should_use_batch,
 )
 
 from benchmarks.medmemorybench.checkpoint import (
@@ -207,6 +211,43 @@ class MedMemoryBenchEvaluator:
             ),
             "build_config": copy.deepcopy(build_config),
         }
+
+    def _session_retrieval_quality_enabled(self) -> bool:
+        """Return whether this run builds session-level experimental A-MEM notes."""
+        method_config = getattr(self, "method_config", None)
+        if str(getattr(method_config, "method_name", "")).lower() != "amem_test":
+            return False
+        build_config = getattr(method_config, "build_config", {})
+        if not isinstance(build_config, dict):
+            build_config = {}
+        note_level = str(build_config.get("amem_note_level", "turn"))
+        return note_level.strip().lower() == "session"
+
+    def _session_retrieval_quality(
+        self,
+        query: Any,
+        retrieved_memories: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._session_retrieval_quality_enabled():
+            return None
+        return compute_session_retrieval_quality(
+            retrieved_memories=retrieved_memories,
+            source_key_points=getattr(query, "source_key_points", []),
+            metadata=getattr(query, "metadata", {}),
+        )
+
+    @staticmethod
+    def _attach_session_retrieval_quality(
+        result: MetricResult,
+        retrieval_quality: Optional[Dict[str, Any]],
+    ) -> None:
+        if retrieval_quality is None:
+            return
+        metric_groups = result.details.get("metric_groups")
+        if not isinstance(metric_groups, dict):
+            metric_groups = {}
+            result.details["metric_groups"] = metric_groups
+        metric_groups[RETRIEVAL_QUALITY_GROUP] = retrieval_quality
 
     @staticmethod
     def _feature_for_operation(operation: str) -> str:
@@ -794,6 +835,7 @@ class MedMemoryBenchEvaluator:
             "provider": api_config.get_judge_provider(),
             "model": api_config.get_judge_model(),
             "temperature": getattr(api_config, "judge_temperature", 1.0),
+            "reasoning_effort": getattr(api_config, "judge_reasoning_effort", None),
             "client_max_tokens": getattr(api_config, "judge_client_max_tokens", 10000),
             "max_tokens": getattr(api_config, "judge_max_tokens", 500),
             "mcd_max_tokens": getattr(api_config, "judge_mcd_max_tokens", 2000),
@@ -841,6 +883,254 @@ class MedMemoryBenchEvaluator:
 
     def _memory_snapshot_embeddings_path(self, unit: EvaluationUnit) -> Path:
         return self._memory_snapshot_path(unit).with_suffix(".embeddings.npy")
+
+    def _artifact_relative_path(self, path: Optional[Path]) -> Optional[str]:
+        """Return an artifact path relative to this run when possible."""
+        if path is None or not hasattr(self, "output_dir"):
+            return None
+        return os.path.relpath(Path(path), self.output_dir)
+
+    def _query_artifact_references(
+        self,
+        *,
+        context_id: Optional[int],
+        unit_id: Optional[int],
+        answer_request_id: Optional[str] = None,
+        answer_batch_client: Optional[Any] = None,
+        answer_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build compact, joinable provenance for one scored query."""
+        references: Dict[str, Any] = {}
+        manifest = getattr(self, "_memory_snapshot_manifest", None) or {}
+        if context_id is not None and unit_id is not None and manifest:
+            snapshot = next(
+                (
+                    item for item in manifest.get("snapshots", [])
+                    if item.get("context_id") == context_id
+                    and item.get("unit_id") == unit_id
+                ),
+                {},
+            )
+            if snapshot:
+                snapshot_path = self._memory_snapshot_dir() / snapshot.get("path", "")
+                references["memory_snapshot"] = {
+                    "build_id": manifest.get("build_id", ""),
+                    "build_config_hash": manifest.get("build_config_hash", ""),
+                    "retrieval_config_hash": manifest.get("retrieval_config_hash", ""),
+                    "manifest_path": self._artifact_relative_path(
+                        self._memory_snapshot_manifest_path()
+                    ),
+                    "snapshot_path": self._artifact_relative_path(snapshot_path),
+                    "integrity_hash": snapshot.get("integrity_hash", ""),
+                    "embedding_sha256": snapshot.get("embedding_sha256", ""),
+                }
+        if answer_request_id:
+            answer_reference: Dict[str, Any] = {
+                "transport": "batch" if answer_batch_client is not None else "realtime",
+            }
+            answer_reference[
+                "request_id" if answer_batch_client is not None else "correlation_id"
+            ] = answer_request_id
+            relative_path = self._artifact_relative_path(
+                getattr(answer_batch_client, "manifest_path", None)
+            )
+            if relative_path is not None:
+                answer_reference["manifest_path"] = relative_path
+            if answer_messages is not None:
+                answer_reference["prompt_sha256"] = self._artifact_content_hash(
+                    answer_messages
+                )
+            references["answer"] = answer_reference
+        return references
+
+    def _batch_artifact_reference(
+        self,
+        batch_client: Any,
+        request_id: str,
+    ) -> Dict[str, Any]:
+        """Describe a persisted batch request without copying its raw payload."""
+        reference: Dict[str, Any] = {
+            "transport": "batch",
+            "request_id": request_id,
+        }
+        relative_path = self._artifact_relative_path(
+            getattr(batch_client, "manifest_path", None)
+        )
+        if relative_path is not None:
+            reference["manifest_path"] = relative_path
+        return reference
+
+    @staticmethod
+    def _artifact_content_hash(value: Any) -> str:
+        """Return a stable digest for a JSON artifact fragment."""
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _batch_response_usage(response: Any, *, transport: str) -> Dict[str, Any]:
+        """Normalize provider usage without treating unavailable timing as zero."""
+        return {
+            "transport": transport,
+            "input_tokens": int(getattr(response, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(response, "output_tokens", 0) or 0),
+            "visible_output_tokens": int(
+                getattr(response, "visible_output_tokens", 0) or 0
+            ),
+            "thinking_tokens": int(getattr(response, "thinking_tokens", 0) or 0),
+            "duration_seconds": getattr(response, "duration_seconds", None),
+        }
+
+    @staticmethod
+    def _usage_total(*usage_values: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge tracker usage objects while preserving derived averages."""
+        total = TokenUsage()
+        for usage in usage_values:
+            total.merge(TokenUsage.from_dict(usage))
+        return total.to_dict()
+
+    @staticmethod
+    def _model_usage_identity(model_config: Any, *, transport: str) -> Dict[str, Any]:
+        """Describe the configured model used by a stage, never a guessed route."""
+        return {
+            "provider": str(getattr(model_config, "provider", "") or ""),
+            "model": str(getattr(model_config, "name", "") or ""),
+            "transport": transport,
+            "service_tier": getattr(model_config, "openrouter_service_tier", None),
+        }
+
+    def _batch_manifest_stage_summaries(self, batch_client: Any) -> List[Dict[str, Any]]:
+        """Expose compact batch lifecycle and provider usage from a raw manifest."""
+        manifest_path = getattr(batch_client, "manifest_path", None)
+        if manifest_path is None:
+            return []
+        try:
+            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        summaries = []
+        for stage_name, stage in (manifest.get("jobs") or {}).items():
+            if not isinstance(stage, dict):
+                continue
+            responses = stage.get("responses") or {}
+            response_values = list(responses.values()) if isinstance(responses, dict) else []
+            submitted_at = stage.get("submitted_at")
+            completed_at = stage.get("completed_at")
+            duration_seconds = None
+            if isinstance(submitted_at, str) and isinstance(completed_at, str):
+                try:
+                    duration_seconds = (
+                        datetime.fromisoformat(completed_at)
+                        - datetime.fromisoformat(submitted_at)
+                    ).total_seconds()
+                except ValueError:
+                    pass
+            fallback_reason = stage.get("fallback_reason")
+            summaries.append({
+                "stage": stage_name,
+                "manifest_path": self._artifact_relative_path(Path(manifest_path)),
+                "transport": "realtime_fallback" if fallback_reason else "batch",
+                "provider": manifest.get("provider") or (
+                    "openrouter" if manifest.get("project") == "openrouter" else "vertex"
+                ),
+                "model": manifest.get("model", ""),
+                "state": stage.get("state", ""),
+                "request_count": len(stage.get("requests") or []),
+                "response_count": len(response_values),
+                "successful_response_count": sum(
+                    not item.get("status") for item in response_values if isinstance(item, dict)
+                ),
+                "failed_response_count": sum(
+                    bool(item.get("status")) for item in response_values if isinstance(item, dict)
+                ),
+                "retry_count": len(stage.get("retries") or []),
+                "submitted_at": submitted_at,
+                "completed_at": completed_at,
+                "remote_elapsed_seconds": duration_seconds,
+                "token_usage": {
+                    field: sum(
+                        int(item.get(field, 0) or 0)
+                        for item in response_values if isinstance(item, dict)
+                    )
+                    for field in (
+                        "input_tokens", "output_tokens", "visible_output_tokens",
+                        "thinking_tokens",
+                    )
+                },
+                "fallback_reason": fallback_reason,
+            })
+        return summaries
+
+    def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
+        """Publish stage attribution, batch lifecycle, and explicit cost status."""
+        query_operations = (llm_usage.get("operations") or {}).get("query", {})
+        query_total = llm_usage.get("query_phase", {})
+        answer_batch = query_operations.get("query.answer_batch", {})
+        answer_realtime = query_operations.get("query.answer_realtime", {})
+        judge_batch = query_operations.get("query.judge_batch", {})
+        judge_realtime = query_operations.get("query.judge_realtime", {})
+        retrieval = query_operations.get("query.retrieval_preparation", {})
+        attributed = self._usage_total(
+            answer_batch, answer_realtime, judge_batch, judge_realtime, retrieval
+        )
+        unattributed = TokenUsage.from_dict(query_total).subtract(
+            TokenUsage.from_dict(attributed)
+        ).to_dict()
+        api_config = get_api_config()
+        answer_model = self._model_usage_identity(
+            self.method_config.model,
+            transport="batch_or_realtime",
+        )
+        judge_model = {
+            "provider": api_config.get_judge_provider(),
+            "model": api_config.get_judge_model(),
+            "transport": "batch_or_realtime",
+            "service_tier": None,
+        }
+        cost_unavailable = {
+            "available": False,
+            "currency": "USD",
+            "reason": (
+                "No versioned provider price schedule is configured; token totals "
+                "are recorded without an estimated monetary cost."
+            ),
+        }
+        batch_stages = (
+            self._batch_manifest_stage_summaries(getattr(self, "_batch_client", None))
+            + self._batch_manifest_stage_summaries(
+                getattr(self, "_judge_batch_client", None)
+            )
+        )
+        return {
+            "schema_version": 1,
+            "memory_build": {
+                "usage": llm_usage.get("memorize_phase", {}),
+                "models": [],
+                "cost": cost_unavailable,
+            },
+            "retrieval_preparation": {
+                "usage": retrieval,
+                "models": [answer_model],
+                "cost": cost_unavailable,
+            },
+            "answer": {
+                "usage": self._usage_total(answer_batch, answer_realtime),
+                "models": [answer_model],
+                "cost": cost_unavailable,
+            },
+            "judge": {
+                "usage": self._usage_total(judge_batch, judge_realtime),
+                "models": [judge_model],
+                "cost": cost_unavailable,
+            },
+            "unattributed_query_usage": unattributed,
+            "batch_stages": batch_stages,
+        }
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
@@ -1103,6 +1393,8 @@ class MedMemoryBenchEvaluator:
                 "unit_id": unit.unit_id,
                 "context_id": unit.context_id,
                 "path": target_path.name,
+                "integrity_hash": child_payload.get("integrity_hash", ""),
+                "embedding_sha256": self._snapshot_embedding_sha256(child_payload),
                 "source": self.memory_source_run_dir.name,
                 "session_count": len(child_payload.get("session_ids", [])),
                 "memory_build_time": child_payload.get("memory_build_time", 0.0),
@@ -1297,6 +1589,17 @@ class MedMemoryBenchEvaluator:
             separators=(",", ":"),
         )
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _snapshot_embedding_sha256(payload: Dict[str, Any]) -> str:
+        """Return the published embedding sidecar digest, when present."""
+        embeddings = (
+            payload.get("memory_state", {})
+            .get("system_state", {})
+            .get("retriever", {})
+            .get("embeddings")
+        )
+        return str(embeddings.get("sha256", "")) if isinstance(embeddings, dict) else ""
 
     @staticmethod
     def _measure_snapshot_memory_size(
@@ -1504,6 +1807,8 @@ class MedMemoryBenchEvaluator:
             "unit_id": unit.unit_id,
             "context_id": unit.context_id,
             "path": path.name,
+            "integrity_hash": payload["integrity_hash"],
+            "embedding_sha256": self._snapshot_embedding_sha256(payload),
             "session_count": len(unit.sessions_to_inject),
             "memory_build_time": memory_build_time,
             "memory_build_metrics": copy.deepcopy(memory_build_metrics or {}),
@@ -1670,7 +1975,7 @@ class MedMemoryBenchEvaluator:
         if not isinstance(items, list):
             raise VertexBatchError(f"Deferred judge state is invalid: {path}")
         self._deferred_judges = items
-        self._log(f"[Vertex Batch] Restored {len(items):,} deferred LLM-judge request(s) from {path}.")
+        self._log(f"[Batch] Restored {len(items):,} deferred LLM-judge request(s) from {path}.")
 
     def _clear_deferred_judges(self) -> None:
         for path in self._deferred_judge_state_paths():
@@ -2141,7 +2446,7 @@ class MedMemoryBenchEvaluator:
                 )
                 query_results = []
                 self._log(
-                    f"    [Vertex Batch] Prepared {prepared_count:,} request(s) for "
+                    f"    [Batch] Prepared {prepared_count:,} request(s) for "
                     f"combined stage '{combined_stage}'."
                 )
             for result in query_results:
@@ -2158,7 +2463,7 @@ class MedMemoryBenchEvaluator:
         else:
             if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
                 self._log(
-                    "Vertex batch API is unavailable for this adapter; "
+                    "Batch API is unavailable for this adapter; "
                     "using real-time final-answer generation.",
                     level="WARNING",
                 )
@@ -2183,12 +2488,14 @@ class MedMemoryBenchEvaluator:
                         query,
                         unit.context_id,
                         memory_time_per_query=memory_time_per_query,
+                        unit_id=unit.unit_id,
                     )
                 else:
                     result = self._evaluate_query(
                         query,
                         unit.context_id,
                         memory_time_per_query=memory_time_per_query,
+                        unit_id=unit.unit_id,
                     )
                 if result is None:
                     continue
@@ -2222,21 +2529,22 @@ class MedMemoryBenchEvaluator:
                 raise VertexBatchError("Agent manager is not initialized for batch execution.")
             llm_client = self.agent_manager.get_batch_llm_client()
             if llm_client is None:
-                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
-            self._batch_client = VertexBatchClient.from_gemini_client(
+                raise VertexBatchError("This method does not expose a managed batch client.")
+            self._batch_client = create_batch_client(
                 llm_client,
                 gcs_uri=self.batch_gcs_uri,
                 manifest_path=self._batch_manifest_path("medmemorybench_batch_manifest", llm_client.model),
                 wait=self.batch_wait,
                 config_hash=self._batch_manifest_config_hash(),
                 progress_callback=self._log,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._batch_client
 
     def _get_judge_batch_client(self, judge_client) -> VertexBatchClient:
         """Create an independent manifest because judge and agent models may differ."""
         if self._judge_batch_client is None:
-            self._judge_batch_client = VertexBatchClient.from_gemini_client(
+            self._judge_batch_client = create_batch_client(
                 judge_client,
                 gcs_uri=self.batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -2248,6 +2556,7 @@ class MedMemoryBenchEvaluator:
                 wait=self.batch_wait,
                 config_hash=self._judge_batch_config_hash(),
                 progress_callback=self._log,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._judge_batch_client
 
@@ -2349,13 +2658,16 @@ class MedMemoryBenchEvaluator:
             return []
 
         self._log(
-            f"    [Vertex Batch] Stage '{stage}': local preparation complete; "
+            f"    [Batch] Stage '{stage}': local preparation complete; "
             f"submitting {len(requests):,} final-answer request(s)."
         )
         get_saved_requests = getattr(batch_client, "get_saved_requests", None)
         saved_requests = get_saved_requests(stage) if callable(get_saved_requests) else []
         submitted_requests = saved_requests or requests
-        responses = batch_client.run_stage(stage, submitted_requests)
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
+        with tracker.scope("query.answer_batch"):
+            responses = batch_client.run_stage(stage, submitted_requests)
         results: List[MetricResult] = []
         for request_id, (query, prepared) in prepared_by_id.items():
             batch_response = responses.get(request_id)
@@ -2363,7 +2675,7 @@ class MedMemoryBenchEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 self._record_batch_api_failure(
                     query,
-                    f"Vertex batch request failed: {error}",
+                    f"Batch request failed: {error}",
                     failure_duration_seconds=(
                         getattr(batch_response, "duration_seconds", 0.0)
                         if batch_response is not None else 0.0
@@ -2386,6 +2698,18 @@ class MedMemoryBenchEvaluator:
                     response,
                     context_id=unit.context_id,
                     memory_construction_time=memory_time_per_query,
+                    artifact_references=self._query_artifact_references(
+                        context_id=unit.context_id,
+                        unit_id=unit.unit_id,
+                        answer_request_id=request_id,
+                        answer_batch_client=batch_client,
+                        answer_messages=prepared.get("messages"),
+                    ),
+                    execution_usage={
+                        "answer": self._batch_response_usage(
+                            batch_response, transport="batch"
+                        ),
+                    },
                 )
             except LLMAPIError as e:
                 self._log(
@@ -2506,7 +2830,7 @@ class MedMemoryBenchEvaluator:
         return prepared_count
 
     def _complete_combined_batch_queries(self) -> List[Dict[str, Any]]:
-        """Submit all frozen final-answer prompts in one Vertex batch job."""
+        """Submit all frozen final-answer prompts in one provider batch job."""
         if not self._pending_batch_queries:
             return []
 
@@ -2520,7 +2844,10 @@ class MedMemoryBenchEvaluator:
             f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined "
             "final-answer request(s) from all prepared units."
         )
-        responses = batch_client.run_stage(stage, requests)
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
+        with tracker.scope("query.answer_batch"):
+            responses = batch_client.run_stage(stage, requests)
         finalized: List[Dict[str, Any]] = []
 
         for item in self._pending_batch_queries:
@@ -2531,7 +2858,7 @@ class MedMemoryBenchEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 self._record_batch_api_failure(
                     query,
-                    f"Vertex batch request failed: {error}",
+                    f"Batch request failed: {error}",
                     failure_duration_seconds=(
                         getattr(batch_response, "duration_seconds", 0.0)
                         if batch_response is not None else 0.0
@@ -2554,6 +2881,18 @@ class MedMemoryBenchEvaluator:
                     response,
                     context_id=item["persona_id"],
                     memory_construction_time=item["memory_time_per_query"],
+                    artifact_references=self._query_artifact_references(
+                        context_id=item["persona_id"],
+                        unit_id=item["unit_id"],
+                        answer_request_id=request.request_id,
+                        answer_batch_client=batch_client,
+                        answer_messages=item["prepared"].get("messages"),
+                    ),
+                    execution_usage={
+                        "answer": self._batch_response_usage(
+                            batch_response, transport="batch"
+                        ),
+                    },
                 )
             except LLMAPIError as e:
                 self._log(
@@ -2588,6 +2927,7 @@ class MedMemoryBenchEvaluator:
         query,
         context_id: int,
         memory_time_per_query: float = 0.0,
+        unit_id: Optional[int] = None,
     ) -> Optional[MetricResult]:
         if self.dry_run:
             return MetricResult(
@@ -2638,6 +2978,14 @@ class MedMemoryBenchEvaluator:
                 response,
                 context_id=context_id,
                 memory_construction_time=memory_time_per_query,
+                artifact_references=self._query_artifact_references(
+                    context_id=context_id,
+                    unit_id=unit_id,
+                    answer_request_id=make_request_id(
+                        "query", f"{self.method_config.method_name}:{unit_id}:{query.query_id}"
+                    ) if unit_id is not None else None,
+                    answer_messages=[{"role": "user", "content": formatted_question}],
+                ),
             )
         except LLMAPIError as e:
             self._log(
@@ -2659,6 +3007,7 @@ class MedMemoryBenchEvaluator:
         query,
         context_id: int,
         memory_time_per_query: float = 0.0,
+        unit_id: Optional[int] = None,
     ) -> Optional[MetricResult]:
         """Run retrieval, final answering, and scoring as explicit stages."""
         formatted_question = self.prompt_manager.format_query(
@@ -2700,6 +3049,14 @@ class MedMemoryBenchEvaluator:
                 response,
                 context_id=context_id,
                 memory_construction_time=memory_time_per_query,
+                artifact_references=self._query_artifact_references(
+                    context_id=context_id,
+                    unit_id=unit_id,
+                    answer_request_id=make_request_id(
+                        "query", f"{self.method_config.method_name}:{unit_id}:{query.query_id}"
+                    ) if unit_id is not None else None,
+                    answer_messages=staged_query.get("messages") if isinstance(staged_query, dict) else None,
+                ),
             )
         except LLMAPIError as e:
             self._log(
@@ -2743,6 +3100,8 @@ class MedMemoryBenchEvaluator:
         response: Any,
         context_id: Optional[int] = None,
         memory_construction_time: float = 0.0,
+        artifact_references: Optional[Dict[str, Any]] = None,
+        execution_usage: Optional[Dict[str, Any]] = None,
     ) -> Optional[MetricResult]:
         """Score a normal or batch-finalized agent response with unchanged metrics."""
         answers_data = query.answers_data if isinstance(query, MedQuery) else None
@@ -2752,16 +3111,23 @@ class MedMemoryBenchEvaluator:
             query_time = response.get("query_time", 0.0)
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
+            response_usage = response.get("answer_usage")
         elif hasattr(response, "output"):
             model_output = response.output
             query_time = getattr(response, "query_time", 0.0)
             retrieved_memories = getattr(response, "retrieved_memories", [])
             retrieved_count = getattr(response, "retrieved_count", 0)
+            response_usage = None
         else:
             model_output = str(response)
             query_time = 0.0
             retrieved_memories = []
             retrieved_count = 0
+            response_usage = None
+
+        resolved_execution_usage = copy.deepcopy(execution_usage or {})
+        if isinstance(response_usage, dict) and "answer" not in resolved_execution_usage:
+            resolved_execution_usage["answer"] = copy.deepcopy(response_usage)
 
         metric_kwargs = {
             "answers_data": answers_data,
@@ -2794,30 +3160,59 @@ class MedMemoryBenchEvaluator:
                     "memory_construction_time": memory_construction_time,
                     "retrieved_memories": retrieved_memories,
                     "retrieved_count": retrieved_count,
+                    "retrieval_quality": self._session_retrieval_quality(
+                        query, retrieved_memories
+                    ),
+                    "artifact_references": copy.deepcopy(artifact_references or {}),
+                    "execution_usage": resolved_execution_usage,
                 })
                 return None
             result = self.metrics_calculator.finalize_batch(prepared_metric, "")
         else:
             if prepared_metric is not None and not self._judge_batch_fallback_logged:
                 self._log(
-                    "Vertex batch API cannot batch the configured LLM judge; "
+                    "Batch API cannot batch the configured LLM judge; "
                     "using its existing real-time client.",
                     level="WARNING",
                 )
                 self._judge_batch_fallback_logged = True
-            result = self.metrics_calculator.compute(
-                query_id=query.query_id,
-                query_type=query.query_type,
-                model_output=model_output,
-                expected_answers=query.get_correct_answers(),
-                question=query.question,
-                **metric_kwargs,
-            )
+            tracker = get_usage_tracker()
+            tracker.set_phase("query")
+            with tracker.scope("query.judge_realtime"):
+                result = self.metrics_calculator.compute(
+                    query_id=query.query_id,
+                    query_type=query.query_type,
+                    model_output=model_output,
+                    expected_answers=query.get_correct_answers(),
+                    question=query.question,
+                    **metric_kwargs,
+                )
 
         result.query_time = query_time
         result.memory_construction_time = memory_construction_time
         result.retrieved_memories = retrieved_memories
         result.retrieved_count = retrieved_count
+        references = copy.deepcopy(artifact_references or {})
+        references["retrieval"] = {
+            "payload_sha256": self._artifact_content_hash(retrieved_memories),
+            "memory_ids_sha256": self._artifact_content_hash([
+                memory.get("memory_id", memory.get("id"))
+                for memory in retrieved_memories
+                if isinstance(memory, dict)
+            ]),
+        }
+        answer_reference = references.get("answer")
+        if isinstance(answer_reference, dict):
+            answer_reference["response_sha256"] = self._artifact_content_hash(
+                model_output
+            )
+        references.setdefault("judge", {"transport": "realtime"})
+        self._attach_session_retrieval_quality(
+            result,
+            self._session_retrieval_quality(query, retrieved_memories),
+        )
+        result.details["artifact_references"] = references
+        result.details["execution_usage"] = resolved_execution_usage
 
         return result
 
@@ -2825,50 +3220,6 @@ class MedMemoryBenchEvaluator:
         """Submit all independent MedMemoryBench judge prompts as one final stage."""
         if not self._deferred_judges:
             return []
-
-        can_fallback_to_realtime = all(
-            "expected_answers" in item and "metric_kwargs" in item
-            for item in self._deferred_judges
-        )
-        if not should_use_batch(len(self._deferred_judges)) and can_fallback_to_realtime:
-            self._log(
-                f"[Vertex Batch] Only {len(self._deferred_judges):,} judge request(s); "
-                "using real-time judging."
-            )
-            finalized: List[Dict[str, Any]] = []
-            for item in self._deferred_judges:
-                prepared = item["prepared_metric"]["prepared"]
-                try:
-                    result = self._run_api_call(
-                        self.metrics_calculator.compute,
-                        query_id=prepared["query_id"],
-                        query_type=prepared["query_type"],
-                        model_output=prepared["model_output"],
-                        expected_answers=item["expected_answers"],
-                        question=prepared["question"],
-                        **item["metric_kwargs"],
-                    )
-                except LLMAPIError as e:
-                    self._log(
-                        f"[API ERROR] Judge failed for {prepared['query_id']}; "
-                        f"no metric result recorded. Error: {e}",
-                        level="ERROR",
-                    )
-                    self._record_api_failure(
-                        "judge",
-                        e,
-                        query_id=prepared["query_id"],
-                        query_type=prepared["query_type"],
-                        context_id=item["persona_id"],
-                    )
-                    continue
-                result.query_time = item["query_time"]
-                result.memory_construction_time = item["memory_construction_time"]
-                result.retrieved_memories = item["retrieved_memories"]
-                result.retrieved_count = item["retrieved_count"]
-                finalized.append({"persona_id": item["persona_id"], "result": result})
-            self._clear_deferred_judges()
-            return finalized
 
         first_prepared = self._deferred_judges[0]["prepared_metric"]["prepared"]
         judge_client = self.metrics_calculator.get_batch_judge_client(first_prepared["query_type"])
@@ -2895,6 +3246,7 @@ class MedMemoryBenchEvaluator:
                         "temperature", getattr(get_api_config(), "judge_temperature", 1.0)
                     ),
                     max_tokens=payload["max_tokens"],
+                    reasoning_effort=payload.get("reasoning_effort"),
                     response_format={"type": "json_object"},
                     phase="query",
                     metadata={"query_id": item["query_id"], "phase": "judge"},
@@ -2903,9 +3255,13 @@ class MedMemoryBenchEvaluator:
             by_id[request_id] = item
 
         self._log(
-            f"[Vertex Batch] Stage 'judge-final': prepared {len(requests):,} LLM-judge request(s)."
+            f"[Batch] Stage 'judge-final': prepared {len(requests):,} LLM-judge request(s)."
         )
-        responses = self._get_judge_batch_client(judge_client).run_stage("judge-final", requests)
+        judge_batch_client = self._get_judge_batch_client(judge_client)
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
+        with tracker.scope("query.judge_batch"):
+            responses = judge_batch_client.run_stage("judge-final", requests)
         finalized: List[Dict[str, Any]] = []
         for request_id, item in by_id.items():
             response = responses.get(request_id)
@@ -2953,6 +3309,26 @@ class MedMemoryBenchEvaluator:
             result.memory_construction_time = item["memory_construction_time"]
             result.retrieved_memories = item["retrieved_memories"]
             result.retrieved_count = item["retrieved_count"]
+            self._attach_session_retrieval_quality(
+                result,
+                item.get("retrieval_quality"),
+            )
+            references = copy.deepcopy(item.get("artifact_references") or {})
+            references["judge"] = self._batch_artifact_reference(
+                judge_batch_client, request_id
+            )
+            references["judge"]["prompt_sha256"] = self._artifact_content_hash(
+                payload["prompt"]
+            )
+            references["judge"]["response_sha256"] = self._artifact_content_hash(
+                response.content
+            )
+            result.details["artifact_references"] = references
+            execution_usage = copy.deepcopy(item.get("execution_usage") or {})
+            execution_usage["judge"] = self._batch_response_usage(
+                response, transport="batch"
+            )
+            result.details["execution_usage"] = execution_usage
             finalized.append({"persona_id": item["persona_id"], "result": result})
         self._clear_deferred_judges()
         return finalized
@@ -2969,6 +3345,7 @@ class MedMemoryBenchEvaluator:
         build_metrics = self._build_metrics_report()
 
         llm_usage = get_usage_tracker().get_stats()
+        stage_usage = self._stage_usage_report(llm_usage)
         retry_failure_duration = self._retry_failure_duration(llm_usage)
         failed_query_ids = set()
         for failure in self._api_failures:
@@ -3005,6 +3382,9 @@ class MedMemoryBenchEvaluator:
                     "provider": get_api_config().get_judge_provider(),
                     "model": get_api_config().get_judge_model(),
                     "temperature": getattr(get_api_config(), "judge_temperature", 1.0),
+                    "reasoning_effort": getattr(
+                        get_api_config(), "judge_reasoning_effort", None
+                    ),
                     "client_max_tokens": getattr(
                         get_api_config(), "judge_client_max_tokens", 10000
                     ),
@@ -3024,6 +3404,7 @@ class MedMemoryBenchEvaluator:
                 "memory_size": build_metrics["memory_size"],
                 "feature_configuration": build_metrics["feature_configuration"],
                 "llm_usage": llm_usage,
+                "stage_usage": stage_usage,
                 "evaluation_coverage": evaluation_coverage,
                 "api_failures": self._api_failures,
                 "api_failure_duration_seconds": retry_failure_duration,
@@ -3071,8 +3452,7 @@ class MedMemoryBenchEvaluator:
             return sum(len(unit.queries_to_evaluate) for unit in units)
         if self.execution_stage == "query" and self._memory_unit_ids is not None:
             units = [unit for unit in units if unit.unit_id in self._memory_unit_ids]
-            return sum(len(unit.queries_to_evaluate) for unit in units)
-        return self.dataset.get_total_queries()
+        return sum(len(unit.queries_to_evaluate) for unit in units)
 
     def _summarize_memory_builds(self) -> Dict[str, Any]:
         build_logs = self._combined_memory_build_logs()

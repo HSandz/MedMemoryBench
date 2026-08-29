@@ -20,6 +20,7 @@ class GeminiLLM(LLMBase):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             api_key=self.config.api_key,
+            reasoning_effort=self.config.reasoning_effort,
         )
 
     def generate_response(

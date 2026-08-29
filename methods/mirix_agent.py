@@ -73,6 +73,7 @@ class MIRIXAgent(BaseAgent):
 
         # Store config
         self._provider = provider
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
@@ -108,6 +109,7 @@ class MIRIXAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # MIRIX components (lazy initialization)
@@ -158,6 +160,21 @@ class MIRIXAgent(BaseAgent):
             self._run_async(ensure_tables_created())
 
             # Build LLM config
+            extra_body = None
+            if self._provider.lower() == "openrouter":
+                extra_body = {}
+                if self._llm_client_kwargs.get("provider_routing") is not None:
+                    extra_body["provider"] = self._llm_client_kwargs[
+                        "provider_routing"
+                    ]
+                if self._llm_client_kwargs.get("service_tier") is not None:
+                    extra_body["service_tier"] = self._llm_client_kwargs[
+                        "service_tier"
+                    ]
+                if self._llm_client_kwargs.get("reasoning_effort") is not None:
+                    extra_body["reasoning"] = {
+                        "effort": self._llm_client_kwargs["reasoning_effort"]
+                    }
             llm_config = LLMConfig(
                 model=self.model,
                 model_endpoint_type=self._get_mirix_endpoint_type(self._provider),
@@ -165,6 +182,8 @@ class MIRIXAgent(BaseAgent):
                 context_window=self.max_context_tokens,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                extra_body=extra_body or None,
+                reasoning_effort=self._llm_client_kwargs.get("reasoning_effort"),
             )
 
             # Build embedding config

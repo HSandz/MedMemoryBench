@@ -7,7 +7,12 @@ from typing import List, Dict, Any, Optional
 
 from .base import BaseMetric, MetricResult
 from .string_match import StringContainMetric
-from utils.llm_client import InvalidLLMResponseError, is_gemini_provider, with_retry
+from utils.llm_client import (
+    InvalidLLMResponseError,
+    OpenRouterClient,
+    is_gemini_provider,
+    with_retry,
+)
 from utils.templates import get_prompt_manager
 
 logger = logging.getLogger(__name__)
@@ -22,6 +27,7 @@ class LLMJudge:
                  judge_model: str = None, judge_provider: str = None,
                  judge_api_key: str = None, judge_base_url: str = None,
                  judge_temperature: float = None,
+                 judge_reasoning_effort=None,
                  judge_client_max_tokens: int = None,
                  judge_max_tokens: int = None,
                  judge_mcd_max_tokens: int = None,
@@ -35,6 +41,7 @@ class LLMJudge:
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
         self._judge_temperature = judge_temperature
+        self._judge_reasoning_effort = judge_reasoning_effort
         self._judge_client_max_tokens = judge_client_max_tokens
         self._judge_max_tokens = judge_max_tokens
         self._judge_mcd_max_tokens = judge_mcd_max_tokens
@@ -54,6 +61,11 @@ class LLMJudge:
                 self._judge_client_max_tokens
                 if self._judge_client_max_tokens is not None
                 else api_config.get_judge_client_max_tokens()
+            ),
+            "reasoning_effort": (
+                self._judge_reasoning_effort
+                if self._judge_reasoning_effort is not None
+                else getattr(api_config, "get_judge_reasoning_effort", lambda: None)()
             ),
             "max_tokens": (
                 self._judge_max_tokens
@@ -88,6 +100,7 @@ class LLMJudge:
                     max_tokens=self._settings()["client_max_tokens"],
                     api_key=api_key,
                     base_url=base_url,
+                    reasoning_effort=self._settings()["reasoning_effort"],
                 )
             self._initialized = True
 
@@ -146,6 +159,8 @@ class LLMJudge:
             "temperature": settings["temperature"],
             "max_tokens": max_tokens if max_tokens is not None else settings["max_tokens"],
         }
+        if settings["reasoning_effort"] is not None:
+            request["reasoning_effort"] = settings["reasoning_effort"]
         # Gemini guarantees a JSON MIME response for judge prompts.
         if is_gemini_provider(self._active_judge_provider):
             request["response_format"] = {"type": "json_object"}
@@ -169,13 +184,16 @@ class LLMJudge:
         return not model_output or not model_output.strip()
 
     def get_batch_client(self):
-        """Return the managed Gemini client after lazy initialization."""
+        """Return a managed client supported by an offline batch transport."""
         self._ensure_client()
         from utils.llm_client import GeminiHybridClient, GeminiVertexClient
 
         return (
             self._client
-            if isinstance(self._client, (GeminiVertexClient, GeminiHybridClient))
+            if isinstance(
+                self._client,
+                (GeminiVertexClient, GeminiHybridClient, OpenRouterClient),
+            )
             else None
         )
 
@@ -219,6 +237,7 @@ class LLMJudge:
                 "prompt": prompt,
                 "temperature": self._settings()["temperature"],
                 "max_tokens": self._settings()["max_tokens"],
+                "reasoning_effort": self._settings()["reasoning_effort"],
                 "query_type": query_type,
             }
 
@@ -256,6 +275,7 @@ class LLMJudge:
                 "prompt": prompt,
                 "temperature": self._settings()["temperature"],
                 "max_tokens": self._settings()["mcd_max_tokens"],
+                "reasoning_effort": self._settings()["reasoning_effort"],
                 "query_type": query_type,
             }
 
@@ -276,6 +296,7 @@ class LLMJudge:
             "prompt": prompt,
             "temperature": self._settings()["temperature"],
             "max_tokens": self._settings()["max_tokens"],
+            "reasoning_effort": self._settings()["reasoning_effort"],
             "query_type": query_type,
         }
 
@@ -615,7 +636,8 @@ class LLMJudgeMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_client_max_tokens: int = None,
+                 judge_temperature: float = None, judge_reasoning_effort=None,
+                 judge_client_max_tokens: int = None,
                  judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
@@ -623,6 +645,7 @@ class LLMJudgeMetric(BaseMetric):
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
         self._judge_temperature = judge_temperature
+        self._judge_reasoning_effort = judge_reasoning_effort
         self._judge_client_max_tokens = judge_client_max_tokens
         self._judge_max_tokens = judge_max_tokens
         self._judge_mcd_max_tokens = judge_mcd_max_tokens
@@ -638,6 +661,7 @@ class LLMJudgeMetric(BaseMetric):
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
                 judge_temperature=self._judge_temperature,
+                judge_reasoning_effort=self._judge_reasoning_effort,
                 judge_client_max_tokens=self._judge_client_max_tokens,
                 judge_max_tokens=self._judge_max_tokens,
                 judge_mcd_max_tokens=self._judge_mcd_max_tokens,
@@ -833,7 +857,8 @@ class LLMJudgeMCDMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_client_max_tokens: int = None,
+                 judge_temperature: float = None, judge_reasoning_effort=None,
+                 judge_client_max_tokens: int = None,
                  judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
@@ -841,6 +866,7 @@ class LLMJudgeMCDMetric(BaseMetric):
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
         self._judge_temperature = judge_temperature
+        self._judge_reasoning_effort = judge_reasoning_effort
         self._judge_client_max_tokens = judge_client_max_tokens
         self._judge_max_tokens = judge_max_tokens
         self._judge_mcd_max_tokens = judge_mcd_max_tokens
@@ -856,6 +882,7 @@ class LLMJudgeMCDMetric(BaseMetric):
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
                 judge_temperature=self._judge_temperature,
+                judge_reasoning_effort=self._judge_reasoning_effort,
                 judge_client_max_tokens=self._judge_client_max_tokens,
                 judge_max_tokens=self._judge_max_tokens,
                 judge_mcd_max_tokens=self._judge_mcd_max_tokens,

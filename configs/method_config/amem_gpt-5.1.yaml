@@ -6,9 +6,10 @@ model:
   name: gpt-5.1
   temperature: 0.0
   max_completion_tokens: 20000
+memorize_model:
+  provider: openai
+  name: gpt-5.1
 build_config:
-  amem_backend: openai
-  amem_model: gpt-5.1
   amem_embedding_model: BAAI/bge-small-zh-v1.5
   amem_evo_threshold: 100
   amem_max_tokens: 10000

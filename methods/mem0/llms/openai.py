@@ -131,6 +131,17 @@ class OpenAILLM(LLMBase):
             "temperature": self.config.temperature,
             "max_completion_tokens": self.config.max_tokens,
         }
+        if self.config.reasoning_effort is not None:
+            if os.getenv("OPENROUTER_API_KEY"):
+                extra_body = dict(params.get("extra_body") or {})
+                reasoning = dict(extra_body.get("reasoning") or {})
+                reasoning.setdefault("effort", self.config.reasoning_effort)
+                extra_body["reasoning"] = reasoning
+                params["extra_body"] = extra_body
+            else:
+                params["reasoning_effort"] = self.config.reasoning_effort
+        if self.config.extra_body:
+            params["extra_body"] = self.config.extra_body
 
         if os.getenv("OPENROUTER_API_KEY"):
             openrouter_params = {}

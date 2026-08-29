@@ -16,9 +16,13 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-from utils.llm_client import LLMResponse, get_usage_tracker
+from utils.llm_client import (
+    LLMResponse,
+    extract_usage_token_counts,
+    get_usage_tracker,
+)
 
 
 MANIFEST_VERSION = 2
@@ -77,11 +81,16 @@ class BatchChatRequest:
     messages: List[Dict[str, str]]
     temperature: float
     max_tokens: int
+    reasoning_effort: Optional[Union[str, int]] = None
     response_format: Optional[Dict[str, Any]] = None
     phase: str = "query"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_vertex_request(self) -> Dict[str, Any]:
+    def to_vertex_request(
+        self,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[Union[str, int]] = None,
+    ) -> Dict[str, Any]:
         """Convert chat messages to one documented GenerateContent request."""
         system_messages: List[str] = []
         contents: List[Dict[str, Any]] = []
@@ -125,6 +134,31 @@ class BatchChatRequest:
                     raise VertexBatchError("response_schema must be a JSON object.")
                 generation_config["responseSchema"] = response_schema
 
+        effective_reasoning_effort = (
+            self.reasoning_effort if self.reasoning_effort is not None else reasoning_effort
+        )
+        if effective_reasoning_effort is not None:
+            model_name = str(model or self.metadata.get("model", "")).lower()
+            # The batch client supplies the model name while serializing;
+            # standalone requests default to the Gemini 2.5 budget form.
+            if isinstance(effective_reasoning_effort, int) and not isinstance(effective_reasoning_effort, bool):
+                generation_config["thinkingConfig"] = {
+                    "thinkingBudget": effective_reasoning_effort,
+                }
+            elif isinstance(effective_reasoning_effort, str) and "gemini-3" in model_name:
+                level = effective_reasoning_effort.strip().upper()
+                if level not in {"MINIMAL", "LOW", "MEDIUM", "HIGH"}:
+                    raise VertexBatchError(
+                        "Gemini 3 reasoning_effort must be minimal, low, medium, or high."
+                    )
+                generation_config["thinkingConfig"] = {"thinkingLevel": level}
+            elif isinstance(effective_reasoning_effort, str):
+                raise VertexBatchError(
+                    "Gemini 2.5 reasoning_effort must be an integer thinking budget."
+                )
+            else:
+                raise VertexBatchError("reasoning_effort must be a string or integer.")
+
         request: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": generation_config,
@@ -136,11 +170,20 @@ class BatchChatRequest:
 
         return request
 
-    def to_vertex_record(self) -> Dict[str, Any]:
+    def to_vertex_record(
+        self,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[Union[str, int]] = None,
+    ) -> Dict[str, Any]:
         """Wrap a GenerateContent request in the documented GCS JSONL shape."""
         # Vertex's GCS output echoes ``request`` but does not preserve arbitrary
         # top-level fields, so local request IDs remain in the manifest only.
-        return {"request": self.to_vertex_request()}
+        return {
+            "request": self.to_vertex_request(
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        }
 
     def to_manifest_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -152,6 +195,7 @@ class BatchChatRequest:
             messages=data["messages"],
             temperature=data["temperature"],
             max_tokens=data["max_tokens"],
+            reasoning_effort=data.get("reasoning_effort"),
             response_format=data.get("response_format"),
             phase=data.get("phase", "query"),
             metadata=data.get("metadata", {}),
@@ -169,6 +213,21 @@ class BatchChatResponse:
     status: str = ""
     duration_seconds: float = 0.0
     raw_response: Any = field(default_factory=dict)
+    visible_output_tokens: Optional[int] = None
+    thinking_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        self.input_tokens = max(int(self.input_tokens or 0), 0)
+        self.output_tokens = max(int(self.output_tokens or 0), 0)
+        self.thinking_tokens = min(
+            max(int(self.thinking_tokens or 0), 0), self.output_tokens
+        )
+        if self.visible_output_tokens is None:
+            self.visible_output_tokens = self.output_tokens - self.thinking_tokens
+        self.visible_output_tokens = min(
+            max(int(self.visible_output_tokens or 0), 0),
+            self.output_tokens - self.thinking_tokens,
+        )
 
     @property
     def succeeded(self) -> bool:
@@ -179,6 +238,8 @@ class BatchChatResponse:
             content=self.content,
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
+            visible_output_tokens=self.visible_output_tokens,
+            thinking_tokens=self.thinking_tokens,
             # Job queue time is not a per-request model latency.
             latency=0.0,
             model=model,
@@ -528,7 +589,14 @@ class VertexBatchClient:
     def _upload_jsonl(self, uri: str, requests: Iterable[BatchChatRequest]) -> int:
         bucket_name, object_name = _parse_gcs_uri(uri)
         body = "\n".join(
-            json.dumps(request.to_vertex_record(), ensure_ascii=False, separators=(",", ":"))
+            json.dumps(
+                request.to_vertex_record(
+                    model=self.model,
+                    reasoning_effort=getattr(self._direct_client, "reasoning_effort", None),
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             for request in requests
         ) + "\n"
         self._progress(
@@ -641,6 +709,8 @@ class VertexBatchClient:
                     content=response.content,
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
+                    visible_output_tokens=response.visible_output_tokens,
+                    thinking_tokens=response.thinking_tokens,
                     duration_seconds=time.perf_counter() - started_at,
                     raw_response=response.raw_response,
                 )
@@ -789,11 +859,16 @@ class VertexBatchClient:
         if candidates:
             parts = (candidates[0].get("content") or {}).get("parts") or []
             content = "".join(part.get("text", "") for part in parts)
+        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+            extract_usage_token_counts(usage)
+        )
         return BatchChatResponse(
             request_id=request_id,
             content=content,
-            input_tokens=int(usage.get("promptTokenCount", usage.get("prompt_token_count", 0)) or 0),
-            output_tokens=int(usage.get("candidatesTokenCount", usage.get("candidates_token_count", 0)) or 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             status=status,
             raw_response=row,
         )
@@ -833,6 +908,8 @@ class VertexBatchClient:
                 "content": response.content,
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
+                "visible_output_tokens": response.visible_output_tokens,
+                "thinking_tokens": response.thinking_tokens,
                 "status": response.status,
             }
             for request_id, response in responses.items()
@@ -892,11 +969,10 @@ class VertexBatchClient:
         stage: str,
         requests: List[BatchChatRequest],
     ) -> Dict[str, BatchChatResponse]:
-        """Run one deterministic stage through direct or batch Vertex AI.
+        """Run one deterministic stage through Vertex Batch AI.
 
-        New stages with fewer than ``min_batch_requests()`` requests use the
-        normal real-time client. Existing batch manifests always resume their
-        submitted job. In submit-only batch mode this raises
+        Every non-empty stage submitted through this explicit batch client uses
+        a batch job. In submit-only batch mode this raises
         :class:`VertexBatchPending` for later ``--resume`` collection.
         """
         if not requests:
@@ -906,12 +982,6 @@ class VertexBatchClient:
         manifest = self._load_manifest()
         jobs = manifest.setdefault("jobs", {})
         job_entry = jobs.get(stage)
-        if (
-            job_entry is None
-            and not should_use_batch(len(requests))
-            and self._direct_client is not None
-        ):
-            return self._run_direct(stage, requests)
 
         if job_entry is None:
             job_entry = self._submit(stage, requests, manifest["run_id"])
@@ -942,15 +1012,7 @@ class VertexBatchClient:
             responses.update(self._collect(retry_entry))
 
         unresolved = self._unresolved_requests(requests, responses)
-        direct_response_ids = set()
         while unresolved and len(retries) < 3:
-            if not should_use_batch(len(unresolved)) and self._direct_client is not None:
-                direct_responses = self._run_direct(f"{stage}-retry-direct", unresolved)
-                responses.update(direct_responses)
-                direct_response_ids.update(direct_responses)
-                unresolved = self._unresolved_requests(requests, responses)
-                break
-
             retry_stage = f"{stage}-retry-{len(retries) + 1}"
             self._progress(
                 f"Stage '{stage}': retrying {len(unresolved):,} incomplete request(s) "
@@ -985,6 +1047,8 @@ class VertexBatchClient:
                 "content": response.content,
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
+                "visible_output_tokens": response.visible_output_tokens,
+                "thinking_tokens": response.thinking_tokens,
                 "status": response.status,
             }
             for request_id, response in responses.items()
@@ -998,8 +1062,6 @@ class VertexBatchClient:
         # Attribute completed model tokens to their original evaluator phase.
         by_id = {request.request_id: request for request in requests}
         for request_id, response in responses.items():
-            if request_id in direct_response_ids:
-                continue
             request = by_id.get(request_id)
             if request is not None:
                 get_usage_tracker().set_phase(request.phase)

@@ -9,6 +9,8 @@ import pytest
 
 import main as cli
 from src.config import (
+    AMEM_BUILD_CONFIG_KEYS,
+    AMEM_RETRIEVAL_CONFIG_KEYS,
     DatasetConfig,
     MethodConfig,
     ModelConfig,
@@ -217,6 +219,55 @@ def test_full_run_keeps_config_log_and_reports_in_one_timestamp_directory(
     assert any(name.endswith("_memory_build.json") for name in report_names)
     assert any(name.endswith("_query_answer.json") for name in report_names)
     assert not (evaluator.output_dir / "amem_test-model").exists()
+
+
+def test_run_config_records_sparse_amem_effective_defaults(tmp_path: Path):
+    method = MethodConfig.from_dict({
+        "method_name": "amem_test",
+        "method_type": "agentic_memory",
+        "model": {
+            "name": "configured-model",
+            "api_key": "do-not-write-this-secret",
+        },
+    })
+    dataset = DatasetConfig.from_dict({"dataset_name": "run-layout-test"})
+    evaluator = Evaluator(
+        method_config=method,
+        dataset_config=dataset,
+        output_dir=tmp_path,
+        method_config_name="sparse-amem",
+        dataset_config_name="sparse-dataset",
+    )
+
+    config = json.loads((evaluator.output_dir / "run_config.json").read_text())
+    snapshot = config["method_config"]
+    effective = snapshot["effective_agent"]
+    constructor_params = effective["constructor_params"]
+
+    assert snapshot["raw_config"] == {
+        "method_name": "amem_test",
+        "method_type": "agentic_memory",
+        "model": {
+            "name": "configured-model",
+            "api_key": "<redacted>",
+        },
+    }
+    assert snapshot["model"]["temperature"] == 1.0
+    assert snapshot["model"]["max_tokens"] == 2000
+    assert config["dataset_config"]["evaluation_interval"] == 10
+    assert effective["adapter"] == "amem_test"
+    assert constructor_params["model"] == "configured-model"
+    assert constructor_params["api_key"] == "<redacted>"
+    assert constructor_params["amem_note_level"] == "turn"
+    assert constructor_params["amem_regex_intent_conditioning"] is True
+    assert constructor_params["amem_graph_ranking_mode"] == "fixed_bfs"
+    assert constructor_params["amem_chain_selection"] is False
+    assert set(snapshot["build_config"]) == AMEM_BUILD_CONFIG_KEYS
+    assert set(snapshot["retrieval_config"]) == AMEM_RETRIEVAL_CONFIG_KEYS
+    assert snapshot["agent_params"] == {
+        **snapshot["build_config"],
+        **snapshot["retrieval_config"],
+    }
 
 
 def test_resume_reuses_only_an_incomplete_exactly_matching_run(tmp_path: Path):

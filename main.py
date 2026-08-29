@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-api",
         action="store_true",
-        help="Use Vertex Gemini Batch API for eligible offline evaluator stages",
+        help="Use the configured provider's Batch API for eligible offline stages",
     )
     parser.add_argument(
         "--batch-gcs-uri",
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-wait",
         action="store_true",
-        help="Poll Vertex batch jobs instead of exiting for --resume",
+        help="Poll batch jobs instead of exiting for --resume",
     )
 
     args = parser.parse_args()

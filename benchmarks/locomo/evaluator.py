@@ -17,6 +17,7 @@ from benchmarks.base import EvaluationUnit
 from methods.base import MemoryBuildResult
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from utils.templates import get_prompt_manager
+from utils.batch_client import create_batch_client
 from utils.llm_client import get_usage_tracker
 from utils.vertex_batch import (
     BatchChatRequest,
@@ -78,6 +79,7 @@ class LoCoMoEvaluator:
             judge_api_key=api_config.judge_api_key or None,
             judge_base_url=api_config.judge_base_url or None,
             judge_temperature=getattr(api_config, "judge_temperature", 1.0),
+            judge_reasoning_effort=getattr(api_config, "judge_reasoning_effort", None),
             judge_client_max_tokens=getattr(api_config, "judge_client_max_tokens", 10000),
             judge_max_tokens=getattr(api_config, "judge_max_tokens", 500),
             judge_mcd_max_tokens=getattr(api_config, "judge_mcd_max_tokens", 2000),
@@ -396,13 +398,13 @@ class LoCoMoEvaluator:
                 )
                 query_results = []
                 self._log(
-                    f"  [Vertex Batch] Prepared {prepared_count:,} request(s) for "
+                    f"  [Batch] Prepared {prepared_count:,} request(s) for "
                     f"combined stage '{combined_stage}'."
                 )
         else:
             if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
                 self._log(
-                    "Vertex batch API is unavailable for this adapter; "
+                    "Batch API is unavailable for this adapter; "
                     "using real-time final-answer generation.",
                     level="WARNING",
                 )
@@ -434,8 +436,8 @@ class LoCoMoEvaluator:
                 raise VertexBatchError("Agent manager is not initialized for batch execution.")
             llm_client = self.agent_manager.get_batch_llm_client()
             if llm_client is None:
-                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
-            self._batch_client = VertexBatchClient.from_gemini_client(
+                raise VertexBatchError("This method does not expose a managed batch client.")
+            self._batch_client = create_batch_client(
                 llm_client,
                 gcs_uri=self.batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -447,6 +449,7 @@ class LoCoMoEvaluator:
                 wait=self.batch_wait,
                 config_hash=self._batch_config_hash(),
                 progress_callback=self._log,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._batch_client
 
@@ -513,7 +516,7 @@ class LoCoMoEvaluator:
             batch_response = responses.get(request_id)
             if batch_response is None or batch_response.status:
                 error = batch_response.status if batch_response else "No output row returned"
-                results.append(self._api_error_result(query, f"Vertex batch request failed: {error}"))
+                results.append(self._api_error_result(query, f"Batch request failed: {error}"))
                 continue
             response = self.agent_manager.finalize_batch_query(
                 prepared,
@@ -618,7 +621,7 @@ class LoCoMoEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 result = self._api_error_result(
                     query,
-                    f"Vertex batch request failed: {error}",
+                    f"Batch request failed: {error}",
                 )
             else:
                 response = self.agent_manager.finalize_batch_query(
@@ -676,7 +679,7 @@ class LoCoMoEvaluator:
             query_type=query.query_type,
             score=0.0,
             is_correct=False,
-            model_output="[API_ERROR] Vertex batch request failed",
+            model_output="[API_ERROR] Batch request failed",
             expected_answer=", ".join(query.get_correct_answers()),
             question=query.question,
             details={"api_error": True, "error_message": error_message},
@@ -750,6 +753,9 @@ class LoCoMoEvaluator:
                     "provider": get_api_config().get_judge_provider(),
                     "model": get_api_config().get_judge_model(),
                     "temperature": getattr(get_api_config(), "judge_temperature", 1.0),
+                    "reasoning_effort": getattr(
+                        get_api_config(), "judge_reasoning_effort", None
+                    ),
                     "client_max_tokens": getattr(
                         get_api_config(), "judge_client_max_tokens", 10000
                     ),

@@ -88,6 +88,8 @@ def _metrics_evaluator() -> MedMemoryBenchEvaluator:
     )
     evaluator._memory_build_logs = []
     evaluator._source_memory_build_logs = []
+    evaluator._evaluation_units = []
+    evaluator.dataset = None
     return evaluator
 
 

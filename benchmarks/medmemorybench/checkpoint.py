@@ -468,6 +468,17 @@ def _snapshot_dataset_config(dataset_config) -> Dict[str, Any]:
     }
 
 
+def _snapshot_model_config(model_config) -> Optional[Dict[str, Any]]:
+    """Serialize model settings without changing legacy hashes for unset options."""
+    if model_config is None:
+        return None
+    value = vars(model_config).copy()
+    for key in ("openrouter_provider", "openrouter_service_tier"):
+        if value.get(key) is None:
+            value.pop(key, None)
+    return value
+
+
 def compute_build_config_hash(method_config, dataset_config) -> str:
     """Hash only settings that can change a serialized memory snapshot."""
     try:
@@ -482,7 +493,7 @@ def compute_build_config_hash(method_config, dataset_config) -> str:
             "method_name": getattr(method_config, "method_name", ""),
             "method_type": getattr(method_config, "method_type", ""),
             "embedding": vars(embedding) if embedding is not None else None,
-            "memorize_model": vars(memorize_model) if memorize_model is not None else None,
+            "memorize_model": _snapshot_model_config(memorize_model),
             "build_config": build_config,
             "dataset": _snapshot_dataset_config(dataset_config),
         }, sort_keys=True, default=str)
@@ -499,9 +510,9 @@ def compute_query_config_hash(method_config, dataset_config) -> str:
         content = json.dumps({
             "method_name": getattr(method_config, "method_name", ""),
             "method_type": getattr(method_config, "method_type", ""),
-            "model": vars(getattr(method_config, "model", None)),
+            "model": _snapshot_model_config(getattr(method_config, "model", None)),
             "embedding": vars(embedding) if embedding is not None else None,
-            "memorize_model": vars(memorize_model) if memorize_model is not None else None,
+            "memorize_model": _snapshot_model_config(memorize_model),
             "build_config": (
                 method_config.snapshot_build_config()
                 if hasattr(method_config, "snapshot_build_config")

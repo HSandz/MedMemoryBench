@@ -976,6 +976,8 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         return self._store_edge(edge)
 
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
+        source_session_id = kwargs.pop("source_session_id", None)
+        source_session_index = kwargs.pop("source_session_index", None)
         experimental_metadata_enabled = (
             getattr(self, "temporal_state_enabled", False)
             or getattr(self, "provenance_enabled", False)
@@ -985,7 +987,12 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             and not self.typed_relations_enabled
             and not experimental_metadata_enabled
         ):
-            return super().add_note(content=content, time=time, **kwargs)
+            note_id = super().add_note(content=content, time=time, **kwargs)
+            if source_session_id is not None:
+                note = self.memories[note_id]
+                note.source_session_id = source_session_id
+                note.source_session_index = source_session_index
+            return note_id
 
         source_evidence = kwargs.pop("source_evidence", None)
         source_timestamp = kwargs.pop("source_timestamp", time)
@@ -1002,6 +1009,9 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             note.source_timestamp = _optional_text(source_timestamp)
             # RobustMemoryNote otherwise substitutes execution time for missing input.
             note.timestamp = note.source_timestamp or ""
+        if source_session_id is not None:
+            note.source_session_id = source_session_id
+            note.source_session_index = source_session_index
         if getattr(self, "temporal_state_enabled", False):
             with get_usage_tracker().scope("amem.temporal_state.initialize"):
                 note.temporal_state = self._initial_temporal_state(source_timestamp)

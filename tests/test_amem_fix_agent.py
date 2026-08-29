@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,7 +64,7 @@ def test_amem_fix_memorizes_atomic_turns_with_real_timestamp():
 
 
 def test_amem_fix_uses_raw_question_keywords_and_expands_links_before_batch_answer():
-    keyword_prompts = []
+    keyword_requests = []
     search_queries = []
     memories = {
         "m0": SimpleNamespace(
@@ -96,12 +97,6 @@ def test_amem_fix_uses_raw_question_keywords_and_expands_links_before_batch_answ
         retriever=SimpleNamespace(
             search=lambda query, k: search_queries.append((query, k)) or [0]
         ),
-        llm_controller=SimpleNamespace(
-            llm=SimpleNamespace(
-                get_completion=lambda prompt: keyword_prompts.append(prompt)
-                or '{"keywords": "penicillin, antibiotic allergy"}'
-            )
-        ),
     )
     agent = object.__new__(AMemFixAgent)
     agent._context_id = 4
@@ -111,7 +106,11 @@ def test_amem_fix_uses_raw_question_keywords_and_expands_links_before_batch_answ
     agent.amem_max_context_tokens = 2000
     agent.max_tokens = 100
     agent._tokenizer = _Tokenizer()
-    agent._llm_client = _LLMClient()
+    agent._llm_client = SimpleNamespace(
+        count_tokens=_LLMClient().count_tokens,
+        chat=lambda messages: keyword_requests.append(messages)
+        or SimpleNamespace(content='{"keywords": "penicillin, antibiotic allergy"}'),
+    )
     agent._get_memory_system = lambda context_id: memory_system
 
     formatted_question = "Answer from memory. Question: Which antibiotic must be avoided? Answer:"
@@ -123,8 +122,9 @@ def test_amem_fix_uses_raw_question_keywords_and_expands_links_before_batch_answ
     response = agent.finalize_batch_query(prepared, "penicillin")
     agent.record_batch_query_usage(response, 25, 2)
 
-    assert "Which antibiotic must be avoided?" in keyword_prompts[0]
-    assert "Answer from memory" not in keyword_prompts[0]
+    keyword_prompt = keyword_requests[0][-1]["content"]
+    assert "Which antibiotic must be avoided?" in keyword_prompt
+    assert "Answer from memory" not in keyword_prompt
     assert search_queries == [("penicillin, antibiotic allergy", 10)]
     assert prepared["extra"]["direct_indices"] == [0]
     assert prepared["extra"]["expanded_indices"] == [0, 1, 2]
@@ -140,18 +140,40 @@ def test_amem_fix_does_not_hide_exhausted_keyword_api_calls():
         last_exception=EmptyGeminiResponseError("empty response"),
         attempts=100,
     )
-    memory_system = SimpleNamespace(
-        llm_controller=SimpleNamespace(
-            llm=SimpleNamespace(
-                get_completion=lambda prompt: (_ for _ in ()).throw(failure)
-            )
-        )
-    )
     agent = object.__new__(AMemFixAgent)
     agent.amem_query_keywords = True
+    agent._llm_client = SimpleNamespace(
+        chat=lambda messages: (_ for _ in ()).throw(failure)
+    )
 
     with pytest.raises(LLMRetryExhaustedError):
-        agent._generate_retrieval_query("question", memory_system)
+        agent._generate_retrieval_query("question")
+
+
+def test_gemini_build_client_is_not_initialized_for_query_only_restore(monkeypatch):
+    calls = []
+    robust_module = importlib.import_module("memory_layer_robust")
+
+    monkeypatch.setattr(
+        "utils.llm_client.create_llm_client",
+        lambda **kwargs: calls.append(kwargs)
+        or SimpleNamespace(chat=lambda messages, **options: SimpleNamespace(content="ready")),
+    )
+    controller = robust_module.RobustGeminiController(
+        provider="ai_studio",
+        model="gemini-test",
+    )
+
+    assert controller.client is None
+    assert calls == []
+    assert controller.get_completion("query-time build-independent prompt") == "ready"
+    assert calls == [{
+        "provider": "ai_studio",
+        "model": "gemini-test",
+        "temperature": 0.7,
+        "max_tokens": 1000,
+        "reasoning_effort": None,
+    }]
 
 
 def test_amem_evolution_does_not_store_after_exhausted_api_call():

@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -64,10 +64,13 @@ class LLMConfig(BaseModel):
         4096,
         description="The maximum number of tokens to generate. If not set, the model will use its default value.",
     )
+    extra_body: Optional[Dict[str, Any]] = Field(
+        None, description="Additional JSON fields for OpenAI-compatible APIs."
+    )
     enable_reasoner: bool = Field(
         False, description="Whether or not the model should use extended thinking if it is a 'reasoning' style model"
     )
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Union[str, int]] = Field(
         None,
         description="The reasoning effort to use when generating text reasoning models",
     )

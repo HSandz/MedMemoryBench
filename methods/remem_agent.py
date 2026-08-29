@@ -26,6 +26,7 @@ from utils.llm_client import (
     format_messages,
     get_usage_tracker,
 )
+from utils.batch_client import create_batch_client
 from utils.vertex_batch import (
     BatchChatRequest,
     VertexBatchClient,
@@ -103,6 +104,8 @@ class TrackedLLMWrapper:
                 "response": content,
                 "prompt_tokens": response.input_tokens,
                 "completion_tokens": response.output_tokens,
+                "visible_output_tokens": response.visible_output_tokens,
+                "thinking_tokens": response.thinking_tokens,
                 "finish_reason": "stop",
             }
 
@@ -161,6 +164,8 @@ class TrackedLLMWrapper:
                     "response": content,
                     "prompt_tokens": response.input_tokens,
                     "completion_tokens": response.output_tokens,
+                    "visible_output_tokens": response.visible_output_tokens,
+                    "thinking_tokens": response.thinking_tokens,
                     "finish_reason": "stop",
                 }, False))
             return results
@@ -463,6 +468,7 @@ class RememAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # ReMem instance pool (keyed by context_id)
@@ -483,7 +489,7 @@ class RememAgent(BaseAgent):
             return None
         if self._vertex_batch_client is None:
             manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
-            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+            self._vertex_batch_client = create_batch_client(
                 self._llm_client,
                 gcs_uri=self._vertex_batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -495,6 +501,7 @@ class RememAgent(BaseAgent):
                 wait=self._vertex_batch_wait,
                 config_hash=self._vertex_batch_config_hash,
                 progress_callback=self._vertex_batch_progress_callback,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._vertex_batch_client
 

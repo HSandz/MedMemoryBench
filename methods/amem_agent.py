@@ -53,6 +53,9 @@ class AMemAgent(BaseAgent):
         retrieve_num: int = 5,
         amem_backend: str = "openai",
         amem_model: Optional[str] = None,
+        amem_api_key: Optional[str] = None,
+        amem_base_url: Optional[str] = None,
+        amem_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         amem_embedding_model: str = "all-MiniLM-L6-v2",
         amem_evo_threshold: int = 100,
         amem_max_tokens: Optional[int] = None,
@@ -82,11 +85,23 @@ class AMemAgent(BaseAgent):
         self.amem_chunk_size_tokens = amem_chunk_size_tokens or self.DEFAULT_CHUNK_SIZE_TOKENS
         self._amem_backend = self.amem_backend
         self._amem_model = self.amem_model
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
+        self._amem_llm_client_kwargs = dict(
+            self._llm_client_kwargs
+            if amem_llm_client_kwargs is None
+            else amem_llm_client_kwargs
+        )
 
         # API configuration for A-Mem internal LLM calls
-        self._amem_api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        self._amem_api_key = (
+            amem_api_key
+            or api_key
+            or os.environ.get("BIGMODEL_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
         self._amem_api_base = (
-            base_url
+            amem_base_url
+            or base_url
             or os.environ.get("BIGMODEL_BASE_URL")
             or os.environ.get("OPENAI_BASE_URL")
             or self.BIGMODEL_BASE_URL
@@ -100,6 +115,7 @@ class AMemAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Per-context A-Mem memory systems
@@ -153,6 +169,15 @@ class AMemAgent(BaseAgent):
             max_context_chars=max_context_chars,
             check_connection=False,
             usage_tracker=get_usage_tracker(),
+            provider_routing=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "provider_routing"
+            ),
+            service_tier=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "service_tier"
+            ),
+            reasoning_effort=getattr(self, "_amem_llm_client_kwargs", {}).get(
+                "reasoning_effort"
+            ),
         )
         self._amem_systems[context_id] = system
         logger.info(

@@ -16,6 +16,7 @@ from utils.llm_client import (
     LLMResponse,
     LLMRetryExhaustedError,
     create_llm_client,
+    extract_usage_token_counts,
     get_usage_tracker,
     is_vertex_batch_provider,
 )
@@ -61,6 +62,7 @@ class LettaAgent(BaseAgent):
 
         self.provider = provider
         self._uses_vertex_gemini = is_vertex_batch_provider(provider)
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
         self.api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = (
             base_url
@@ -219,14 +221,20 @@ class LettaAgent(BaseAgent):
         """
         usage = parsed_response.get("usage", {})
         if usage:
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
+            (
+                prompt_tokens,
+                completion_tokens,
+                visible_output_tokens,
+                thinking_tokens,
+            ) = extract_usage_token_counts(usage)
 
             if prompt_tokens > 0 or completion_tokens > 0:
                 llm_response = LLMResponse(
                     content="",
                     input_tokens=prompt_tokens,
                     output_tokens=completion_tokens,
+                    visible_output_tokens=visible_output_tokens,
+                    thinking_tokens=thinking_tokens,
                     latency=latency,
                     model=self.model,
                 )
@@ -247,16 +255,32 @@ class LettaAgent(BaseAgent):
                 context_window=self.context_window,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                reasoning_effort=getattr(self, "_llm_client_kwargs", {}).get(
+                    "reasoning_effort"
+                ),
             )
         endpoint = self.base_url or self.BIGMODEL_BASE_URL
+        extra_body = None
+        if self.provider.lower() == "openrouter":
+            extra_body = {}
+            if self._llm_client_kwargs.get("provider_routing") is not None:
+                extra_body["provider"] = self._llm_client_kwargs["provider_routing"]
+            if self._llm_client_kwargs.get("service_tier") is not None:
+                extra_body["service_tier"] = self._llm_client_kwargs["service_tier"]
         return self._LLMConfig(
             model=self.model,
-            model_endpoint_type=self.provider,
+            model_endpoint_type=(
+                "openai" if self.provider.lower() == "openrouter" else self.provider
+            ),
             model_endpoint=endpoint,
             model_wrapper=None,
             context_window=self.context_window,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            extra_body=extra_body or None,
+            reasoning_effort=getattr(self, "_llm_client_kwargs", {}).get(
+                "reasoning_effort"
+            ),
         )
 
     def _build_embedding_config(self):
@@ -364,10 +388,14 @@ class LettaAgent(BaseAgent):
         # Extract usage statistics
         if hasattr(response, "usage") and response.usage:
             usage = response.usage
+            details = getattr(usage, "completion_tokens_details", None)
             result["usage"] = {
                 "completion_tokens": getattr(usage, "completion_tokens", 0),
                 "prompt_tokens": getattr(usage, "prompt_tokens", 0),
                 "total_tokens": getattr(usage, "total_tokens", 0),
+                "completion_tokens_details": {
+                    "reasoning_tokens": getattr(details, "reasoning_tokens", 0)
+                } if details is not None else None,
             }
 
         # Parse messages from response

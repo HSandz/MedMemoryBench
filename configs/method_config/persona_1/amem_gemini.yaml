@@ -6,9 +6,10 @@ model:
   name: gemini-2.5-flash
   temperature: 0.0
   max_completion_tokens: 20000
+memorize_model:
+  provider: gemini
+  name: gemini-2.5-flash
 build_config:
-  amem_backend: gemini
-  amem_model: gemini-2.5-flash
   amem_embedding_model: BAAI/bge-small-zh-v1.5
   amem_evo_threshold: 100
   amem_max_tokens: 10000

@@ -24,16 +24,128 @@ Common environment settings include:
 ```env
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://api.openai.com/v1
+OPENROUTER_API_KEY=...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 GOOGLE_SERVICE_ACCOUNT_FILE=/absolute/path/service-account.json
 GOOGLE_CLOUD_LOCATION=global
-GOOGLE_AI_STUDIO_API_KEYS=key1,key2
+GOOGLE_AI_STUDIO_API_KEYS_FILE=secrets/google_ai_studio_api_keys.txt
+GOOGLE_AI_STUDIO_KEY_ROTATION_MODE=sequential
+GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY=1
+GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS=1
+GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES=3
+LLM_MAX_RETRIES=100
 JUDGE_PROVIDER=vertex
 JUDGE_MODEL=gemini-2.5-flash
 DEFAULT_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 EMBEDDING_PROVIDER=local
 ```
 
+Generation reasoning can be configured per YAML model block when the selected
+model supports it:
+
+```yaml
+model:
+  provider: openai
+  name: gpt-5.1
+  reasoning_effort: high
+```
+
+The setting is translated to each provider's documented request shape:
+OpenAI, Azure OpenAI, and Modal use `reasoning_effort`; OpenRouter uses
+`reasoning: {effort: ...}`; Anthropic uses `output_config.effort`; and Gemini 3
+uses `thinkingConfig.thinkingLevel` (`minimal`, `low`, `medium`, or `high`).
+Gemini 2.5 requires an integer `reasoning_effort` interpreted as
+`thinkingConfig.thinkingBudget` (for example, `1024`); invalid Gemini
+model/value combinations fail before submission. Other providers pass the
+documented value through for the provider API to validate.
+The optional `memorize_model.reasoning_effort` applies independently to A-MEM
+build calls. Judge calls use `JUDGE_REASONING_EFFORT` in `.env`.
+
+Authoritative references: [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning),
+[Gemini thinking](https://ai.google.dev/gemini-api/docs/thinking), and
+[Anthropic effort](https://platform.claude.com/docs/en/build-with-claude/effort).
+
 Gemini provider names are `vertex`, `ai_studio`, and hybrid `gemini`. Zep additionally needs `ZEP_API_KEY`; MIRIX may need PostgreSQL/Redis services.
+
+For AI Studio and hybrid Gemini, put one API key on each non-empty line of
+`secrets/google_ai_studio_api_keys.txt` and set
+`GOOGLE_AI_STUDIO_API_KEYS_FILE` to that repository-relative path. Lines that
+start with `#` are ignored. The key file takes precedence over inline AI Studio
+key variables and the `secrets/` directory is Git-ignored. Inline
+`GOOGLE_AI_STUDIO_API_KEYS` remains available for existing configurations.
+When an AI Studio key reaches its retry threshold, the client logs a bounded,
+single-line error summary before trying the next key. Set
+`GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS` to a positive number of full key-pool
+passes per `ai_studio` LLM call, or `-1` to keep rotating indefinitely. A 429
+with `You exceeded your current quota` rotates immediately, while a generic
+`Resource has been exhausted` 429 retries the current key the configured number
+of times first; `GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES` defaults to `3`.
+For `ai_studio`, explicit 401, 403, or 404 messages identifying a deleted,
+disabled, suspended, or revoked API key, bound service account, or project
+retire the key immediately. When using `GOOGLE_AI_STUDIO_API_KEYS_FILE`, the
+matching key line is removed atomically so later runs do not use it.
+
+For `provider: ai_studio`, `GOOGLE_AI_STUDIO_KEY_ROTATION_MODE` defaults to
+`sequential`: a key changes only after its configured failure threshold is
+reached. Set it to `round_robin` to distribute successful top-level LLM calls
+across keys. `GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY` is the positive number
+of successful calls served by each key before advancing to the next key and
+defaults to `1`. Failure-triggered rotation and permanent-key retirement still
+apply in both modes. Hybrid `gemini` continues to use its existing
+failure-driven Vertex/AI Studio transport rotation.
+
+`LLM_MAX_RETRIES` is the single per-failure-type retry budget for every
+first-party LLM provider, including OpenAI-compatible APIs, Azure OpenAI,
+Anthropic, Vertex, AI Studio, hybrid Gemini, and OpenRouter Batch. For providers
+with multiple service accounts or API keys, the same value is also the threshold
+before rotating to the next transport. Delays use exponential backoff starting
+at `LLM_RETRY_MIN_DELAY=1` second and are capped at 100 seconds;
+`LLM_RETRY_MAX_DELAY` may lower that cap but cannot raise it above 100. The old
+`GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES` setting is accepted only as a fallback
+when `LLM_MAX_RETRIES` is absent; migrate to the general setting.
+
+OpenRouter uses the same OpenAI-compatible request, retry, failure handling,
+and usage tracking as the `openai` provider. Set `OPENROUTER_API_KEY`; the base
+URL defaults to `https://openrouter.ai/api/v1`. Select it in a method config:
+
+```yaml
+model:
+  provider: openrouter
+  name: openai/gpt-5.1
+  openrouter:
+    provider:
+      order: [openai, azure]
+      allow_fallbacks: false
+    service_tier: priority
+```
+
+Use OpenRouter model IDs, including the provider prefix. A model-level
+`api_key` or `base_url` in YAML overrides the environment setting, but secrets
+should remain in `.env`. The judge also accepts `JUDGE_PROVIDER=openrouter` and
+uses the OpenRouter defaults unless `JUDGE_API_KEY` or `JUDGE_BASE_URL` is set.
+
+The optional `model.openrouter.provider` mapping is passed unchanged as
+OpenRouter's provider-routing object. It can use documented fields such as
+`order`, `only`, `ignore`, `allow_fallbacks`, `require_parameters`, `sort`,
+`data_collection`, `zdr`, `quantizations`, `preferred_min_throughput`,
+`preferred_max_latency`, and `max_price`. This allows separate YAML configs to
+run the same model through different upstream providers without changing the
+model ID.
+
+The optional `model.openrouter.service_tier` selects an OpenRouter service tier.
+Current opt-in values are `flex` and `priority`; `fast` is an alias for
+`priority`. Omit the field for normal default routing. Priority requests prefer
+matching priority endpoints and may fall back, while flex requests stay on
+flex-capable endpoints. Tier availability depends on the selected model and
+upstream provider.
+
+A-MEM methods can configure build calls independently with `memorize_model`,
+using the same model/OpenRouter shape. This allows, for example, flex build
+calls while the top-level query `model` omits `service_tier` and uses Batch API.
+See [A-MEM Method Guide](AMEM_GUIDE.md#configuration).
+
+Official references: [provider routing](https://openrouter.ai/docs/provider-routing)
+and [service tiers](https://openrouter.ai/docs/guides/features/service-tiers).
 
 ### Modal-hosted vLLM
 
@@ -140,15 +252,35 @@ Each append is a new run under `SOURCE_RUN/query_runs/`, with its own `run_confi
 python main.py --stage query --memory-run APPEND_RUN
 ```
 
-## Vertex Batch API
+## Batch API
 
-For eligible Gemini/Vertex stages, provide a private bucket and run:
+For eligible Vertex Gemini or OpenRouter stages, run:
 
 ```bash
 python main.py -m METHOD -d DATASET --batch-api --batch-wait
 ```
 
-Without `--batch-wait`, resume the submitted job with `--resume --batch-api`. Batch mode does not batch stateful memory construction or local retrieval; it only batches supported immutable LLM stages. Use `GOOGLE_BATCH_GCS_URI` or `--batch-gcs-uri`.
+Without `--batch-wait`, resume a submitted job with `--resume --batch-api`.
+Batch mode does not batch stateful memory construction or local retrieval; it
+only batches supported immutable LLM stages and LLM-judge requests.
+Batch eligibility is evaluated independently for query answering and judging:
+each supported non-empty stage uses its provider's Batch API regardless of
+request count. An unsupported stage logs the fallback and remains real-time
+without disabling batch execution for other supported stages.
+
+Vertex Gemini uses Cloud Storage JSONL staging and requires
+`GOOGLE_BATCH_GCS_URI` or `--batch-gcs-uri`. OpenRouter submits inline requests
+to its Batch API and ignores the GCS argument. It preserves
+`model.openrouter.provider` routing when the selected upstream has a batch
+endpoint. Before submission, the client checks OpenRouter's `:batch` model
+variant against the configured provider routing and service tier. If no batch
+endpoint matches, or support cannot be confirmed, it logs the reason and uses
+the existing real-time OpenRouter client with the same retry, failure, and
+usage-tracking behavior.
+
+OpenRouter Batch is asynchronous and text-only. The current implementation uses
+its chat-completions shape and correlates results by `custom_id`. See the
+[OpenRouter Batch API quickstart](https://openrouter.ai/docs/batch-quickstart).
 
 ## Outputs and Troubleshooting
 
@@ -156,8 +288,14 @@ Runs are organized as `outputs/<method-model>/<timestamp>/`, with `run_config.js
 
 Result JSON files report `duration_seconds` as total evaluation wall time. `true_duration_seconds` subtracts measured failed API-attempt time and retry waits, including failures that later recover and terminal API failures; successful API-call time remains included. The matching `llm_usage` totals expose the measured retry/error time as `failure_duration_seconds`.
 
+Usage entries preserve the provider-reported total in `output_tokens` and add
+`visible_output_tokens` and `thinking_tokens`. OpenAI-compatible APIs and
+Gemini populate the split when their response usage contains a reasoning or
+thought-token count. Providers that expose only aggregate output usage report
+that count as visible output with `thinking_tokens: 0`.
+
 - Missing API credentials: check `.env` and the provider named in the method YAML.
 - Missing embedding model: use a valid local path or allow the configured Hugging Face model to download.
 - Stale or incompatible resume: use the original method/dataset config and inspect `run_config.json`; do not overwrite a completed run.
-- Vertex job pending: rerun with `--resume --batch-api`, or use `--batch-wait` initially.
+- Batch job pending: rerun with `--resume --batch-api`, or use `--batch-wait` initially.
 - Method import failure: run `python main.py --list-agents` and verify the adapter and YAML exist.

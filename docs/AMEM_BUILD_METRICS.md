@@ -53,7 +53,7 @@ Example:
 }
 ```
 
-Always group experiments by `combination_id` or the explicit `features` map. Do not infer behavior from names such as `amem_test2`.
+Always group experiments by `combination_id` or the explicit `features` map. When comparing note granularity, also group by `build_config.amem_note_level`; an omitted value means `turn`. Do not infer behavior from names such as `amem_test2`.
 
 ## Metrics Schema
 
@@ -94,7 +94,9 @@ Common metric fields:
 | Metric | Definition |
 |---|---|
 | `input_tokens` | Provider-reported LLM prompt tokens |
-| `output_tokens` | Provider-reported LLM completion tokens |
+| `output_tokens` | Provider-reported total generated tokens, including thinking/reasoning tokens when the provider includes them |
+| `visible_output_tokens` | Provider-reported generated tokens excluding separately reported thinking/reasoning tokens |
+| `thinking_tokens` | Provider-reported hidden thinking/reasoning tokens; `0` when the provider does not expose a separate count |
 | `total_tokens` | Input plus output tokens |
 | `successful_calls` / `call_count` | Successful LLM calls |
 | `attempted_calls` | All LLM attempts, including failed attempts before retries |
@@ -129,6 +131,7 @@ Declare every build feature explicitly:
 
 ```yaml
 build_config:
+  amem_note_level: turn
   amem_original_evolution: false
   amem_typed_relations: true
   amem_temporal_state: false

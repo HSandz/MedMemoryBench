@@ -13,10 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery
 from metrics import MetricResult, MetricsAggregator, MetricsCalculator
 from src.config import ConfigLoader, DatasetConfig, PROJECT_ROOT, get_api_config
+from utils.batch_client import create_batch_client
 from utils.llm_client import (
     get_usage_tracker,
+    is_batch_provider,
     is_google_ai_studio_provider,
-    is_vertex_batch_provider,
 )
 from utils.vertex_batch import (
     BatchChatRequest,
@@ -126,6 +127,76 @@ def _metric_result_from_saved(saved_query: Dict[str, Any]) -> MetricResult:
     )
 
 
+def _artifact_path(source_path: Path, value: str) -> Path:
+    """Resolve an artifact path stored relative to a query report."""
+    path = Path(value)
+    return path if path.is_absolute() else source_path.parent / path
+
+
+def _hydrate_retrieved_memories(
+    source_path: Path,
+    source_data: Dict[str, Any],
+    saved_queries: List[Dict[str, Any]],
+) -> None:
+    """Restore compact v2 retrieval references for rejudge output fidelity."""
+    records_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    records_path = source_data.get("retrieval_records_path")
+    if isinstance(records_path, str) and records_path:
+        path = _artifact_path(source_path, records_path)
+        try:
+            records_payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read retrieval records {path}: {exc}") from exc
+        for record in records_payload.get("records", []):
+            if isinstance(record, dict) and isinstance(record.get("retrieved_memories"), list):
+                records_by_id[str(record.get("query_id", ""))] = record["retrieved_memories"]
+
+    batch_requests: Dict[Path, Dict[str, Dict[str, Any]]] = {}
+    for saved_query in saved_queries:
+        if isinstance(saved_query.get("retrieved_memories"), list):
+            continue
+        reference = saved_query.get("retrieval_reference", {})
+        if not isinstance(reference, dict):
+            continue
+        source = reference.get("source")
+        if source == "none":
+            saved_query["retrieved_memories"] = []
+        elif source == "retrieval_records":
+            record_id = str(reference.get("record_id", ""))
+            if record_id not in records_by_id:
+                raise ValueError(f"Retrieval record is missing for query {record_id!r}.")
+            saved_query["retrieved_memories"] = copy.deepcopy(records_by_id[record_id])
+        elif source == "answer_batch_manifest":
+            manifest_value = reference.get("manifest_path")
+            request_id = reference.get("request_id")
+            if not isinstance(manifest_value, str) or not isinstance(request_id, str):
+                raise ValueError("Batch retrieval reference is missing its manifest path or request ID.")
+            manifest_path = _artifact_path(source_path, manifest_value)
+            if manifest_path not in batch_requests:
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"Cannot read answer batch manifest {manifest_path}: {exc}") from exc
+                batch_requests[manifest_path] = {
+                    str(request.get("request_id")): request
+                    for job in manifest.get("jobs", {}).values()
+                    if isinstance(job, dict)
+                    for request in job.get("requests", [])
+                    if isinstance(request, dict) and request.get("request_id")
+                }
+            request = batch_requests[manifest_path].get(request_id)
+            prepared = (
+                request.get("metadata", {}).get("prepared_query")
+                if isinstance(request, dict) else None
+            )
+            memories = prepared.get("retrieved_memories") if isinstance(prepared, dict) else None
+            if not isinstance(memories, list):
+                raise ValueError(
+                    f"Batch retrieval payload is missing for request {request_id!r}."
+                )
+            saved_query["retrieved_memories"] = copy.deepcopy(memories)
+
+
 def _next_output_path(source_path: Path) -> Tuple[Path, int]:
     base_stem = re.sub(r"_rejudge_\d+$", "", source_path.stem)
     pattern = re.compile(rf"^{re.escape(base_stem)}_rejudge_(\d+)\.json$")
@@ -233,7 +304,13 @@ def _load_batch_state(
     return state
 
 
-def _query_output(saved_query: Dict[str, Any], result: MetricResult, context_id: int) -> Dict[str, Any]:
+def _query_output(
+    saved_query: Dict[str, Any],
+    result: MetricResult,
+    context_id: int,
+    *,
+    compact_retrieval: bool = False,
+) -> Dict[str, Any]:
     output = copy.deepcopy(saved_query)
     output.update({
         "context_id": context_id,
@@ -242,11 +319,14 @@ def _query_output(saved_query: Dict[str, Any], result: MetricResult, context_id:
         "model_output": result.model_output,
         "score": result.score,
         "is_correct": result.is_correct,
-        "retrieved_memories": result.retrieved_memories,
         "retrieved_count": result.retrieved_count,
         "query_time": result.query_time,
         "evaluation_details": result.details,
     })
+    if compact_retrieval:
+        output.pop("retrieved_memories", None)
+    else:
+        output["retrieved_memories"] = result.retrieved_memories
     return output
 
 
@@ -275,6 +355,10 @@ def rejudge_medmemorybench(
         raise ValueError(
             "Rejudge input must be a *_query_answer.json file containing a queries list."
         )
+    _hydrate_retrieved_memories(source_path, source_data, saved_queries)
+    compact_retrieval = source_data.get("format") == "medmemorybench.query_answers" and (
+        source_data.get("version") == 2
+    )
 
     resolved_dataset_name = dataset_name or source_data.get("dataset_name")
     if resolved_dataset_name != "medmemorybench":
@@ -291,6 +375,7 @@ def rejudge_medmemorybench(
     judge_provider = api_config.get_judge_provider().lower()
     judge_model = api_config.get_judge_model()
     judge_temperature = getattr(api_config, "judge_temperature", 1.0)
+    judge_reasoning_effort = getattr(api_config, "judge_reasoning_effort", None)
     judge_client_max_tokens = getattr(api_config, "judge_client_max_tokens", 10000)
     judge_max_tokens = getattr(api_config, "judge_max_tokens", 500)
     judge_mcd_max_tokens = getattr(api_config, "judge_mcd_max_tokens", 2000)
@@ -302,10 +387,10 @@ def rejudge_medmemorybench(
             )
         batch_api = False
         resume = False
-    elif batch_api and not is_vertex_batch_provider(judge_provider):
+    elif batch_api and not is_batch_provider(judge_provider):
         if verbose:
             print(
-                f"Judge provider '{judge_provider}' cannot use Vertex batch; "
+                f"Judge provider '{judge_provider}' cannot use a batch API; "
                 "using the existing real-time judge client."
             )
         batch_api = False
@@ -322,6 +407,7 @@ def rejudge_medmemorybench(
         judge_api_key=api_config.judge_api_key or None,
         judge_base_url=api_config.judge_base_url or None,
         judge_temperature=judge_temperature,
+        judge_reasoning_effort=judge_reasoning_effort,
         judge_client_max_tokens=judge_client_max_tokens,
         judge_max_tokens=judge_max_tokens,
         judge_mcd_max_tokens=judge_mcd_max_tokens,
@@ -392,7 +478,14 @@ def rejudge_medmemorybench(
 
         aggregator.add_result(result)
         results_by_context.setdefault(context_id, []).append(result)
-        output_queries.append(_query_output(saved_query, result, context_id))
+        output_queries.append(
+            _query_output(
+                saved_query,
+                result,
+                context_id,
+                compact_retrieval=compact_retrieval,
+            )
+        )
 
     batch_manifest_path: Optional[Path] = None
     active_state_path: Optional[Path] = None
@@ -401,7 +494,7 @@ def rejudge_medmemorybench(
         judge_client = calculator.get_batch_judge_client(first_prepared["query_type"])
         if judge_client is None:
             raise VertexBatchError(
-                "Batch rejudge requires JUDGE_PROVIDER=vertex or JUDGE_PROVIDER=gemini."
+                "Batch rejudge requires a Vertex Gemini or OpenRouter judge."
             )
 
         state_path = _batch_state_path(source_path)
@@ -455,13 +548,14 @@ def rejudge_medmemorybench(
             model=judge_client.model,
             config_hash=state["config_hash"],
         )
-        batch_client = VertexBatchClient.from_gemini_client(
+        batch_client = create_batch_client(
             judge_client,
             gcs_uri=batch_gcs_uri,
             manifest_path=batch_manifest_path,
             wait=batch_wait,
             config_hash=state["config_hash"],
             progress_callback=print if verbose else None,
+            vertex_batch_class=VertexBatchClient,
         )
         requests: List[BatchChatRequest] = []
         by_request_id: Dict[str, Dict[str, Any]] = {}
@@ -477,6 +571,7 @@ def rejudge_medmemorybench(
                 messages=[{"role": "user", "content": payload["prompt"]}],
                 temperature=payload.get("temperature", judge_temperature),
                 max_tokens=payload["max_tokens"],
+                reasoning_effort=payload.get("reasoning_effort", judge_reasoning_effort),
                 response_format={"type": "json_object"},
                 phase="query",
                 metadata={
@@ -507,7 +602,10 @@ def rejudge_medmemorybench(
             aggregator.add_result(result)
             results_by_context.setdefault(item["context_id"], []).append(result)
             output_queries[item["index"]] = _query_output(
-                saved_query, result, item["context_id"]
+                saved_query,
+                result,
+                item["context_id"],
+                compact_retrieval=compact_retrieval,
             )
 
     summary = aggregator.get_summary()
@@ -544,6 +642,7 @@ def rejudge_medmemorybench(
         "judge_provider": api_config.get_judge_provider(),
         "judge_model": api_config.get_judge_model(),
         "judge_temperature": judge_temperature,
+        "judge_reasoning_effort": judge_reasoning_effort,
         "judge_client_max_tokens": judge_client_max_tokens,
         "judge_max_tokens": judge_max_tokens,
         "judge_mcd_max_tokens": judge_mcd_max_tokens,

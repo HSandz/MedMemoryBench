@@ -6,6 +6,11 @@ from .base import BaseMetric, MetricResult
 from .string_match import StringContainMetric, ExactMatchMetric, OptionMatchMetric, MQFixMetric
 from .llm_judge import LLMJudgeMetric, EEMJudgeMetric, LLMJudgeMCDMetric
 from .locomo_metrics import LoCoMoF1Metric, LoCoMoAdversarialMetric, LoCoMoTemporalMetric
+from .retrieval_quality import (
+    RETRIEVAL_QUALITY_GROUP,
+    aggregate_session_retrieval_quality,
+    compute_session_retrieval_quality,
+)
 
 
 METRIC_REGISTRY: Dict[str, Type[BaseMetric]] = {
@@ -42,7 +47,8 @@ class MetricsCalculator:
 
     def __init__(self, custom_mapping: Optional[Dict[str, str]] = None, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_client_max_tokens: int = None,
+                 judge_temperature: float = None, judge_reasoning_effort=None,
+                 judge_client_max_tokens: int = None,
                  judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self.metric_mapping = self.DEFAULT_METRIC_MAPPING.copy()
@@ -54,6 +60,7 @@ class MetricsCalculator:
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
         self._judge_temperature = judge_temperature
+        self._judge_reasoning_effort = judge_reasoning_effort
         self._judge_client_max_tokens = judge_client_max_tokens
         self._judge_max_tokens = judge_max_tokens
         self._judge_mcd_max_tokens = judge_mcd_max_tokens
@@ -71,6 +78,7 @@ class MetricsCalculator:
                     judge_api_key=self._judge_api_key,
                     judge_base_url=self._judge_base_url,
                     judge_temperature=self._judge_temperature,
+                    judge_reasoning_effort=self._judge_reasoning_effort,
                     judge_client_max_tokens=self._judge_client_max_tokens,
                     judge_max_tokens=self._judge_max_tokens,
                     judge_mcd_max_tokens=self._judge_mcd_max_tokens,
@@ -139,7 +147,7 @@ class MetricsCalculator:
         query_type: str,
         metric_name: Optional[str] = None,
     ):
-        """Return the judge's Gemini client, or ``None`` for real-time fallback."""
+        """Return the judge's batch-capable client, or ``None`` for fallback."""
         resolved_name = self.get_metric_name(query_type, metric_name)
         if resolved_name not in {"llm_judge", "eem_judge", "llm_judge_mcd"}:
             return None
@@ -147,7 +155,7 @@ class MetricsCalculator:
         return metric.get_batch_client()
 
     def finalize_batch(self, batch_payload: Dict[str, Any], result_text: str) -> MetricResult:
-        """Turn a Vertex judge response back into the normal metric result."""
+        """Turn a batch judge response back into the normal metric result."""
         metric = self._get_metric(batch_payload["metric_name"])
         return metric.finalize_batch(batch_payload["prepared"], result_text)
 
@@ -260,7 +268,13 @@ class MetricsAggregator:
             "avg_query_time": total_query_time / total if total > 0 else 0.0,
         }
 
-        return {
+        retrieval_quality = aggregate_session_retrieval_quality(self.results)
+        metric_groups = (
+            {"retrieval_quality": retrieval_quality}
+            if retrieval_quality else {}
+        )
+
+        summary = {
             "total": total,
             "correct": correct_count,
             "overall_accuracy": correct_count / total if total > 0 else 0.0,
@@ -269,6 +283,9 @@ class MetricsAggregator:
             "by_metric": metric_stats,
             "efficiency": efficiency_stats,
         }
+        if metric_groups:
+            summary["metric_groups"] = metric_groups
+        return summary
 
     def get_detailed_results(self) -> List[Dict[str, Any]]:
         return [r.to_dict() for r in self.results]
@@ -290,6 +307,9 @@ __all__ = [
     "LoCoMoF1Metric",
     "LoCoMoAdversarialMetric",
     "LoCoMoTemporalMetric",
+    "RETRIEVAL_QUALITY_GROUP",
+    "compute_session_retrieval_quality",
+    "aggregate_session_retrieval_quality",
     "MetricsCalculator",
     "MetricsAggregator",
     "METRIC_REGISTRY",

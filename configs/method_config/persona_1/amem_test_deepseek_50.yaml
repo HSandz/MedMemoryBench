@@ -2,13 +2,13 @@ method_name: amem_test
 method_type: agentic_memory
 description: Typed-relation A-MEM without original evolution or untyped link retrieval
 model:
-  provider: modal
-  name: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+  provider: openai
+  name: OrcaRouter/deepseek/deepseek-v4-flash-free
   temperature: 0.0
-  max_completion_tokens: 2000
+  max_completion_tokens: 5000
 memorize_model:
-  provider: modal
-  name: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+  provider: openai
+  name: OrcaRouter/deepseek/deepseek-v4-flash-free
 build_config:
   amem_embedding_model: all-MiniLM-L6-v2
   amem_evo_threshold: 100

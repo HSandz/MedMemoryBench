@@ -323,6 +323,61 @@ def test_rejudge_rejects_non_query_answer_file(tmp_path):
         raise AssertionError("Expected invalid rejudge input to fail")
 
 
+def test_rejudge_hydrates_compact_batch_and_sidecar_retrieval(tmp_path):
+    source_path = tmp_path / "run_query_answer.json"
+    batch_dir = tmp_path / "batch"
+    batch_dir.mkdir()
+    manifest_path = batch_dir / "answers.json"
+    manifest_path.write_text(json.dumps({
+        "jobs": {
+            "query-final": {
+                "requests": [{
+                    "request_id": "batch-request",
+                    "metadata": {
+                        "prepared_query": {
+                            "retrieved_memories": [{"memory_id": "batch-memory"}],
+                        }
+                    },
+                }]
+            }
+        }
+    }), encoding="utf-8")
+    records_path = tmp_path / "run_retrieval_records.json"
+    records_path.write_text(json.dumps({
+        "records": [{
+            "query_id": "realtime-query",
+            "retrieved_memories": [{"memory_id": "realtime-memory"}],
+        }]
+    }), encoding="utf-8")
+    source_data = {
+        "format": "medmemorybench.query_answers",
+        "version": 2,
+        "retrieval_records_path": records_path.name,
+    }
+    queries = [
+        {
+            "query_id": "batch-query",
+            "retrieval_reference": {
+                "source": "answer_batch_manifest",
+                "manifest_path": "batch/answers.json",
+                "request_id": "batch-request",
+            },
+        },
+        {
+            "query_id": "realtime-query",
+            "retrieval_reference": {
+                "source": "retrieval_records",
+                "record_id": "realtime-query",
+            },
+        },
+    ]
+
+    rejudge._hydrate_retrieved_memories(source_path, source_data, queries)
+
+    assert queries[0]["retrieved_memories"] == [{"memory_id": "batch-memory"}]
+    assert queries[1]["retrieved_memories"] == [{"memory_id": "realtime-memory"}]
+
+
 def test_rejudge_output_number_uses_original_stem(tmp_path):
     first_rejudge = tmp_path / "run_query_answer_rejudge_1.json"
     first_rejudge.write_text("{}", encoding="utf-8")

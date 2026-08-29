@@ -12,6 +12,10 @@ import yaml
 from methods.amem_agent import AMemAgent
 from methods.amem_fix_agent import AMemFixAgent
 from methods.amem_test_agent import AMemTestAgent
+from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from metrics import MetricsAggregator
+from metrics.base import MetricResult
+from metrics.retrieval_quality import compute_session_retrieval_quality
 from src.agent import AgentManager
 from src.config import DatasetConfig, MethodConfig, method_config_from_snapshot
 from benchmarks.medmemorybench.checkpoint import compute_config_hash
@@ -362,6 +366,15 @@ def test_temporal_state_requires_typed_relations():
             model="mock",
             amem_typed_relations=False,
             amem_temporal_state=True,
+        )
+
+
+def test_amem_test_rejects_invalid_note_level():
+    with pytest.raises(ValueError, match="amem_note_level"):
+        AMemTestAgent.__init__(
+            object.__new__(AMemTestAgent),
+            model="mock",
+            amem_note_level="message",
         )
 
 
@@ -963,6 +976,35 @@ def test_feature_disabled_delegates_to_original_memory_add_note(monkeypatch):
     assert calls == [("unchanged baseline input", "2025-01-01", {})]
 
 
+def test_session_source_identity_is_stored_without_enabling_provenance(monkeypatch):
+    def add_base_note(system, content, time=None, **kwargs):
+        system.memories["session-note"] = SimpleNamespace(
+            content=content,
+            timestamp=time,
+        )
+        return "session-note"
+
+    monkeypatch.setattr(RobustAgenticMemorySystem, "add_note", add_base_note)
+    system = _empty_system()
+    system.original_evolution_enabled = True
+    system.typed_relations_enabled = False
+    system.temporal_state_enabled = False
+    system.provenance_enabled = False
+
+    note_id = system.add_note(
+        "whole session",
+        time="2025-01-01",
+        source_session_id=12,
+        source_session_index=4,
+    )
+
+    assert note_id == "session-note"
+    assert system.memories[note_id].source_session_id == 12
+    assert system.memories[note_id].source_session_index == 4
+    assert not hasattr(system.memories[note_id], "provenance")
+    assert not hasattr(system.memories[note_id], "source_timestamp")
+
+
 def test_original_amem_loader_and_query_path_remain_separate():
     assert AMemAgent._load_amem_system_class(object()).__name__ == (
         "RobustAgenticMemorySystem"
@@ -1107,6 +1149,7 @@ def test_amem_test_memorization_is_amem_fix_atomic_flow():
     agent._is_initialized = False
     agent.retrieve_num = 10
     agent.amem_chunk_size_tokens = 10240
+    agent.amem_note_level = "turn"
     agent.amem_original_evolution = True
     agent.amem_typed_relations = False
     agent.amem_relation_candidate_count = 5
@@ -1129,7 +1172,126 @@ def test_amem_test_memorization_is_amem_fix_atomic_flow():
     assert result.method == "amem_test"
     assert result.extra["turns_received"] == 2
     assert result.extra["notes_created"] == 2
+    assert result.extra["amem_note_level"] == "turn"
     assert "formatted wrapper" not in result.stored_content
+
+
+def test_amem_test_session_level_combines_turns_before_add_note():
+    calls = []
+    memory_system = SimpleNamespace(
+        add_note=lambda **kwargs: calls.append(kwargs) or "note-1"
+    )
+    agent = object.__new__(AMemTestAgent)
+    agent._context_id = 7
+    agent._memory_chunks = []
+    agent._is_initialized = False
+    agent.retrieve_num = 10
+    agent.amem_chunk_size_tokens = 10240
+    agent.amem_note_level = "session"
+    agent.amem_original_evolution = True
+    agent.amem_typed_relations = False
+    agent.amem_temporal_state = False
+    agent.amem_provenance = False
+    agent.amem_relation_candidate_count = 5
+    agent._llm_client = _LLMClient()
+    agent._get_memory_system = lambda context_id: memory_system
+
+    result = agent.memorize(
+        "formatted wrapper",
+        timestamp="2025-01-02",
+        source_session_id=12,
+        source_session_index=4,
+        memory_items=[
+            {"role": "user", "content": "First turn."},
+            {"role": "assistant", "content": "Second turn."},
+        ],
+    )
+
+    assert calls == [{
+        "content": (
+            "Speaker Patient says: First turn.\n"
+            "Speaker Doctor says: Second turn."
+        ),
+        "time": "2025-01-02",
+        "source_session_id": 12,
+        "source_session_index": 4,
+    }]
+    assert result.action == "add_session_notes_with_optional_typed_relations"
+    assert result.extra["amem_note_level"] == "session"
+    assert result.extra["turns_received"] == 2
+    assert result.extra["source_units_received"] == 1
+    assert result.extra["notes_created"] == 1
+    assert result.memory_entries[0]["session_index"] == 4
+
+
+def test_amem_test_session_provenance_uses_one_session_evidence_record():
+    calls = []
+    memory_system = SimpleNamespace(
+        add_note=lambda **kwargs: calls.append(kwargs) or "note-1",
+        get_relation_audit=lambda memory_id: {},
+        get_provenance_audit=lambda memory_id: {
+            "memory_id": memory_id,
+            "evidence_ids": ["ev-session"],
+            "error": "",
+        },
+    )
+    agent = object.__new__(AMemTestAgent)
+    agent._context_id = 7
+    agent._memory_chunks = []
+    agent._is_initialized = False
+    agent.retrieve_num = 10
+    agent.amem_chunk_size_tokens = 10240
+    agent.amem_note_level = "session"
+    agent.amem_original_evolution = False
+    agent.amem_typed_relations = False
+    agent.amem_temporal_state = False
+    agent.amem_provenance = True
+    agent.amem_relation_candidate_count = 5
+    agent._llm_client = _LLMClient()
+    agent._get_memory_system = lambda context_id: memory_system
+
+    result = agent.memorize(
+        "formatted wrapper",
+        timestamp="2024-04-03",
+        source_session_id=12,
+        source_session_index=4,
+        source_event_id="event-12",
+        memory_items=[
+            {"role": "user", "content": "Exact first source."},
+            {
+                "role": "assistant",
+                "content": "Exact second source.",
+                "blip_caption": "Exact scan caption.",
+            },
+        ],
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["content"] == (
+        "Speaker Patient says: Exact first source.\n"
+        "Speaker Doctor says: Exact second source. "
+        "Shared image: Exact scan caption."
+    )
+    assert calls[0]["source_evidence"] == {
+        "raw_text": (
+            "Patient: Exact first source.\n"
+            "Doctor: Exact second source. Shared image: Exact scan caption."
+        ),
+        "source_context_id": 7,
+        "source_session_id": 12,
+        "source_session_index": 4,
+        "source_event_id": "event-12",
+        "source_turn_id": None,
+        "source_timestamp": "2024-04-03",
+        "speaker": None,
+        "role": None,
+        "blip_caption": None,
+        "source_text_scope": "source_session",
+    }
+    assert calls[0]["source_session_id"] == 12
+    assert calls[0]["source_session_index"] == 4
+    assert result.extra["evidence_ids"] == ["ev-session"]
+    assert result.extra["notes_created"] == 1
 
 
 def test_amem_test_provenance_memorization_passes_real_source_metadata():
@@ -1267,7 +1429,7 @@ def test_relation_aware_context_explicitly_shows_supersession():
 
 
 def test_typed_query_extends_amem_fix_keyword_and_link_retrieval():
-    keyword_prompts = []
+    keyword_requests = []
     search_queries = []
     system = _empty_system()
     system.memories["m0"] = _memory("semantic seed")
@@ -1276,12 +1438,6 @@ def test_typed_query_extends_amem_fix_keyword_and_link_retrieval():
     system.memories["m0"].links = [1]
     system.retriever = SimpleNamespace(
         search=lambda query, k: search_queries.append((query, k)) or [0]
-    )
-    system.llm_controller = SimpleNamespace(
-        llm=SimpleNamespace(
-            get_completion=lambda prompt: keyword_prompts.append(prompt)
-            or '{"keywords": "current state"}'
-        )
     )
     system.add_typed_relation({
         "source_id": "m2",
@@ -1304,7 +1460,11 @@ def test_typed_query_extends_amem_fix_keyword_and_link_retrieval():
     agent.amem_max_context_tokens = 2000
     agent.max_tokens = 100
     agent._tokenizer = _Tokenizer()
-    agent._llm_client = _LLMClient()
+    agent._llm_client = SimpleNamespace(
+        count_tokens=_LLMClient().count_tokens,
+        chat=lambda messages: keyword_requests.append(messages)
+        or SimpleNamespace(content='{"keywords": "current state"}'),
+    )
     agent._get_memory_system = lambda context_id: system
 
     prepared = agent.prepare_batch_query(
@@ -1313,7 +1473,7 @@ def test_typed_query_extends_amem_fix_keyword_and_link_retrieval():
         raw_question="What is the current state?",
     )
 
-    assert "What is the current state?" in keyword_prompts[0]
+    assert "What is the current state?" in keyword_requests[0][-1]["content"]
     assert search_queries == [("current state", 10)]
     assert prepared["extra"]["direct_indices"] == [0]
     assert prepared["extra"]["amem_fix_expanded_indices"] == [0, 1]
@@ -1390,6 +1550,8 @@ def test_retrieval_switches_disable_built_features_without_rebuilding():
     system.memories["new"] = _timestamped_memory(
         "I left Google and joined Microsoft.", "2024-02-01"
     )
+    system.memories["old"].source_session_id = 7
+    system.memories["old"].source_session_index = 6
     system.memories["old"].id = "old"
     system.memories["new"].id = "new"
     system._attach_provenance(
@@ -1403,6 +1565,7 @@ def test_retrieval_switches_disable_built_features_without_rebuilding():
 
     agent = object.__new__(AMemTestAgent)
     agent._context_id = 3
+    agent.amem_note_level = "session"
     agent.retrieve_num = 1
     agent.amem_query_keywords = False
     agent.amem_expand_links = False
@@ -1434,6 +1597,8 @@ def test_retrieval_switches_disable_built_features_without_rebuilding():
     assert prepared["extra"]["typed_relations"] == []
     assert prepared["extra"]["temporal_expanded_memories"] == []
     assert prepared["extra"]["provenance_evidence"] == []
+    assert prepared["retrieved_memories"][0]["source_session_id"] == 7
+    assert prepared["retrieved_memories"][0]["source_session_index"] == 6
     context = prepared["messages"][-1]["content"]
     assert "[Typed Memory Relations]" not in context
     assert "[Temporal State / Validity]" not in context
@@ -2006,10 +2171,18 @@ def test_build_context_and_temporal_transition_threshold_change_snapshot_hash():
             "amem_temporal_transition_min_confidence": 0.9,
         },
     }
+    changed_note_level = {
+        **base,
+        "build_config": {
+            **base["build_config"],
+            "amem_note_level": "session",
+        },
+    }
 
     base_hash = compute_config_hash(MethodConfig.from_dict(base), dataset)
     assert compute_config_hash(MethodConfig.from_dict(changed_context), dataset) != base_hash
     assert compute_config_hash(MethodConfig.from_dict(changed_threshold), dataset) != base_hash
+    assert compute_config_hash(MethodConfig.from_dict(changed_note_level), dataset) != base_hash
 
 
 def test_legacy_amem_config_preserves_shared_build_and_retrieval_values():
@@ -2092,6 +2265,7 @@ def test_amem_test_registration_creation_and_baseline_mapping(monkeypatch):
             "amem_typed_expansion_count": 7,
             "amem_hybrid_retrieval": True,
             "amem_graph_ranking_mode": "none",
+            "amem_regex_intent_conditioning": False,
         },
     })
     manager.dataset_config = DatasetConfig(dataset_name="medmemorybench")
@@ -2126,6 +2300,7 @@ def test_amem_test_registration_creation_and_baseline_mapping(monkeypatch):
     assert captured["amem_provenance_inject_raw_text"] is False
     assert captured["retrieve_num"] == 10
     assert captured["amem_query_keywords"] is True
+    assert captured["amem_regex_intent_conditioning"] is False
     assert captured["amem_expand_links"] is True
 
 def test_invalid_graph_ranking_configuration_is_rejected():
@@ -2231,6 +2406,54 @@ def test_gemini_answer_model_does_not_override_amem_build_model(monkeypatch):
     assert system.kwargs["llm_model"] == "gemini-2.5-flash"
 
 
+def test_amem_build_openrouter_options_are_separate_from_query_options(monkeypatch):
+    import methods.amem_agent as amem_agent_module
+
+    query_calls = []
+
+    class _System:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        amem_agent_module,
+        "create_llm_client",
+        lambda **kwargs: query_calls.append(kwargs) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(AMemTestAgent, "_load_amem_system_class", lambda self: _System)
+    agent = AMemTestAgent(
+        model="openai/gpt-5-nano",
+        provider="openrouter",
+        api_key="query-key",
+        base_url="https://query.openrouter.example/api/v1",
+        llm_client_kwargs={
+            "provider_routing": {"only": ["openai"]},
+        },
+        amem_backend="openrouter",
+        amem_model="openai/gpt-5-nano",
+        amem_api_key="build-key",
+        amem_base_url="https://build.openrouter.example/api/v1",
+        amem_llm_client_kwargs={
+            "provider_routing": {"only": ["openai"], "allow_fallbacks": False},
+            "service_tier": "flex",
+        },
+    )
+
+    system = agent._get_memory_system(0)
+
+    assert query_calls[0]["api_key"] == "query-key"
+    assert query_calls[0]["base_url"] == "https://query.openrouter.example/api/v1"
+    assert query_calls[0]["provider_routing"] == {"only": ["openai"]}
+    assert "service_tier" not in query_calls[0]
+    assert system.kwargs["api_key"] == "build-key"
+    assert system.kwargs["api_base"] == "https://build.openrouter.example/api/v1"
+    assert system.kwargs["provider_routing"] == {
+        "only": ["openai"],
+        "allow_fallbacks": False,
+    }
+    assert system.kwargs["service_tier"] == "flex"
+
+
 @pytest.mark.parametrize(
     "typed, temporal, provenance",
     [
@@ -2312,6 +2535,7 @@ def test_amem_test_configs_load(config_name, enabled):
     assert config.agent_params["amem_query_keywords"] is True
     assert config.agent_params["amem_expand_links"] is True
     assert config.agent_params["amem_original_evolution"] is True
+    assert config.agent_params.get("amem_note_level", "turn") == "turn"
     if config_name == "amem_test_gemini":
         assert config.retrieval_config["amem_hybrid_retrieval"] is False
         assert config.retrieval_config["amem_graph_ranking_mode"] == "fixed_bfs"
@@ -2328,6 +2552,7 @@ def test_all_amem_test_configs_declare_complete_retrieval_controls():
         "retrieve_num",
         "amem_max_context_tokens",
         "amem_query_keywords",
+        "amem_regex_intent_conditioning",
         "amem_expand_links",
         "amem_typed_retrieval",
         "amem_typed_expansion_count",
@@ -2426,3 +2651,214 @@ def test_amem_test_ablation_configs_load(config_name, temporal, provenance):
     assert config.retrieval_config["amem_typed_retrieval"] is True
     assert config.retrieval_config["amem_temporal_retrieval"] is temporal
     assert config.retrieval_config["amem_provenance_retrieval"] is provenance
+
+
+def _retrieval_metric_result(query_id, query_type, retrieval_quality):
+    return MetricResult(
+        query_id=query_id,
+        query_type=query_type,
+        score=0.0,
+        is_correct=False,
+        model_output="",
+        expected_answer="",
+        details={
+            "metric_groups": {
+                "retrieval_quality": retrieval_quality,
+            }
+        },
+    )
+
+
+def test_session_retrieval_quality_deduplicates_and_scores_ranked_sessions():
+    quality = compute_session_retrieval_quality(
+        retrieved_memories=[
+            {"source_session_id": 1},
+            {"source_session_id": "1"},
+            {"source_session_id": 3},
+            {"provenance": {"source_session_id": 2}},
+        ],
+        source_key_points=[
+            {"session_id": 1},
+            {"session_id": 2},
+            {"session_id": 2},
+        ],
+    )
+
+    assert quality["predicted_session_ids"] == ["1", "3", "2"]
+    assert quality["gold_session_ids"] == ["1", "2"]
+    assert quality["precision"] == pytest.approx(2 / 3)
+    assert quality["recall"] == 1.0
+    assert quality["f1"] == pytest.approx(0.8)
+    assert quality["average_precision"] == pytest.approx((1.0 + 2 / 3) / 2)
+    assert quality["reciprocal_rank"] == 1.0
+    assert quality["hit"] is True
+    assert quality["exact_match"] is False
+
+
+def test_session_retrieval_quality_handles_empty_missing_and_ground_truth_ids():
+    empty = compute_session_retrieval_quality([], [{"session_id": 7}])
+    assert empty["available"] is True
+    assert empty["precision"] == 0.0
+    assert empty["recall"] == 0.0
+    assert empty["false_negative_count"] == 1
+
+    ground_truth = compute_session_retrieval_quality(
+        [{"session_id": 8}],
+        [],
+        metadata={"ground_truth": {"source_session_ids": [8]}},
+    )
+    assert ground_truth["gold_session_ids"] == ["8"]
+    assert ground_truth["f1"] == 1.0
+
+    unavailable = compute_session_retrieval_quality(
+        [{"source_session_id": 7}],
+        [],
+    )
+    assert unavailable["available"] is False
+    assert unavailable["precision"] is None
+    assert unavailable["unavailable_reason"] == "no gold source session IDs"
+
+
+def test_session_retrieval_quality_rejects_incomplete_retrieved_identity():
+    quality = compute_session_retrieval_quality(
+        [
+            {"source_session_id": 7},
+            {"memory": "legacy session note without source identity"},
+        ],
+        [{"session_id": 7}],
+    )
+
+    assert quality["available"] is False
+    assert quality["retrieved_notes_with_session_id"] == 1
+    assert quality["retrieved_note_count"] == 2
+    assert quality["unavailable_reason"] == (
+        "one or more retrieved notes lack source session IDs"
+    )
+
+
+def test_session_retrieval_quality_aggregates_macro_micro_and_coverage():
+    exact = compute_session_retrieval_quality(
+        [{"source_session_id": 1}], [{"session_id": 1}]
+    )
+    partial = compute_session_retrieval_quality(
+        [{"source_session_id": 2}, {"source_session_id": 9}],
+        [{"session_id": 2}, {"session_id": 3}],
+    )
+    unavailable = compute_session_retrieval_quality(
+        [{"source_session_id": 4}], []
+    )
+    aggregator = MetricsAggregator()
+    aggregator.add_results([
+        _retrieval_metric_result("q1", "entity_exact_match", exact),
+        _retrieval_metric_result(
+            "q2", "multi_hop_clinical_deduction", partial
+        ),
+        _retrieval_metric_result(
+            "q3", "multi_hop_clinical_deduction", unavailable
+        ),
+    ])
+
+    summary = aggregator.get_summary()["metric_groups"]["retrieval_quality"]
+    assert summary["total_queries"] == 3
+    assert summary["evaluated_queries"] == 2
+    assert summary["coverage"] == pytest.approx(2 / 3)
+    assert summary["macro_precision"] == pytest.approx(0.75)
+    assert summary["macro_recall"] == pytest.approx(0.75)
+    assert summary["macro_f1"] == pytest.approx(0.75)
+    assert summary["micro"]["precision"] == pytest.approx(2 / 3)
+    assert summary["micro"]["recall"] == pytest.approx(2 / 3)
+    assert summary["micro"]["f1"] == pytest.approx(2 / 3)
+    multi_hop = summary["by_query_type"]["multi_hop_clinical_deduction"]
+    assert multi_hop["total_queries"] == 2
+    assert multi_hop["evaluated_queries"] == 1
+    assert multi_hop["coverage"] == 0.5
+
+
+def test_evaluator_retrieval_group_is_session_only_and_preserves_answer_score():
+    class _Calculator:
+        @staticmethod
+        def compute(**kwargs):
+            return MetricResult(
+                query_id=kwargs["query_id"],
+                query_type=kwargs["query_type"],
+                score=0.75,
+                is_correct=True,
+                model_output=kwargs["model_output"],
+                expected_answer=kwargs["expected_answers"][0],
+                details={"metric": "test"},
+            )
+
+    evaluator = object.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(
+        method_name="amem_test",
+        build_config={"amem_note_level": "session"},
+    )
+    evaluator.metrics_calculator = _Calculator()
+    evaluator.batch_api = False
+    evaluator.dry_run = False
+    query = SimpleNamespace(
+        query_id="q1",
+        query_type="entity_exact_match",
+        question="question",
+        answers_data=[],
+        metadata={},
+        source_key_points=[{"session_id": 12}],
+        get_correct_answers=lambda: ["answer"],
+    )
+
+    result = evaluator._score_agent_response(
+        query,
+        {
+            "output": "answer",
+            "retrieved_memories": [{"source_session_id": 12}],
+            "retrieved_count": 1,
+        },
+    )
+
+    assert result.score == 0.75
+    assert result.details["metric_groups"]["retrieval_quality"]["f1"] == 1.0
+    evaluator.method_config.build_config["amem_note_level"] = "turn"
+    assert evaluator._session_retrieval_quality_enabled() is False
+
+
+def test_deferred_judge_keeps_session_retrieval_quality_payload():
+    class _BatchCalculator:
+        @staticmethod
+        def prepare_batch(**kwargs):
+            return {
+                "metric_name": "llm_judge",
+                "prepared": {"judge_payload": {"prompt": "judge"}},
+            }
+
+        @staticmethod
+        def get_batch_judge_client(query_type):
+            return object()
+
+    evaluator = object.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(
+        method_name="amem_test",
+        build_config={"amem_note_level": "session"},
+    )
+    evaluator.metrics_calculator = _BatchCalculator()
+    evaluator.batch_api = True
+    evaluator.dry_run = False
+    evaluator._deferred_judges = []
+    query = SimpleNamespace(
+        query_id="q1",
+        query_type="temporal_localization",
+        question="question",
+        answers_data=[],
+        metadata={},
+        source_key_points=[{"session_id": 12}],
+        get_correct_answers=lambda: ["answer"],
+    )
+
+    assert evaluator._score_agent_response(
+        query,
+        {
+            "output": "answer",
+            "retrieved_memories": [{"source_session_id": 12}],
+            "retrieved_count": 1,
+        },
+    ) is None
+    assert evaluator._deferred_judges[0]["retrieval_quality"]["f1"] == 1.0

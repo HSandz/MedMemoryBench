@@ -7,9 +7,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List, Tuple
 
-from src.config import MethodConfig, DatasetConfig, ConfigLoader, PROJECT_ROOT, get_api_config
+from src.config import (
+    AMEM_BUILD_CONFIG_KEYS,
+    AMEM_RETRIEVAL_CONFIG_KEYS,
+    MethodConfig,
+    DatasetConfig,
+    ConfigLoader,
+    PROJECT_ROOT,
+    get_api_config,
+)
 from src.result import EvaluationReport, ResultCollector
-from utils.llm_client import is_google_ai_studio_provider, is_vertex_batch_provider
+from utils.llm_client import (
+    is_batch_provider,
+    is_google_ai_studio_provider,
+    is_vertex_batch_provider,
+)
 from utils.logger import get_eval_logger
 from utils.vertex_batch import VertexBatchPending
 
@@ -78,16 +90,37 @@ class Evaluator:
             if config_inference
             else None
         )
+        judge_provider = get_api_config().get_judge_provider()
+        method_batch_supported = is_batch_provider(method_config.model.provider)
+        judge_batch_supported = (
+            dataset_config.dataset_name.lower() == "medmemorybench"
+            and is_batch_provider(judge_provider)
+        )
         self._ai_studio_batch_skipped = bool(
             batch_api and is_google_ai_studio_provider(method_config.model.provider)
         )
-        self.batch_api = batch_api and not self._ai_studio_batch_skipped
-        self.batch_gcs_uri = (
-            None
-            if self._ai_studio_batch_skipped
-            else batch_gcs_uri or os.environ.get("GOOGLE_BATCH_GCS_URI")
+        self._method_batch_skipped = bool(batch_api and not method_batch_supported)
+        self.batch_api = bool(
+            batch_api and (method_batch_supported or judge_batch_supported)
         )
-        self.batch_wait = False if self._ai_studio_batch_skipped else batch_wait
+        uses_vertex_batch = (
+            method_batch_supported
+            and is_vertex_batch_provider(method_config.model.provider)
+        ) or (
+            judge_batch_supported and is_vertex_batch_provider(judge_provider)
+        )
+        configured_batch_gcs_uri = batch_gcs_uri or os.environ.get(
+            "GOOGLE_BATCH_GCS_URI"
+        )
+        self._batch_gcs_skipped = bool(
+            self.batch_api and configured_batch_gcs_uri and not uses_vertex_batch
+        )
+        self.batch_gcs_uri = (
+            configured_batch_gcs_uri
+            if self.batch_api and uses_vertex_batch
+            else None
+        )
+        self.batch_wait = batch_wait if self.batch_api else False
 
         self.base_output_dir = output_dir or (PROJECT_ROOT / "outputs")
         self.base_output_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +184,44 @@ class Evaluator:
         if is_dataclass(value):
             value = asdict(value)
         return self._redact_secrets(value)
+
+    def _method_config_snapshot(self) -> Dict[str, Any]:
+        """Capture source settings plus the kwargs actually sent to the adapter."""
+        from src.agent import AgentManager
+
+        method_key, init_params = AgentManager.resolve_effective_init_params(
+            self.method_config,
+            self.dataset_config,
+            batch_api=self.batch_api,
+            batch_gcs_uri=self.batch_gcs_uri,
+            batch_wait=self.batch_wait,
+            batch_manifest_dir=self.output_dir / "batch",
+        )
+        snapshot = self._config_value(self.method_config)
+        resolved_params = self._config_value(init_params)
+        snapshot["effective_agent"] = {
+            "adapter": method_key,
+            "constructor_params": resolved_params,
+        }
+
+        # A-MEM has separately versioned build and retrieval semantics. Persist
+        # their resolved values as well so a sparse YAML can be reproduced.
+        if method_key in {"amem", "amem_fix", "amem_test"}:
+            snapshot["build_config"] = {
+                key: resolved_params[key]
+                for key in AMEM_BUILD_CONFIG_KEYS
+                if key in resolved_params
+            }
+            snapshot["retrieval_config"] = {
+                key: resolved_params[key]
+                for key in AMEM_RETRIEVAL_CONFIG_KEYS
+                if key in resolved_params
+            }
+            snapshot["agent_params"] = {
+                **snapshot["build_config"],
+                **snapshot["retrieval_config"],
+            }
+        return snapshot
 
     def _new_run_id(self) -> str:
         base = self.run_started_at.strftime("%Y%m%d_%H%M%S")
@@ -304,7 +375,7 @@ class Evaluator:
             "updated_at": datetime.now().isoformat(),
             "method_config_name": self.method_config_name,
             "dataset_config_name": self.dataset_config_name,
-            "method_config": self._config_value(self.method_config),
+            "method_config": self._method_config_snapshot(),
             "dataset_config": self._config_value(self.dataset_config),
             "api_config": self._config_value(get_api_config()),
             "config_sources": {
@@ -429,13 +500,25 @@ class Evaluator:
                 "  Configuration Source: "
                 f"{self.config_inference.get('source_run_dir')}"
             )
-        if self._ai_studio_batch_skipped:
+        if self._method_batch_skipped:
+            remaining_behavior = (
+                "other supported stages will still use batch."
+                if self.batch_api
+                else "no configured stage supports batch, so the batch arguments are ignored."
+            )
             self._log(
-                "  Google AI Studio does not use this repository's Vertex batch path; "
-                "ignoring --batch-api, --batch-gcs-uri, and --batch-wait.",
+                f"  Query-answer provider '{self.method_config.model.provider}' does not "
+                f"support batch execution; query-answer calls remain real-time, and "
+                f"{remaining_behavior}",
                 level="WARNING",
             )
-        self._log(f"  Vertex Batch API: {self.batch_api}")
+        if self._batch_gcs_skipped:
+            self._log(
+                "  No active Vertex batch stage uses Cloud Storage; "
+                "ignoring --batch-gcs-uri.",
+                level="WARNING",
+            )
+        self._log(f"  Batch API: {self.batch_api}")
         self._log("=" * 60)
 
         try:
@@ -499,7 +582,7 @@ class Evaluator:
         return report
 
     def _validate_batch_eligibility(self) -> None:
-        """Fail early when --batch-api cannot reach any safe Gemini stage."""
+        """Fail early when --batch-api cannot reach any supported stage."""
         provider = self.method_config.model.provider.lower()
         method_name = self.method_config.method_name.lower()
         eligible_methods = (
@@ -509,7 +592,7 @@ class Evaluator:
         )
         agent_params = getattr(self.method_config, "raw_config", {}).get("agent_params", {})
         has_method_stage = (
-            is_vertex_batch_provider(provider)
+            is_batch_provider(provider)
             and any(name in method_name for name in eligible_methods)
             and not (
                 "mirix" in method_name
@@ -518,14 +601,25 @@ class Evaluator:
         )
         has_medmemorybench_judge = (
             self.dataset_config.dataset_name.lower() == "medmemorybench"
-            and is_vertex_batch_provider(get_api_config().get_judge_provider())
+            and is_batch_provider(get_api_config().get_judge_provider())
         )
         if not has_method_stage and not has_medmemorybench_judge:
             raise ValueError(
-                "--batch-api requires at least one eligible Gemini stage. "
-                "Use a supported Gemini method or configure a Gemini MedMemoryBench judge."
+                "--batch-api requires at least one eligible Gemini stage or OpenRouter "
+                "stage. Use a supported method or configure a compatible "
+                "MedMemoryBench judge."
             )
-        if not self.batch_gcs_uri and not os.environ.get("GOOGLE_BATCH_GCS_URI"):
+        has_vertex_stage = (
+            has_method_stage and is_vertex_batch_provider(provider)
+        ) or (
+            has_medmemorybench_judge
+            and is_vertex_batch_provider(get_api_config().get_judge_provider())
+        )
+        if (
+            has_vertex_stage
+            and not self.batch_gcs_uri
+            and not os.environ.get("GOOGLE_BATCH_GCS_URI")
+        ):
             raise ValueError(
                 "--batch-api requires --batch-gcs-uri or GOOGLE_BATCH_GCS_URI before evaluation starts."
             )

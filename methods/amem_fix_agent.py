@@ -193,7 +193,7 @@ class AMemFixAgent(AMemAgent):
         marker = re.search(r"^KEYWORDS?\s*:\s*(.+)$", cleaned, re.IGNORECASE | re.MULTILINE)
         return marker.group(1).strip() if marker else cleaned
 
-    def _generate_retrieval_query(self, question: str, memory_system: Any) -> str:
+    def _generate_retrieval_query(self, question: str) -> str:
         if not self.amem_query_keywords:
             return question
 
@@ -204,8 +204,9 @@ Question: {question}
 Return only a JSON object with a \"keywords\" field.
 Example: {{\"keywords\": \"keyword1, keyword2, keyword3\"}}"""
         try:
-            response = memory_system.llm_controller.llm.get_completion(prompt)
-            retrieval_query = self._parse_keyword_response(response)
+            # Query rewrites use the query model, not A-Mem's build controller.
+            response = self._llm_client.chat(format_messages(prompt))
+            retrieval_query = self._parse_keyword_response(response.content)
             return retrieval_query or question
         except Exception as exc:
             if isinstance(exc, LLMAPIError):
@@ -300,7 +301,7 @@ Example: {{\"keywords\": \"keyword1, keyword2, keyword3\"}}"""
         context_id = self._get_context_id()
         memory_system = self._get_memory_system(context_id)
         raw_question = str(kwargs.get("raw_question") or question).strip()
-        retrieval_query = self._generate_retrieval_query(raw_question, memory_system)
+        retrieval_query = self._generate_retrieval_query(raw_question)
         memory_str, direct_indices, selected_indices, retrieved_memories = self._retrieve_with_links(
             memory_system,
             retrieval_query,

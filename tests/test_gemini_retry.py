@@ -102,6 +102,40 @@ def test_empty_gemini_response_is_retried(monkeypatch):
     assert llm_client.run_with_gemini_retry(operation) == "complete"
     assert len(attempts) == 2
 
+
+def test_all_provider_retry_aliases_use_the_general_budget():
+    assert llm_client.DEFAULT_MAX_RETRIES == llm_client.LLM_MAX_RETRIES
+    assert llm_client.GEMINI_MAX_RETRIES == llm_client.LLM_MAX_RETRIES
+    assert llm_client.GOOGLE_AI_STUDIO_KEY_RETRIES == llm_client.LLM_MAX_RETRIES
+    assert (
+        llm_client.GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES
+        == llm_client.LLM_MAX_RETRIES
+    )
+
+
+def test_default_retry_backoff_is_exponential_and_capped(monkeypatch):
+    delays = []
+    attempts = 0
+    monkeypatch.setattr(llm_client.time, "sleep", delays.append)
+
+    @llm_client.with_retry(
+        max_retries=11,
+        retry_min_delay=1.0,
+        retry_max_delay=1000.0,
+    )
+    def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 10:
+            raise ResourceExhausted("429 quota exceeded")
+        return "complete"
+
+    assert operation() == "complete"
+    assert delays == [
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0, 100.0, 100.0,
+    ]
+
+
 def test_successful_retry_records_failed_attempt_and_wait_duration(monkeypatch):
     timestamps = iter((10.0, 12.0, 12.0, 17.0, 17.0))
     monkeypatch.setattr(llm_client.time, "perf_counter", lambda: next(timestamps))

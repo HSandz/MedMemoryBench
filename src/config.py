@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from dataclasses import dataclass, field
 
 import yaml
@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 AMEM_BUILD_CONFIG_KEYS = {
     "amem_backend", "amem_model", "amem_embedding_model", "amem_evo_threshold",
     "amem_max_tokens", "amem_chunk_size_tokens", "amem_original_evolution",
+    "amem_note_level",
     "amem_typed_relations", "amem_relation_candidate_count",
     "amem_relation_temperature", "amem_temporal_state", "amem_provenance",
     "amem_temperature", "amem_retry_temperature", "amem_connectivity_temperature",
@@ -28,7 +29,7 @@ AMEM_BUILD_CONFIG_KEYS = {
 
 AMEM_RETRIEVAL_CONFIG_KEYS = {
     "retrieve_num", "amem_max_context_tokens", "amem_query_keywords",
-    "amem_expand_links", "amem_typed_retrieval", "amem_typed_expansion_count",
+    "amem_regex_intent_conditioning", "amem_expand_links", "amem_typed_retrieval", "amem_typed_expansion_count",
     "amem_expand_related", "amem_relation_min_confidence",
     "amem_temporal_retrieval", "amem_temporal_ordering",
     "amem_temporal_expansion_count", "amem_provenance_retrieval",
@@ -82,6 +83,9 @@ class APIConfig:
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
 
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
     modal_api_key: str = ""
     modal_base_url: str = ""
 
@@ -106,6 +110,7 @@ class APIConfig:
     judge_api_keys: str = ""
     judge_base_url: str = ""
     judge_temperature: float = 1.0
+    judge_reasoning_effort: Optional[Union[str, int]] = None
     judge_client_max_tokens: int = 10000
     judge_max_tokens: int = 500
     judge_mcd_max_tokens: int = 2000
@@ -118,7 +123,9 @@ class APIConfig:
     def is_configured(self) -> bool:
         if self.use_azure:
             return True
-        return bool(self.openai_api_key or self.modal_api_key)
+        return bool(
+            self.openai_api_key or self.openrouter_api_key or self.modal_api_key
+        )
 
     def get_judge_model(self) -> str:
         return self.judge_model or self.default_llm_model
@@ -134,15 +141,23 @@ class APIConfig:
             return self.judge_api_key
         if provider == "modal":
             return self.judge_api_key or self.modal_api_key
+        if provider == "openrouter":
+            return self.judge_api_key or self.openrouter_api_key
         return self.judge_api_key or self.openai_api_key
 
     def get_judge_base_url(self) -> str:
-        if self.get_judge_provider().lower() == "modal":
+        provider = self.get_judge_provider().lower()
+        if provider == "modal":
             return self.judge_base_url or self.modal_base_url
+        if provider == "openrouter":
+            return self.judge_base_url or self.openrouter_base_url
         return self.judge_base_url or self.openai_base_url
 
     def get_judge_temperature(self) -> float:
         return self.judge_temperature
+
+    def get_judge_reasoning_effort(self) -> Optional[Union[str, int]]:
+        return self.judge_reasoning_effort
 
     def get_judge_client_max_tokens(self) -> int:
         return self.judge_client_max_tokens
@@ -163,6 +178,10 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
 
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
+    openrouter_base_url = os.getenv(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+    )
     modal_api_key = os.getenv("MODAL_API_KEY", "") or os.getenv("MODAL_PROXY_TOKEN", "")
     modal_base_url = os.getenv("MODAL_BASE_URL", "")
     bigmodel_api_key = os.getenv("BIGMODEL_API_KEY", "")
@@ -176,9 +195,17 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
         if env_bigmodel_base_url:
             openai_base_url = env_bigmodel_base_url
 
+    raw_judge_reasoning_effort = os.getenv("JUDGE_REASONING_EFFORT")
+    if raw_judge_reasoning_effort and raw_judge_reasoning_effort.strip().isdigit():
+        judge_reasoning_effort: Optional[Union[str, int]] = int(raw_judge_reasoning_effort)
+    else:
+        judge_reasoning_effort = raw_judge_reasoning_effort or None
+
     return APIConfig(
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_base_url=openrouter_base_url,
         modal_api_key=modal_api_key,
         modal_base_url=modal_base_url,
         bigmodel_api_key=bigmodel_api_key,
@@ -203,6 +230,7 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
         judge_api_keys=os.getenv("JUDGE_API_KEYS", ""),
         judge_base_url=os.getenv("JUDGE_BASE_URL", ""),
         judge_temperature=float(os.getenv("JUDGE_TEMPERATURE", "1.0")),
+        judge_reasoning_effort=judge_reasoning_effort,
         judge_client_max_tokens=int(os.getenv("JUDGE_CLIENT_MAX_TOKENS", "10000")),
         judge_max_tokens=int(os.getenv("JUDGE_MAX_TOKENS", "500")),
         judge_mcd_max_tokens=int(os.getenv("JUDGE_MCD_MAX_TOKENS", "2000")),
@@ -217,8 +245,34 @@ class ModelConfig:
     temperature: float = 1.0
     max_tokens: int = 2000
     max_completion_tokens: Optional[int] = None  # For new models (gpt-5.x, o1-*, o3-*)
+    reasoning_effort: Optional[Union[str, int]] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    openrouter_provider: Optional[Dict[str, Any]] = None
+    openrouter_service_tier: Optional[str] = None
+
+
+def _parse_openrouter_options(
+    model_data: Dict[str, Any],
+    section: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse OpenRouter-only request options from a model config block."""
+    openrouter_data = model_data.get("openrouter", {})
+    if openrouter_data is None:
+        openrouter_data = {}
+    if not isinstance(openrouter_data, dict):
+        raise ValueError(f"{section}.openrouter must be a mapping")
+
+    provider_routing = openrouter_data.get("provider")
+    if provider_routing is not None and not isinstance(provider_routing, dict):
+        raise ValueError(f"{section}.openrouter.provider must be a mapping")
+    service_tier = openrouter_data.get("service_tier")
+    if service_tier is not None and not isinstance(service_tier, str):
+        raise ValueError(f"{section}.openrouter.service_tier must be a string")
+    return (
+        dict(provider_routing) if provider_routing is not None else None,
+        service_tier,
+    )
 
 
 @dataclass
@@ -241,7 +295,7 @@ class MethodConfig:
 
     model: ModelConfig = field(default_factory=ModelConfig)
     embedding: Optional[EmbeddingConfig] = None
-    memorize_model: Optional[ModelConfig] = None  # Optional separate model for memorize phase
+    memorize_model: Optional[ModelConfig] = None  # Optional separate memory-build model
     build_config: Dict[str, Any] = field(default_factory=dict)
     retrieval_config: Dict[str, Any] = field(default_factory=dict)
     agent_params: Dict[str, Any] = field(default_factory=dict)
@@ -253,14 +307,20 @@ class MethodConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "MethodConfig":
         """Create config from dict."""
         model_data = data.get("model", {})
+        openrouter_provider, openrouter_service_tier = _parse_openrouter_options(
+            model_data, "model"
+        )
         model_config = ModelConfig(
             provider=model_data.get("provider", "openai"),
             name=model_data.get("name", "gpt-4o-mini"),
             temperature=model_data.get("temperature", 1.0),
             max_tokens=model_data.get("max_tokens", 2000),
             max_completion_tokens=model_data.get("max_completion_tokens"),
+            reasoning_effort=model_data.get("reasoning_effort"),
             api_key=model_data.get("api_key"),
             base_url=model_data.get("base_url"),
+            openrouter_provider=openrouter_provider,
+            openrouter_service_tier=openrouter_service_tier,
         )
 
         embedding_config = None
@@ -298,14 +358,21 @@ class MethodConfig:
         memorize_model_config = None
         if "memorize_model" in data:
             mem_data = data["memorize_model"]
+            (
+                mem_openrouter_provider,
+                mem_openrouter_service_tier,
+            ) = _parse_openrouter_options(mem_data, "memorize_model")
             memorize_model_config = ModelConfig(
                 provider=mem_data.get("provider", "openai"),
                 name=mem_data.get("name", model_config.name),
                 temperature=mem_data.get("temperature", 0.7),
                 max_tokens=mem_data.get("max_tokens", 1000),
                 max_completion_tokens=mem_data.get("max_completion_tokens"),
+                reasoning_effort=mem_data.get("reasoning_effort"),
                 api_key=mem_data.get("api_key"),
                 base_url=mem_data.get("base_url"),
+                openrouter_provider=mem_openrouter_provider,
+                openrouter_service_tier=mem_openrouter_service_tier,
             )
 
         # New configs separate snapshot/build semantics from query behavior.
@@ -357,10 +424,10 @@ class MethodConfig:
             build_config = {**legacy_build, **raw_build_config}
             retrieval_config = {**legacy_retrieval, **raw_retrieval_config}
             if legacy_amem_only and model_config.provider.lower() in {
-                "gemini", "vertex", "ai_studio"
+                "gemini", "vertex", "ai_studio", "openrouter"
             }:
-                # Historical adapters replaced AMEM's configured controller with
-                # the top-level Gemini transport/model during construction.
+                # Historical adapters replaced A-MEM's configured controller with
+                # the top-level managed transport/model during construction.
                 build_config["amem_backend"] = model_config.provider.lower()
                 build_config["amem_model"] = model_config.name
         elif legacy_agent_params and not (

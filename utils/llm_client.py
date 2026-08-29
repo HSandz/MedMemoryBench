@@ -6,6 +6,7 @@ import time
 import logging
 import re
 import threading
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -15,10 +16,19 @@ from functools import wraps
 
 from utils.tokenizer import get_tokenizer, TokenizerProtocol
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
 @dataclass
 class TokenUsage:
     """Token usage statistics."""
     input_tokens: int = 0
+    # ``output_tokens`` is the provider-reported total. It includes thinking
+    # tokens whenever a provider defines its output count that way.
     output_tokens: int = 0
     total_tokens: int = 0
     call_count: int = 0
@@ -29,10 +39,28 @@ class TokenUsage:
     total_latency: float = 0.0
     wall_time: float = 0.0
     failure_duration_seconds: float = 0.0
+    visible_output_tokens: int = 0
+    thinking_tokens: int = 0
 
-    def add(self, input_tokens: int, output_tokens: int, latency: float) -> None:
+    def add(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        latency: float,
+        visible_output_tokens: Optional[int] = None,
+        thinking_tokens: int = 0,
+    ) -> None:
+        output_tokens = max(int(output_tokens or 0), 0)
+        thinking_tokens = min(max(int(thinking_tokens or 0), 0), output_tokens)
+        if visible_output_tokens is None:
+            visible_output_tokens = output_tokens - thinking_tokens
+        visible_output_tokens = min(
+            max(int(visible_output_tokens or 0), 0), output_tokens - thinking_tokens
+        )
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
+        self.visible_output_tokens += visible_output_tokens
+        self.thinking_tokens += thinking_tokens
         self.total_tokens += input_tokens + output_tokens
         self.call_count += 1
         # Batch and externally supplied responses may not expose an attempt hook.
@@ -61,6 +89,8 @@ class TokenUsage:
     def merge(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
+        self.visible_output_tokens += other.visible_output_tokens
+        self.thinking_tokens += other.thinking_tokens
         self.total_tokens += other.total_tokens
         self.call_count += other.call_count
         self.attempt_count += other.attempt_count
@@ -75,6 +105,8 @@ class TokenUsage:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "visible_output_tokens": self.visible_output_tokens,
+            "thinking_tokens": self.thinking_tokens,
             "total_tokens": self.total_tokens,
             "call_count": self.call_count,
             "successful_calls": self.call_count,
@@ -93,6 +125,14 @@ class TokenUsage:
         value = value or {}
         input_tokens = int(value.get("input_tokens", 0) or 0)
         output_tokens = int(value.get("output_tokens", 0) or 0)
+        thinking_tokens = min(
+            max(int(value.get("thinking_tokens", 0) or 0), 0), output_tokens
+        )
+        # Legacy result files reported only one output total. Treat it as
+        # visible output unless a separate thinking total is available.
+        visible_output_tokens = value.get("visible_output_tokens")
+        if visible_output_tokens is None:
+            visible_output_tokens = output_tokens - thinking_tokens
         call_count = int(
             value.get("call_count", value.get("successful_calls", 0)) or 0
         )
@@ -100,6 +140,10 @@ class TokenUsage:
         return cls(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            visible_output_tokens=min(
+                max(int(visible_output_tokens or 0), 0), output_tokens - thinking_tokens
+            ),
+            thinking_tokens=thinking_tokens,
             total_tokens=int(
                 value.get("total_tokens", input_tokens + output_tokens) or 0
             ),
@@ -121,6 +165,10 @@ class TokenUsage:
         return TokenUsage(
             input_tokens=max(self.input_tokens - other.input_tokens, 0),
             output_tokens=max(self.output_tokens - other.output_tokens, 0),
+            visible_output_tokens=max(
+                self.visible_output_tokens - other.visible_output_tokens, 0
+            ),
+            thinking_tokens=max(self.thinking_tokens - other.thinking_tokens, 0),
             total_tokens=max(self.total_tokens - other.total_tokens, 0),
             call_count=max(self.call_count - other.call_count, 0),
             attempt_count=max(self.attempt_count - other.attempt_count, 0),
@@ -182,10 +230,18 @@ class LLMUsageTracker:
     def record(self, response: "LLMResponse") -> None:
         with self._lock:
             self._phase_bucket().add(
-                response.input_tokens, response.output_tokens, response.latency
+                response.input_tokens,
+                response.output_tokens,
+                response.latency,
+                response.visible_output_tokens,
+                response.thinking_tokens,
             )
             self._operation_bucket().add(
-                response.input_tokens, response.output_tokens, response.latency
+                response.input_tokens,
+                response.output_tokens,
+                response.latency,
+                response.visible_output_tokens,
+                response.thinking_tokens,
             )
 
     def record_attempt(self) -> None:
@@ -369,17 +425,36 @@ def diff_usage_stats(
         },
     }
 
-# Default retry config (can be overridden via environment variables)
-DEFAULT_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
-DEFAULT_RETRY_MIN_DELAY = float(os.environ.get("LLM_RETRY_MIN_DELAY", "10.0"))
-DEFAULT_RETRY_MAX_DELAY = float(os.environ.get("LLM_RETRY_MAX_DELAY", "20.0"))
-GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "100"))
-GEMINI_RETRY_INITIAL_DELAY = float(os.environ.get("GEMINI_RETRY_INITIAL_DELAY", "1.0"))
-GEMINI_RETRY_MAX_DELAY = float(os.environ.get("GEMINI_RETRY_MAX_DELAY", "100.0"))
-GOOGLE_AI_STUDIO_KEY_RETRIES = int(os.environ.get("GOOGLE_AI_STUDIO_KEY_RETRIES", "5"))
-GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES = int(
-    os.environ.get("GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES", "5")
+# One retry policy covers every first-party LLM transport.
+_LEGACY_VERTEX_RETRIES = os.environ.get("GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES")
+LLM_MAX_RETRIES = max(
+    int(os.environ.get("LLM_MAX_RETRIES", _LEGACY_VERTEX_RETRIES or "100")),
+    1,
 )
+LLM_RETRY_DELAY_CAP_SECONDS = 100.0
+LLM_RETRY_INITIAL_DELAY = max(
+    float(os.environ.get("LLM_RETRY_MIN_DELAY", "1.0")),
+    0.0,
+)
+LLM_RETRY_MAX_DELAY = min(
+    max(float(os.environ.get("LLM_RETRY_MAX_DELAY", "100.0")), 0.0),
+    LLM_RETRY_DELAY_CAP_SECONDS,
+)
+AI_STUDIO_KEY_ROTATION_DELAY_SECONDS = 2.0
+AI_STUDIO_ROTATION_ERROR_MAX_LENGTH = 120
+AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES_DEFAULT = 3
+AI_STUDIO_KEY_ROTATION_MODES = frozenset({"sequential", "round_robin"})
+
+# Backward-compatible Python aliases. Provider-specific environment variables
+# no longer define separate retry budgets.
+DEFAULT_MAX_RETRIES = LLM_MAX_RETRIES
+DEFAULT_RETRY_MIN_DELAY = LLM_RETRY_INITIAL_DELAY
+DEFAULT_RETRY_MAX_DELAY = LLM_RETRY_MAX_DELAY
+GEMINI_MAX_RETRIES = LLM_MAX_RETRIES
+GEMINI_RETRY_INITIAL_DELAY = LLM_RETRY_INITIAL_DELAY
+GEMINI_RETRY_MAX_DELAY = LLM_RETRY_MAX_DELAY
+GOOGLE_AI_STUDIO_KEY_RETRIES = LLM_MAX_RETRIES
+GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES = LLM_MAX_RETRIES
 
 VERTEX_GEMINI_PROVIDER = "vertex"
 GOOGLE_AI_STUDIO_PROVIDER = "ai_studio"
@@ -617,6 +692,22 @@ def _get_retry_delay(min_delay: float, max_delay: float) -> float:
     import random
     return random.uniform(min_delay, max_delay)
 
+
+def _get_exponential_retry_delay(
+    attempt: int,
+    initial_delay: float = LLM_RETRY_INITIAL_DELAY,
+    max_delay: float = LLM_RETRY_MAX_DELAY,
+) -> float:
+    """Double the retry delay for each failure without exceeding the cap."""
+    max_delay = min(max(max_delay, 0.0), LLM_RETRY_DELAY_CAP_SECONDS)
+    delay = min(max(initial_delay, 0.0), max_delay)
+    for _ in range(max(attempt - 1, 0)):
+        if delay >= max_delay:
+            break
+        delay = min(delay * 2, max_delay)
+    return delay
+
+
 def _record_untracked_failure_duration(
     tracker: LLMUsageTracker,
     failure_duration_before: float,
@@ -625,6 +716,7 @@ def _record_untracked_failure_duration(
     """Record elapsed failure time unless an inner client already measured it."""
     if tracker.current_failure_duration() == failure_duration_before:
         tracker.record_failure_duration(time.perf_counter() - started_at)
+
 
 def _sleep_after_failure(delay: float) -> None:
     """Sleep before a retry and account for the actual failure-induced wait."""
@@ -653,23 +745,130 @@ def _log_retry_attempt(
     )
 
 
+def _get_ai_studio_provider_message(exc: Exception) -> str:
+    """Extract the provider message without the SDK's status wrapper."""
+    raw_message = getattr(exc, "message", None)
+    if not isinstance(raw_message, str) or not raw_message.strip():
+        raw_message = str(exc)
+    payload_message = re.search(
+        r"['\"]message['\"]\s*:\s*['\"](.*?)['\"]\s*(?:[,}])",
+        raw_message,
+        flags=re.DOTALL,
+    )
+    if payload_message:
+        raw_message = payload_message.group(1)
+    return " ".join(raw_message.split())
+
+
+def _format_rotation_error(exc: Exception) -> str:
+    """Return a bounded, single-line provider message for rotation logs."""
+    message = re.sub(r"https?://\S+", "", _get_ai_studio_provider_message(exc)).strip()
+    if len(message) > AI_STUDIO_ROTATION_ERROR_MAX_LENGTH:
+        return message[: AI_STUDIO_ROTATION_ERROR_MAX_LENGTH - 3] + "..."
+    return message or "request failed"
+
+
+def _resolve_ai_studio_max_rotation_rounds(value: Optional[int] = None) -> int:
+    """Return a valid per-call AI Studio key-pool rotation limit."""
+    raw_value = (
+        os.environ.get("GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS", "1")
+        if value is None
+        else value
+    )
+    try:
+        rounds = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS must be -1 or a positive integer"
+        ) from exc
+    if rounds == -1 or rounds >= 1:
+        return rounds
+    raise ValueError(
+        "GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS must be -1 or a positive integer"
+    )
+
+
+def _resolve_ai_studio_key_rotation_mode(value: Optional[str] = None) -> str:
+    """Return the configured AI Studio API key rotation strategy."""
+    raw_value = (
+        os.environ.get("GOOGLE_AI_STUDIO_KEY_ROTATION_MODE", "sequential")
+        if value is None
+        else value
+    )
+    mode = str(raw_value).strip().lower().replace("-", "_")
+    if mode in AI_STUDIO_KEY_ROTATION_MODES:
+        return mode
+    supported_modes = ", ".join(sorted(AI_STUDIO_KEY_ROTATION_MODES))
+    raise ValueError(
+        "GOOGLE_AI_STUDIO_KEY_ROTATION_MODE must be one of: "
+        f"{supported_modes}"
+    )
+
+
+def _resolve_ai_studio_round_robin_calls_per_key(
+    value: Optional[int] = None,
+) -> int:
+    """Return the positive successful-call limit for one AI Studio key."""
+    raw_value = (
+        os.environ.get("GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY", "1")
+        if value is None
+        else value
+    )
+    try:
+        calls_per_key = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY must be a positive integer"
+        ) from exc
+    if calls_per_key >= 1:
+        return calls_per_key
+    raise ValueError(
+        "GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY must be a positive integer"
+    )
+
+
+def _resolve_ai_studio_resource_exhausted_retries(
+    value: Optional[int] = None,
+) -> int:
+    """Return the retry count for generic AI Studio resource-exhausted 429s."""
+    raw_value = (
+        os.environ.get(
+            "GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES",
+            str(AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES_DEFAULT),
+        )
+        if value is None
+        else value
+    )
+    try:
+        retries = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES must be a non-negative integer"
+        ) from exc
+    if retries >= 0:
+        return retries
+    raise ValueError(
+        "GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES must be a non-negative integer"
+    )
+
+
 def with_retry(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_min_delay: float = DEFAULT_RETRY_MIN_DELAY,
     retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
-    exponential_backoff: bool = False,
+    exponential_backoff: bool = True,
 ):
-    """API call retry decorator with jitter strategy.
+    """Retry provider API calls using the shared policy.
 
     Args:
-        max_retries: Maximum number of retry attempts (default: 10)
-        retry_min_delay: Minimum delay between retries in seconds (default: 10.0)
-        retry_max_delay: Maximum delay between retries in seconds (default: 20.0)
+        max_retries: Maximum failures per normalized failure type.
+        retry_min_delay: Initial exponential delay in seconds.
+        retry_max_delay: Maximum delay in seconds, capped globally at 100.
         exponential_backoff: Double the delay after each failure, capped at max delay.
 
     Each normalized failure type has its own max_retries budget and backoff
-    sequence. The actual delay is randomly chosen between retry_min_delay and
-    retry_max_delay (jitter strategy) unless exponential_backoff is enabled.
+    sequence. Exponential backoff is the default; callers may explicitly
+    disable it to use random jitter between retry_min_delay and retry_max_delay.
     """
     def decorator(func):
         @wraps(func)
@@ -723,9 +922,10 @@ def with_retry(
                         ) from exc
 
                     if exponential_backoff:
-                        delay = min(
-                            retry_min_delay * (2 ** (failure_attempt - 1)),
-                            retry_max_delay,
+                        delay = _get_exponential_retry_delay(
+                            failure_attempt,
+                            retry_min_delay,
+                            min(retry_max_delay, LLM_RETRY_DELAY_CAP_SECONDS),
                         )
                     else:
                         delay = _get_retry_delay(retry_min_delay, retry_max_delay)
@@ -744,15 +944,15 @@ def with_retry(
     return decorator
 
 
-@with_retry(
-    max_retries=GEMINI_MAX_RETRIES,
-    retry_min_delay=GEMINI_RETRY_INITIAL_DELAY,
-    retry_max_delay=GEMINI_RETRY_MAX_DELAY,
-    exponential_backoff=True,
-)
-def run_with_gemini_retry(operation, *args, **kwargs):
-    """Run a raw Gemini SDK call with the shared retry policy."""
+@with_retry()
+def run_with_llm_retry(operation, *args, **kwargs):
+    """Run a raw provider SDK call with the shared retry policy."""
     return operation(*args, **kwargs)
+
+
+def run_with_gemini_retry(operation, *args, **kwargs):
+    """Backward-compatible alias for raw Gemini SDK callers."""
+    return run_with_llm_retry(operation, *args, **kwargs)
 
 
 def is_vertex_gemini_provider(provider: Optional[str]) -> bool:
@@ -775,9 +975,79 @@ def is_vertex_batch_provider(provider: Optional[str]) -> bool:
     return is_vertex_gemini_provider(provider) or is_hybrid_gemini_provider(provider)
 
 
+def is_openrouter_batch_provider(provider: Optional[str]) -> bool:
+    """Return whether batch requests can use OpenRouter's Batch API."""
+    return bool(provider and provider.lower() == "openrouter")
+
+
+def is_batch_provider(provider: Optional[str]) -> bool:
+    """Return whether the provider has a repository batch transport."""
+    return is_vertex_batch_provider(provider) or is_openrouter_batch_provider(provider)
+
+
 def is_gemini_provider(provider: Optional[str]) -> bool:
     """Return whether a provider is any supported Gemini transport."""
     return bool(provider and provider.lower() in GEMINI_PROVIDERS)
+
+
+def _usage_value(usage: Any, *names: str) -> int:
+    """Read one integer token field from an SDK object or JSON dictionary."""
+    for name in names:
+        value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        if value is not None:
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def extract_usage_token_counts(usage: Any) -> Tuple[int, int, int, int]:
+    """Normalize provider usage into input, total output, visible, and thinking tokens.
+
+    OpenAI-compatible APIs report reasoning in ``completion_tokens_details``;
+    Gemini reports it as ``thoughts_token_count``. Providers without either
+    field retain their aggregate output as visible output.
+    """
+    if not usage:
+        return 0, 0, 0, 0
+
+    input_tokens = _usage_value(
+        usage,
+        "prompt_tokens",
+        "input_tokens",
+        "prompt_token_count",
+        "promptTokenCount",
+    )
+    output_tokens = _usage_value(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+        "candidates_token_count",
+        "candidatesTokenCount",
+    )
+    details = None
+    for name in ("completion_tokens_details", "completionTokensDetails"):
+        details = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        if details is not None:
+            break
+    thinking_tokens = _usage_value(
+        details,
+        "reasoning_tokens",
+        "thinking_tokens",
+        "reasoningTokenCount",
+        "thinkingTokenCount",
+    ) if details is not None else _usage_value(
+        usage,
+        "reasoning_tokens",
+        "thinking_tokens",
+        "thoughts_token_count",
+        "thoughtsTokenCount",
+        "reasoningTokenCount",
+        "thinkingTokenCount",
+    )
+    thinking_tokens = min(thinking_tokens, output_tokens)
+    return input_tokens, output_tokens, output_tokens - thinking_tokens, thinking_tokens
 
 
 @dataclass
@@ -789,6 +1059,21 @@ class LLMResponse:
     latency: float = 0.0
     model: str = ""
     raw_response: Any = None
+    visible_output_tokens: Optional[int] = None
+    thinking_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        self.input_tokens = max(int(self.input_tokens or 0), 0)
+        self.output_tokens = max(int(self.output_tokens or 0), 0)
+        self.thinking_tokens = min(
+            max(int(self.thinking_tokens or 0), 0), self.output_tokens
+        )
+        if self.visible_output_tokens is None:
+            self.visible_output_tokens = self.output_tokens - self.thinking_tokens
+        self.visible_output_tokens = min(
+            max(int(self.visible_output_tokens or 0), 0),
+            self.output_tokens - self.thinking_tokens,
+        )
 
 
 class BaseLLMClient:
@@ -799,11 +1084,13 @@ class BaseLLMClient:
         model: str,
         temperature: float = 1.0,
         max_tokens: int = 2000,
+        reasoning_effort: Optional[Union[str, int]] = None,
         **kwargs
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
 
         # Tokenizer (prefer local model, fallback to tiktoken)
         self._tokenizer: TokenizerProtocol = get_tokenizer(
@@ -906,6 +1193,9 @@ class OpenAIClient(BaseLLMClient):
         else:
             params["max_tokens"] = token_limit
 
+        reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
         params.update(kwargs)
 
         response = self.client.chat.completions.create(**params)
@@ -921,16 +1211,81 @@ class OpenAIClient(BaseLLMClient):
                 f"(finish_reason={finish_reason}, refusal={refusal}, model={self.model})."
             )
 
+        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+            extract_usage_token_counts(getattr(response, "usage", None))
+        )
         llm_response = LLMResponse(
             content=content,
-            input_tokens=response.usage.prompt_tokens if response.usage else 0,
-            output_tokens=response.usage.completion_tokens if response.usage else 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             latency=latency,
             model=self.model,
             raw_response=response,
         )
         get_usage_tracker().record(llm_response)
         return llm_response
+
+
+class OpenRouterClient(OpenAIClient):
+    """OpenAI-compatible client for OpenRouter."""
+
+    def __init__(
+        self,
+        model: str = "openai/gpt-4o-mini",
+        temperature: float = 1.0,
+        max_tokens: int = 2000,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider_routing: Optional[Dict[str, Any]] = None,
+        service_tier: Optional[str] = None,
+        **kwargs,
+    ):
+        self.provider_routing = (
+            dict(provider_routing) if provider_routing is not None else None
+        )
+        self.service_tier = service_tier
+        super().__init__(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key or os.environ.get("OPENROUTER_API_KEY"),
+            base_url=(
+                base_url
+                or os.environ.get("OPENROUTER_BASE_URL")
+                or "https://openrouter.ai/api/v1"
+            ),
+            **kwargs,
+        )
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> LLMResponse:
+        provider_routing = kwargs.pop("provider_routing", self.provider_routing)
+        service_tier = kwargs.pop("service_tier", self.service_tier)
+        reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
+        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+        if provider_routing is not None:
+            extra_body.setdefault("provider", provider_routing)
+        if service_tier is not None:
+            extra_body.setdefault("service_tier", service_tier)
+        if reasoning_effort is not None:
+            reasoning = dict(extra_body.get("reasoning", {}) or {})
+            reasoning.setdefault("effort", reasoning_effort)
+            extra_body["reasoning"] = reasoning
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return super().chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
 
 class ModalModelNotReadyError(TimeoutError):
     """Raised when a Modal endpoint does not advertise the requested model."""
@@ -1081,6 +1436,9 @@ class AzureOpenAIClient(BaseLLMClient):
         else:
             params["max_tokens"] = token_limit
 
+        reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
         params.update(kwargs)
 
         response = self.client.chat.completions.create(**params)
@@ -1096,10 +1454,15 @@ class AzureOpenAIClient(BaseLLMClient):
                 f"(finish_reason={finish_reason}, refusal={refusal}, model={self.deployment})."
             )
 
+        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+            extract_usage_token_counts(getattr(response, "usage", None))
+        )
         llm_response = LLMResponse(
             content=content,
-            input_tokens=response.usage.prompt_tokens if response.usage else 0,
-            output_tokens=response.usage.completion_tokens if response.usage else 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             latency=latency,
             model=self.deployment,
             raw_response=response,
@@ -1155,6 +1518,12 @@ class AnthropicClient(BaseLLMClient):
         if system_content:
             params["system"] = system_content
 
+        reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
+        output_config = dict(kwargs.pop("output_config", {}) or {})
+        if reasoning_effort is not None:
+            output_config.setdefault("effort", reasoning_effort)
+        if output_config:
+            params["output_config"] = output_config
         params.update(kwargs)
 
         response = self.client.messages.create(**params)
@@ -1166,10 +1535,15 @@ class AnthropicClient(BaseLLMClient):
                 f"Anthropic returned an empty response (model={self.model})."
             )
 
+        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+            extract_usage_token_counts(getattr(response, "usage", None))
+        )
         llm_response = LLMResponse(
             content=content,
-            input_tokens=response.usage.input_tokens if response.usage else 0,
-            output_tokens=response.usage.output_tokens if response.usage else 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             latency=latency,
             model=self.model,
             raw_response=response,
@@ -1230,6 +1604,42 @@ class BaseGeminiClient(BaseLLMClient):
             if key in kwargs:
                 config[key] = kwargs.pop(key)
 
+        # Gemini 3 exposes named thinking levels; Gemini 2.5 exposes an integer
+        # thinking budget.  Keep the generic setting provider-neutral while
+        # rejecting combinations that the selected Gemini family cannot use.
+        thinking_config = kwargs.pop("thinking_config", None)
+        thinking_budget = kwargs.pop("thinking_budget", None)
+        thinking_level = kwargs.pop("thinking_level", None)
+        reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
+        if thinking_config is None and (thinking_budget is not None or thinking_level is not None):
+            thinking_config = types.ThinkingConfig(
+                thinkingBudget=thinking_budget,
+                thinkingLevel=thinking_level,
+            )
+        if thinking_config is None and reasoning_effort is not None:
+            model_name = self.model.lower()
+            if isinstance(reasoning_effort, int) and not isinstance(reasoning_effort, bool):
+                thinking_config = types.ThinkingConfig(thinkingBudget=reasoning_effort)
+            elif isinstance(reasoning_effort, str) and "gemini-3" in model_name:
+                level = reasoning_effort.strip().upper()
+                valid_levels = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+                if level not in valid_levels:
+                    raise ValueError(
+                        "Gemini 3 reasoning_effort must be one of: minimal, low, medium, high"
+                    )
+                thinking_config = types.ThinkingConfig(
+                    thinkingLevel=types.ThinkingLevel(level),
+                )
+            elif isinstance(reasoning_effort, str):
+                raise ValueError(
+                    "Gemini 2.5 reasoning_effort must be an integer thinking budget; "
+                    "named effort levels require a Gemini 3 model."
+                )
+            else:
+                raise TypeError("reasoning_effort must be a string or integer")
+        if thinking_config is not None:
+            config["thinking_config"] = thinking_config
+
         active_client = client or self.client
         tracker = get_usage_tracker()
         tracker.record_attempt()
@@ -1273,10 +1683,15 @@ class BaseGeminiClient(BaseLLMClient):
                     "Gemini returned malformed JSON for a structured response."
                 ) from exc
         usage = getattr(response, "usage_metadata", None)
+        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+            extract_usage_token_counts(usage)
+        )
         llm_response = LLMResponse(
             content=content,
-            input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-            output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             latency=latency,
             model=self.model,
             raw_response=response,
@@ -1376,12 +1791,7 @@ class GeminiVertexClient(BaseGeminiClient):
 
         self.location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
         if service_account_failure_threshold is None:
-            service_account_failure_threshold = int(
-                os.environ.get(
-                    "GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES",
-                    str(GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES),
-                )
-            )
+            service_account_failure_threshold = LLM_MAX_RETRIES
         if service_account_failure_threshold < 1:
             raise ValueError("service_account_failure_threshold must be at least 1")
         self.service_account_failure_threshold = service_account_failure_threshold
@@ -1540,9 +1950,8 @@ class GeminiVertexClient(BaseGeminiClient):
                 if threshold_reached:
                     break
 
-                delay = min(
-                    GEMINI_RETRY_INITIAL_DELAY * (2 ** (max(account_attempt, 1) - 1)),
-                    GEMINI_RETRY_MAX_DELAY,
+                delay = _get_exponential_retry_delay(
+                    max(account_attempt, 1),
                 )
                 _log_retry_attempt(
                     max(account_attempt, 1),
@@ -1600,6 +2009,62 @@ def _split_api_keys(value: Union[str, Sequence[str], None]) -> List[str]:
     return keys
 
 
+def _get_google_ai_studio_api_keys_file_path(path_value: str) -> Path:
+    """Resolve the project-relative AI Studio key-file path."""
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        raise ValueError(
+            "GOOGLE_AI_STUDIO_API_KEYS_FILE must be a path relative to the project root"
+        )
+
+    project_root = Path(__file__).resolve().parent.parent
+    path = (project_root / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Google AI Studio API key file not found: {path}")
+    return path
+
+
+def _load_google_ai_studio_api_keys_file(path_value: str) -> List[str]:
+    """Load one AI Studio API key per line from a project-relative text file."""
+    path = _get_google_ai_studio_api_keys_file_path(path_value)
+
+    keys = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not keys:
+        raise ValueError(f"Google AI Studio API key file contains no keys: {path}")
+    return keys
+
+
+def _remove_google_ai_studio_api_key_from_file(path: Path, api_key: str) -> bool:
+    """Atomically remove all matching key lines without logging the credential."""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    retained_lines = [line for line in lines if line.strip() != api_key]
+    if len(retained_lines) == len(lines):
+        return False
+
+    original_mode = path.stat().st_mode
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        text=True,
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.writelines(retained_lines)
+        os.chmod(temporary_path, original_mode)
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return True
+
+
 def get_google_ai_studio_api_keys(
     api_key: Union[str, Sequence[str], None] = None,
     api_keys: Union[str, Sequence[str], None] = None,
@@ -1610,14 +2075,18 @@ def get_google_ai_studio_api_keys(
     elif api_key:
         configured = _split_api_keys(api_key)
     else:
-        configured = _split_api_keys(os.environ.get("GOOGLE_AI_STUDIO_API_KEYS"))
-        if not configured:
-            configured = _split_api_keys(os.environ.get("GOOGLE_AI_STUDIO_API_KEY"))
-        if not configured:
-            # Match Google's documented precedence when both standard variables exist.
-            configured = _split_api_keys(
-                os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-            )
+        key_file = os.environ.get("GOOGLE_AI_STUDIO_API_KEYS_FILE", "").strip()
+        if key_file:
+            configured = _load_google_ai_studio_api_keys_file(key_file)
+        else:
+            configured = _split_api_keys(os.environ.get("GOOGLE_AI_STUDIO_API_KEYS"))
+            if not configured:
+                configured = _split_api_keys(os.environ.get("GOOGLE_AI_STUDIO_API_KEY"))
+            if not configured:
+                # Match Google's documented precedence when both standard variables exist.
+                configured = _split_api_keys(
+                    os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+                )
 
     return list(dict.fromkeys(configured))
 
@@ -1636,8 +2105,42 @@ def _is_google_ai_studio_retryable(exc: Exception) -> Tuple[bool, str]:
     return False, reason
 
 
+def _is_ai_studio_permanently_invalid_key_error(exc: Exception) -> bool:
+    """Identify explicit project or credential removal states that cannot recover."""
+    if _get_status_code(exc) not in {401, 403, 404}:
+        return False
+
+    message = _get_ai_studio_provider_message(exc).lower()
+    if "service account" in message and any(
+        phrase in message
+        for phrase in (
+            "deleted",
+            "disabled",
+            "must be active",
+        )
+    ):
+        return True
+    if "project" in message and any(
+        phrase in message
+        for phrase in (
+            "deleted",
+            "disabled",
+            "suspended",
+        )
+    ):
+        return True
+    return "api key" in message and any(
+        phrase in message
+        for phrase in (
+            "deleted",
+            "disabled",
+            "revoked",
+        )
+    )
+
+
 class GeminiAIStudioClient(BaseGeminiClient):
-    """Gemini Developer API client with per-failure-type API key rotation."""
+    """Gemini Developer API client with failure or call-count key rotation."""
 
     def __init__(
         self,
@@ -1647,6 +2150,10 @@ class GeminiAIStudioClient(BaseGeminiClient):
         api_key: Union[str, Sequence[str], None] = None,
         api_keys: Union[str, Sequence[str], None] = None,
         key_failure_threshold: Optional[int] = None,
+        max_rotation_rounds: Optional[int] = None,
+        key_rotation_mode: Optional[str] = None,
+        round_robin_calls_per_key: Optional[int] = None,
+        resource_exhausted_retries: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -1659,24 +2166,45 @@ class GeminiAIStudioClient(BaseGeminiClient):
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
 
+        key_file = os.environ.get("GOOGLE_AI_STUDIO_API_KEYS_FILE", "").strip()
+        self._api_key_file_path = (
+            _get_google_ai_studio_api_keys_file_path(key_file)
+            if key_file and not api_key and not api_keys
+            else None
+        )
         self.api_keys = get_google_ai_studio_api_keys(api_key=api_key, api_keys=api_keys)
         if not self.api_keys:
             raise ValueError(
-                "Google AI Studio requires GOOGLE_AI_STUDIO_API_KEYS, "
+                "Google AI Studio requires GOOGLE_AI_STUDIO_API_KEYS_FILE, "
+                "GOOGLE_AI_STUDIO_API_KEYS, "
                 "GOOGLE_AI_STUDIO_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or api_key."
             )
         if key_failure_threshold is None:
-            key_failure_threshold = int(
-                os.environ.get("GOOGLE_AI_STUDIO_KEY_RETRIES", str(GOOGLE_AI_STUDIO_KEY_RETRIES))
-            )
+            key_failure_threshold = LLM_MAX_RETRIES
         if key_failure_threshold < 1:
             raise ValueError("key_failure_threshold must be at least 1")
 
         self.key_failure_threshold = key_failure_threshold
+        self.max_rotation_rounds = _resolve_ai_studio_max_rotation_rounds(
+            max_rotation_rounds
+        )
+        self.key_rotation_mode = _resolve_ai_studio_key_rotation_mode(
+            key_rotation_mode
+        )
+        self.round_robin_calls_per_key = (
+            _resolve_ai_studio_round_robin_calls_per_key(round_robin_calls_per_key)
+            if self.key_rotation_mode == "round_robin"
+            else 1
+        )
+        self.resource_exhausted_retries = (
+            _resolve_ai_studio_resource_exhausted_retries(resource_exhausted_retries)
+        )
         self._clients = [genai.Client(api_key=key) for key in self.api_keys]
         self._key_lock = threading.Lock()
+        self._key_file_lock = threading.Lock()
         self._active_key_index = 0
         self._failure_counts: Dict[str, int] = {}
+        self._successful_calls_on_active_key = 0
         self.client = self._clients[0]
 
     @property
@@ -1693,11 +2221,26 @@ class GeminiAIStudioClient(BaseGeminiClient):
         with self._key_lock:
             if self._active_key_index == key_index:
                 self._failure_counts.clear()
+                if (
+                    self.key_rotation_mode == "round_robin"
+                    and len(self._clients) > 1
+                ):
+                    self._successful_calls_on_active_key += 1
+                    if (
+                        self._successful_calls_on_active_key
+                        >= self.round_robin_calls_per_key
+                    ):
+                        self._active_key_index = (
+                            self._active_key_index + 1
+                        ) % len(self._clients)
+                        self._successful_calls_on_active_key = 0
+                        self.client = self._clients[self._active_key_index]
 
     def _record_failure(
         self,
         key_index: int,
         failure_type: str,
+        failure_threshold: int,
     ) -> Tuple[int, bool, bool, int]:
         with self._key_lock:
             if self._active_key_index != key_index:
@@ -1705,14 +2248,64 @@ class GeminiAIStudioClient(BaseGeminiClient):
 
             failure_count = self._failure_counts.get(failure_type, 0) + 1
             self._failure_counts[failure_type] = failure_count
-            threshold_reached = failure_count >= self.key_failure_threshold
+            threshold_reached = failure_count >= failure_threshold
             rotated = threshold_reached and len(self._clients) > 1
             if rotated:
                 self._active_key_index = (self._active_key_index + 1) % len(self._clients)
+                self._successful_calls_on_active_key = 0
             if threshold_reached:
                 self._failure_counts.clear()
                 self.client = self._clients[self._active_key_index]
             return failure_count, threshold_reached, rotated, self._active_key_index
+
+    def _get_failure_policy(
+        self,
+        exc: Exception,
+        failure_type: str,
+    ) -> Tuple[str, int]:
+        """Choose a separate pool and threshold for known AI Studio 429s."""
+        if failure_type != "http_429":
+            return failure_type, self.key_failure_threshold
+
+        message = _get_ai_studio_provider_message(exc).lower()
+        if "you exceeded your current quota" in message:
+            return "ai_studio_quota_exceeded", 1
+        if re.search(r"\bresource(?:\s+has\s+been|\s+is)?\s+exhausted\b", message):
+            return (
+                "ai_studio_resource_exhausted",
+                self.resource_exhausted_retries + 1,
+            )
+        return failure_type, self.key_failure_threshold
+
+    def _retire_client(self, client: Any) -> Tuple[Optional[str], int]:
+        """Remove a permanently invalid key from this process's active pool."""
+        with self._key_lock:
+            try:
+                key_index = self._clients.index(client)
+            except ValueError:
+                return None, len(self._clients)
+
+            retired_key = self.api_keys.pop(key_index)
+            self._clients.pop(key_index)
+            self._failure_counts.clear()
+            self._successful_calls_on_active_key = 0
+            if self._clients:
+                self._active_key_index = key_index % len(self._clients)
+                self.client = self._clients[self._active_key_index]
+            else:
+                self._active_key_index = 0
+                self.client = None
+            return retired_key, len(self._clients)
+
+    def _remove_retired_key_from_file(self, api_key: str) -> bool:
+        """Persist a retired key only when this client loaded the configured text file."""
+        if self._api_key_file_path is None:
+            return False
+        with self._key_file_lock:
+            return _remove_google_ai_studio_api_key_from_file(
+                self._api_key_file_path,
+                api_key,
+            )
 
     def chat(
         self,
@@ -1725,8 +2318,12 @@ class GeminiAIStudioClient(BaseGeminiClient):
         retry_counts: Dict[str, int] = {}
         total_attempts = 0
         exhausted_keys = 0
+        completed_rounds = 0
 
-        while exhausted_keys < len(self._clients):
+        while (
+            self.max_rotation_rounds == -1
+            or completed_rounds < self.max_rotation_rounds
+        ):
             key_index, client = self._active_client()
             tracker = get_usage_tracker()
             failure_duration_before = tracker.current_failure_duration()
@@ -1749,6 +2346,39 @@ class GeminiAIStudioClient(BaseGeminiClient):
                 )
                 total_attempts += 1
                 last_exception = exc
+                if _is_ai_studio_permanently_invalid_key_error(exc):
+                    total_keys = len(self._clients)
+                    retired_key, remaining_keys = self._retire_client(client)
+                    if retired_key is None:
+                        # Another concurrent call already retired this client.
+                        continue
+                    try:
+                        removed_from_file = self._remove_retired_key_from_file(retired_key)
+                    except OSError as file_exc:
+                        logger.error(
+                            "Failed to remove a permanently invalid AI Studio key from its file: %s",
+                            file_exc,
+                        )
+                        removed_from_file = False
+
+                    logger.warning(
+                        "%d/%d | %s | critical project or credential error | %s",
+                        key_index + 1,
+                        total_keys,
+                        _get_retry_failure_type(exc).removeprefix("http_"),
+                        "removed" if removed_from_file else "retired",
+                    )
+                    if remaining_keys:
+                        get_usage_tracker().record_retry()
+                        continue
+                    raise LLMRetryExhaustedError(
+                        "Google AI Studio call has no usable API keys after a permanent credential error",
+                        last_exception=exc,
+                        attempts=total_attempts,
+                        failure_type=_get_retry_failure_type(exc),
+                        retry_counts=retry_counts,
+                    )
+
                 retryable, reason = _is_google_ai_studio_retryable(exc)
                 if not retryable:
                     logger.error(
@@ -1758,48 +2388,70 @@ class GeminiAIStudioClient(BaseGeminiClient):
                     raise
 
                 failure_type = _get_retry_failure_type(exc)
+                failure_pool, failure_threshold = self._get_failure_policy(
+                    exc,
+                    failure_type,
+                )
                 key_attempt, threshold_reached, rotated, active_index = self._record_failure(
                     key_index,
-                    failure_type,
+                    failure_pool,
+                    failure_threshold,
                 )
                 retry_counts[failure_type] = retry_counts.get(failure_type, 0) + 1
                 if threshold_reached:
                     exhausted_keys += 1
+                    if exhausted_keys == len(self._clients):
+                        completed_rounds += 1
+                        exhausted_keys = 0
+                        if (
+                            self.max_rotation_rounds != -1
+                            and completed_rounds >= self.max_rotation_rounds
+                        ):
+                            break
                 if rotated:
                     logger.warning(
-                        "Google AI Studio API key %d/%d reached %d/%d for %s; "
-                        "rotating to key %d/%d.",
+                        "%d/%d | %s | %s | rotating",
                         key_index + 1,
                         len(self._clients),
-                        key_attempt,
-                        self.key_failure_threshold,
-                        failure_type,
-                        active_index + 1,
-                        len(self._clients),
+                        failure_type.removeprefix("http_"),
+                        _format_rotation_error(exc),
                     )
                     get_usage_tracker().record_retry()
+                    _sleep_after_failure(AI_STUDIO_KEY_ROTATION_DELAY_SECONDS)
                     continue
                 if threshold_reached:
-                    break
+                    # A one-key pool can repeat only when another round is allowed.
+                    get_usage_tracker().record_retry()
+                    _sleep_after_failure(AI_STUDIO_KEY_ROTATION_DELAY_SECONDS)
+                    continue
 
                 backoff_attempt = max(key_attempt, 1)
-                delay = min(
-                    GEMINI_RETRY_INITIAL_DELAY * (2 ** (backoff_attempt - 1)),
-                    GEMINI_RETRY_MAX_DELAY,
-                )
-                _log_retry_attempt(
+                delay = _get_exponential_retry_delay(
                     backoff_attempt,
-                    self.key_failure_threshold,
-                    delay,
-                    exc,
-                    reason,
-                    failure_type=failure_type,
                 )
+                if failure_pool == "ai_studio_resource_exhausted":
+                    logger.warning(
+                        "%d/%d | 429 | %s | retrying %d/%d",
+                        key_index + 1,
+                        len(self._clients),
+                        _format_rotation_error(exc),
+                        key_attempt,
+                        self.resource_exhausted_retries,
+                    )
+                else:
+                    _log_retry_attempt(
+                        backoff_attempt,
+                        failure_threshold,
+                        delay,
+                        exc,
+                        reason,
+                        failure_type=failure_type,
+                    )
                 get_usage_tracker().record_retry()
                 _sleep_after_failure(delay)
 
         raise LLMRetryExhaustedError(
-            "Google AI Studio call failed after trying every configured API key",
+            "Google AI Studio call failed after exhausting configured key rotation rounds",
             last_exception=last_exception,
             attempts=total_attempts,
             failure_type=_get_retry_failure_type(last_exception),
@@ -1900,7 +2552,7 @@ class GeminiHybridClient(BaseGeminiClient):
                         self.vertex_client,
                         "service_account_failure_threshold",
                         service_account_failure_threshold
-                        or GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES,
+                        or LLM_MAX_RETRIES,
                     )
                 ]
                 * vertex_account_count
@@ -2019,9 +2671,8 @@ class GeminiHybridClient(BaseGeminiClient):
                     get_usage_tracker().record_retry()
                     continue
 
-                delay = min(
-                    GEMINI_RETRY_INITIAL_DELAY * (2 ** (max(transport_attempt, 1) - 1)),
-                    GEMINI_RETRY_MAX_DELAY,
+                delay = _get_exponential_retry_delay(
+                    max(transport_attempt, 1),
                 )
                 _log_retry_attempt(
                     max(transport_attempt, 1),
@@ -2052,6 +2703,7 @@ def create_llm_client(
     """Create LLM client."""
     provider_map = {
         "openai": OpenAIClient,
+        "openrouter": OpenRouterClient,
         "modal": ModalClient,
         "azure": AzureOpenAIClient,
         "anthropic": AnthropicClient,
@@ -2090,6 +2742,7 @@ __all__ = [
     "BaseLLMClient",
     # Client implementations
     "OpenAIClient",
+    "OpenRouterClient",
     "ModalClient",
     "AzureOpenAIClient",
     "AnthropicClient",
@@ -2107,8 +2760,13 @@ __all__ = [
     "InvalidLLMResponseError",
     # Factory functions
     "create_llm_client",
+    "extract_usage_token_counts",
     "format_messages",
     # Retry config
+    "LLM_MAX_RETRIES",
+    "LLM_RETRY_INITIAL_DELAY",
+    "LLM_RETRY_MAX_DELAY",
+    "LLM_RETRY_DELAY_CAP_SECONDS",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_RETRY_MIN_DELAY",
     "DEFAULT_RETRY_MAX_DELAY",
@@ -2122,11 +2780,14 @@ __all__ = [
     "HYBRID_GEMINI_PROVIDER",
     "GEMINI_PROVIDERS",
     "with_retry",
+    "run_with_llm_retry",
     "run_with_gemini_retry",
     "is_vertex_gemini_provider",
     "is_google_ai_studio_provider",
     "is_hybrid_gemini_provider",
     "is_vertex_batch_provider",
+    "is_openrouter_batch_provider",
+    "is_batch_provider",
     "is_gemini_provider",
     "get_google_ai_studio_api_keys",
     "get_google_service_account_files",

@@ -6,8 +6,15 @@ from types import SimpleNamespace
 from benchmarks.base import EvaluationUnit
 from benchmarks.medmemorybench.dataset import MedQuery, MedSession
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from metrics import MetricResult
 from src.result import EvaluationReport, ResultCollector
-from utils.llm_client import EmptyGeminiResponseError, LLMAPIError, LLMRetryExhaustedError
+from utils.llm_client import (
+    EmptyGeminiResponseError,
+    LLMAPIError,
+    LLMResponse,
+    LLMRetryExhaustedError,
+    get_usage_tracker,
+)
 
 
 def _retry_exhausted():
@@ -130,6 +137,195 @@ def test_api_failures_are_saved_outside_result_and_query_files(tmp_path):
     assert "failures" not in result_data
     assert query_data["queries"] == []
     assert failure_data["failures"] == [failure]
+
+
+def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_path):
+    collector = ResultCollector()
+    batch_result = MetricResult(
+        query_id="batch-query",
+        query_type="entity_exact_match",
+        score=1.0,
+        is_correct=True,
+        model_output="batch answer",
+        expected_answer="answer",
+        retrieved_count=1,
+        retrieved_memories=[{"memory_id": "m1", "content": "large payload"}],
+        details={
+            "artifact_references": {
+                "memory_snapshot": {"build_id": "build-1"},
+                "answer": {
+                    "transport": "batch",
+                    "manifest_path": "batch/answers.json",
+                    "request_id": "request-batch-query",
+                },
+                "judge": {
+                    "transport": "batch",
+                    "manifest_path": "batch/judges.json",
+                    "request_id": "judge-batch-query",
+                },
+            },
+            "execution_usage": {
+                "answer": {
+                    "transport": "batch",
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                },
+                "judge": {"input_tokens": 20, "output_tokens": 5},
+            },
+        },
+    )
+    realtime_result = MetricResult(
+        query_id="realtime-query",
+        query_type="temporal_localization",
+        score=0.5,
+        is_correct=False,
+        model_output="realtime answer",
+        expected_answer="answer",
+        retrieved_count=1,
+        retrieved_memories=[{"memory_id": "m2", "content": "raw only once"}],
+    )
+    collector.add_result(batch_result, context_id=1)
+    collector.add_result(realtime_result, context_id=2)
+    report = EvaluationReport(
+        method_name="amem_test",
+        model_name="model",
+        dataset_name="medmemorybench",
+        start_time="start",
+        end_time="end",
+        duration_seconds=1.0,
+        summary={
+            "total": 2,
+            "correct": 1,
+            "overall_accuracy": 0.5,
+            "overall_avg_score": 0.75,
+            "by_type": {"entity_exact_match": {"total": 1}},
+            "by_metric": {"exact_match": {"total": 1}},
+        },
+        detailed_results=[batch_result.to_dict(), realtime_result.to_dict()],
+        metadata={"evaluation_coverage": {"expected_queries": 2, "complete": True}},
+    )
+
+    _, _, query_path = collector.save_reports(
+        report,
+        tmp_path,
+        [],
+        include_memory_build=False,
+    )
+
+    query_data = json.loads(query_path.read_text())
+    assert query_data["version"] == 2
+    assert query_data["summary"]["overall_accuracy"] == 0.5
+    assert query_data["summary"]["evaluation_coverage"]["complete"] is True
+    batch_query, realtime_query = query_data["queries"]
+    assert "retrieved_memories" not in batch_query
+    assert batch_query["retrieved_memory_ids"] == ["m1"]
+    assert batch_query["retrieval_reference"] == {
+        "source": "answer_batch_manifest",
+        "manifest_path": "batch/answers.json",
+        "request_id": "request-batch-query",
+        "prepared_query_key": "prepared_query",
+    }
+    assert batch_query["execution_usage"]["judge"]["output_tokens"] == 5
+    assert batch_query["timing"] == {
+        "kind": "per_request_latency_unavailable_for_batch",
+        "query_time_seconds": 0.0,
+        "answer_provider_duration_seconds": None,
+    }
+    assert realtime_query["retrieval_reference"] == {
+        "source": "retrieval_records",
+        "record_id": "realtime-query",
+    }
+    retrieval_path = query_path.with_name(
+        query_path.name.replace("_query_answer.json", "_retrieval_records.json")
+    )
+    retrieval_data = json.loads(retrieval_path.read_text())
+    assert retrieval_data["records"][0]["retrieved_memories"] == [
+        {"memory_id": "m2", "content": "raw only once"}
+    ]
+
+
+def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path):
+    tracker = get_usage_tracker()
+    tracker.reset()
+    for operation, tokens in (
+        ("query.retrieval_preparation", (11, 2)),
+        ("query.answer_batch", (101, 12)),
+        ("query.judge_batch", (21, 3)),
+    ):
+        tracker.set_phase("query")
+        with tracker.scope(operation):
+            tracker.record(LLMResponse(
+                content="ok",
+                input_tokens=tokens[0],
+                output_tokens=tokens[1],
+                model="test-model",
+            ))
+
+    manifest_path = tmp_path / "batch.json"
+    manifest_path.write_text(json.dumps({
+        "project": "openrouter",
+        "provider": "openrouter",
+        "model": "test-model",
+        "jobs": {
+            "query-final": {
+                "state": "completed",
+                "submitted_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": "2026-01-01T00:00:03+00:00",
+                "requests": [{"request_id": "q1"}],
+                "responses": {
+                    "q1": {
+                        "input_tokens": 101,
+                        "output_tokens": 12,
+                        "visible_output_tokens": 12,
+                        "thinking_tokens": 0,
+                        "status": "",
+                    }
+                },
+            }
+        },
+    }), encoding="utf-8")
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.output_dir = tmp_path
+    evaluator.method_config = SimpleNamespace(
+        model=SimpleNamespace(
+            provider="openrouter",
+            name="test-model",
+            openrouter_service_tier="flex",
+        )
+    )
+    evaluator._batch_client = SimpleNamespace(manifest_path=manifest_path)
+    evaluator._judge_batch_client = None
+
+    stage_usage = evaluator._stage_usage_report(tracker.get_stats())
+
+    assert stage_usage["retrieval_preparation"]["usage"]["input_tokens"] == 11
+    assert stage_usage["answer"]["usage"]["output_tokens"] == 12
+    assert stage_usage["judge"]["usage"]["input_tokens"] == 21
+    assert stage_usage["unattributed_query_usage"]["call_count"] == 0
+    assert stage_usage["batch_stages"] == [{
+        "stage": "query-final",
+        "manifest_path": "batch.json",
+        "transport": "batch",
+        "provider": "openrouter",
+        "model": "test-model",
+        "state": "completed",
+        "request_count": 1,
+        "response_count": 1,
+        "successful_response_count": 1,
+        "failed_response_count": 0,
+        "retry_count": 0,
+        "submitted_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:00:03+00:00",
+        "remote_elapsed_seconds": 3.0,
+        "token_usage": {
+            "input_tokens": 101,
+            "output_tokens": 12,
+            "visible_output_tokens": 12,
+            "thinking_tokens": 0,
+        },
+        "fallback_reason": None,
+    }]
+    assert stage_usage["answer"]["cost"]["available"] is False
 
 
 def test_true_duration_subtracts_measured_api_failure_time(tmp_path):

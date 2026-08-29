@@ -64,6 +64,8 @@ def _snapshot_agent(system, *, agent_class=AMemAgent, context_id=4):
     agent.amem_build_max_context_tokens = 1234
     agent.amem_max_context_tokens = 1234
     agent.amem_chunk_size_tokens = 321
+    if agent_class is AMemTestAgent:
+        agent.amem_note_level = "turn"
     agent._amem_backend = "openai"
     agent._amem_model = "build-model"
     agent._amem_systems = {context_id: system}
@@ -249,12 +251,51 @@ def test_amem_test_snapshot_declares_enabled_experimental_features():
     state = agent.export_memory_state(context_id=4)
 
     assert state["experimental_features"] == {
+        "note_level": "turn",
         "original_evolution": False,
         "typed_relations": True,
         "temporal_state": True,
         "provenance": True,
         "provenance_inject_raw_text": False,
     }
+
+
+def test_amem_test_snapshot_rejects_different_note_level():
+    system = _robust_system()
+    system.original_evolution_enabled = False
+    system.typed_relations_enabled = False
+    system.temporal_state_enabled = False
+    system.provenance_enabled = False
+    agent = _snapshot_agent(system, agent_class=AMemTestAgent)
+    agent.amem_original_evolution = False
+    agent.amem_typed_relations = False
+    agent.amem_temporal_state = False
+    agent.amem_provenance = False
+
+    state = agent.export_memory_state(context_id=4)
+    agent.amem_note_level = "session"
+
+    with pytest.raises(ValueError, match="note level"):
+        agent.import_memory_state(state, context_id=4)
+
+
+def test_amem_test_accepts_legacy_turn_snapshot_without_note_level():
+    system = _robust_system()
+    system.original_evolution_enabled = False
+    system.typed_relations_enabled = False
+    system.temporal_state_enabled = False
+    system.provenance_enabled = False
+    agent = _snapshot_agent(system, agent_class=AMemTestAgent)
+    agent.amem_original_evolution = False
+    agent.amem_typed_relations = False
+    agent.amem_temporal_state = False
+    agent.amem_provenance = False
+
+    state = agent.export_memory_state(context_id=4)
+    state["config"].pop("note_level")
+    state["experimental_features"].pop("note_level")
+
+    agent.import_memory_state(state, context_id=4)
 
 
 class _StageManager:
@@ -401,8 +442,11 @@ def test_evaluator_orders_build_save_load_retrieve_answer_and_isolates_units(tmp
     memory_dir = evaluator._memory_snapshot_run_dir
     first_payload = json.loads((memory_dir / "persona_1_unit_0.json").read_text())
     second_payload = json.loads((memory_dir / "persona_1_unit_1.json").read_text())
+    manifest = json.loads((memory_dir / "manifest.json").read_text())
     assert first_payload["memory_state"]["notes"] == ["unit-one"]
     assert second_payload["memory_state"]["notes"] == ["unit-one", "unit-two"]
+    assert manifest["snapshots"][0]["integrity_hash"] == first_payload["integrity_hash"]
+    assert manifest["snapshots"][0]["embedding_sha256"] == ""
     assert evaluator._memory_build_logs[0]["memory_snapshot"].endswith("persona_1_unit_0.json")
     assert evaluator._memory_build_logs[1]["memory_snapshot"].endswith("persona_1_unit_1.json")
 

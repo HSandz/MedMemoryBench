@@ -23,6 +23,22 @@ def _true_duration_seconds(report: "EvaluationReport") -> float:
     )
 
 
+def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, Any]:
+    """Avoid presenting unavailable batch per-request latency as a real zero."""
+    efficiency = dict(report.summary.get("efficiency", {}))
+    stage_usage = report.metadata.get("stage_usage", {})
+    batch_stages = stage_usage.get("batch_stages", []) if isinstance(stage_usage, dict) else []
+    if not batch_stages:
+        return efficiency
+    efficiency["query_time_kind"] = "per_request_latency_unavailable_for_batch"
+    efficiency["stage_wall_time_seconds"] = {
+        name: (stage_usage.get(name, {}).get("usage", {}).get("wall_time"))
+        for name in ("retrieval_preparation", "answer", "judge")
+    }
+    efficiency["batch_stage_count"] = len(batch_stages)
+    return efficiency
+
+
 @dataclass
 class EvaluationReport:
     """Evaluation report data structure."""
@@ -125,6 +141,18 @@ class ResultCollector:
         """Save evaluation metrics file (result.json)."""
         filepath = output_dir / f"{prefix}_result.json"
 
+        result_summary = {
+            "total_queries": report.summary.get("total", 0),
+            "correct_count": report.summary.get("correct", 0),
+            "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
+            "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
+            "by_type": report.summary.get("by_type", {}),
+            "by_metric": report.summary.get("by_metric", {}),
+        }
+        metric_groups = report.summary.get("metric_groups")
+        if isinstance(metric_groups, dict) and metric_groups:
+            result_summary["metric_groups"] = metric_groups
+
         result_data = {
             "method_name": report.method_name,
             "model_name": report.model_name,
@@ -133,15 +161,8 @@ class ResultCollector:
             "end_time": report.end_time,
             "duration_seconds": report.duration_seconds,
             "true_duration_seconds": _true_duration_seconds(report),
-            "summary": {
-                "total_queries": report.summary.get("total", 0),
-                "correct_count": report.summary.get("correct", 0),
-                "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
-                "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
-                "by_type": report.summary.get("by_type", {}),
-                "by_metric": report.summary.get("by_metric", {}),
-            },
-            "efficiency": report.summary.get("efficiency", {}),
+            "summary": result_summary,
+            "efficiency": _efficiency_with_timing_semantics(report),
             "memory_build_summary": report.metadata.get("memory_build_summary", {}),
             "build_metrics": report.metadata.get("build_metrics", {}),
             "memory_size": report.metadata.get("memory_size", {}),
@@ -149,6 +170,7 @@ class ResultCollector:
                 "feature_configuration", {}
             ),
             "llm_usage": report.metadata.get("llm_usage", {}),
+            "stage_usage": report.metadata.get("stage_usage", {}),
             "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
             "config": {
                 "evaluation_mode": report.metadata.get("evaluation_mode", ""),
@@ -325,6 +347,7 @@ class ResultCollector:
                 "feature_configuration", {}
             ),
             "llm_usage": report.metadata.get("llm_usage", {}),
+            "stage_usage": report.metadata.get("stage_usage", {}),
             "memory_chunk_size": report.metadata.get("memory_chunk_size"),
             "total_units": len(processed_units),
             "units": processed_units,
@@ -349,9 +372,63 @@ class ResultCollector:
             for context_id, results in self._results_by_context.items()
             for result in results
         }
+        retrieval_records = []
         query_details = []
         for index, result in enumerate(report.detailed_results):
             result_object = self._results[index] if index < len(self._results) else None
+            retrieved_memories = result.get("retrieved_memories", [])
+            if not isinstance(retrieved_memories, list):
+                retrieved_memories = []
+            memory_ids = []
+            for memory in retrieved_memories:
+                if not isinstance(memory, dict):
+                    continue
+                memory_id = memory.get("memory_id", memory.get("id"))
+                if memory_id is not None:
+                    memory_ids.append(str(memory_id))
+            details = result.get("details", {})
+            if not isinstance(details, dict):
+                details = {}
+            artifact_references = details.get("artifact_references", {})
+            if not isinstance(artifact_references, dict):
+                artifact_references = {}
+            execution_usage = details.get("execution_usage", {})
+            if not isinstance(execution_usage, dict):
+                execution_usage = {}
+            answer_usage = execution_usage.get("answer", {})
+            if not isinstance(answer_usage, dict):
+                answer_usage = {}
+            answer_reference = artifact_references.get("answer", {})
+            if not isinstance(answer_reference, dict):
+                answer_reference = {}
+            has_batch_retrieval = bool(
+                answer_reference.get("transport") == "batch"
+                and answer_reference.get("manifest_path")
+                and answer_reference.get("request_id")
+            )
+            retrieval_reference: Dict[str, Any]
+            if has_batch_retrieval:
+                retrieval_reference = {
+                    "source": "answer_batch_manifest",
+                    "manifest_path": answer_reference["manifest_path"],
+                    "request_id": answer_reference["request_id"],
+                    "prepared_query_key": "prepared_query",
+                }
+            elif retrieved_memories:
+                retrieval_records.append({
+                    "query_id": result.get("query_id", ""),
+                    "context_id": (
+                        context_by_result.get(id(result_object))
+                        if result_object is not None else None
+                    ),
+                    "retrieved_memories": retrieved_memories,
+                })
+                retrieval_reference = {
+                    "source": "retrieval_records",
+                    "record_id": result.get("query_id", ""),
+                }
+            else:
+                retrieval_reference = {"source": "none"}
             query_detail = {
                 "context_id": (
                     context_by_result.get(id(result_object))
@@ -365,10 +442,28 @@ class ResultCollector:
                 "model_output": result.get("model_output", ""),
                 "score": result.get("score", 0.0),
                 "is_correct": result.get("is_correct", False),
-                "retrieved_memories": result.get("retrieved_memories", []),
                 "retrieved_count": result.get("retrieved_count", 0),
+                "retrieved_memory_ids": memory_ids,
+                "retrieval_reference": retrieval_reference,
                 "query_time": result.get("query_time", 0.0),
-                "evaluation_details": result.get("details", {}),
+                "execution_references": artifact_references,
+                "execution_usage": execution_usage,
+                "timing": {
+                    "kind": (
+                        "per_request_latency_unavailable_for_batch"
+                        if answer_usage.get("transport") == "batch"
+                        else "end_to_end_local"
+                    ),
+                    "query_time_seconds": result.get("query_time", 0.0),
+                    "answer_provider_duration_seconds": answer_usage.get(
+                        "duration_seconds"
+                    ),
+                },
+                "evaluation_details": {
+                    key: value
+                    for key, value in details.items()
+                    if key not in {"artifact_references", "execution_usage"}
+                },
             }
             query_details.append(query_detail)
 
@@ -387,23 +482,54 @@ class ResultCollector:
                     by_context[ctx_id]["query_ids"].append(result.query_id)
                     break
 
+        retrieval_records_path = None
+        if retrieval_records:
+            retrieval_records_path = output_dir / f"{prefix}_retrieval_records.json"
+            retrieval_data = {
+                "format": "medmemorybench.query_retrieval_records",
+                "version": 1,
+                "method_name": report.method_name,
+                "model_name": report.model_name,
+                "dataset_name": report.dataset_name,
+                "records": retrieval_records,
+            }
+            with open(retrieval_records_path, "w", encoding="utf-8") as f:
+                json.dump(retrieval_data, f, ensure_ascii=False, indent=2)
+
+        query_summary = {
+            "total_queries": len(query_details),
+            "correct_count": sum(1 for q in query_details if q["is_correct"]),
+            "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
+            "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
+            "by_type": report.summary.get("by_type", {}),
+            "by_metric": report.summary.get("by_metric", {}),
+            "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
+            "stage_usage": report.metadata.get("stage_usage", {}),
+            "efficiency": _efficiency_with_timing_semantics(report),
+            "total_query_time": sum(q["query_time"] for q in query_details),
+            "avg_query_time": (
+                sum(q["query_time"] for q in query_details) / len(query_details)
+                if query_details else 0.0
+            ),
+            "avg_retrieved_count": (
+                sum(q["retrieved_count"] for q in query_details) / len(query_details)
+                if query_details else 0.0
+            ),
+        }
+        metric_groups = report.summary.get("metric_groups")
+        if isinstance(metric_groups, dict) and metric_groups:
+            query_summary["metric_groups"] = metric_groups
+
         query_answer_data = {
+            "format": "medmemorybench.query_answers",
+            "version": 2,
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,
-            "summary": {
-                "total_queries": len(query_details),
-                "correct_count": sum(1 for q in query_details if q["is_correct"]),
-                "total_query_time": sum(q["query_time"] for q in query_details),
-                "avg_query_time": (
-                    sum(q["query_time"] for q in query_details) / len(query_details)
-                    if query_details else 0.0
-                ),
-                "avg_retrieved_count": (
-                    sum(q["retrieved_count"] for q in query_details) / len(query_details)
-                    if query_details else 0.0
-                ),
-            },
+            "summary": query_summary,
+            "retrieval_records_path": (
+                retrieval_records_path.name if retrieval_records_path is not None else None
+            ),
             "by_context": by_context,
             "queries": query_details,
         }

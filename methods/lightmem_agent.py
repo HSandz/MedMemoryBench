@@ -89,6 +89,8 @@ class TrackedMemoryManager:
         usage_info = {
             "prompt_tokens": response.input_tokens,
             "completion_tokens": response.output_tokens,
+            "visible_output_tokens": response.visible_output_tokens,
+            "thinking_tokens": response.thinking_tokens,
             "total_tokens": response.input_tokens + response.output_tokens,
         }
 
@@ -402,6 +404,7 @@ class LightMemAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Initialize LLM client for LightMem internal operations (memory extraction)
@@ -412,6 +415,7 @@ class LightMemAgent(BaseAgent):
             max_tokens=lightmem_max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # LightMem instances per context_id

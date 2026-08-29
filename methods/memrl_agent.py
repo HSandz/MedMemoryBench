@@ -23,6 +23,7 @@ from utils.llm_client import (
     is_gemini_provider,
     LLMResponse,
 )
+from utils.batch_client import create_batch_client
 from utils.vertex_batch import (
     BatchChatRequest,
     VertexBatchClient,
@@ -411,6 +412,7 @@ class MemRLAgent(BaseAgent):
             or self.BIGMODEL_BASE_URL
         )
         self._provider = provider
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
 
         # Batch is limited to the independent script-generation map phase.
         # Ordered memory writes and all value/Q updates still use MemRL's
@@ -432,6 +434,7 @@ class MemRLAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Progress tracker
@@ -478,6 +481,17 @@ class MemRLAgent(BaseAgent):
             "temperature": self.memrl_extractor_temperature,
             "max_tokens": self.memrl_extractor_max_tokens,
         }
+        if self._provider == "openrouter":
+            extra_body = {
+                key: value
+                for key, value in (
+                    ("provider", self._llm_client_kwargs.get("provider_routing")),
+                    ("service_tier", self._llm_client_kwargs.get("service_tier")),
+                )
+                if value is not None
+            } or None
+            llm_config["extra_body"] = extra_body
+            extractor_config["extra_body"] = extra_body
         if use_gemini:
             llm_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
             extractor_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
@@ -636,7 +650,7 @@ class MemRLAgent(BaseAgent):
             return None
         if self._vertex_batch_client is None:
             manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
-            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+            self._vertex_batch_client = create_batch_client(
                 self._llm_client,
                 gcs_uri=self._vertex_batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -648,6 +662,7 @@ class MemRLAgent(BaseAgent):
                 wait=self._vertex_batch_wait,
                 config_hash=self._vertex_batch_config_hash,
                 progress_callback=self._vertex_batch_progress_callback,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._vertex_batch_client
 
@@ -680,14 +695,14 @@ class MemRLAgent(BaseAgent):
                 )
             )
 
-        logger.info("[Vertex Batch] Stage '%s': prepared %d MemRL script request(s).", stage, len(requests))
+        logger.info("[Batch] Stage '%s': prepared %d MemRL script request(s).", stage, len(requests))
         responses = batch_client.run_stage(stage, requests)
         contents: Dict[int, str] = {}
         for index, request_id in request_by_index.items():
             response = responses.get(request_id)
             if response is None or response.status or not response.content:
                 logger.warning(
-                    "[Vertex Batch] MemRL script %d was incomplete; using the original real-time builder for it.",
+                    "[Batch] MemRL script %d was incomplete; using the original real-time builder for it.",
                     index,
                 )
                 continue

@@ -34,12 +34,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
 from utils.llm_client import (
-    EmptyGeminiResponseError,
+    EmptyLLMResponseError,
     GeminiVertexClient,
     create_llm_client,
     get_usage_tracker,
-    run_with_gemini_retry,
+    run_with_llm_retry,
 )
+from utils.batch_client import create_batch_client
 from utils.vertex_batch import BatchChatRequest, VertexBatchClient, make_request_id, scoped_manifest_path
 
 # Setup
@@ -126,7 +127,13 @@ class _RotatingVertexChatModel(ChatGoogleGenerativeAI):
         )
 
 
-def _get_chat_model(model_name: str, temperature: float = 0.7, max_tokens: int = 100, callbacks=None):
+def _get_chat_model(
+    model_name: str,
+    temperature: float = 0.7,
+    max_tokens: int = 100,
+    callbacks=None,
+    llm_client_kwargs: Optional[Dict[str, Any]] = None,
+):
     """Create Chat model instance with provider auto-detection."""
     model_lower = model_name.lower()
 
@@ -164,6 +171,17 @@ def _get_chat_model(model_name: str, temperature: float = 0.7, max_tokens: int =
         kwargs["base_url"] = base_url
     if callbacks:
         kwargs["callbacks"] = callbacks
+    client_options = llm_client_kwargs or {}
+    extra_body = {}
+    if client_options.get("provider_routing") is not None:
+        extra_body["provider"] = client_options["provider_routing"]
+    if client_options.get("service_tier") is not None:
+        extra_body["service_tier"] = client_options["service_tier"]
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+
+    # LangChain's retry budget is disabled so all providers use LLM_MAX_RETRIES.
+    kwargs["max_retries"] = 0
 
     return ChatOpenAI(**kwargs)
 
@@ -179,11 +197,10 @@ class AnswerCheck(BaseModel):
     answer: str = Field(description="The current answer based on the context")
 
 
-def _invoke_realtime_chain(chain, inputs: Any, is_gemini: bool):
-    """Invoke a LangChain runnable without bypassing Gemini retry policy."""
-    if is_gemini:
-        return run_with_gemini_retry(chain.invoke, inputs)
-    return chain.invoke(inputs)
+def _invoke_realtime_chain(chain, inputs: Any, _is_gemini: bool):
+    """Invoke a LangChain runnable through the shared provider retry policy."""
+    return run_with_llm_retry(chain.invoke, inputs)
+
 
 class DocumentProcessor:
     """Processes documents into chunks and creates embeddings."""
@@ -629,35 +646,30 @@ class QueryEngine:
         response_chain = response_prompt | self.llm
 
         truncated_context = self._truncate_context(context)
-        if self.is_gemini:
-            def generate_answer():
-                response = response_chain.invoke(
-                    {"query": query, "context": truncated_context}
+
+        def generate_answer():
+            response = response_chain.invoke(
+                {"query": query, "context": truncated_context}
+            )
+            response_text = getattr(response, "content", response)
+            if not str(response_text or "").strip():
+                metadata = getattr(response, "response_metadata", {}) or {}
+                prompt_feedback = metadata.get("prompt_feedback", {})
+                if not isinstance(prompt_feedback, dict):
+                    prompt_feedback = {}
+                diagnostics = {
+                    "finish_reason": metadata.get("finish_reason"),
+                    "block_reason": prompt_feedback.get("block_reason"),
+                    "model_name": metadata.get("model_name"),
+                }
+                raise EmptyLLMResponseError(
+                    "GraphRAG final-answer request completed without text "
+                    f"(provider metadata: {diagnostics})."
                 )
-                response_text = getattr(response, "content", response)
-                if not str(response_text or "").strip():
-                    metadata = getattr(response, "response_metadata", {}) or {}
-                    prompt_feedback = metadata.get("prompt_feedback", {})
-                    if not isinstance(prompt_feedback, dict):
-                        prompt_feedback = {}
-                    diagnostics = {
-                        "finish_reason": metadata.get("finish_reason"),
-                        "block_reason": prompt_feedback.get("block_reason"),
-                        "model_name": metadata.get("model_name"),
-                    }
-                    raise EmptyGeminiResponseError(
-                        "GraphRAG final-answer request completed without text "
-                        f"(Vertex metadata: {diagnostics})."
-                    )
-                return response
+            return response
 
-            return run_with_gemini_retry(generate_answer)
+        return run_with_llm_retry(generate_answer)
 
-        response = response_chain.invoke(
-            {"query": query, "context": truncated_context}
-        )
-
-        return response
 
 class GraphRAG:
     """Main GraphRAG system coordinating document processing, graph building, and querying."""
@@ -675,6 +687,7 @@ class GraphRAG:
         callbacks: List = None,
         batch_client: Optional[VertexBatchClient] = None,
         batch_stage_prefix: str = "graphrag-concepts",
+        llm_client_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.retrieve_num = retrieve_num
         self.temperature = temperature
@@ -690,6 +703,7 @@ class GraphRAG:
             temperature=temperature,
             max_tokens=max_tokens,
             callbacks=self._callbacks,
+            llm_client_kwargs=llm_client_kwargs,
         )
 
         # Initialize components
@@ -779,6 +793,7 @@ class GraphRAGAgent(BaseAgent):
         self._api_key = api_key
         self._base_url = base_url
         self._provider = provider
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
 
         self._embedding_model = embedding_model or embedding_model_path
         self._embedding_provider = embedding_provider
@@ -830,6 +845,7 @@ class GraphRAGAgent(BaseAgent):
             batch_stage_prefix=(
                 f"graphrag-concepts-context-{self._context_id or 0}-build-{self._graph_build_index}"
             ),
+            llm_client_kwargs=self._llm_client_kwargs,
         )
 
     def _get_concept_batch_client(self) -> Optional[VertexBatchClient]:
@@ -844,9 +860,10 @@ class GraphRAGAgent(BaseAgent):
                 max_tokens=self.max_tokens,
                 api_key=self._api_key,
                 base_url=self._base_url,
+                **self._llm_client_kwargs,
             )
             manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
-            self._vertex_batch_client = VertexBatchClient.from_gemini_client(
+            self._vertex_batch_client = create_batch_client(
                 llm_client,
                 gcs_uri=self._vertex_batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -858,6 +875,7 @@ class GraphRAGAgent(BaseAgent):
                 wait=self._vertex_batch_wait,
                 config_hash=self._vertex_batch_config_hash,
                 progress_callback=self._vertex_batch_progress_callback,
+                vertex_batch_class=VertexBatchClient,
             )
         return self._vertex_batch_client
 

@@ -7,8 +7,8 @@ from src.config import MethodConfig, DatasetConfig, get_api_config
 from methods.base import MemoryBuildResult, AgentResponse
 from utils.llm_client import (
     get_usage_tracker,
+    is_batch_provider,
     is_gemini_provider,
-    is_vertex_batch_provider,
 )
 
 
@@ -66,17 +66,46 @@ class AgentManager:
         self._initialize_agent()
 
     def _initialize_agent(self) -> None:
-        matched_method = None
-        for method_key in self.SUPPORTED_METHODS:
-            if method_key in self.method_name:
-                matched_method = method_key
-                break
-
-        if matched_method is None:
-            matched_method = "long_context"
+        matched_method = self._matched_method_key(self.method_name)
 
         module_path, class_name = self.SUPPORTED_METHODS[matched_method]
         self._agent = self._create_agent_instance(module_path, class_name, matched_method)
+
+    @classmethod
+    def _matched_method_key(cls, method_name: str) -> str:
+        """Return the adapter key selected for a configured method name."""
+        normalized_name = method_name.lower()
+        for method_key in cls.SUPPORTED_METHODS:
+            if method_key in normalized_name:
+                return method_key
+        return "long_context"
+
+    @classmethod
+    def resolve_effective_init_params(
+        cls,
+        method_config: MethodConfig,
+        dataset_config: DatasetConfig,
+        *,
+        batch_api: bool = False,
+        batch_gcs_uri: Optional[str] = None,
+        batch_wait: bool = False,
+        batch_manifest_dir: Optional[Path] = None,
+        batch_config_hash: str = "",
+    ) -> tuple[str, Dict[str, Any]]:
+        """Resolve adapter kwargs without constructing an agent or making provider calls."""
+        manager = cls.__new__(cls)
+        manager.method_config = method_config
+        manager.dataset_config = dataset_config
+        manager.method_name = method_config.method_name.lower()
+        manager._batch_api = batch_api
+        manager._batch_gcs_uri = batch_gcs_uri
+        manager._batch_wait = batch_wait
+        manager._batch_manifest_dir = batch_manifest_dir
+        manager._batch_config_hash = batch_config_hash
+        manager._batch_progress_callback = None
+        manager._api_config = get_api_config()
+        method_key = cls._matched_method_key(manager.method_name)
+        return method_key, manager._build_agent_params(method_key)
 
     def _create_agent_instance(self, module_path: str, class_name: str, method_key: str):
         import importlib
@@ -85,6 +114,43 @@ class AgentManager:
 
         init_params = self._build_agent_params(method_key)
         return agent_class(**init_params)
+
+    def _resolve_model_runtime(
+        self,
+        model_config,
+    ) -> tuple[Optional[str], str, Dict[str, Any]]:
+        """Resolve credentials, endpoint, and provider options for one model block."""
+        api_key = model_config.api_key
+        provider = model_config.provider.lower()
+        if not is_gemini_provider(provider):
+            if provider == "modal":
+                api_key = api_key or getattr(self._api_config, "modal_api_key", "")
+            elif provider == "openrouter":
+                api_key = api_key or getattr(
+                    self._api_config, "openrouter_api_key", ""
+                )
+            else:
+                api_key = api_key or getattr(self._api_config, "openai_api_key", "")
+
+        configured_base_url = getattr(self._api_config, "openai_base_url", "")
+        if provider == "modal":
+            configured_base_url = getattr(self._api_config, "modal_base_url", "")
+        elif provider == "openrouter":
+            configured_base_url = getattr(self._api_config, "openrouter_base_url", "")
+
+        client_kwargs: Dict[str, Any] = {}
+        reasoning_effort = getattr(model_config, "reasoning_effort", None)
+        if reasoning_effort is not None:
+            client_kwargs["reasoning_effort"] = reasoning_effort
+        if provider == "openrouter":
+            if model_config.openrouter_provider is not None:
+                client_kwargs["provider_routing"] = dict(
+                    model_config.openrouter_provider
+                )
+            if model_config.openrouter_service_tier is not None:
+                client_kwargs["service_tier"] = model_config.openrouter_service_tier
+
+        return api_key, model_config.base_url or configured_base_url, client_kwargs
 
     def _build_agent_params(self, method_key: str) -> Dict[str, Any]:
         model_config = self.method_config.model
@@ -110,17 +176,7 @@ class AgentManager:
         )
 
         effective_max_tokens = model_config.max_completion_tokens or model_config.max_tokens
-
-        api_key = model_config.api_key
-        if not is_gemini_provider(model_config.provider):
-            if model_config.provider.lower() == "modal":
-                api_key = api_key or self._api_config.modal_api_key
-            else:
-                api_key = api_key or self._api_config.openai_api_key
-
-        configured_base_url = self._api_config.openai_base_url
-        if model_config.provider.lower() == "modal":
-            configured_base_url = self._api_config.modal_base_url
+        api_key, base_url, llm_client_kwargs = self._resolve_model_runtime(model_config)
 
         params = {
             "model": model_config.name,
@@ -128,15 +184,28 @@ class AgentManager:
             "max_tokens": effective_max_tokens,
             "provider": model_config.provider,
             "api_key": api_key,
-            "base_url": (
-                model_config.base_url
-                or configured_base_url
-            ),
+            "base_url": base_url,
         }
+        if llm_client_kwargs:
+            params["llm_client_kwargs"] = llm_client_kwargs
+
+        build_model_config = self.method_config.memorize_model
+        if build_model_config is not None:
+            build_api_key, build_base_url, build_client_kwargs = (
+                self._resolve_model_runtime(build_model_config)
+            )
+            build_max_tokens = (
+                build_model_config.max_completion_tokens
+                or build_model_config.max_tokens
+            )
+        else:
+            build_api_key = build_base_url = None
+            build_client_kwargs = {}
+            build_max_tokens = None
 
         if (
             self._batch_api
-            and is_vertex_batch_provider(model_config.provider)
+            and is_batch_provider(model_config.provider)
             and method_key in {"lightmem", "remem", "graph_rag", "memrl"}
         ):
             params.update({
@@ -193,14 +262,25 @@ class AgentManager:
         elif method_key == "amem_fix":
             params.update({
                 "retrieve_num": agent_params.get("retrieve_num", 10),
-                "amem_backend": agent_params.get("amem_backend", "openai"),
-                "amem_model": agent_params.get("amem_model", model_config.name),
+                "amem_backend": agent_params.get(
+                    "amem_backend",
+                    build_model_config.provider if build_model_config else "openai",
+                ),
+                "amem_model": agent_params.get(
+                    "amem_model",
+                    build_model_config.name if build_model_config else model_config.name,
+                ),
                 "amem_embedding_model": agent_params.get(
                     "amem_embedding_model", "all-MiniLM-L6-v2"
                 ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get("amem_max_tokens", 1000),
-                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_max_tokens": agent_params.get(
+                    "amem_max_tokens", build_max_tokens or 1000
+                ),
+                "amem_temperature": agent_params.get(
+                    "amem_temperature",
+                    build_model_config.temperature if build_model_config else 0.7,
+                ),
                 "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
                 "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
                 "amem_build_max_context_tokens": agent_params.get(
@@ -215,14 +295,25 @@ class AgentManager:
         elif method_key == "amem_test":
             params.update({
                 "retrieve_num": agent_params.get("retrieve_num", 10),
-                "amem_backend": agent_params.get("amem_backend", "openai"),
-                "amem_model": agent_params.get("amem_model", model_config.name),
+                "amem_backend": agent_params.get(
+                    "amem_backend",
+                    build_model_config.provider if build_model_config else "openai",
+                ),
+                "amem_model": agent_params.get(
+                    "amem_model",
+                    build_model_config.name if build_model_config else model_config.name,
+                ),
                 "amem_embedding_model": agent_params.get(
                     "amem_embedding_model", "all-MiniLM-L6-v2"
                 ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get("amem_max_tokens", 1000),
-                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_max_tokens": agent_params.get(
+                    "amem_max_tokens", build_max_tokens or 1000
+                ),
+                "amem_temperature": agent_params.get(
+                    "amem_temperature",
+                    build_model_config.temperature if build_model_config else 0.7,
+                ),
                 "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
                 "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
                 "amem_build_max_context_tokens": agent_params.get(
@@ -231,7 +322,11 @@ class AgentManager:
                 "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
                 "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
                 "amem_query_keywords": agent_params.get("amem_query_keywords", True),
+                "amem_regex_intent_conditioning": agent_params.get(
+                    "amem_regex_intent_conditioning", True
+                ),
                 "amem_expand_links": agent_params.get("amem_expand_links", True),
+                "amem_note_level": agent_params.get("amem_note_level", "turn"),
                 "amem_original_evolution": agent_params.get(
                     "amem_original_evolution", True
                 ),
@@ -364,16 +459,27 @@ class AgentManager:
         elif method_key == "amem":
             params.update({
                 "retrieve_num": agent_params.get("retrieve_num", 5),
-                "amem_backend": agent_params.get("amem_backend", "openai"),
-                "amem_model": agent_params.get("amem_model", model_config.name),
+                "amem_backend": agent_params.get(
+                    "amem_backend",
+                    build_model_config.provider if build_model_config else "openai",
+                ),
+                "amem_model": agent_params.get(
+                    "amem_model",
+                    build_model_config.name if build_model_config else model_config.name,
+                ),
                 "amem_embedding_model": (
                     env_embedding_model
                     if use_env_amem_embedding
                     else amem_embedding_model
                 ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get("amem_max_tokens"),
-                "amem_temperature": agent_params.get("amem_temperature", 0.7),
+                "amem_max_tokens": agent_params.get(
+                    "amem_max_tokens", build_max_tokens
+                ),
+                "amem_temperature": agent_params.get(
+                    "amem_temperature",
+                    build_model_config.temperature if build_model_config else 0.7,
+                ),
                 "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
                 "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
                 "amem_build_max_context_tokens": agent_params.get(
@@ -711,6 +817,15 @@ class AgentManager:
                 if self.method_config.embedding.model_path:
                     params["embedding_model_path"] = self.method_config.embedding.model_path
 
+        if build_model_config is not None and method_key in {
+            "amem", "amem_fix", "amem_test"
+        }:
+            params.update({
+                "amem_api_key": build_api_key,
+                "amem_base_url": build_base_url,
+                "amem_llm_client_kwargs": build_client_kwargs,
+            })
+
         return params
 
     def send_message(
@@ -740,7 +855,7 @@ class AgentManager:
         if callable(adapter_support) and not adapter_support():
             return False
         return bool(
-            is_vertex_batch_provider(self.method_config.model.provider)
+            is_batch_provider(self.method_config.model.provider)
             and hasattr(self._agent, "prepare_batch_query")
             and hasattr(self._agent, "finalize_batch_query")
         )
@@ -780,13 +895,15 @@ class AgentManager:
     def prepare_batch_query(self, message: str, **kwargs) -> Dict[str, Any]:
         """Prepare local retrieval and an immutable final-answer request."""
         if not self.supports_batch_queries():
-            raise RuntimeError(f"{self.method_name} does not support Vertex batch queries")
+            raise RuntimeError(f"{self.method_name} does not support batch queries")
         context_id = kwargs.pop("context_id", None)
         if context_id is not None and context_id != self._context_id:
             self._context_id = context_id
             self._agent.set_context_id(context_id)
-        get_usage_tracker().set_phase("query")
-        return self._agent.prepare_batch_query(message, **kwargs)
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
+        with tracker.scope("query.retrieval_preparation"):
+            return self._agent.prepare_batch_query(message, **kwargs)
 
     def supports_staged_queries(self) -> bool:
         """Return whether retrieval and final generation can run separately."""
@@ -803,16 +920,18 @@ class AgentManager:
         context_id = kwargs.pop("context_id", None)
         if context_id is not None and context_id != self._context_id:
             self.set_context_id(context_id)
-        get_usage_tracker().set_phase("query")
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
         from utils.templates import get_template_manager
         template_manager = get_template_manager(self.dataset_config.dataset_name)
         system_message = template_manager.get_system_message()
         started_at = time.time()
-        prepared = self._agent.prepare_batch_query(
-            message,
-            system_message=system_message,
-            **kwargs,
-        )
+        with tracker.scope("query.retrieval_preparation"):
+            prepared = self._agent.prepare_batch_query(
+                message,
+                system_message=system_message,
+                **kwargs,
+            )
         return {"prepared": prepared, "started_at": started_at}
 
     def answer_prepared_query(self, staged_query: Dict[str, Any]) -> Dict[str, Any]:
@@ -820,13 +939,24 @@ class AgentManager:
         if not self.supports_staged_queries():
             raise RuntimeError(f"{self.method_name} does not support staged queries")
         prepared = staged_query["prepared"]
-        response = self._agent._llm_client.chat(prepared["messages"])
+        tracker = get_usage_tracker()
+        tracker.set_phase("query")
+        with tracker.scope("query.answer_realtime"):
+            response = self._agent._llm_client.chat(prepared["messages"])
         finalized = self._agent.finalize_batch_query(prepared, response.content)
         return {
             "output": finalized.output,
             "query_time": time.time() - staged_query["started_at"],
             "retrieved_count": finalized.retrieved_count,
             "retrieved_memories": finalized.retrieved_memories,
+            "answer_usage": {
+                "transport": "realtime",
+                "input_tokens": getattr(response, "input_tokens", 0),
+                "output_tokens": getattr(response, "output_tokens", 0),
+                "visible_output_tokens": getattr(response, "visible_output_tokens", 0),
+                "thinking_tokens": getattr(response, "thinking_tokens", 0),
+                "duration_seconds": getattr(response, "latency", None),
+            },
         }
 
     def finalize_batch_query(
@@ -896,11 +1026,12 @@ class AgentManager:
 
         start_time = time.time()
 
-        response = self._agent.query(
-            message,
-            system_message=system_message,
-            **kwargs,
-        )
+        with get_usage_tracker().scope("query.answer_realtime"):
+            response = self._agent.query(
+                message,
+                system_message=system_message,
+                **kwargs,
+            )
 
         query_time = time.time() - start_time
 

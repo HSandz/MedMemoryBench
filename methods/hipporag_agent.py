@@ -360,6 +360,7 @@ class HippoRAGAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Per-context instance pool: {context_id: HippoRAG}

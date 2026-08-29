@@ -10,7 +10,7 @@ Key differences from the original:
   - Graceful degradation: evolution failure -> memory stored without evolution
 """
 
-from typing import List, Dict, Optional, Literal, Any
+from typing import List, Dict, Optional, Literal, Any, Union
 import json
 import re
 import uuid
@@ -22,7 +22,12 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 
 from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
-from utils.llm_client import LLMAPIError, ModalModelNotReadyError, get_usage_tracker
+from utils.llm_client import (
+    LLMAPIError,
+    ModalModelNotReadyError,
+    extract_usage_token_counts,
+    get_usage_tracker,
+)
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
     EVOLUTION_DECISION_PROMPT,
@@ -135,6 +140,10 @@ class RobustOpenAIController(RobustBaseLLMController):
         max_tokens: int = 1000,
         usage_tracker: Optional[Any] = None,
         wait_for_model: bool = False,
+        provider_routing: Optional[Dict[str, Any]] = None,
+        service_tier: Optional[str] = None,
+        reasoning_effort: Optional[Union[str, int]] = None,
+        reasoning_in_extra_body: bool = False,
     ):
         try:
             from openai import OpenAI
@@ -143,6 +152,10 @@ class RobustOpenAIController(RobustBaseLLMController):
         self.model = model
         self.max_tokens = max_tokens
         self.usage_tracker = usage_tracker
+        self.provider_routing = provider_routing
+        self.service_tier = service_tier
+        self.reasoning_effort = reasoning_effort
+        self.reasoning_in_extra_body = reasoning_in_extra_body
         if api_key is None:
             api_key = os.getenv('OPENAI_API_KEY')
         if api_key is None:
@@ -163,10 +176,15 @@ class RobustOpenAIController(RobustBaseLLMController):
             return
         try:
             from utils.llm_client import LLMResponse
+            input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+                extract_usage_token_counts(response.usage)
+            )
             llm_response = LLMResponse(
                 content="",
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                visible_output_tokens=visible_output_tokens,
+                thinking_tokens=thinking_tokens,
                 latency=latency,
                 model=self.model,
             )
@@ -191,6 +209,17 @@ class RobustOpenAIController(RobustBaseLLMController):
             params["max_completion_tokens"] = self.max_tokens
         else:
             params["max_tokens"] = self.max_tokens
+        extra_body = {}
+        if self.provider_routing is not None:
+            extra_body["provider"] = self.provider_routing
+        if self.service_tier is not None:
+            extra_body["service_tier"] = self.service_tier
+        if self.reasoning_effort is not None and self.reasoning_in_extra_body:
+            extra_body["reasoning"] = {"effort": self.reasoning_effort}
+        elif self.reasoning_effort is not None:
+            params["reasoning_effort"] = self.reasoning_effort
+        if extra_body:
+            params["extra_body"] = extra_body
         response = self.client.chat.completions.create(**params)
         latency = time.time() - start_time
         self._record_usage(response, latency)
@@ -206,18 +235,28 @@ class RobustGeminiController(RobustBaseLLMController):
         max_tokens: int = 1000,
         provider: str = "gemini",
         temperature: float = 0.7,
+        reasoning_effort: Optional[Union[str, int]] = None,
     ):
         from utils.llm_client import create_llm_client
 
-        self.client = create_llm_client(
-            provider=provider,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        self._client_factory = create_llm_client
+        self._client_kwargs = {
+            "provider": provider,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "reasoning_effort": reasoning_effort,
+        }
+        # Query-only snapshot restores need retrieval state, not build credentials.
+        self.client: Optional[Any] = None
+
+    def _get_client(self) -> Any:
+        if self.client is None:
+            self.client = self._client_factory(**self._client_kwargs)
+        return self.client
 
     def get_completion(self, prompt: str, temperature: Optional[float] = None) -> str:
-        response = self.client.chat(
+        response = self._get_client().chat(
             [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt},
@@ -362,7 +401,7 @@ class RobustLLMController:
     def __init__(self,
                  backend: Literal[
                      "openai", "modal", "gemini", "vertex", "ai_studio",
-                     "ollama", "sglang", "vllm"
+                     "openrouter", "ollama", "sglang", "vllm"
                  ] = "sglang",
                  model: str = "gpt-4",
                  api_key: Optional[str] = None,
@@ -374,8 +413,11 @@ class RobustLLMController:
                  retry_temperature: float = 0.3,
                  connectivity_temperature: float = 0.0,
                  check_connection: bool = False,
-                 usage_tracker: Optional[Any] = None):
-        if backend in {"openai", "modal"}:
+                 usage_tracker: Optional[Any] = None,
+                 provider_routing: Optional[Dict[str, Any]] = None,
+                 service_tier: Optional[str] = None,
+                 reasoning_effort: Optional[Union[str, int]] = None):
+        if backend in {"openai", "openrouter", "modal"}:
             if backend == "modal":
                 api_key = (
                     api_key
@@ -383,14 +425,32 @@ class RobustLLMController:
                     or os.getenv("MODAL_PROXY_TOKEN")
                 )
                 api_base = api_base or os.getenv("MODAL_BASE_URL")
-            self.llm = RobustOpenAIController(
-                model, api_key=api_key, api_base=api_base,
-                max_tokens=max_tokens, usage_tracker=usage_tracker,
-                wait_for_model=backend == "modal",
-            )
+            elif backend == "openrouter":
+                api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+                api_base = (
+                    api_base
+                    or os.getenv("OPENROUTER_BASE_URL")
+                    or "https://openrouter.ai/api/v1"
+                )
+            controller_kwargs = {
+                "api_key": api_key,
+                "api_base": api_base,
+                "max_tokens": max_tokens,
+                "usage_tracker": usage_tracker,
+                "wait_for_model": backend == "modal",
+            }
+            if reasoning_effort is not None:
+                controller_kwargs["reasoning_effort"] = reasoning_effort
+                controller_kwargs["reasoning_in_extra_body"] = backend == "openrouter"
+            if provider_routing is not None:
+                controller_kwargs["provider_routing"] = provider_routing
+            if service_tier is not None:
+                controller_kwargs["service_tier"] = service_tier
+            self.llm = RobustOpenAIController(model, **controller_kwargs)
         elif backend in {"gemini", "vertex", "ai_studio"}:
             self.llm = RobustGeminiController(
-                model, max_tokens=max_tokens, provider=backend, temperature=temperature
+                model, max_tokens=max_tokens, provider=backend, temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
         elif backend == "ollama":
             self.llm = RobustOllamaController(model, max_tokens=max_tokens)
@@ -532,7 +592,10 @@ class RobustAgenticMemorySystem:
                  connectivity_temperature: float = 0.0,
                  max_context_chars: int = 100000,
                  check_connection: bool = False,
-                 usage_tracker: Optional[Any] = None):
+                 usage_tracker: Optional[Any] = None,
+                 provider_routing: Optional[Dict[str, Any]] = None,
+                 service_tier: Optional[str] = None,
+                 reasoning_effort: Optional[Union[str, int]] = None):
 
         self.memories: Dict[str, RobustMemoryNote] = {}
         self.retriever = SimpleEmbeddingRetriever(model_name)
@@ -542,6 +605,9 @@ class RobustAgenticMemorySystem:
             temperature, retry_temperature, connectivity_temperature,
             check_connection,
             usage_tracker=usage_tracker,
+            provider_routing=provider_routing,
+            service_tier=service_tier,
+            reasoning_effort=reasoning_effort,
         )
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold

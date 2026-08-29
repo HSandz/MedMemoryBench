@@ -18,6 +18,7 @@ class BaseLlmConfig(ABC):
         api_key: Optional[str] = None,
         gemini_provider: str = "gemini",
         max_tokens: int = 2000,
+        reasoning_effort: Optional[Union[str, int]] = None,
         top_p: float = 0.1,
         top_k: int = 1,
         enable_vision: bool = False,
@@ -30,6 +31,7 @@ class BaseLlmConfig(ABC):
         openai_base_url: Optional[str] = None,
         site_url: Optional[str] = None,
         app_name: Optional[str] = None,
+        extra_body: Optional[Dict] = None,
         # Ollama specific
         ollama_base_url: Optional[str] = None,
         # AzureOpenAI specific
@@ -95,6 +97,7 @@ class BaseLlmConfig(ABC):
         self.api_key = api_key
         self.gemini_provider = gemini_provider
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
         self.top_p = top_p
         self.top_k = top_k
         self.enable_vision = enable_vision
@@ -110,6 +113,7 @@ class BaseLlmConfig(ABC):
         self.openai_base_url = openai_base_url
         self.site_url = site_url
         self.app_name = app_name
+        self.extra_body = extra_body
 
         # Ollama specific
         self.ollama_base_url = ollama_base_url

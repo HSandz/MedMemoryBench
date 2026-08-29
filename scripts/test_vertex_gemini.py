@@ -55,7 +55,7 @@ def main() -> int:
 
     load_dotenv(PROJECT_ROOT / ".env")
     # One shared-client attempt per loop keeps --count equal to the requested API calls.
-    os.environ["GEMINI_MAX_RETRIES"] = "1"
+    os.environ["LLM_MAX_RETRIES"] = "1"
 
     from utils.llm_client import create_llm_client
 

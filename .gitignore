@@ -10,6 +10,7 @@ methods.before-local-conversion
 .*
 *.env
 !.env.example
+/secrets/
 
 # Generation pipeline
 /generation/.serena

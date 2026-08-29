@@ -113,6 +113,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     temperature: Optional[float] = 1  # TODO: might need to add logics to control this
     top_p: Optional[float] = 1
+    extra_body: Optional[Dict[str, Any]] = None
 
     # function-calling related
     tools: Optional[List[Tool]] = None

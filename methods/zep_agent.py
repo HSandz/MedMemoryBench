@@ -96,6 +96,7 @@ class ZepAgent(BaseAgent):
         self._api_key = api_key
         self._base_url = base_url
         self._provider = provider
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
 
         # Azure config
         self._use_azure = use_azure or bool(os.environ.get("AZURE_OPENAI_ENDPOINT"))
@@ -145,6 +146,7 @@ class ZepAgent(BaseAgent):
                 max_tokens=self.max_tokens,
                 api_key=self._api_key,
                 base_url=self._base_url,
+                **self._llm_client_kwargs,
             )
 
     def _get_ids(self, sub_dataset: str = "default") -> tuple:

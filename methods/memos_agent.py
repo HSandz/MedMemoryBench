@@ -63,6 +63,7 @@ class MemOSAgent(BaseAgent):
 
         self.retrieve_num = retrieve_num
         self._provider = provider.lower()
+        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
         self.memos_backend = memos_backend
         self.memos_model = memos_model or model
         self.memos_temperature = memos_temperature
@@ -108,6 +109,7 @@ class MemOSAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
+            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Memory system instances per context
@@ -175,6 +177,15 @@ class MemOSAgent(BaseAgent):
                 self, "memos_max_tokens", self.DEFAULT_EXTRACTOR_MAX_TOKENS
             ),
         }
+        if self._provider == "openrouter":
+            extractor_config["extra_body"] = {
+                key: value
+                for key, value in (
+                    ("provider", self._llm_client_kwargs.get("provider_routing")),
+                    ("service_tier", self._llm_client_kwargs.get("service_tier")),
+                )
+                if value is not None
+            } or None
         if use_ai_studio or use_hybrid_gemini:
             extractor_config.update({
                 "gemini_provider": self._provider,

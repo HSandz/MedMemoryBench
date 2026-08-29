@@ -24,32 +24,11 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
         self._start_time = time.time()
 
     @staticmethod
-    def _usage_pair(usage: Any) -> tuple[int, int]:
-        """Read OpenAI and Gemini/LangChain usage objects or dictionaries."""
-        if not usage:
-            return 0, 0
+    def _usage_counts(usage: Any) -> tuple[int, int, int, int]:
+        """Read normalized input, total output, visible, and thinking counts."""
+        from utils.llm_client import extract_usage_token_counts
 
-        def get_value(*names: str) -> int:
-            for name in names:
-                value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
-                if value is not None:
-                    return int(value or 0)
-            return 0
-
-        return (
-            get_value(
-                "prompt_tokens",
-                "input_tokens",
-                "prompt_token_count",
-                "promptTokenCount",
-            ),
-            get_value(
-                "completion_tokens",
-                "output_tokens",
-                "candidates_token_count",
-                "candidatesTokenCount",
-            ),
-        )
+        return extract_usage_token_counts(usage)
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         latency = time.time() - self._start_time if self._start_time else 0.0
@@ -57,10 +36,14 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
 
         input_tokens = 0
         output_tokens = 0
+        visible_output_tokens = 0
+        thinking_tokens = 0
 
         if response.llm_output:
             for key in ("token_usage", "usage", "usage_metadata"):
-                input_tokens, output_tokens = self._usage_pair(response.llm_output.get(key))
+                input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+                    self._usage_counts(response.llm_output.get(key))
+                )
                 if input_tokens or output_tokens:
                     break
 
@@ -69,14 +52,18 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
                 for gen in gen_list:
                     if hasattr(gen, "generation_info") and gen.generation_info:
                         for key in ("usage", "usage_metadata", "token_usage"):
-                            input_tokens, output_tokens = self._usage_pair(gen.generation_info.get(key))
+                            input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+                                self._usage_counts(gen.generation_info.get(key))
+                            )
                             if input_tokens or output_tokens:
                                 break
                         if input_tokens or output_tokens:
                             break
 
                     if hasattr(gen, "message") and hasattr(gen.message, "usage_metadata"):
-                        input_tokens, output_tokens = self._usage_pair(gen.message.usage_metadata)
+                        input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+                            self._usage_counts(gen.message.usage_metadata)
+                        )
                         if input_tokens or output_tokens:
                             break
 
@@ -87,7 +74,9 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
                         response_metadata = getattr(gen.message, "response_metadata", None)
                         if isinstance(response_metadata, dict):
                             for key in ("usage_metadata", "usageMetadata", "usage", "token_usage"):
-                                input_tokens, output_tokens = self._usage_pair(response_metadata.get(key))
+                                input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
+                                    self._usage_counts(response_metadata.get(key))
+                                )
                                 if input_tokens or output_tokens:
                                     break
                             if input_tokens or output_tokens:
@@ -109,6 +98,8 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
             content="",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            visible_output_tokens=visible_output_tokens,
+            thinking_tokens=thinking_tokens,
             latency=latency,
             model=self._model_name,
         )
