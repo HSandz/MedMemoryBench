@@ -278,12 +278,14 @@ class MedMemoryBenchEvaluator:
     def _session_retrieval_quality_enabled(self) -> bool:
         """Return whether this run builds session-level experimental A-MEM notes."""
         method_config = getattr(self, "method_config", None)
-        if str(getattr(method_config, "method_name", "")).lower() != "amem_test":
+        if str(getattr(method_config, "method_name", "")).lower() not in {"amem_test", "event_state"}:
             return False
         build_config = getattr(method_config, "build_config", {})
         if not isinstance(build_config, dict):
             build_config = {}
         note_level = str(build_config.get("amem_note_level", "turn"))
+        if str(getattr(method_config, "method_name", "")).lower() == "event_state":
+            return True
         return note_level.strip().lower() == "session"
 
     def _session_retrieval_quality(
@@ -658,7 +660,7 @@ class MedMemoryBenchEvaluator:
         method_name = str(
             getattr(getattr(self, "method_config", None), "method_name", "")
         ).lower()
-        return bool(getattr(self, "force_resume", False) and not method_name.startswith("amem"))
+        return bool(getattr(self, "force_resume", False) and not (method_name.startswith("amem") or method_name == "event_state"))
 
     def _get_evaluation_units(self) -> List[EvaluationUnit]:
         """Return the loaded units without consuming the dataset iterator twice."""
@@ -785,7 +787,7 @@ class MedMemoryBenchEvaluator:
         if (
             not config_matches
             and force_requested
-            and method_name.startswith("amem")
+            and (method_name.startswith("amem") or method_name == "event_state")
         ):
             raise ValueError(
                 "Cannot force-resume an A-MEM run after memory-build configuration "
@@ -2146,12 +2148,12 @@ class MedMemoryBenchEvaluator:
 
         self._init_dataset()
 
-        if self.execution_stage != "all" and not self.method_config.method_name.lower().startswith("amem"):
+        if self.execution_stage != "all" and not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
             raise ValueError(
                 "Separated memory/query execution is currently implemented for AMem methods only"
             )
         if getattr(self, "append", False):
-            if not self.method_config.method_name.lower().startswith("amem"):
+            if not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
                 raise ValueError("--append is currently implemented for AMem methods only")
             self._prepare_append_plan()
 
@@ -2161,7 +2163,7 @@ class MedMemoryBenchEvaluator:
 
         if self.execution_stage == "query":
             self._load_memory_snapshot_manifest()
-        elif not self.dry_run and self.method_config.method_name.lower().startswith("amem"):
+        elif not self.dry_run and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
             self._start_memory_snapshot_manifest(resume_existing=resumed)
 
         # Deferred judge inputs belong to the loaded checkpoint namespace.
@@ -2184,7 +2186,7 @@ class MedMemoryBenchEvaluator:
         if (
             self.execution_stage in {"all", "memory"}
             and not self.dry_run
-            and self.method_config.method_name.lower().startswith("amem")
+            and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state")
         ):
             self._complete_memory_snapshot_manifest()
 
@@ -2675,7 +2677,7 @@ class MedMemoryBenchEvaluator:
                         "method_name",
                         "",
                     )
-                    if method_name == "amem_test":
+                    if method_name in {"amem_test", "event_state"}:
                         experimental_source = {
                             "source_session_id": session.session_id,
                             "source_session_index": idx,

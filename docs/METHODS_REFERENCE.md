@@ -18,6 +18,7 @@ The method controls the write path and read path. The answer model and judge mod
 |---|---|---|---|---|
 | `long_context` | Baseline | Available | Yes | Full retained history with truncation. |
 | `embedding_rag` | Dense RAG | Available | Yes | FAISS/vector retrieval. |
+| `event_state` | Agentic memory | Available | Yes | Immutable episodes plus versioned semantic claims; see `event_state_method.md`. |
 | `bm25_rag` | Sparse RAG | Available | Yes | Lexical BM25 retrieval. |
 | `graph_rag` | Graph RAG | Available | No | May batch internal concept extraction. |
 | `amem` / `amem_fix` / `amem_test` | Agentic memory | Available | Yes | See `AMEM_IMPLEMENTATION.md`. |
@@ -54,6 +55,7 @@ For a fair comparison, pin the complete YAML, answer model, judge provider/model
 
 - **Long context:** simplest control; retains history until its context policy removes older material.
 - **Embedding RAG:** bounded dense retrieval; good for paraphrases but can miss exact terms or negations.
+- **Event-State Hybrid:** preserves source episodes while compressing recurring/evolving claims; dense hybrid retrieval and optional query-only PPR.
 - **BM25 RAG:** deterministic lexical baseline; good for rare names, dates, and medications.
 - **Graph methods:** add extraction, linking, graph traversal, or PPR; expect higher setup cost and more failure points.
 - **Agentic memory:** rewrites or manages memory during ingestion and may use tools at query time.

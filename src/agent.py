@@ -20,6 +20,7 @@ class AgentManager:
         "bm25_rag": ("methods.bm25_rag", "BM25RAGAgent"),
         "amem_fix": ("methods.amem_fix_agent", "AMemFixAgent"),
         "amem_test": ("methods.amem_test_agent", "AMemTestAgent"),
+        "event_state": ("methods.event_state_agent", "EventStateAgent"),
         "amem": ("methods.amem_agent", "AMemAgent"),
         "letta": ("methods.letta_agent", "LettaAgent"),
         "memos": ("methods.memos_agent", "MemOSAgent"),
@@ -471,6 +472,26 @@ class AgentManager:
                     "amem_chain_redundancy_weight", 0.25
                 ),
             })
+
+        elif method_key == "event_state":
+            params.update(agent_params)
+            params.update({
+                "memory_model": build_model_config.name if build_model_config else model_config.name,
+                "memory_provider": build_model_config.provider if build_model_config else model_config.provider,
+                "memory_temperature": build_model_config.temperature if build_model_config else model_config.temperature,
+                "memory_max_tokens": build_max_tokens or effective_max_tokens,
+                "memory_api_key": build_api_key if build_model_config else api_key,
+                "memory_base_url": build_base_url if build_model_config else base_url,
+                "memory_llm_client_kwargs": build_client_kwargs if build_model_config else llm_client_kwargs,
+            })
+            if self.method_config.embedding:
+                params.update({
+                    "embedding_model": self.method_config.embedding.model,
+                    "embedding_provider": self.method_config.embedding.provider,
+                    "embedding_model_path": self.method_config.embedding.model_path,
+                    "embedding_api_key": self.method_config.embedding.api_key,
+                    "embedding_base_url": self.method_config.embedding.base_url,
+                })
 
         elif method_key == "amem":
             params.update({
@@ -1057,6 +1078,7 @@ class AgentManager:
             "query_time": query_time,
             "retrieved_count": response.retrieved_count,
             "retrieved_memories": response.retrieved_memories, 
+            "extra": response.extra,
         }
 
     def reset(self) -> None:

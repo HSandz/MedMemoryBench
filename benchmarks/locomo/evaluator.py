@@ -286,7 +286,7 @@ class LoCoMoEvaluator:
 
                 try:
                     memory_items = []
-                    for session in chunk_sessions:
+                    for session_index, session in enumerate(chunk_sessions):
                         for turn in session.dialogues:
                             memory_item = {
                                 "speaker": turn.get("speaker", "Unknown"),
@@ -294,10 +294,10 @@ class LoCoMoEvaluator:
                                 "blip_caption": turn.get("blip_caption", ""),
                                 "timestamp": session.date_time,
                             }
-                            if self.method_config.method_name == "amem_test":
+                            if self.method_config.method_name in {"amem_test", "event_state"}:
                                 memory_item.update({
                                     "source_session_id": session.session_id,
-                                    "source_session_index": session.session_id,
+                                    "source_session_index": session_index if self.method_config.method_name == "event_state" else session.session_id,
                                     "source_turn_id": turn.get("dia_id"),
                                     "source_event_id": session.metadata.get("session_key"),
                                 })
