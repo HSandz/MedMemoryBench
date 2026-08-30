@@ -18,7 +18,7 @@ from .event_state.prompts import EXTRACTION_SYSTEM_PROMPT
 from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
-from .event_state.subjects import normalize_name, normalize_scope, resolve_subject_id
+from .event_state.subjects import is_canonical_subject_id, normalize_name, normalize_scope, resolve_subject_id
 from .event_state.validation import validated_claim
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,19 @@ class EventStateAgent(BaseAgent):
         role = str(item.get("role")).casefold() if item.get("role") else None
         speaker = item.get("speaker") or {"user": "User", "assistant": "Assistant", "system": "System"}.get(role, "Unknown")
         return NormalizedTurn(item.get("source_turn_id", item.get("turn_id", item.get("dia_id", fallback_index))), session.get("source_session_id"), session.get("source_session_index"), item.get("source_event_id", session.get("source_event_id")), role, str(speaker), "speaker:" + normalize_name(str(speaker)), str(item.get("text", item.get("content", "")) or ""), item.get("image_caption", item.get("blip_caption")), item.get("timestamp", session.get("timestamp")))
+
+    @staticmethod
+    def resolve_claim_source_speaker(raw_claim: Dict[str, Any], normalized_turns: List[NormalizedTurn]) -> Optional[str]:
+        source_ids = set(raw_claim.get("source_turn_ids") or [])
+        source_speakers = []
+        for turn in normalized_turns:
+            if turn.source_turn_id in source_ids and turn.speaker not in source_speakers:
+                source_speakers.append(turn.speaker)
+        if len(source_speakers) == 1:
+            return source_speakers[0]
+        if not source_ids and len({turn.speaker for turn in normalized_turns}) == 1:
+            return normalized_turns[0].speaker
+        return None
 
     @staticmethod
     def _normalize_source_sessions(text: str, memory_items: Optional[List[Dict[str, Any]]], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -170,13 +183,16 @@ class EventStateAgent(BaseAgent):
             pass
         return None
 
+    def truncate_to_tokens(self, text: str, limit: int) -> str:
+        return self._tokenizer.decode(self._tokenizer.encode(text)[:max(0, int(limit))])
+
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
         context_id = kwargs.get("context_id", self._context_id)
         if context_id != self._context_id:
             self.set_context_id(context_id)
         store = self._store(context_id)
         sessions = self._normalize_source_sessions(text, kwargs.get("memory_items"), kwargs)
-        counts = {"episodes_added": 0, "claims_extracted": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        counts = {"episodes_added": 0, "claims_extracted": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
         added_records: List[Dict[str, Any]] = []
         for session in sessions:
             extracted = self._extract(session)
@@ -198,23 +214,26 @@ class EventStateAgent(BaseAgent):
                 continue
             claims: List[Claim] = []
             for index, raw_claim in enumerate(extracted["claims"]):
-                subject_id = resolve_subject_id(raw_claim.get("subject"), session["conversation_scope"], [turn.speaker for turn in normalized], normalized[0].speaker if normalized else None)
+                source_speaker = self.resolve_claim_source_speaker(raw_claim, normalized)
+                raw_subject_id = raw_claim.get("subject_id") if is_canonical_subject_id(raw_claim.get("subject_id")) else None
+                subject_id = resolve_subject_id(raw_subject_id or raw_claim.get("subject"), session["conversation_scope"], [turn.speaker for turn in normalized], source_speaker)
                 persistence = raw_claim["persistence"]
                 claims.append(Claim(store.stable_id("C", [episode_id, index, subject_id, raw_claim["predicate"], raw_claim["value"]]), str(raw_claim.get("subject") or subject_id), subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time), raw_claim.get("valid_to"), raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], subject_id))
             counts["claims_extracted"] += len(claims)
             compiler = StateCompiler(store, self._embedder, self._memory_llm_client, self._build_config["state_candidate_top_k"], self._build_config["state_candidate_min_similarity"], self._build_config["update_min_confidence"], self._build_config["update_temperature"], self._build_config["update_max_tokens"])
             for claim in claims:
+                if claim.confidence < 0.55:
+                    counts["low_extraction_confidence_count"] += 1
                 with get_usage_tracker().scope("event_state.embedding"):
                     claim_embedding = self._embedder.embed_documents([claim.semantic_text()])[0]
                 if not self.enable_state_compilation:
                     store.add_claim(claim, claim_embedding)
                     counts["uncompiled_claim_count"] += 1
                     counts["new_count"] += 1
-                    if claim.confidence < self._build_config["update_min_confidence"]:
-                        counts["low_confidence_new_count"] += 1
                     added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": session["source_session_id"]})
                     continue
-                operation = compiler.apply(claim, episode_id, claim_embedding)
+                compile_result = compiler.apply(claim, episode_id, claim_embedding)
+                operation = compile_result.operation
                 counts["update_llm_calls"] += compiler.update_llm_calls
                 counts["update_parse_failures"] += compiler.update_parse_failures
                 counts[f"{operation.casefold()}_count"] = counts.get(f"{operation.casefold()}_count", 0) + 1
@@ -223,7 +242,7 @@ class EventStateAgent(BaseAgent):
                     added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": session["source_session_id"]})
                 if operation == "EPISODIC":
                     counts["episodic_claims_added"] += 1
-                if operation == "NEW" and claim.confidence < self._build_config["update_min_confidence"]:
+                if operation == "NEW" and compile_result.fallback_reason == "below_confidence_threshold":
                     counts["low_confidence_new_count"] += 1
                 compiler.update_llm_calls = 0
                 compiler.update_parse_failures = 0
@@ -247,7 +266,7 @@ class EventStateAgent(BaseAgent):
             return {"id": episode.episode_id, "type": "episode", "memory": render_episode(episode), "source_session_id": episode.source_session_id, "timestamp": episode.recorded_at, "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "selected_rank": item.get("selected_rank")}
         claim = store.claims[item["id"]]
         evidence = [{"evidence": {"source_session_id": ref.source_session_id, "episode_id": ref.episode_id, "source_turn_ids": ref.source_turn_ids, "support_type": ref.support_type}} for ref in claim.evidence]
-        return {"id": claim.claim_id, "type": "state_claim", "memory": render_claim(claim, store.edges), "subject": claim.subject, "subject_id": claim.subject_id or claim.subject_key, "status": claim.status, "source_session_id": claim.evidence[0].source_session_id if claim.evidence else None, "all_provenance_evidence": evidence, "provenance_evidence": evidence, "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "selected_rank": item.get("selected_rank")}
+        return {"id": claim.claim_id, "type": "state_claim", "memory": render_claim(claim, store.edges), "subject": claim.subject, "subject_id": claim.subject_id or claim.subject_key, "status": claim.status, "source_session_id": claim.evidence[0].source_session_id if claim.evidence else None, "all_provenance_evidence": evidence, "provenance_evidence": evidence[:1], "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "selected_rank": item.get("selected_rank")}
 
     def prepare_batch_query(self, question: str, system_message: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         store = self._store(kwargs.get("context_id"))
@@ -255,21 +274,21 @@ class EventStateAgent(BaseAgent):
             selected, retrieval_extra = EventStateRetriever(store, self._embedder, **self._retrieval_config).retrieve(kwargs.get("raw_question", question))
         records = [self._record(store, item) for item in selected]
         episode_ids = {item["id"] for item in records if item["type"] == "episode"}
-        blocks = [record["memory"] for record in records]
+        blocks = [{"text": record["memory"], "kind": "state" if record["type"] == "state_claim" else "episode", "record_id": record["id"]} for record in records]
         if self.inject_source_evidence:
-            blocks.extend(block for record in records if record["type"] == "state_claim" for block in expand_claim_evidence(store.claims[record["id"]], store.episodes, episode_ids, self.max_source_excerpts_per_claim))
-        included_blocks, included_tokens = fit_context(blocks, system_message or "", question, self.max_context_tokens, self.max_tokens, self.count_tokens)
+            blocks.extend({"text": block, "kind": "source", "record_id": None} for record in records if record["type"] == "state_claim" for block in expand_claim_evidence(store.claims[record["id"]], store.episodes, episode_ids, self.max_source_excerpts_per_claim))
+        instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
+        included_blocks, included_tokens = fit_context(blocks, system_message or "", instruction, question, self.max_context_tokens, self.max_tokens, self.count_tokens, self.truncate_to_tokens)
         included_ids = [record["id"] for record in records if record["memory"] in included_blocks]
         included_evidence_episodes = set(re.findall(r"\[Supporting Evidence ([^ /]+)", "\n".join(included_blocks)))
         included_evidence_episodes.update(record["id"] for record in records if record["type"] == "episode" and record["id"] in included_ids)
         for record in records:
             if record["type"] != "state_claim":
                 continue
-            record["included_provenance_evidence"] = [item for item in record.get("provenance_evidence", []) if item.get("evidence", {}).get("episode_id") in included_evidence_episodes]
+            record["included_provenance_evidence"] = [item for item in record.get("all_provenance_evidence", []) if item.get("evidence", {}).get("episode_id") in included_evidence_episodes]
         context = "\n\n".join(included_blocks)
-        instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
         user_content = f"{instruction}\n\n{context}\n\n{question}" if context else f"{instruction}\n\n{question}"
-        extra = {**retrieval_extra, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": sum(self.count_tokens(block) for block in blocks), "included_context_tokens": included_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
+        extra = {**retrieval_extra, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": sum(self.count_tokens(block["text"]) for block in blocks), "included_context_tokens": included_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
         return {"messages": format_messages(user_content, system_message), "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     @staticmethod

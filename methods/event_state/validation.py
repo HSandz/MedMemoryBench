@@ -58,6 +58,7 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
     return {
         **raw,
         "subject": str(raw.get("subject") or ""),
+        "subject_id": str(raw.get("subject_id") or "").strip(),
         "predicate": predicate.strip(),
         "value": value.strip(),
         "qualifiers": qualifiers,

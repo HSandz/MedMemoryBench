@@ -39,3 +39,17 @@ def test_ppr_expansion_does_not_escape_hop_bound():
     retriever = EventStateRetriever(store, Embedder(), ppr_expand_hops=1)
     result = retriever._ppr_impl([{"id": "C1", "type": "state_claim", "score": 1.0}])
     assert {item["id"] for item in result} == {"C1", "C2"}
+
+
+def test_ppr_follows_claim_episode_claim_and_excludes_disconnected_component():
+    store = EventStateStore("ctx")
+    store.claims = {key: SimpleNamespace() for key in ("C1", "C2", "C99")}
+    store.episodes = {key: SimpleNamespace(source_session_id=key) for key in ("E1", "E99")}
+    store.claim_embeddings = {key: [1.0, 0.0] for key in store.claims}
+    store.episode_embeddings = {key: [1.0, 0.0] for key in store.episodes}
+    store.add_edge("C1", "E1", "CLAIM_SUPPORTED_BY_EPISODE")
+    store.add_edge("E1", "C2", "EPISODE_SUPPORTS_CLAIM")
+    store.add_edge("C99", "E99", "CLAIM_SUPPORTED_BY_EPISODE")
+    retriever = EventStateRetriever(store, Embedder(), ppr_expand_hops=2)
+    result = retriever._ppr_impl([{"id": "C1", "type": "state_claim", "score": 1.0}])
+    assert {item["id"] for item in result} == {"C1", "E1", "C2"}

@@ -29,10 +29,21 @@ def normalize_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").casefold()).strip("_") or "unknown"
 
 
+def is_canonical_subject_id(value: Any) -> bool:
+    lowered = str(value or "").casefold()
+    return lowered in {"primary_user", "general_non_personal"} or lowered.startswith(("speaker:", "third_party:"))
+
+
 def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str] = (), speaker: Optional[str] = None) -> str:
     raw = str(raw_subject or "").strip()
+    canonical = raw.casefold()
+    if canonical in {"primary_user", "general_non_personal"}:
+        return canonical
+    for prefix in ("speaker:", "third_party:"):
+        if canonical.startswith(prefix):
+            return prefix + normalize_name(raw.split(":", 1)[1])
     key = normalize_name(raw)
-    aliases = {"i", "me", "myself", "self", "user", "patient", "the_patient", "primary_user", "primary_patient"}
+    aliases = {"i", "me", "myself", "self", "user", "the_user", "patient", "the_patient", "primary_user", "primary_patient"}
     participant_map = {normalize_name(name): name for name in participants if name}
     if scope == "general_non_personal":
         if key in aliases:

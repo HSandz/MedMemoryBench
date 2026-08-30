@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .embeddings import cosine
@@ -16,6 +16,20 @@ from utils.llm_client import format_messages, get_usage_tracker
 
 OPERATIONS = {"NEW", "DUPLICATE", "CORROBORATE", "REFINE", "SUPERSEDE", "CONFLICT", "EPISODIC"}
 NON_OBSERVATION_MODALITIES = {"planned", "recommended", "hypothetical"}
+
+
+@dataclass
+class CompileResult:
+    operation: str
+    matched_claim_id: Optional[str] = None
+    result_claim_id: Optional[str] = None
+    decision_confidence: Optional[float] = None
+    used_update_llm: bool = False
+    fallback_reason: Optional[str] = None
+
+    def __eq__(self, other: Any) -> bool:
+        return self.operation == (other.operation if isinstance(other, CompileResult) else other)
+
 
 
 def normalized_subject(value: str) -> str:
@@ -75,53 +89,65 @@ class StateCompiler:
             parsed = parse_json(response.content)
         except ValueError:
             self.update_parse_failures += 1
-            return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response"}
+            return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response"}
         operation = str(parsed.get("operation", "NEW")).upper()
         if operation not in OPERATIONS:
             operation = "NEW"
         matched = parsed.get("matched_claim_id")
         known_ids = {item.claim_id for item, _ in candidates}
+        fallback_reason = None
         if matched not in known_ids:
+            fallback_reason = "unknown_matched_claim" if matched is not None else None
             matched = None
         try:
             confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
         except (TypeError, ValueError):
             confidence = 0.0
-        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500]}
+        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason}
 
-    def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float]) -> str:
+    def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float]) -> CompileResult:
         """Compile one observation and return the operation applied."""
         if claim.persistence == "episode" or claim.modality in NON_OBSERVATION_MODALITIES:
             return self._record_new(claim, episode_id, embedding, "EPISODIC", "non-persistent or non-observation claim")
         candidates = self._candidates(claim, embedding)
-        same_content = [item for item, _ in candidates if normalized_content(item) == normalized_content(claim)]
+        current = [(item, score) for item, score in candidates if item.status in {"active", "contested"}]
+        same_content = [item for item, _ in current if normalized_content(item) == normalized_content(claim)]
         if same_content:
             matched = same_content[0]
             support_type = "duplicate" if any(ref.episode_id == episode_id for ref in matched.evidence) else "corroboration"
             operation = "DUPLICATE" if support_type == "duplicate" else "CORROBORATE"
-            self._attach_evidence(matched, claim.evidence[0], support_type)
-            self.store.add_edge(matched.claim_id, claim.evidence[0].episode_id, "CLAIM_SUPPORTED_BY_EPISODE")
-            self.store.add_edge(claim.evidence[0].episode_id, matched.claim_id, "EPISODE_SUPPORTS_CLAIM")
-            return self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
+            self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], support_type)
+            self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
+            return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration")
         if not candidates:
-            return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate")
+            return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate", "no_candidate")
         decision = self._classify(claim, candidates)
         operation, matched_id = decision["operation"], decision["matched_claim_id"]
-        if decision["confidence"] < self.min_confidence or matched_id is None:
+        fallback_reason = decision.get("fallback_reason")
+        if decision["confidence"] < self.min_confidence:
             operation, matched_id = "NEW", None
+            fallback_reason = "below_confidence_threshold"
+        elif matched_id is None and operation != "NEW":
+            operation = "NEW"
+            fallback_reason = fallback_reason or "unknown_matched_claim"
         if operation in {"DUPLICATE", "CORROBORATE"} and matched_id:
             matched = self.store.claims[matched_id]
-            self._attach_evidence(matched, claim.evidence[0], "duplicate" if operation == "DUPLICATE" else "corroboration")
-            return self._audit(claim, episode_id, matched_id, matched_id, operation, decision["confidence"], decision["rationale"])
+            if matched.status not in {"active", "contested"}:
+                operation, matched_id = "NEW", None
+                fallback_reason = "historical_match"
+            else:
+                self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], "duplicate" if operation == "DUPLICATE" else "corroboration")
+                self._audit(claim, episode_id, matched_id, matched_id, operation, decision["confidence"], decision["rationale"])
+                return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason)
         if operation == "EPISODIC":
-            return self._record_new(claim, episode_id, embedding, operation, decision["rationale"])
+            return self._record_new(claim, episode_id, embedding, operation, decision["rationale"], "non_observation")
         self.store.add_claim(claim, list(embedding))
         if matched_id:
             old = self.store.claims[matched_id]
             if operation == "SUPERSEDE":
                 old.status = "superseded"
-                if claim.valid_from or claim.recorded_at:
-                    old.valid_to = claim.valid_from or claim.recorded_at
+                if claim.valid_from:
+                    old.valid_to = claim.valid_from
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "SUPERSEDES")
             elif operation == "REFINE":
                 old.status = "refined"
@@ -129,24 +155,18 @@ class StateCompiler:
             elif operation == "CONFLICT":
                 old.status = claim.status = "contested"
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "CONFLICTS_WITH")
-        return self._audit(claim, episode_id, matched_id, claim.claim_id, operation, decision["confidence"], decision["rationale"])
+        self._audit(claim, episode_id, matched_id, claim.claim_id, operation, decision["confidence"], decision["rationale"])
+        return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason)
 
-    def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str) -> str:
+    def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str, fallback_reason: Optional[str] = None) -> CompileResult:
         if operation == "EPISODIC":
             claim.persistence = "episode"
             claim.status = "standalone"
         elif claim.persistence == "history":
             claim.status = "standalone"
         self.store.add_claim(claim, list(embedding))
-        return self._audit(claim, episode_id, None, claim.claim_id, operation, 1.0, rationale)
-
-    @staticmethod
-    def _attach_evidence(claim: Claim, evidence: EvidenceRef, support_type: str) -> None:
-        for item in claim.evidence:
-            if item.episode_id == evidence.episode_id and item.source_turn_ids == evidence.source_turn_ids:
-                return
-        evidence.support_type = support_type
-        claim.evidence.append(evidence)
+        self._audit(claim, episode_id, None, claim.claim_id, operation, 1.0, rationale)
+        return CompileResult(operation, None, claim.claim_id, 1.0, False, fallback_reason)
 
     def _audit(self, claim: Claim, episode_id: str, matched: Optional[str], result: Optional[str], operation: str, confidence: float, rationale: str) -> str:
         record = StateOperation(operation_id=self.store.stable_id("O", [episode_id, claim.claim_id, len(self.store.operations), operation]), episode_id=episode_id, observation=asdict(claim), matched_claim_id=matched, result_claim_id=result, operation=operation, confidence=confidence, rationale=rationale, recorded_at=claim.recorded_at)

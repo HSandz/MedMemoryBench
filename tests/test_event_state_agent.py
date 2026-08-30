@@ -39,3 +39,20 @@ def test_agent_build_query_snapshot_and_provenance(monkeypatch):
     clone = EventStateAgent(model="query", memory_model="build", embedding_client=FakeEmbedder())
     clone.import_memory_state(state, context_id="sample")
     assert clone.prepare_batch_query("What dose?")["retrieved_memories"] == prepared["retrieved_memories"]
+
+
+def test_agent_routes_low_confidence_classifier_fallback_separately_from_extraction_confidence():
+    outputs = iter([
+        '{"episode_summary":"one","claims":[{"subject":"patient","predicate":"dose","value":"500 mg","confidence":0.95}]}',
+        '{"episode_summary":"two","claims":[{"subject":"patient","predicate":"dose","value":"850 mg","confidence":0.95}]}',
+    ])
+    class LLM:
+        def chat(self, messages, **kwargs):
+            if "Extract conversational memory" in messages[0]["content"]:
+                return SimpleNamespace(content=next(outputs))
+            return SimpleNamespace(content='{"matched_claim_id":"missing","operation":"SUPERSEDE","confidence":0.3}')
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=FakeEmbedder(), state_candidate_min_similarity=0.1)
+    agent.memorize("one", source_session_id=1)
+    result = agent.memorize("two", source_session_id=2)
+    assert result.extra["low_confidence_new_count"] == 1
+    assert result.extra["low_extraction_confidence_count"] == 0

@@ -62,20 +62,42 @@ def expand_claim_evidence(claim: Claim, episodes: Dict[str, Episode], already: s
     return blocks
 
 
-def fit_context(blocks: Sequence[str], system_message: str, question: str, max_context_tokens: int, answer_reserve: int, count_tokens: Any) -> Tuple[List[str], int]:
-    budget = max(0, int(max_context_tokens) - count_tokens(system_message or "") - count_tokens(question) - max(0, int(answer_reserve)) - 32)
+def fit_context(
+    blocks: Sequence[Dict[str, str]],
+    system_message: str,
+    instruction: str,
+    question: str,
+    max_context_tokens: int,
+    answer_reserve: int,
+    count_tokens: Any,
+    truncate_to_tokens: Any,
+) -> Tuple[List[str], int]:
+    """Fit complete state/episode blocks and truncate only source excerpts."""
     included: List[str] = []
-    used = 0
+
+    def total(texts: Sequence[str]) -> int:
+        user_content = instruction + ("\n\n" + "\n\n".join(texts) if texts else "") + "\n\n" + question
+        return count_tokens(system_message or "") + count_tokens(user_content) + max(0, int(answer_reserve))
+
     for block in blocks:
-        tokens = count_tokens(block)
-        if used + tokens <= budget:
-            included.append(block)
-            used += tokens
+        text, kind = block["text"], block.get("kind", "state")
+        if total(included + [text]) <= int(max_context_tokens):
+            included.append(text)
             continue
-        remaining = budget - used
-        if remaining > 20:
-            words = (block.split())[:remaining]
-            included.append(" ".join(words) + "...")
-            used = budget
-        break
-    return included, used
+        if kind != "source":
+            continue
+        remaining = int(max_context_tokens) - total(included)
+        if remaining <= 0:
+            continue
+        low, high, best = 0, max(1, count_tokens(text)), ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = truncate_to_tokens(text, mid)
+            if candidate and total(included + [candidate]) <= int(max_context_tokens):
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best:
+            included.append(best)
+    return included, sum(count_tokens(block) for block in included)

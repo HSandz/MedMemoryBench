@@ -72,3 +72,91 @@ def test_subject_scope_and_non_observation_claims_are_not_merged():
     assert store.claims["U"].status == "active"
     assert store.claims["F"].status == "active"
     assert store.claims["P"].status == "standalone"
+
+
+def test_state_reversion_creates_new_version_instead_of_reactivating_history():
+    decisions = iter([
+        '{"matched_claim_id":"C500","operation":"SUPERSEDE","confidence":0.9}',
+        '{"matched_claim_id":"C850","operation":"SUPERSEDE","confidence":0.9}',
+    ])
+    store = EventStateStore("p")
+    compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
+    c500 = Claim("C500", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s1", "s1", [1])])
+    c850 = Claim("C850", "Alice", "alice", "dose", "850 mg", recorded_at="2024-03-01", evidence=[EvidenceRef("s2", "s2", [2])])
+    c500_again = Claim("C500B", "Alice", "alice", "dose", "500 mg", recorded_at="2024-06-01", evidence=[EvidenceRef("s3", "s3", [3])])
+    assert compiler.apply(c500, "s1", [1.0, 0.0]) == "NEW"
+    assert compiler.apply(c850, "s2", [1.0, 0.0]) == "SUPERSEDE"
+    result = compiler.apply(c500_again, "s3", [1.0, 0.0])
+    assert result.operation == "SUPERSEDE"
+    assert len(store.claims) == 3
+    assert store.claims["C500"].status == "superseded"
+    assert store.claims["C850"].status == "superseded"
+    assert store.claims["C500B"].status == "active"
+
+
+def test_supersede_only_closes_validity_when_valid_from_is_explicit():
+    store = EventStateStore("p")
+    decisions = iter([
+        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","confidence":0.9}',
+        '{"matched_claim_id":"OLD2","operation":"SUPERSEDE","confidence":0.9}',
+    ])
+    compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
+    old = Claim("OLD", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s1", "s1", [1])])
+    old2 = Claim("OLD2", "Alice", "alice", "city", "Seattle", evidence=[EvidenceRef("s2", "s2", [2])])
+    store.add_claim(old, [1.0, 0.0]); store.add_claim(old2, [1.0, 0.0])
+    explicit = Claim("NEW1", "Alice", "alice", "city", "Toronto", recorded_at="2024-06-20", valid_from="2024-06-17", evidence=[EvidenceRef("s3", "s3", [3])])
+    unknown = Claim("NEW2", "Alice", "alice", "city", "Boston", recorded_at="2024-06-20", evidence=[EvidenceRef("s4", "s4", [4])])
+    compiler.apply(explicit, "s3", [1.0, 0.0]); compiler.apply(unknown, "s4", [1.0, 0.0])
+    assert old.valid_to == "2024-06-17"
+    assert old2.valid_to is None
+
+
+def test_llm_classified_corroboration_and_duplicate_keep_graph_edges():
+    store = EventStateStore("p")
+    decisions = iter([
+        '{"matched_claim_id":"OLD","operation":"CORROBORATE","confidence":0.9}',
+        '{"matched_claim_id":"OLD","operation":"DUPLICATE","confidence":0.9}',
+    ])
+    compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
+    old = Claim("OLD", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s1", "s1", [1])])
+    store.add_claim(old, [1.0, 0.0])
+    for cid, session, value in (("C2", "s2", "500 milligrams"), ("C3", "s3", "500mg")):
+        result = compiler.apply(Claim(cid, "Alice", "alice", "dose", value, evidence=[EvidenceRef(session, session, [2])]), session, [1.0, 0.0])
+        assert result.operation in {"CORROBORATE", "DUPLICATE"}
+    assert len(store.claims["OLD"].evidence) == 3
+    for session in ("s1", "s2", "s3"):
+        assert {edge["relation_type"] for edge in store.edges if edge["source_id"] == "OLD" and edge["target_id"] == session} == {"CLAIM_SUPPORTED_BY_EPISODE"}
+        assert {edge["relation_type"] for edge in store.edges if edge["source_id"] == session and edge["target_id"] == "OLD"} == {"EPISODE_SUPPORTS_CLAIM"}
+
+
+def test_low_confidence_classifier_falls_back_to_new_with_reason():
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s1", "s1", [1])])
+    store.add_claim(old, [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","confidence":0.3}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1, min_confidence=0.55)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "dose", "850 mg", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
+    assert result.operation == "NEW"
+    assert result.fallback_reason == "below_confidence_threshold"
+    assert store.claims["OLD"].status == "active"
+
+
+def test_classifier_cannot_reactivate_historical_claim_via_duplicate():
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "dose", "500 mg", status="superseded", evidence=[EvidenceRef("s1", "s1", [1])])
+    store.add_claim(old, [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","confidence":0.9}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
+    assert result.operation == "NEW"
+    assert len(store.claims["OLD"].evidence) == 1
+
+
+def test_store_invariant_checker_reports_missing_nodes_and_embeddings():
+    store = EventStateStore("p")
+    store.claims["C"] = Claim("C", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("MISSING", "s", [1])])
+    store.add_edge("C", "MISSING", "CLAIM_SUPPORTED_BY_EPISODE")
+    errors = store.validate_state_invariants()
+    assert any("missing node" in error for error in errors)
+    assert any("missing claim embedding" in error for error in errors)
+    assert any("missing evidence episode" in error for error in errors)

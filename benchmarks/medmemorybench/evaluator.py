@@ -314,11 +314,39 @@ class MedMemoryBenchEvaluator:
     ) -> Optional[Dict[str, Any]]:
         if not self._session_retrieval_quality_enabled():
             return None
-        return compute_session_retrieval_quality(
+        quality = compute_session_retrieval_quality(
             retrieved_memories=retrieved_memories,
             source_key_points=getattr(query, "source_key_points", []),
             metadata=getattr(query, "metadata", {}),
         )
+        if str(getattr(self.method_config, "method_name", "")).lower() != "event_state":
+            return quality
+        visible_records = []
+        for record in retrieved_memories:
+            copied = copy.deepcopy(record)
+            if copied.get("type") == "state_claim":
+                copied["provenance_evidence"] = copied.get("included_provenance_evidence", [])
+            visible_records.append(copied)
+        lineage_records = []
+        for record in retrieved_memories:
+            copied = copy.deepcopy(record)
+            if copied.get("type") == "state_claim":
+                copied["provenance_evidence"] = copied.get("all_provenance_evidence", [])
+            lineage_records.append(copied)
+        quality["claim_lineage"] = compute_session_retrieval_quality(
+            retrieved_memories=lineage_records,
+            source_key_points=getattr(query, "source_key_points", []),
+            metadata=getattr(query, "metadata", {}),
+        )
+        quality["answer_visible"] = compute_session_retrieval_quality(
+            retrieved_memories=visible_records,
+            source_key_points=getattr(query, "source_key_points", []),
+            metadata=getattr(query, "metadata", {}),
+        )
+        quality["retrieval_quality_claim_lineage"] = quality["claim_lineage"]
+        quality["retrieval_quality_answer_visible"] = quality["answer_visible"]
+        quality["provenance_semantics"] = "selected claim origin plus selected episodes; answer_visible uses included evidence only"
+        return quality
 
     @staticmethod
     def _attach_session_retrieval_quality(

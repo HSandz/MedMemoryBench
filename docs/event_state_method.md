@@ -7,6 +7,12 @@ unresolved contradictions remain contested. Retrieval independently searches
 claims and episode summaries, fuses ranks, and selects a small top-k/MMR
 evidence set. Optional typed PPR is query-only and does not alter snapshots.
 
+Claim self-references are resolved from cited source turns, so alternating
+named speakers remain separate subject namespaces. Repeating an older
+superseded value creates a new version and never reactivates the historical
+node. Evidence references and claim/episode graph edges are maintained through
+one store operation.
+
 Snapshots use schema version 2. Version 1 snapshots are rejected rather than
 silently reinterpreted; rebuild the memory when upgrading from the prototype
 format. Claims retain canonical subject IDs and lifecycle statuses (`active`,
@@ -50,3 +56,7 @@ claims expose `all_provenance_evidence` for complete lineage and
 When enabled, source expansion follows claim references to compact turn
 excerpts, prefers referenced turn IDs, and deduplicates episodes already in
 the selected context.
+
+The evaluator keeps the legacy session metric for compatibility and adds
+Event-State `claim_lineage` (all evidence attached to selected claims) and
+`answer_visible` (only evidence present in the final prompt) diagnostics.

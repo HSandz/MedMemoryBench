@@ -53,5 +53,8 @@ retrieval_config:
   selector_mode: state_mmr
   evidence_count: 8
   mmr_lambda: 0.7
+  state_relation_bonus: 0.05
+  source_diversity_bonus: 0.02
+  representation_balance_bonus: 0.02
   inject_source_evidence: true
   max_source_excerpts_per_claim: 2

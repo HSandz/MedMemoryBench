@@ -8,6 +8,7 @@ from methods.event_state.schemas import Claim, EvidenceRef
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import normalize_scope, resolve_subject_id
 from methods.event_state.validation import validated_claim
+from methods.event_state.context import fit_context
 from utils.llm_client import LLMAPIError
 
 
@@ -35,6 +36,31 @@ def test_scope_and_subject_aliases_do_not_contaminate_primary_user():
     assert resolve_subject_id("the patient", "primary_user") == "primary_user"
     assert resolve_subject_id("Mary", "general_non_personal") == "third_party:mary"
     assert resolve_subject_id("I", "primary_user", ["Alice"], "Alice") == "speaker:alice"
+    assert resolve_subject_id("primary_user", "primary_user") == "primary_user"
+    assert resolve_subject_id("the user", "primary_user") == "primary_user"
+    assert resolve_subject_id("speaker:Alice", "primary_user") == "speaker:alice"
+    assert resolve_subject_id("third_party:Mary", "primary_user") == "third_party:mary"
+
+
+def test_claim_source_speaker_comes_from_referenced_turns():
+    session = {"source_session_id": 1}
+    turns = [
+        EventStateAgent.normalize_turn({"speaker": "Alice", "text": "I went to Boston", "source_turn_id": "a"}, 0, session),
+        EventStateAgent.normalize_turn({"speaker": "Bob", "text": "I moved to Seattle", "source_turn_id": "b"}, 1, session),
+    ]
+    assert EventStateAgent.resolve_claim_source_speaker({"subject": "I", "source_turn_ids": ["a"]}, turns) == "Alice"
+    assert EventStateAgent.resolve_claim_source_speaker({"subject": "I", "source_turn_ids": ["b"]}, turns) == "Bob"
+    assert EventStateAgent.resolve_claim_source_speaker({"subject": "I", "source_turn_ids": ["a", "b"]}, turns) is None
+
+
+def test_locomo_self_references_are_scoped_to_their_source_speaker():
+    class LLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content='{"episode_summary":"two speakers","claims":[{"subject":"I","predicate":"visited","value":"Boston","source_turn_ids":["a"]},{"subject":"I","predicate":"moved","value":"Seattle","source_turn_ids":["b"]}]}')
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    agent.memorize("", memory_items=[{"speaker": "Alice", "text": "I visited Boston", "source_turn_id": "a"}, {"speaker": "Bob", "text": "I moved to Seattle", "source_turn_id": "b"}], source_session_id=1)
+    subjects = {claim.predicate: claim.subject_id for claim in agent._store().claims.values()}
+    assert subjects == {"visited": "speaker:alice", "moved": "speaker:bob"}
 
 
 def test_extraction_prompt_contains_turn_role_speaker_and_ids(monkeypatch):
@@ -131,3 +157,23 @@ def test_source_evidence_is_expanded_and_budget_keeps_question_intact():
     prepared = agent.prepare_batch_query("What dose does the user take?", raw_question="What dose does the user take?")
     assert prepared["messages"][-1]["content"].endswith("What dose does the user take?")
     assert prepared["extra"]["included_provenance_evidence"]
+
+
+def test_context_budget_accounts_for_instruction_system_question_and_reserve():
+    count = lambda text: len(text.split())
+    truncate = lambda text, limit: " ".join(text.split()[:limit])
+    blocks, memory_tokens = fit_context(
+        [{"text": "STATE metadata stays complete", "kind": "state"}, {"text": "source one two three four five six", "kind": "source"}],
+        "system words",
+        "instruction words",
+        "complete question words",
+        18,
+        2,
+        count,
+        truncate,
+    )
+    assert blocks[0] == "STATE metadata stays complete"
+    assert blocks[1].startswith("source") and len(blocks[1].split()) < 7
+    final_user = "instruction words\n\n" + "\n\n".join(blocks) + "\n\ncomplete question words"
+    assert count("system words") + count(final_user) + 2 <= 18
+    assert final_user.endswith("complete question words")

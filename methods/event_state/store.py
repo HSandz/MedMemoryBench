@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional
 
 from .schemas import Claim, Episode, StateOperation, claim_from_dict, episode_from_dict
@@ -38,8 +38,49 @@ class EventStateStore:
         self.claims[claim.claim_id] = claim
         self.claim_embeddings[claim.claim_id] = list(embedding)
         for evidence in claim.evidence:
-            self.add_edge(claim.claim_id, evidence.episode_id, "CLAIM_SUPPORTED_BY_EPISODE")
-            self.add_edge(evidence.episode_id, claim.claim_id, "EPISODE_SUPPORTS_CLAIM")
+            self.attach_claim_evidence(claim.claim_id, evidence, evidence.support_type)
+
+    def attach_claim_evidence(self, claim_id: str, evidence: Any, support_type: str = "origin") -> bool:
+        """Attach one provenance reference and keep the heterogeneous graph in sync."""
+        claim = self.claims[claim_id]
+        normalized = replace(evidence, support_type=support_type)
+        for existing in claim.evidence:
+            if existing.episode_id == normalized.episode_id and existing.source_turn_ids == normalized.source_turn_ids:
+                self.add_edge(claim_id, normalized.episode_id, "CLAIM_SUPPORTED_BY_EPISODE")
+                self.add_edge(normalized.episode_id, claim_id, "EPISODE_SUPPORTS_CLAIM")
+                return False
+        claim.evidence.append(normalized)
+        self.add_edge(claim_id, normalized.episode_id, "CLAIM_SUPPORTED_BY_EPISODE")
+        self.add_edge(normalized.episode_id, claim_id, "EPISODE_SUPPORTS_CLAIM")
+        return True
+
+    def validate_state_invariants(self) -> List[str]:
+        errors: List[str] = []
+        node_ids = set(self.claims) | set(self.episodes)
+        seen_edges = set()
+        for edge in self.edges:
+            key = tuple(edge.get(field) for field in ("source_id", "target_id", "relation_type", "weight"))
+            if key in seen_edges:
+                errors.append(f"duplicate edge: {key}")
+            seen_edges.add(key)
+            if edge.get("source_id") not in node_ids or edge.get("target_id") not in node_ids:
+                errors.append(f"edge references missing node: {edge}")
+        for claim_id, claim in self.claims.items():
+            if claim_id not in self.claim_embeddings:
+                errors.append(f"missing claim embedding: {claim_id}")
+            for ref in claim.evidence:
+                if ref.episode_id not in self.episodes:
+                    errors.append(f"missing evidence episode: {claim_id}->{ref.episode_id}")
+        for episode_id in self.episodes:
+            if episode_id not in self.episode_embeddings:
+                errors.append(f"missing episode embedding: {episode_id}")
+        for edge in self.edges:
+            if edge.get("relation_type") in {"SUPERSEDES", "REFINES"}:
+                newer = self.claims.get(edge.get("source_id"))
+                older = self.claims.get(edge.get("target_id"))
+                if newer and older and newer.status == "active" and older.status == "active":
+                    errors.append(f"version target remains active: {edge}")
+        return errors
 
     def add_edge(self, source_id: str, target_id: str, relation_type: str, weight: float = 1.0) -> None:
         edge = {"source_id": source_id, "target_id": target_id, "relation_type": relation_type, "weight": weight}
