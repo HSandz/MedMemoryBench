@@ -8,6 +8,8 @@ import json
 import logging
 import math
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -523,6 +525,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         relation_candidate_count: int = 5,
         relation_temperature: float = 0.2,
         temporal_min_confidence: float = 0.5,
+        parallel_workers: int = 1,
         **kwargs,
     ):
         if temporal_state_enabled and not typed_relations_enabled:
@@ -538,6 +541,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         self.relation_candidate_count = max(0, int(relation_candidate_count))
         self.relation_temperature = float(relation_temperature)
         self.temporal_min_confidence = _clamp_confidence(temporal_min_confidence)
+        self.parallel_workers = max(1, int(parallel_workers))
         self.typed_relations: List[Dict[str, Any]] = []
         self._typed_edge_keys = set()
         self.relation_audit: List[Dict[str, Any]] = []
@@ -547,6 +551,49 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         self.evidence_store: Dict[str, Dict[str, Any]] = {}
         self.provenance_audit: List[Dict[str, Any]] = []
         self._provenance_audit_by_memory: Dict[str, Dict[str, Any]] = {}
+        self._api_failure_events: List[Dict[str, Any]] = []
+        self._api_failure_lock = threading.Lock()
+        self.llm_controller.failure_callback = self._record_llm_failure
+        underlying_llm = getattr(self.llm_controller, "llm", None)
+        if underlying_llm is not None:
+            underlying_llm.failure_callback = self._record_llm_failure
+
+    def _record_llm_failure(
+        self,
+        operation_name: str,
+        error: Exception,
+        attempts: int,
+    ) -> None:
+        """Capture retry-exhausted build calls while preserving A-MEM fallbacks."""
+        tracker = get_usage_tracker()
+        operation = tracker.current_operation()
+        if operation == "unscoped":
+            operation = operation_name
+        event = {
+            "operation": operation,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "attempts": int(getattr(error, "attempts", attempts)),
+        }
+        if getattr(error, "failure_type", None):
+            event["failure_type"] = error.failure_type
+        if getattr(error, "retry_counts", None):
+            event["retry_counts"] = dict(error.retry_counts)
+        root_error = getattr(error, "last_exception", None)
+        if root_error is not None:
+            event["root_error_type"] = type(root_error).__name__
+            event["root_error_message"] = str(root_error)
+        else:
+            event["root_error_type"] = type(error).__name__
+            event["root_error_message"] = str(error)
+        with self._api_failure_lock:
+            self._api_failure_events.append(event)
+
+    def drain_api_failure_events(self) -> List[Dict[str, Any]]:
+        with self._api_failure_lock:
+            events = list(self._api_failure_events)
+            self._api_failure_events.clear()
+        return events
 
     @staticmethod
     def _append_unique(values: List[str], value: str) -> None:
@@ -975,7 +1022,173 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         """Validate and add an edge; exposed for deterministic tests/imports."""
         return self._store_edge(edge)
 
+    def prepare_note_metadata(
+        self,
+        contents: Sequence[str],
+        max_workers: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Extract note metadata concurrently while preserving input order."""
+        values = [str(content) for content in contents]
+        workers = max(
+            1,
+            int(
+                getattr(self, "parallel_workers", 1)
+                if max_workers is None
+                else max_workers
+            ),
+        )
+
+        def analyze(content: str) -> Dict[str, Any]:
+            get_usage_tracker().set_phase("memorize")
+            max_chars = getattr(
+                self,
+                "max_context_chars",
+                getattr(RobustMemoryNote, "DEFAULT_MAX_ANALYSIS_CHARS", 300000),
+            )
+            analysis_content = content
+            if len(content) > max_chars:
+                analysis_content = content[:max_chars] + "\n... [truncated for analysis]"
+            return RobustMemoryNote.analyze_content(analysis_content, self.llm_controller)
+
+        if workers == 1 or len(values) < 2:
+            return [analyze(value) for value in values]
+        with ThreadPoolExecutor(max_workers=min(workers, len(values))) as executor:
+            return list(executor.map(analyze, values))
+
+    def add_notes_parallel(
+        self,
+        note_specs: Sequence[Dict[str, Any]],
+        max_workers: Optional[int] = None,
+    ) -> List[str]:
+        """Add typed-only notes with parallel analysis/relation inference.
+
+        Notes, indexes, edges, temporal transitions, and audits are committed in
+        source order. Only calls whose inputs are immutable at that point are
+        dispatched concurrently, preserving the serial memory semantics.
+        """
+        specs = list(note_specs)
+        workers = max(
+            1,
+            int(
+                getattr(self, "parallel_workers", 1)
+                if max_workers is None
+                else max_workers
+            ),
+        )
+        if (
+            workers == 1
+            or len(specs) < 2
+            or self.original_evolution_enabled
+            or not self.typed_relations_enabled
+        ):
+            return [
+                self.add_note(
+                    content=spec.get("content", ""),
+                    time=spec.get("time"),
+                    **dict(spec.get("kwargs") or {}),
+                )
+                for spec in specs
+            ]
+
+        # Preserve input order while allowing independent metadata calls.
+        analyses = self.prepare_note_metadata(
+            [spec.get("content", "") for spec in specs], workers
+        )
+
+        prepared: List[Dict[str, Any]] = []
+        for spec, analysis in zip(specs, analyses):
+            content = str(spec.get("content", ""))
+            timestamp = spec.get("time")
+            options = dict(spec.get("kwargs") or {})
+            source_session_id = options.pop("source_session_id", None)
+            source_session_index = options.pop("source_session_index", None)
+            source_evidence = options.pop("source_evidence", None)
+            source_timestamp = options.pop("source_timestamp", timestamp)
+            provenance_part_index = options.pop("provenance_part_index", None)
+            note = RobustMemoryNote(
+                content=content,
+                timestamp=timestamp,
+                keywords=analysis.get("keywords"),
+                context=analysis.get("context"),
+                tags=analysis.get("tags"),
+                llm_controller=None,
+                max_analysis_chars=self.max_context_chars,
+                **options,
+            )
+            if self.temporal_state_enabled or self.provenance_enabled:
+                note.source_timestamp = _optional_text(source_timestamp)
+                note.timestamp = note.source_timestamp or ""
+            if source_session_id is not None:
+                note.source_session_id = source_session_id
+                note.source_session_index = source_session_index
+            if self.temporal_state_enabled:
+                note.temporal_state = self._initial_temporal_state(source_timestamp)
+            self._attach_provenance(note, source_evidence, provenance_part_index)
+            candidate_ids = self._candidate_ids(note.content)
+            self._ensure_relation_lists(note)
+            self.memories[note.id] = note
+            with get_usage_tracker().scope("amem.embedding.index"):
+                self.retriever.add_documents([
+                    "content:" + note.content
+                    + " context:" + note.context
+                    + " keywords: " + ", ".join(note.keywords)
+                    + " tags: " + ", ".join(note.tags)
+                ])
+            prepared.append({
+                "note": note,
+                "candidate_ids": candidate_ids,
+            })
+
+        def infer(item: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, str]:
+            get_usage_tracker().set_phase("memorize")
+            try:
+                edges, raw_response = self._infer_relations(
+                    item["note"], item["candidate_ids"]
+                )
+                return edges, raw_response, ""
+            except Exception as exc:
+                logger.warning(
+                    "Typed relation inference failed for memory %s; "
+                    "storing without typed relations: %s",
+                    item["note"].id,
+                    exc,
+                )
+                return [], "", str(exc)
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(prepared))) as executor:
+            relation_results = list(executor.map(infer, prepared))
+
+        note_ids: List[str] = []
+        for item, (inferred_edges, raw_response, inference_error) in zip(
+            prepared,
+            relation_results,
+        ):
+            note = item["note"]
+            candidate_ids = item["candidate_ids"]
+            stored_edges = [edge for edge in inferred_edges if self._store_edge(edge)]
+            note_ids.append(str(note.id))
+            candidate_records = [
+                {
+                    "candidate_position": position,
+                    "memory_id": memory_id,
+                    "content": self.memories[memory_id].content[:400],
+                }
+                for position, memory_id in enumerate(candidate_ids)
+                if memory_id in self.memories
+            ]
+            audit = {
+                "created_memory_id": note.id,
+                "candidate_neighbors": candidate_records,
+                "predicted_relations": stored_edges,
+                "relation_inference_error": inference_error,
+                "raw_relation_response": raw_response,
+            }
+            self.relation_audit.append(audit)
+            self._relation_audit_by_memory[note.id] = audit
+        return note_ids
+
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
+        prepared_analysis = kwargs.pop("_prepared_analysis", None)
         source_session_id = kwargs.pop("source_session_id", None)
         source_session_index = kwargs.pop("source_session_index", None)
         experimental_metadata_enabled = (
@@ -986,6 +1199,7 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
             self.original_evolution_enabled
             and not self.typed_relations_enabled
             and not experimental_metadata_enabled
+            and not isinstance(prepared_analysis, dict)
         ):
             note_id = super().add_note(content=content, time=time, **kwargs)
             if source_session_id is not None:
@@ -998,12 +1212,19 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         source_timestamp = kwargs.pop("source_timestamp", time)
         provenance_part_index = kwargs.pop("provenance_part_index", None)
 
+        note_options = dict(kwargs)
+        if isinstance(prepared_analysis, dict):
+            note_options.update({
+                "keywords": prepared_analysis.get("keywords"),
+                "context": prepared_analysis.get("context"),
+                "tags": prepared_analysis.get("tags"),
+            })
         note = RobustMemoryNote(
             content=content,
             llm_controller=self.llm_controller,
             timestamp=time,
             max_analysis_chars=self.max_context_chars,
-            **kwargs,
+            **note_options,
         )
         if experimental_metadata_enabled:
             note.source_timestamp = _optional_text(source_timestamp)

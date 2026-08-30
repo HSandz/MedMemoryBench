@@ -89,6 +89,13 @@ def retry_llm_call(max_retries: int = 2, base_delay: float = 1.0):
                             )
             logger.error("LLM call %s failed after %d attempts: %s",
                          func.__name__, max_retries + 1, last_exc)
+            try:
+                last_exc._retry_exhausted = True
+            except Exception:
+                pass
+            callback = getattr(args[0], "failure_callback", None) if args else None
+            if callable(callback):
+                callback(func.__name__, last_exc, max_retries + 1)
             raise last_exc
         return wrapper
     return decorator

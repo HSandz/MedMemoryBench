@@ -23,6 +23,27 @@ def _true_duration_seconds(report: "EvaluationReport") -> float:
     )
 
 
+def _failure_counts_from_usage(llm_usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize failed attempts and retries without duplicating failure logs."""
+    phases = {
+        "memorize": dict(llm_usage.get("memorize_phase") or {}),
+        "query": dict(llm_usage.get("query_phase") or {}),
+    }
+    by_phase = {
+        phase: {
+            "failed_attempts": int(stats.get("failed_attempts", 0) or 0),
+            "retry_count": int(stats.get("retry_count", 0) or 0),
+        }
+        for phase, stats in phases.items()
+    }
+    total = dict(llm_usage.get("total") or {})
+    return {
+        "total_failed_attempts": int(total.get("failed_attempts", 0) or 0),
+        "total_retries": int(total.get("retry_count", 0) or 0),
+        "by_phase": by_phase,
+    }
+
+
 def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, Any]:
     """Avoid presenting unavailable batch per-request latency as a real zero."""
     efficiency = dict(report.summary.get("efficiency", {}))
@@ -125,7 +146,13 @@ class ResultCollector:
             if include_query_answer else None
         )
         self.last_api_failure_path = None
-        if include_api_failures and report.metadata.get("api_failures"):
+        failure_counts = _failure_counts_from_usage(
+            report.metadata.get("llm_usage") or {}
+        )
+        if include_api_failures and (
+            report.metadata.get("api_failures")
+            or failure_counts["total_failed_attempts"]
+        ):
             self.last_api_failure_path = self._save_api_failures_json(
                 report, method_output_dir, prefix
             )
@@ -195,12 +222,16 @@ class ResultCollector:
         """Save provider failures outside metric and query-answer outputs."""
         filepath = output_dir / f"{prefix}_api_failures.json"
         failures = report.metadata.get("api_failures", [])
+        failure_counts = _failure_counts_from_usage(
+            report.metadata.get("llm_usage") or {}
+        )
         failure_data = {
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,
             "summary": report.metadata.get("evaluation_coverage", {}),
             "failure_count": len(failures),
+            "failure_counts": failure_counts,
             "failures": failures,
         }
 

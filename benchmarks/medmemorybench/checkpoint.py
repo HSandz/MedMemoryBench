@@ -473,10 +473,98 @@ def _snapshot_model_config(model_config) -> Optional[Dict[str, Any]]:
     if model_config is None:
         return None
     value = vars(model_config).copy()
-    for key in ("openrouter_provider", "openrouter_service_tier"):
+    for key in (
+        "openrouter_provider",
+        "openrouter_service_tier",
+        "nim_thinking_enabled",
+        "nim_reasoning_budget",
+    ):
         if value.get(key) is None:
             value.pop(key, None)
     return value
+
+
+_QUERY_RELEVANT_AMEM_BUILD_KEYS = frozenset({
+    # The query agent must use the same embedding/index and snapshot features.
+    "amem_embedding_model",
+    "amem_note_level",
+    "amem_original_evolution",
+    "amem_typed_relations",
+    "amem_typed_retrieval",
+    "amem_temporal_state",
+    "amem_temporal_retrieval",
+    "amem_provenance",
+    "amem_provenance_retrieval",
+})
+
+
+def _snapshot_query_dataset_config(dataset_config) -> Dict[str, Any]:
+    """Serialize dataset fields that determine query units and scoring."""
+    return {
+        "dataset_name": getattr(dataset_config, "dataset_name", ""),
+        "language": getattr(dataset_config, "language", ""),
+        "data_root_dir": getattr(dataset_config, "data_root_dir", ""),
+        "data_files": getattr(dataset_config, "data_files", {}),
+        "evaluation_mode": getattr(dataset_config, "evaluation_mode", ""),
+        "persona_ids": getattr(dataset_config, "persona_ids", None),
+        "max_personas": getattr(dataset_config, "max_personas", None),
+        "max_sessions_per_persona": getattr(
+            dataset_config, "max_sessions_per_persona", None
+        ),
+        "inject_noise": getattr(dataset_config, "inject_noise", None),
+        "query_types": [
+            vars(item) for item in getattr(dataset_config, "query_types", [])
+        ],
+    }
+
+
+def _snapshot_embedding_config(embedding_config) -> Optional[Dict[str, Any]]:
+    if embedding_config is None:
+        return None
+    value = vars(embedding_config).copy()
+    # Credentials do not change retrieval semantics and must never affect hashes.
+    value.pop("api_key", None)
+    return value
+
+
+def _snapshot_query_model_config(model_config) -> Optional[Dict[str, Any]]:
+    """Serialize query-model settings without credentials."""
+    value = _snapshot_model_config(model_config)
+    if value is not None:
+        value.pop("api_key", None)
+    return value
+
+
+def _query_relevant_build_config(method_config) -> Dict[str, Any]:
+    build_config = (
+        method_config.snapshot_build_config()
+        if hasattr(method_config, "snapshot_build_config")
+        else getattr(method_config, "agent_params", {})
+    )
+    return {
+        key: build_config[key]
+        for key in sorted(_QUERY_RELEVANT_AMEM_BUILD_KEYS)
+        if key in build_config
+    }
+
+
+def compute_memory_query_compatibility_hash(method_config, dataset_config) -> str:
+    """Hash only settings required to consume an existing memory snapshot."""
+    try:
+        content = json.dumps({
+            "method_name": getattr(method_config, "method_name", ""),
+            "method_type": getattr(method_config, "method_type", ""),
+            "embedding": _snapshot_embedding_config(
+                getattr(method_config, "embedding", None)
+            ),
+            "query_relevant_build_config": _query_relevant_build_config(
+                method_config
+            ),
+            "dataset": _snapshot_query_dataset_config(dataset_config),
+        }, sort_keys=True, default=str)
+        return hashlib.md5(content.encode()).hexdigest()[:16]
+    except Exception:
+        return ""
 
 
 def compute_build_config_hash(method_config, dataset_config) -> str:
@@ -505,25 +593,24 @@ def compute_build_config_hash(method_config, dataset_config) -> str:
 def compute_query_config_hash(method_config, dataset_config) -> str:
     """Hash the effective method/query configuration for query artifacts."""
     try:
-        embedding = getattr(method_config, "embedding", None)
-        memorize_model = getattr(method_config, "memorize_model", None)
         content = json.dumps({
             "method_name": getattr(method_config, "method_name", ""),
             "method_type": getattr(method_config, "method_type", ""),
-            "model": _snapshot_model_config(getattr(method_config, "model", None)),
-            "embedding": vars(embedding) if embedding is not None else None,
-            "memorize_model": _snapshot_model_config(memorize_model),
-            "build_config": (
-                method_config.snapshot_build_config()
-                if hasattr(method_config, "snapshot_build_config")
-                else getattr(method_config, "agent_params", {})
+            "model": _snapshot_query_model_config(
+                getattr(method_config, "model", None)
+            ),
+            "embedding": _snapshot_embedding_config(
+                getattr(method_config, "embedding", None)
             ),
             "retrieval_config": (
                 method_config.query_config()
                 if hasattr(method_config, "query_config")
                 else {}
             ),
-            "dataset": dataset_config.raw_config if hasattr(dataset_config, "raw_config") else {},
+            "query_relevant_build_config": _query_relevant_build_config(
+                method_config
+            ),
+            "dataset": _snapshot_query_dataset_config(dataset_config),
         }, sort_keys=True, default=str)
         return hashlib.md5(content.encode()).hexdigest()[:16]
     except Exception:
@@ -578,4 +665,65 @@ def is_manifest_build_compatible(
     return bool(
         legacy_hash == expected_hash
         or derive_legacy_build_config_hash(manifest, manifest_path) == expected_hash
+    )
+
+
+def is_manifest_query_compatible(
+    manifest: Dict[str, Any],
+    method_config,
+    dataset_config,
+    manifest_path: Optional[Path] = None,
+) -> bool:
+    """Validate settings that affect reading and querying a memory snapshot.
+
+    Older manifests only contain hashes that also included build settings and
+    the original query model. When a run snapshot is available, recompute the
+    new memory-consumer fingerprint from both configurations so those runs can
+    be queried with a different LLM or changed build-only options.
+    """
+    expected_hash = compute_memory_query_compatibility_hash(
+        method_config, dataset_config
+    )
+    if not expected_hash:
+        return False
+
+    if manifest_path is not None:
+        run_config_path = Path(manifest_path).resolve().parent.parent / "run_config.json"
+        try:
+            run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+            stored_method = run_config.get("method_config")
+            stored_dataset = run_config.get("dataset_config")
+            if (
+                isinstance(stored_method, dict)
+                and isinstance(stored_dataset, dict)
+                and isinstance(stored_method.get("raw_config"), dict)
+                and isinstance(stored_dataset.get("raw_config"), dict)
+            ):
+                from src.config import method_config_from_snapshot, dataset_config_from_snapshot
+
+                stored_method_config = method_config_from_snapshot(stored_method)
+                stored_dataset_config = dataset_config_from_snapshot(stored_dataset)
+                query_match = (
+                    compute_memory_query_compatibility_hash(
+                        stored_method_config, stored_dataset_config
+                    )
+                    == expected_hash
+                )
+                if query_match:
+                    return True
+                # Test/legacy manifests without retrieval metadata predate the
+                # stage-specific contract; retain their build-hash behavior.
+                if manifest.get("retrieval_config_hash") or manifest.get(
+                    "retrieval_compatibility_hash"
+                ):
+                    return False
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    # Minimal/legacy manifests may not have a complete run_config snapshot. In
+    # that case retain the historical build-hash check as a conservative
+    # fallback; complete snapshots use the stage-specific comparison above.
+    return str(manifest.get("retrieval_compatibility_hash") or "") == expected_hash or (
+        str(manifest.get("build_config_hash") or manifest.get("config_hash") or "")
+        == compute_build_config_hash(method_config, dataset_config)
     )

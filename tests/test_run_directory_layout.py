@@ -20,8 +20,10 @@ from src.config import (
 from src.evaluator import DATASET_EVALUATOR_REGISTRY, Evaluator, create_evaluator
 from src.result import EvaluationReport, ResultCollector
 from benchmarks.medmemorybench.checkpoint import (
+    compute_memory_query_compatibility_hash,
     compute_config_hash,
     derive_legacy_build_config_hash,
+    is_manifest_query_compatible,
     is_manifest_build_compatible,
 )
 from utils.vertex_batch import VertexBatchPending
@@ -192,6 +194,55 @@ def test_legacy_manifest_derives_build_hash_from_stored_run_config(tmp_path: Pat
 
     manifest["build_config_hash"] = "explicit-but-wrong"
     assert not is_manifest_build_compatible(manifest, expected_hash, manifest_path)
+
+
+def test_query_compatibility_ignores_build_only_and_query_model_changes():
+    method, dataset = _configs(model_name="query-model")
+    method.retrieval_config = {"retrieve_num": 10}
+    method.build_config = {
+        "amem_embedding_model": "all-MiniLM-L6-v2",
+        "amem_max_tokens": 1000,
+    }
+    baseline = compute_memory_query_compatibility_hash(method, dataset)
+
+    method.model.name = "different-query-model"
+    method.build_config["amem_max_tokens"] = 32000
+    assert compute_memory_query_compatibility_hash(method, dataset) == baseline
+
+    method.retrieval_config["retrieve_num"] = 20
+    assert compute_memory_query_compatibility_hash(method, dataset) == baseline
+
+    method.build_config["amem_typed_relations"] = False
+    assert compute_memory_query_compatibility_hash(method, dataset) != baseline
+
+
+def test_query_compatibility_reconstructs_legacy_run_config(tmp_path: Path):
+    source = _write_memory_run(
+        tmp_path,
+        "20260813_143539",
+        manifest_updates={
+            "retrieval_config_hash": "legacy-query-hash",
+        },
+    )
+    manifest_path = source / "memory" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    run_config = json.loads((source / "run_config.json").read_text())
+    stored_method = method_config_from_snapshot(run_config["method_config"])
+    stored_dataset = dataset_config_from_snapshot(run_config["dataset_config"])
+
+    assert is_manifest_query_compatible(
+        manifest, stored_method, stored_dataset, manifest_path
+    )
+
+
+def test_query_resume_identity_ignores_build_only_yaml_changes(tmp_path: Path):
+    evaluator = _evaluator(tmp_path, execution_stage="query")
+    first = evaluator._resume_identity()
+    evaluator.method_config.build_config["amem_max_tokens"] = 32000
+    assert evaluator._resume_identity() == first
+
+    evaluator.method_config.model.name = "new-query-model"
+    assert evaluator._resume_identity() != first
 
 
 def test_full_run_keeps_config_log_and_reports_in_one_timestamp_directory(
@@ -442,6 +493,14 @@ def test_memory_run_accepts_underscore_cli_alias(monkeypatch):
     args = cli.parse_args()
 
     assert args.memory_run == "20260813_143538"
+
+
+def test_batch_wait_defaults_to_true_and_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert cli.parse_args().batch_wait is True
+
+    monkeypatch.setattr(sys, "argv", ["main.py", "--no-batch-wait"])
+    assert cli.parse_args().batch_wait is False
 
 
 @pytest.mark.parametrize("stage", ["memory", "all"])

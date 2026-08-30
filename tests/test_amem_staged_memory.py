@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +139,18 @@ def test_amem_state_import_rejects_changed_build_semantics():
 
     with pytest.raises(ValueError, match="configuration does not match"):
         agent.import_memory_state(state, context_id=4)
+
+
+def test_amem_query_import_ignores_build_controller_settings():
+    system = _robust_system()
+    agent = _snapshot_agent(system)
+    state = agent.export_memory_state(context_id=4)
+    agent.amem_query_only = True
+    agent._amem_model = "different-query-build-controller"
+    agent.amem_evo_threshold = 999
+    agent.amem_chunk_size_tokens = 9999
+
+    agent.import_memory_state(state, context_id=4)
 
 
 def test_amem_typed_state_round_trip_preserves_relation_indexes_and_audit():
@@ -743,6 +757,129 @@ def test_query_only_stage_loads_each_saved_unit_without_rebuilding(tmp_path: Pat
         "unit-one",
         "unit-one|unit-two",
     ]
+
+
+def test_query_only_stage_runs_units_in_parallel_with_isolated_agents(
+    tmp_path: Path,
+    monkeypatch,
+):
+    build_manager = _StageManager()
+    builder = _staged_evaluator(tmp_path, build_manager)
+    builder.execution_stage = "memory"
+    units = [_unit(0, 10, "unit-one", "q1"), _unit(1, 11, "unit-two", "q2")]
+    for unit in units:
+        builder._evaluate_unit_with_checkpoint(unit)
+    builder._memory_snapshot_manifest["status"] = "complete"
+    builder._memory_snapshot_manifest["completed_at"] = "2026-01-01T00:00:00"
+    builder._write_memory_snapshot_manifest()
+
+    barrier = threading.Barrier(2)
+    managers = []
+
+    class ParallelStageManager(_StageManager):
+        def prepare_query(self, *, message, **kwargs):
+            managers.append(self)
+            barrier.wait(timeout=5)
+            return super().prepare_query(message=message, **kwargs)
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(
+        "benchmarks.medmemorybench.evaluator.AgentManager",
+        lambda **kwargs: ParallelStageManager(),
+    )
+
+    evaluator = _staged_evaluator(tmp_path, _StageManager())
+    evaluator.execution_stage = "query"
+    evaluator.workers = 2
+    evaluator.dataset = SimpleNamespace(
+        get_evaluation_units=lambda: iter(units),
+        get_persona_ids=lambda: [1],
+    )
+    evaluator.aggregator = SimpleNamespace(add_result=lambda result: None)
+    collected = []
+    evaluator.result_collector = SimpleNamespace(
+        add_result=lambda result, persona_id: collected.append(result)
+    )
+    evaluator._complete_combined_batch_queries = lambda: []
+    evaluator._complete_deferred_judges = lambda: []
+    evaluator._load_memory_snapshot_manifest()
+
+    evaluator._run_evaluation_loop()
+
+    assert len(managers) == 2
+    assert [result.model_output for result in collected] == [
+        "unit-one",
+        "unit-one|unit-two",
+    ]
+
+
+def test_query_only_stage_applies_workers_as_a_global_query_limit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    build_manager = _StageManager()
+    builder = _staged_evaluator(tmp_path, build_manager)
+    builder.execution_stage = "memory"
+    units = [_unit(0, 10, "unit-one", "q1"), _unit(1, 11, "unit-two", "q3")]
+    units[0].queries_to_evaluate.append(
+        SimpleNamespace(query_id="q2", question="question-q2", query_type="entity_exact_match")
+    )
+    units[1].queries_to_evaluate.append(
+        SimpleNamespace(query_id="q4", question="question-q4", query_type="entity_exact_match")
+    )
+    for unit in units:
+        builder._evaluate_unit_with_checkpoint(unit)
+    builder._memory_snapshot_manifest["status"] = "complete"
+    builder._memory_snapshot_manifest["completed_at"] = "2026-01-01T00:00:00"
+    builder._write_memory_snapshot_manifest()
+
+    active_queries = 0
+    max_active_queries = 0
+    query_lock = threading.Lock()
+
+    class CountingStageManager(_StageManager):
+        def prepare_query(self, *, message, **kwargs):
+            nonlocal active_queries, max_active_queries
+            with query_lock:
+                active_queries += 1
+                max_active_queries = max(max_active_queries, active_queries)
+            try:
+                time.sleep(0.05)
+                return super().prepare_query(message=message, **kwargs)
+            finally:
+                with query_lock:
+                    active_queries -= 1
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(
+        "benchmarks.medmemorybench.evaluator.AgentManager",
+        lambda **kwargs: CountingStageManager(),
+    )
+
+    evaluator = _staged_evaluator(tmp_path, _StageManager())
+    evaluator.execution_stage = "query"
+    evaluator.workers = 2
+    evaluator.dataset = SimpleNamespace(
+        get_evaluation_units=lambda: iter(units),
+        get_persona_ids=lambda: [1],
+    )
+    evaluator.aggregator = SimpleNamespace(add_result=lambda result: None)
+    collected = []
+    evaluator.result_collector = SimpleNamespace(
+        add_result=lambda result, persona_id: collected.append(result)
+    )
+    evaluator._complete_combined_batch_queries = lambda: []
+    evaluator._complete_deferred_judges = lambda: []
+    evaluator._load_memory_snapshot_manifest()
+
+    evaluator._run_evaluation_loop()
+
+    assert max_active_queries == 2
+    assert [result.query_id for result in collected] == ["q1", "q2", "q3", "q4"]
 
 
 def test_fresh_memory_stage_initializes_manifest_after_resume_state():

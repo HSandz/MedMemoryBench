@@ -3,12 +3,15 @@ method_type: agentic_memory
 description: Typed-relation A-MEM without original evolution or untyped link retrieval
 model:
   provider: openai
-  name: TokenRouter/z-ai/glm-5.3-free
+  name: NIM/nvidia/nemotron-3.5-lightning-30b-a3b
   temperature: 0.0
-  max_completion_tokens: 5000
+  max_completion_tokens: 32000
+  nim:
+    enable_thinking: true
+    reasoning_budget: 5000
 memorize_model:
-  provider: openai
-  name: TokenRouter/z-ai/glm-5.3-free
+  provider: ai_studio
+  name: gemini-3.5-flash-lite
 build_config:
   amem_embedding_model: all-MiniLM-L6-v2
   amem_evo_threshold: 100

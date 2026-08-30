@@ -68,6 +68,7 @@ class Evaluator:
         batch_api: bool = False,
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
+        workers: int = 1,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -121,6 +122,9 @@ class Evaluator:
             else None
         )
         self.batch_wait = batch_wait if self.batch_api else False
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = workers
 
         self.base_output_dir = output_dir or (PROJECT_ROOT / "outputs")
         self.base_output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +200,8 @@ class Evaluator:
             batch_gcs_uri=self.batch_gcs_uri,
             batch_wait=self.batch_wait,
             batch_manifest_dir=self.output_dir / "batch",
+            query_only=self.execution_stage == "query",
+            workers=self.workers,
         )
         snapshot = self._config_value(self.method_config)
         resolved_params = self._config_value(init_params)
@@ -270,8 +276,23 @@ class Evaluator:
 
         from benchmarks.medmemorybench.checkpoint import (
             compute_config_hash,
+            is_manifest_query_compatible,
             is_manifest_build_compatible,
         )
+
+        if self.execution_stage == "query":
+            config_compatible = is_manifest_query_compatible(
+                manifest,
+                self.method_config,
+                self.dataset_config,
+                manifest_path,
+            )
+        else:
+            config_compatible = is_manifest_build_compatible(
+                manifest,
+                compute_config_hash(self.method_config, self.dataset_config),
+                manifest_path,
+            )
 
         compatible = (
             isinstance(manifest, dict)
@@ -279,11 +300,7 @@ class Evaluator:
             and manifest.get("version") == 1
             and manifest.get("status") in ({"complete", "building"} if self.append else {"complete"})
             and manifest.get("method_name") == self.method_config.method_name
-            and is_manifest_build_compatible(
-                manifest,
-                compute_config_hash(self.method_config, self.dataset_config),
-                manifest_path,
-            )
+            and config_compatible
         )
         if not compatible:
             raise ValueError(
@@ -294,11 +311,9 @@ class Evaluator:
 
     def _resume_identity(self) -> Dict[str, Any]:
         """Return the configuration fields that must agree for a safe resume."""
-        return {
+        identity = {
             "method_config_name": self.method_config_name,
             "dataset_config_name": self.dataset_config_name,
-            "method_config": self._config_value(self.method_config),
-            "dataset_config": self._config_value(self.dataset_config),
             "api_config": self._config_value(get_api_config()),
             "stage": self.execution_stage,
             "append": self.append,
@@ -309,6 +324,17 @@ class Evaluator:
             "batch_api": self.batch_api,
             "batch_gcs_uri": self.batch_gcs_uri,
         }
+        if self.execution_stage == "query":
+            from benchmarks.medmemorybench.checkpoint import compute_query_config_hash
+
+            # Query resumes must not be invalidated by build-only YAML edits.
+            identity["query_config_hash"] = compute_query_config_hash(
+                self.method_config, self.dataset_config
+            )
+        else:
+            identity["method_config"] = self._config_value(self.method_config)
+            identity["dataset_config"] = self._config_value(self.dataset_config)
+        return identity
 
     @staticmethod
     def _identity_hash(identity: Dict[str, Any]) -> str:
@@ -400,6 +426,7 @@ class Evaluator:
                 "batch_api": self.batch_api,
                 "batch_gcs_uri": self.batch_gcs_uri,
                 "batch_wait": self.batch_wait,
+                "workers": self.workers,
             },
             "command": [sys.executable, *sys.argv],
             "output_dir": str(self.output_dir),
@@ -544,6 +571,7 @@ class Evaluator:
                 batch_api=self.batch_api,
                 batch_gcs_uri=self.batch_gcs_uri,
                 batch_wait=self.batch_wait,
+                workers=self.workers,
             )
         except VertexBatchPending as exc:
             self._write_run_config(

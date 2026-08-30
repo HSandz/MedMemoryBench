@@ -4,14 +4,18 @@ import hashlib
 import copy
 import json
 import os
+import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import logging
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
@@ -49,9 +53,11 @@ from utils.vertex_batch import (
 from benchmarks.medmemorybench.checkpoint import (
     MedMemoryBenchCheckpointManager,
     compute_config_hash,
+    compute_memory_query_compatibility_hash,
     compute_query_config_hash,
     derive_legacy_build_config_hash,
     is_manifest_build_compatible,
+    is_manifest_query_compatible,
 )
 
 
@@ -79,6 +85,7 @@ class MedMemoryBenchEvaluator:
         batch_api: bool = False,
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
+        workers: int = 1,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -105,6 +112,9 @@ class MedMemoryBenchEvaluator:
         self.batch_api = batch_api
         self.batch_gcs_uri = batch_gcs_uri
         self.batch_wait = batch_wait
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -145,6 +155,7 @@ class MedMemoryBenchEvaluator:
         self._pending_batch_queries: List[Dict[str, Any]] = []
         self._api_failures: List[Dict[str, Any]] = []
         self._api_failure_duration_seconds = 0.0
+        self._api_failure_lock = threading.Lock()
 
         self._checkpoint_manager: Optional[MedMemoryBenchCheckpointManager] = None
         self._checkpoint_enabled = False
@@ -168,6 +179,58 @@ class MedMemoryBenchEvaluator:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
             self.logger.info(message)
+
+    def _start_query_progress(self, units: List[EvaluationUnit]) -> None:
+        """Display one run-wide counter for terminal query processing."""
+        if getattr(self, "execution_stage", "all") == "memory":
+            return
+        total = 0
+        checkpoint = getattr(self, "_checkpoint_manager", None)
+        for unit in units:
+            for query in unit.queries_to_evaluate:
+                if not (
+                    checkpoint
+                    and checkpoint.is_query_completed(
+                        query.query_id,
+                        persona_id=unit.context_id,
+                    )
+                ):
+                    total += 1
+        if not total:
+            return
+        self._query_progress_lock = threading.Lock()
+        self._query_progress_completed = set()
+        self._query_progress = tqdm(
+            total=total,
+            desc="Query progress",
+            unit="question",
+            dynamic_ncols=True,
+            file=sys.stdout,
+            disable=not getattr(self, "verbose", True),
+        )
+
+    def _advance_query_progress(
+        self,
+        query_id: str,
+        *,
+        context_id: Optional[int] = None,
+    ) -> None:
+        """Advance once after a question reaches a terminal run outcome."""
+        progress = getattr(self, "_query_progress", None)
+        if progress is None:
+            return
+        key = (context_id, query_id)
+        with self._query_progress_lock:
+            if key in self._query_progress_completed:
+                return
+            self._query_progress_completed.add(key)
+            progress.update(1)
+
+    def _finish_query_progress(self) -> None:
+        progress = getattr(self, "_query_progress", None)
+        if progress is not None:
+            progress.close()
+            self._query_progress = None
 
     def _amem_feature_configuration(self) -> Dict[str, Any]:
         """Describe the build feature combination represented by this run."""
@@ -465,33 +528,67 @@ class MedMemoryBenchEvaluator:
         except (TypeError, ValueError):
             failure_duration_seconds = 0.0
 
+        structured = error if isinstance(error, dict) else None
         root_error = (
             error.last_exception
             if isinstance(error, LLMRetryExhaustedError)
             else error
         )
+        if structured is not None:
+            root_error = None
         failure = {
             "timestamp": datetime.now().isoformat(),
             "phase": phase,
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "root_error_type": type(root_error).__name__,
-            "root_error_message": str(root_error),
+            "error_type": (
+                structured.get("error_type", "UnknownError")
+                if structured is not None
+                else type(error).__name__
+            ),
+            "error_message": (
+                structured.get("error_message", "")
+                if structured is not None
+                else str(error)
+            ),
             **{key: value for key, value in context.items() if value is not None},
         }
-        if failure_duration_seconds:
-            failure["duration_seconds"] = failure_duration_seconds
-            self._api_failure_duration_seconds = (
-                getattr(self, "_api_failure_duration_seconds", 0.0)
-                + failure_duration_seconds
-            )
+        if structured is not None:
+            for key in (
+                "operation",
+                "memory_id",
+                "root_error_type",
+                "root_error_message",
+                "attempts",
+                "failure_type",
+                "retry_counts",
+                "duration_seconds",
+            ):
+                if structured.get(key) is not None:
+                    failure[key] = structured[key]
+        else:
+            failure["root_error_type"] = type(root_error).__name__
+            failure["root_error_message"] = str(root_error)
         if isinstance(error, LLMRetryExhaustedError):
             failure["attempts"] = error.attempts
             if error.failure_type:
                 failure["failure_type"] = error.failure_type
             if error.retry_counts:
                 failure["retry_counts"] = error.retry_counts
-        self._api_failures.append(failure)
+
+        def store_failure() -> None:
+            if failure_duration_seconds:
+                failure["duration_seconds"] = failure_duration_seconds
+                self._api_failure_duration_seconds = (
+                    getattr(self, "_api_failure_duration_seconds", 0.0)
+                    + failure_duration_seconds
+                )
+            self._api_failures.append(failure)
+
+        lock = getattr(self, "_api_failure_lock", None)
+        if lock is None:
+            store_failure()
+        else:
+            with lock:
+                store_failure()
 
     @staticmethod
     def _run_api_call(operation, *args, **kwargs):
@@ -517,6 +614,17 @@ class MedMemoryBenchEvaluator:
                 + max(elapsed - tracked_failure_duration, 0.0)
             )
             raise
+
+    def _drain_memory_api_failures(self, context_id: Any) -> List[Dict[str, Any]]:
+        """Collect retry-exhausted A-MEM build calls even when a build aborts."""
+        manager = getattr(self, "agent_manager", None)
+        agent = getattr(manager, "_agent", None)
+        getter = getattr(agent, "_get_memory_system", None)
+        if not callable(getter):
+            return []
+        system = getter(context_id)
+        drain = getattr(system, "drain_api_failure_events", None)
+        return list(drain()) if callable(drain) else []
 
     def _init_dataset(self) -> None:
         self._log(f"Loading dataset: {self.dataset_config.dataset_name}")
@@ -813,11 +921,13 @@ class MedMemoryBenchEvaluator:
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
                 batch_api=self.batch_api,
-                batch_gcs_uri=self.batch_gcs_uri,
-                batch_wait=self.batch_wait,
+                batch_gcs_uri=getattr(self, "batch_gcs_uri", None),
+                batch_wait=getattr(self, "batch_wait", False),
+                workers=self.workers,
                 batch_manifest_dir=self.output_dir / "batch",
                 batch_config_hash=self._batch_manifest_config_hash(),
                 batch_progress_callback=self._log,
+                query_only=self.execution_stage == "query",
             )
             self._log(f"[DEBUG] AgentManager created successfully")
 
@@ -825,6 +935,8 @@ class MedMemoryBenchEvaluator:
         self._log(f"[DEBUG] Context ID set to {context_id}")
 
     def _batch_config_hash(self) -> str:
+        if self.execution_stage == "query":
+            return compute_query_config_hash(self.method_config, self.dataset_config)
         return compute_config_hash(self.method_config, self.dataset_config)
 
     def _judge_batch_config_hash(self) -> str:
@@ -1329,8 +1441,17 @@ class MedMemoryBenchEvaluator:
             if (
                 manifest.get("format") != "medmemorybench.memory_manifest"
                 or manifest.get("version") != 1
-                or not is_manifest_build_compatible(
-                    manifest, self._batch_config_hash(), manifest_path
+                or not (
+                    is_manifest_query_compatible(
+                        manifest,
+                        self.method_config,
+                        self.dataset_config,
+                        manifest_path,
+                    )
+                    if self.execution_stage == "query"
+                    else is_manifest_build_compatible(
+                        manifest, self._batch_config_hash(), manifest_path
+                    )
                 )
                 or manifest.get("method_name") != self.method_config.method_name
                 or (require_complete and manifest.get("status") != "complete")
@@ -1431,6 +1552,9 @@ class MedMemoryBenchEvaluator:
             "retrieval_config_hash": compute_query_config_hash(
                 self.method_config, self.dataset_config
             ),
+            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
+                self.method_config, self.dataset_config
+            ),
             "feature_configuration": self._amem_feature_configuration(),
             "created_at": datetime.now().isoformat(),
             "completed_at": None,
@@ -1513,6 +1637,9 @@ class MedMemoryBenchEvaluator:
             "config_hash": self._batch_config_hash(),
             "build_config_hash": self._batch_config_hash(),
             "retrieval_config_hash": compute_query_config_hash(
+                self.method_config, self.dataset_config
+            ),
+            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
                 self.method_config, self.dataset_config
             ),
             "feature_configuration": self._amem_feature_configuration(),
@@ -1726,25 +1853,49 @@ class MedMemoryBenchEvaluator:
         expected_hash = self._snapshot_integrity_hash(payload)
         if payload.get("integrity_hash") != expected_hash:
             raise ValueError(f"A-MEM snapshot integrity check failed: {path}")
-        if (
-            require_current_config
-            and not is_manifest_build_compatible(
-                manifest,
-                self._batch_config_hash(),
-                path.parent / "manifest.json",
-            )
-        ):
-            raise ValueError(
-                f"A-MEM snapshot build configuration does not match: {path}"
-            )
+        if require_current_config:
+            manifest_path = path.parent / "manifest.json"
+            if self.execution_stage == "query":
+                config_compatible = is_manifest_query_compatible(
+                    manifest,
+                    self.method_config,
+                    self.dataset_config,
+                    manifest_path,
+                )
+                mismatch_message = "query configuration"
+            else:
+                config_compatible = is_manifest_build_compatible(
+                    manifest,
+                    self._batch_config_hash(),
+                    manifest_path,
+                )
+                mismatch_message = "build configuration"
+            if not config_compatible:
+                raise ValueError(
+                    f"A-MEM snapshot {mismatch_message} does not match: {path}"
+                )
         payload_build_hash = str(payload.get("build_config_hash") or "")
         if (
             require_current_config
+            and self.execution_stage != "query"
             and payload_build_hash
             and payload_build_hash != self._batch_config_hash()
         ):
             raise ValueError(
                 f"A-MEM snapshot payload build configuration does not match: {path}"
+            )
+        payload_query_hash = str(payload.get("retrieval_compatibility_hash") or "")
+        if (
+            require_current_config
+            and self.execution_stage == "query"
+            and payload_query_hash
+            and payload_query_hash
+            != compute_memory_query_compatibility_hash(
+                self.method_config, self.dataset_config
+            )
+        ):
+            raise ValueError(
+                f"A-MEM snapshot payload query configuration does not match: {path}"
             )
         payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
         embedding_state = (
@@ -1788,6 +1939,9 @@ class MedMemoryBenchEvaluator:
             "config_hash": self._batch_config_hash(),
             "build_config_hash": self._batch_config_hash(),
             "retrieval_config_hash": compute_query_config_hash(
+                self.method_config, self.dataset_config
+            ),
+            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
                 self.method_config, self.dataset_config
             ),
             "build_id": self._memory_snapshot_manifest["build_id"],
@@ -2022,7 +2176,10 @@ class MedMemoryBenchEvaluator:
         if not resumed and self._checkpoint_enabled:
             self._create_new_checkpoint()
 
-        self._run_evaluation_loop()
+        try:
+            self._run_evaluation_loop()
+        finally:
+            self._finish_query_progress()
 
         if (
             self.execution_stage in {"all", "memory"}
@@ -2054,6 +2211,15 @@ class MedMemoryBenchEvaluator:
             units = units[: self._append_target_index + 1]
         elif self.execution_stage == "query" and self._memory_unit_ids is not None:
             units = [unit for unit in units if unit.unit_id in self._memory_unit_ids]
+
+        self._start_query_progress(units)
+
+        if self.execution_stage == "query" and getattr(self, "workers", 1) > 1 and len(units) > 1:
+            try:
+                self._run_query_stage_parallel(units)
+            finally:
+                self._finish_query_progress()
+            return
 
         for unit in units:
             persona_id = unit.context_id
@@ -2121,6 +2287,7 @@ class MedMemoryBenchEvaluator:
                 self.result_collector.add_result(result, persona_id)
 
         if getattr(self, "execution_stage", "all") == "memory":
+            self._finish_query_progress()
             return
 
         for item in self._complete_combined_batch_queries():
@@ -2152,6 +2319,256 @@ class MedMemoryBenchEvaluator:
                 self._checkpoint_manager.complete_persona(persona_id)
         elif current_context_id is not None and self._checkpoint_manager:
             self._checkpoint_manager.complete_persona(current_context_id)
+        self._finish_query_progress()
+
+    def _run_query_stage_parallel(self, units: List[EvaluationUnit]) -> None:
+        """Evaluate snapshot-backed units concurrently with isolated agents.
+
+        Query-stage snapshots are immutable and independent, but ``AgentManager``
+        keeps mutable active-memory state. Each task therefore owns a manager;
+        shared report/checkpoint state is merged by this coordinator in dataset
+        order after the workers finish.
+        """
+        if not hasattr(self, "_pending_batch_queries"):
+            self._pending_batch_queries = []
+        if not hasattr(self, "_api_failures"):
+            self._api_failures = []
+        pending_units: List[tuple[EvaluationUnit, Dict[str, Any]]] = []
+        deferred_query_ids = {
+            item.get("query_id") for item in self._deferred_judges
+        }
+        for unit in units:
+            if (
+                self._checkpoint_manager
+                and self._checkpoint_manager.is_persona_completed(unit.context_id)
+            ):
+                self._log(f"Skipping completed Persona: {unit.context_id}")
+                continue
+            payload = self._read_memory_snapshot(unit)
+            if payload is None:
+                raise FileNotFoundError(
+                    f"No compatible A-MEM snapshot for evaluation unit {unit.unit_id}: "
+                    f"{self._memory_snapshot_path(unit)}"
+                )
+            self._record_source_build_metrics(unit, payload)
+            queries = [
+                query
+                for query in unit.queries_to_evaluate
+                if not (
+                    self._checkpoint_manager
+                    and self._checkpoint_manager.is_query_completed(
+                        query.query_id,
+                        persona_id=unit.context_id,
+                    )
+                )
+                and query.query_id not in deferred_query_ids
+            ]
+            pending_units.append((
+                EvaluationUnit(
+                    unit_id=unit.unit_id,
+                    sessions_to_inject=unit.sessions_to_inject,
+                    queries_to_evaluate=queries,
+                    context_id=unit.context_id,
+                    metadata={
+                        **unit.metadata,
+                        # Resume may omit completed queries from this worker,
+                        # but memory-build time must retain the serial run's
+                        # original per-query attribution.
+                        "_query_stage_original_query_count": len(
+                            unit.queries_to_evaluate
+                        ),
+                    },
+                ),
+                payload,
+            ))
+
+        if not pending_units:
+            return
+
+        # Batch completion/finalization uses the coordinator's manager. Worker
+        # managers are independent and never mutate this active manager state.
+        if self.batch_api:
+            self._init_agent_for_context(
+                context_id=pending_units[0][0].context_id,
+                force_new=True,
+            )
+            if self._supports_batch_queries():
+                self._get_batch_client()
+
+        def create_worker(item: tuple[EvaluationUnit, Dict[str, Any]]) -> Dict[str, Any]:
+            unit, payload = item
+            worker = copy.copy(self)
+            # The outer executor owns the complete worker budget. Never let an
+            # isolated unit create a nested per-query executor.
+            worker.workers = 1
+            worker.agent_manager = AgentManager(
+                method_config=self.method_config,
+                dataset_config=self.dataset_config,
+                batch_api=self.batch_api,
+                batch_gcs_uri=getattr(self, "batch_gcs_uri", None),
+                batch_wait=getattr(self, "batch_wait", False),
+                workers=1,
+                batch_manifest_dir=self.output_dir / "batch",
+                batch_config_hash=self._batch_manifest_config_hash(),
+                batch_progress_callback=self._log,
+                query_only=self.execution_stage == "query",
+            )
+            worker._checkpoint_manager = None
+            worker._memory_build_logs = []
+            worker._source_memory_build_logs = []
+            worker._pending_batch_queries = []
+            worker._deferred_judges = []
+            worker._api_failures = []
+            worker._api_failure_duration_seconds = 0.0
+            worker._api_failure_lock = threading.Lock()
+            worker._batch_fallback_logged = True
+            worker._judge_batch_fallback_logged = True
+            worker._batch_client = getattr(self, "_batch_client", None)
+            worker._judge_batch_client = getattr(self, "_judge_batch_client", None)
+            worker.agent_manager.import_memory_state(
+                payload["memory_state"],
+                context_id=unit.context_id,
+            )
+            return {
+                "unit": unit,
+                "payload": payload,
+                "worker": worker,
+                "results": [],
+            }
+
+        context_worker_count = min(self.workers, len(pending_units))
+        self._log(
+            f"[Workers] Initializing {len(pending_units):,} isolated query-unit "
+            f"contexts with up to {context_worker_count} workers."
+        )
+        with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
+            worker_results = list(executor.map(create_worker, pending_units))
+
+        try:
+            if self._supports_batch_queries():
+                # Batch final-answer transport has one combined dispatch below.
+                # Unit preparation is bounded by the same global worker budget.
+                with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
+                    for item, results in zip(
+                        worker_results,
+                        executor.map(
+                            lambda item: item["worker"]._evaluate_unit_queries(
+                                item["unit"],
+                                total_memory_time=float(
+                                    item["payload"].get("memory_build_time", 0.0)
+                                ),
+                            ),
+                            worker_results,
+                        ),
+                    ):
+                        item["results"] = results
+            else:
+                query_jobs = [
+                    (item, query)
+                    for item in worker_results
+                    for query in item["unit"].queries_to_evaluate
+                ]
+                query_worker_count = min(self.workers, len(query_jobs))
+                self._log(
+                    f"[Workers] Running {len(query_jobs):,} real-time queries across "
+                    f"{len(worker_results):,} query units with {query_worker_count} "
+                    "workers total."
+                )
+
+                def evaluate_query_job(job):
+                    item, query = job
+                    unit = item["unit"]
+                    worker = item["worker"]
+                    try:
+                        memory_time = float(
+                            item["payload"].get("memory_build_time", 0.0)
+                        ) / int(
+                            unit.metadata.get(
+                                "_query_stage_original_query_count",
+                                len(unit.queries_to_evaluate),
+                            )
+                        )
+                        if worker._supports_memory_snapshots():
+                            result = worker._evaluate_query_staged(
+                                query,
+                                unit.context_id,
+                                memory_time_per_query=memory_time,
+                                unit_id=unit.unit_id,
+                            )
+                        else:
+                            result = worker._evaluate_query(
+                                query,
+                                unit.context_id,
+                                memory_time_per_query=memory_time,
+                                unit_id=unit.unit_id,
+                            )
+                        return item, result
+                    finally:
+                        self._advance_query_progress(
+                            query.query_id,
+                            context_id=unit.context_id,
+                        )
+
+                if query_jobs:
+                    with ThreadPoolExecutor(max_workers=query_worker_count) as executor:
+                        # map preserves unit/query ordering for report aggregation.
+                        evaluated_queries = list(executor.map(evaluate_query_job, query_jobs))
+                    for item, result in evaluated_queries:
+                        if result is not None:
+                            item["results"].append(result)
+        finally:
+            for item in worker_results:
+                item["worker"].agent_manager.reset()
+
+        for item in worker_results:
+            worker = item["worker"]
+            self._api_failures.extend(worker._api_failures)
+            self._api_failure_duration_seconds = (
+                getattr(self, "_api_failure_duration_seconds", 0.0)
+                + worker._api_failure_duration_seconds
+            )
+            self._pending_batch_queries.extend(worker._pending_batch_queries)
+            self._deferred_judges.extend(worker._deferred_judges)
+            for result in item["results"]:
+                self.aggregator.add_result(result)
+                self.result_collector.add_result(result, item["unit"].context_id)
+                if self._checkpoint_manager:
+                    self._checkpoint_manager.mark_query_completed(
+                        result.query_id,
+                        result.to_dict(),
+                        persona_id=item["unit"].context_id,
+                    )
+
+        for item in self._complete_combined_batch_queries():
+            result = item["result"]
+            persona_id = item["persona_id"]
+            self.aggregator.add_result(result)
+            self.result_collector.add_result(result, persona_id)
+            if self._checkpoint_manager:
+                self._checkpoint_manager.mark_query_completed(
+                    result.query_id,
+                    result.to_dict(),
+                    persona_id=persona_id,
+                )
+
+        for item in self._complete_deferred_judges():
+            result = item["result"]
+            persona_id = item["persona_id"]
+            self.aggregator.add_result(result)
+            self.result_collector.add_result(result, persona_id)
+            if self._checkpoint_manager:
+                self._checkpoint_manager.mark_query_completed(
+                    result.query_id,
+                    result.to_dict(),
+                    persona_id=persona_id,
+                )
+
+        if self._checkpoint_manager and self.batch_api:
+            for persona_id in self.dataset.get_persona_ids():
+                self._checkpoint_manager.complete_persona(persona_id)
+        elif self._checkpoint_manager:
+            for unit, _ in pending_units:
+                self._checkpoint_manager.complete_persona(unit.context_id)
 
     def _evaluate_append_unit(self, unit: EvaluationUnit) -> List[MetricResult]:
         """Reuse a carried-forward snapshot or build the next missing unit."""
@@ -2279,6 +2696,16 @@ class MedMemoryBenchEvaluator:
                         session_succeeded = True
                         total_memory_time += memory_result.time_cost
 
+                        for failure in memory_result.extra.get("api_failures", []):
+                            self._record_api_failure(
+                                "memory_build",
+                                failure,
+                                unit_id=unit.unit_id,
+                                context_id=unit.context_id,
+                                session_id=session.session_id,
+                                session_index=idx,
+                            )
+
                         # Log brief progress info
                         passages_count = len(memory_result.all_passages) if memory_result.all_passages else memory_result.extra.get("inserted_count", 0)
                         self._log(f"        → Stored {passages_count} passages, time={memory_result.time_cost:.2f}s")
@@ -2297,17 +2724,21 @@ class MedMemoryBenchEvaluator:
                         level="ERROR"
                     )
                     memory_build_failed = True
-                    self._record_api_failure(
-                        "memory_build",
-                        e,
-                        unit_id=unit.unit_id,
-                        context_id=unit.context_id,
-                        session_id=session.session_id,
-                        session_index=idx,
-                        affected_query_ids=[
-                            query.query_id for query in unit.queries_to_evaluate
-                        ],
-                    )
+                    memory_failures = self._drain_memory_api_failures(unit.context_id)
+                    if not memory_failures:
+                        memory_failures = [{}]
+                    for failure in memory_failures:
+                        self._record_api_failure(
+                            "memory_build",
+                            failure if failure else e,
+                            unit_id=unit.unit_id,
+                            context_id=unit.context_id,
+                            session_id=session.session_id,
+                            session_index=idx,
+                            affected_query_ids=[
+                                query.query_id for query in unit.queries_to_evaluate
+                            ],
+                        )
                     rollback_incomplete = getattr(
                         self._checkpoint_manager,
                         "rollback_incomplete_session",
@@ -2414,7 +2845,12 @@ class MedMemoryBenchEvaluator:
         total_query_time = 0.0
         self._log(f"    --- Query Evaluation Start ---")
 
-        query_count = len(unit.queries_to_evaluate)
+        query_count = int(
+            getattr(unit, "metadata", {}).get(
+                "_query_stage_original_query_count",
+                len(unit.queries_to_evaluate),
+            )
+        )
         memory_time_per_query = total_memory_time / query_count if query_count > 0 else 0.0
 
         pending_query_count = sum(
@@ -2469,6 +2905,7 @@ class MedMemoryBenchEvaluator:
                 )
                 self._batch_fallback_logged = True
 
+            pending_queries = []
             for query in unit.queries_to_evaluate:
                 if (
                     self._checkpoint_manager
@@ -2482,21 +2919,14 @@ class MedMemoryBenchEvaluator:
                 if self._is_deferred_judge_query(query.query_id):
                     self._log(f"    [Skip] {query.query_id} (awaiting saved Vertex judge result)")
                     continue
+                pending_queries.append(query)
 
-                if self._supports_memory_snapshots():
-                    result = self._evaluate_query_staged(
-                        query,
-                        unit.context_id,
-                        memory_time_per_query=memory_time_per_query,
-                        unit_id=unit.unit_id,
-                    )
-                else:
-                    result = self._evaluate_query(
-                        query,
-                        unit.context_id,
-                        memory_time_per_query=memory_time_per_query,
-                        unit_id=unit.unit_id,
-                    )
+            for query, result in self._evaluate_realtime_queries(
+                pending_queries,
+                context_id=unit.context_id,
+                memory_time_per_query=memory_time_per_query,
+                unit_id=unit.unit_id,
+            ):
                 if result is None:
                     continue
                 results.append(result)
@@ -2515,6 +2945,47 @@ class MedMemoryBenchEvaluator:
         self._log(f"    --- Query Evaluation Done, time={total_query_time:.2f}s ---")
 
         return results
+
+    def _evaluate_realtime_queries(
+        self,
+        queries: List[MedQuery],
+        *,
+        context_id: int,
+        memory_time_per_query: float,
+        unit_id: int,
+    ) -> List[tuple[MedQuery, Optional[MetricResult]]]:
+        """Run independent answer-and-score pairs with bounded concurrency."""
+        def evaluate_one(query: MedQuery) -> tuple[MedQuery, Optional[MetricResult]]:
+            try:
+                if self._supports_memory_snapshots():
+                    result = self._evaluate_query_staged(
+                        query,
+                        context_id,
+                        memory_time_per_query=memory_time_per_query,
+                        unit_id=unit_id,
+                    )
+                else:
+                    result = self._evaluate_query(
+                        query,
+                        context_id,
+                        memory_time_per_query=memory_time_per_query,
+                        unit_id=unit_id,
+                    )
+                return query, result
+            finally:
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=context_id,
+                )
+
+        if len(queries) < 2 or self.workers == 1:
+            return [evaluate_one(query) for query in queries]
+
+        worker_count = min(self.workers, len(queries))
+        self._log(f"    [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            # executor.map preserves dataset order for deterministic reports/checkpoints.
+            return list(executor.map(evaluate_one, queries))
 
     def _supports_batch_queries(self) -> bool:
         return bool(
@@ -2627,6 +3098,10 @@ class MedMemoryBenchEvaluator:
                         context_id=unit.context_id,
                         unit_id=unit.unit_id,
                     )
+                    self._advance_query_progress(
+                        query.query_id,
+                        context_id=unit.context_id,
+                    )
                     continue
 
             if saved_request is not None:
@@ -2683,6 +3158,10 @@ class MedMemoryBenchEvaluator:
                     context_id=unit.context_id,
                     unit_id=unit.unit_id,
                 )
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=unit.context_id,
+                )
                 continue
             try:
                 response = self._run_api_call(
@@ -2725,9 +3204,22 @@ class MedMemoryBenchEvaluator:
                     context_id=unit.context_id,
                     unit_id=unit.unit_id,
                 )
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=unit.context_id,
+                )
                 continue
             if result is not None:
                 results.append(result)
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=unit.context_id,
+                )
+            elif not self._is_deferred_judge_query(query.query_id):
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=unit.context_id,
+                )
         return results
 
     def _prepare_combined_batch_queries(
@@ -2740,20 +3232,22 @@ class MedMemoryBenchEvaluator:
         batch_client = self._get_batch_client()
         prepared_count = 0
 
+        query_items = []
         for query in unit.queries_to_evaluate:
             if (
                 self._checkpoint_manager
                 and self._checkpoint_manager.is_query_completed(
-                    query.query_id,
-                    persona_id=unit.context_id,
+                    query.query_id, persona_id=unit.context_id
                 )
             ):
                 self._log(f"    [Skip] {query.query_id} (completed)")
                 continue
             if self._is_deferred_judge_query(query.query_id):
-                self._log(f"    [Skip] {query.query_id} (awaiting saved Vertex judge result)")
+                self._log(
+                    f"    [Skip] {query.query_id} "
+                    "(awaiting saved Vertex judge result)"
+                )
                 continue
-
             request_id = make_request_id(
                 "query",
                 f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
@@ -2765,36 +3259,56 @@ class MedMemoryBenchEvaluator:
                 else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             )
             prepared = restore_prepared_query(saved_request) if saved_request else None
-            if prepared is None:
-                formatted_question = self.prompt_manager.format_query(
-                    question=query.question,
+            query_items.append((query, request_id, saved_request, batch_request_time, prepared))
+
+        def prepare_item(item):
+            query, _, _, batch_request_time, prepared = item
+            if prepared is not None:
+                return prepared, None
+            formatted_question = self.prompt_manager.format_query(
+                question=query.question, query_type=query.query_type
+            )
+            try:
+                return self._run_api_call(
+                    self.agent_manager.prepare_batch_query,
+                    formatted_question,
+                    query_id=query.query_id,
+                    context_id=unit.context_id,
+                    batch_request_time=batch_request_time,
+                    raw_question=query.question,
                     query_type=query.query_type,
+                ), None
+            except LLMAPIError as exc:
+                return None, exc
+
+        worker_count = getattr(self, "workers", 1)
+        if worker_count > 1 and len(query_items) > 1:
+            with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
+                prepared_items = list(executor.map(prepare_item, query_items))
+        else:
+            prepared_items = [prepare_item(item) for item in query_items]
+
+        for item, (prepared, preparation_error) in zip(query_items, prepared_items):
+            query, request_id, saved_request, batch_request_time, _ = item
+            if preparation_error is not None:
+                self._log(
+                    f"    [API ERROR] {query.query_id}: query preparation failed; "
+                    f"skipping this query. Error: {preparation_error}",
+                    level="ERROR",
                 )
-                try:
-                    prepared = self._run_api_call(
-                        self.agent_manager.prepare_batch_query,
-                        formatted_question,
-                        query_id=query.query_id,
-                        context_id=unit.context_id,
-                        batch_request_time=batch_request_time,
-                        raw_question=query.question,
-                        query_type=query.query_type,
-                    )
-                except LLMAPIError as e:
-                    self._log(
-                        f"    [API ERROR] {query.query_id}: query preparation failed; "
-                        f"skipping this query. Error: {e}",
-                        level="ERROR",
-                    )
-                    self._record_api_failure(
-                        "query_preparation",
-                        e,
-                        query_id=query.query_id,
-                        query_type=query.query_type,
-                        context_id=unit.context_id,
-                        unit_id=unit.unit_id,
-                    )
-                    continue
+                self._record_api_failure(
+                    "query_preparation",
+                    preparation_error,
+                    query_id=query.query_id,
+                    query_type=query.query_type,
+                    context_id=unit.context_id,
+                    unit_id=unit.unit_id,
+                )
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=unit.context_id,
+                )
+                continue
 
             request = saved_request or BatchChatRequest(
                 request_id=request_id,
@@ -2866,6 +3380,10 @@ class MedMemoryBenchEvaluator:
                     context_id=item["persona_id"],
                     unit_id=item["unit_id"],
                 )
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=item["persona_id"],
+                )
                 continue
             try:
                 response = self._run_api_call(
@@ -2908,6 +3426,10 @@ class MedMemoryBenchEvaluator:
                     context_id=item["persona_id"],
                     unit_id=item["unit_id"],
                 )
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=item["persona_id"],
+                )
                 continue
             if result is not None:
                 status = "✓" if result.is_correct else "✗"
@@ -2918,6 +3440,15 @@ class MedMemoryBenchEvaluator:
                     "persona_id": item["persona_id"],
                     "result": result,
                 })
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=item["persona_id"],
+                )
+            elif not self._is_deferred_judge_query(query.query_id):
+                self._advance_query_progress(
+                    query.query_id,
+                    context_id=item["persona_id"],
+                )
 
         self._pending_batch_queries = []
         return finalized
@@ -3284,6 +3815,10 @@ class MedMemoryBenchEvaluator:
                     query_type=prepared["query_type"],
                     context_id=item["persona_id"],
                 )
+                self._advance_query_progress(
+                    item["query_id"],
+                    context_id=item["persona_id"],
+                )
                 continue
             try:
                 result = self._run_api_call(
@@ -3302,6 +3837,10 @@ class MedMemoryBenchEvaluator:
                     e,
                     query_id=item["query_id"],
                     query_type=prepared["query_type"],
+                    context_id=item["persona_id"],
+                )
+                self._advance_query_progress(
+                    item["query_id"],
                     context_id=item["persona_id"],
                 )
                 continue
@@ -3330,6 +3869,10 @@ class MedMemoryBenchEvaluator:
             )
             result.details["execution_usage"] = execution_usage
             finalized.append({"persona_id": item["persona_id"], "result": result})
+            self._advance_query_progress(
+                item["query_id"],
+                context_id=item["persona_id"],
+            )
         self._clear_deferred_judges()
         return finalized
 
@@ -3527,6 +4070,7 @@ def evaluate_medmemorybench(
     batch_api: bool = False,
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
+    workers: int = 1,
     **kwargs
 ) -> EvaluationReport:
     """MedMemoryBench evaluation entry point."""
@@ -3550,5 +4094,6 @@ def evaluate_medmemorybench(
         batch_api=batch_api,
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
+        workers=workers,
     )
     return evaluator.evaluate()

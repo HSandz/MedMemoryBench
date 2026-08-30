@@ -139,6 +139,41 @@ def test_api_failures_are_saved_outside_result_and_query_files(tmp_path):
     assert failure_data["failures"] == [failure]
 
 
+def test_failure_counts_are_saved_even_without_terminal_failure_events(tmp_path):
+    report = EvaluationReport(
+        method_name="method",
+        model_name="model",
+        dataset_name="medmemorybench",
+        start_time="start",
+        end_time="end",
+        duration_seconds=1.0,
+        summary={"total": 0},
+        metadata={
+            "api_failures": [],
+            "llm_usage": {
+                "memorize_phase": {"failed_attempts": 4, "retry_count": 3},
+                "query_phase": {"failed_attempts": 2, "retry_count": 1},
+                "total": {"failed_attempts": 6, "retry_count": 4},
+            },
+            "evaluation_coverage": {},
+        },
+    )
+
+    ResultCollector().save_reports(report, tmp_path, [])
+
+    failure_path = next(tmp_path.rglob("*_api_failures.json"))
+    failure_data = json.loads(failure_path.read_text())
+    assert failure_data["failure_count"] == 0
+    assert failure_data["failure_counts"] == {
+        "total_failed_attempts": 6,
+        "total_retries": 4,
+        "by_phase": {
+            "memorize": {"failed_attempts": 4, "retry_count": 3},
+            "query": {"failed_attempts": 2, "retry_count": 1},
+        },
+    }
+
+
 def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_path):
     collector = ResultCollector()
     batch_result = MetricResult(

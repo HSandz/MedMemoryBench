@@ -250,6 +250,8 @@ class ModelConfig:
     base_url: Optional[str] = None
     openrouter_provider: Optional[Dict[str, Any]] = None
     openrouter_service_tier: Optional[str] = None
+    nim_thinking_enabled: Optional[bool] = None
+    nim_reasoning_budget: Optional[int] = None
 
 
 def _parse_openrouter_options(
@@ -273,6 +275,32 @@ def _parse_openrouter_options(
         dict(provider_routing) if provider_routing is not None else None,
         service_tier,
     )
+
+
+def _parse_nim_options(
+    model_data: Dict[str, Any],
+    section: str,
+) -> tuple[Optional[bool], Optional[int]]:
+    """Parse NIM Nemotron thinking controls for Bifrost's passthrough API."""
+    nim_data = model_data.get("nim", {})
+    if nim_data is None:
+        nim_data = {}
+    if not isinstance(nim_data, dict):
+        raise ValueError(f"{section}.nim must be a mapping")
+
+    enabled = nim_data.get("enable_thinking")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"{section}.nim.enable_thinking must be a boolean")
+
+    budget = nim_data.get("reasoning_budget")
+    if budget is not None:
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            raise ValueError(f"{section}.nim.reasoning_budget must be an integer")
+        if not -1 <= budget <= 32768:
+            raise ValueError(
+                f"{section}.nim.reasoning_budget must be between -1 and 32768"
+            )
+    return enabled, budget
 
 
 @dataclass
@@ -310,6 +338,9 @@ class MethodConfig:
         openrouter_provider, openrouter_service_tier = _parse_openrouter_options(
             model_data, "model"
         )
+        nim_thinking_enabled, nim_reasoning_budget = _parse_nim_options(
+            model_data, "model"
+        )
         model_config = ModelConfig(
             provider=model_data.get("provider", "openai"),
             name=model_data.get("name", "gpt-4o-mini"),
@@ -321,6 +352,8 @@ class MethodConfig:
             base_url=model_data.get("base_url"),
             openrouter_provider=openrouter_provider,
             openrouter_service_tier=openrouter_service_tier,
+            nim_thinking_enabled=nim_thinking_enabled,
+            nim_reasoning_budget=nim_reasoning_budget,
         )
 
         embedding_config = None
@@ -362,6 +395,9 @@ class MethodConfig:
                 mem_openrouter_provider,
                 mem_openrouter_service_tier,
             ) = _parse_openrouter_options(mem_data, "memorize_model")
+            mem_nim_thinking_enabled, mem_nim_reasoning_budget = _parse_nim_options(
+                mem_data, "memorize_model"
+            )
             memorize_model_config = ModelConfig(
                 provider=mem_data.get("provider", "openai"),
                 name=mem_data.get("name", model_config.name),
@@ -373,6 +409,8 @@ class MethodConfig:
                 base_url=mem_data.get("base_url"),
                 openrouter_provider=mem_openrouter_provider,
                 openrouter_service_tier=mem_openrouter_service_tier,
+                nim_thinking_enabled=mem_nim_thinking_enabled,
+                nim_reasoning_budget=mem_nim_reasoning_budget,
             )
 
         # New configs separate snapshot/build semantics from query behavior.

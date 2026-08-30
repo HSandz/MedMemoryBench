@@ -22,6 +22,30 @@ This guide covers the A-MEM integration in MedMemoryBench. Repository-wide Pytho
 
 The robust layer may make up to three conditional evolution calls when adding a note: decide whether to evolve, strengthen details, and update neighbors. `amem_evo_threshold` controls periodic retriever consolidation.
 
+When `--workers N` is greater than one, `amem_test` uses those workers for
+independent build/query substeps without changing its logical ordering. Note
+metadata extraction can run concurrently. In typed-only builds
+(`amem_original_evolution: false` and `amem_typed_relations: true`), typed
+relation inference can also run concurrently after each note's candidate set
+and stable insertion position are fixed. Note insertion, retriever indexing,
+edge storage, temporal transitions, provenance, audits, and checkpoint-visible
+ordering remain serial. Original evolution stays serial because it mutates
+existing neighbors and is state-dependent. For Batch API query runs, keyword
+rewriting and read-only retrieval preparation are also bounded by `N` workers;
+final-answer requests still follow the normal batch transport.
+
+For `--stage query`, completed memory snapshots can initialize independent
+evaluation-unit contexts concurrently. Each unit uses an isolated
+`AgentManager`, but `--workers N` remains one global cap across every unit's
+real-time query pipelines. Results, batch requests, deferred judges, and
+checkpoint updates are merged in dataset order so the report matches a
+sequential run. This applies only to snapshot-backed query execution; memory
+construction remains ordered.
+
+Retry-exhausted A-MEM build calls are preserved as `memory_build` entries in the
+run's separate `*_api_failures.json` report. Aggregate failed-attempt and retry
+counts include both recovered and terminal failures.
+
 ## Configuration
 
 AMEM method files separate `build_config` from `retrieval_config`. Build settings define the stored snapshot: embedding, chunking, metadata/evolution settings, and `amem_build_max_context_tokens`. The optional top-level `memorize_model` block independently configures the internal build LLM, including its provider, model, credentials, OpenRouter routing, and service tier. The top-level `model` configures both query keyword rewrites and final-answer generation. Legacy `build_config.amem_backend` and `build_config.amem_model` remain supported when `memorize_model` is absent. Retrieval settings can change on a frozen snapshot, including `retrieve_num`, keyword use, graph budgets, `amem_relation_min_confidence`, temporal ordering, provenance injection, and `amem_max_context_tokens`.

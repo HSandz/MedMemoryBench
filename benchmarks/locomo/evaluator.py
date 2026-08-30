@@ -3,6 +3,7 @@
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -51,6 +52,7 @@ class LoCoMoEvaluator:
         batch_api: bool = False,
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
+        workers: int = 1,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -63,6 +65,9 @@ class LoCoMoEvaluator:
         self.batch_api = batch_api
         self.batch_gcs_uri = batch_gcs_uri
         self.batch_wait = batch_wait
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -149,6 +154,7 @@ class LoCoMoEvaluator:
                 batch_api=self.batch_api,
                 batch_gcs_uri=self.batch_gcs_uri,
                 batch_wait=self.batch_wait,
+                workers=self.workers,
                 batch_manifest_dir=self.output_dir / "batch",
                 batch_config_hash=self._batch_config_hash(),
                 batch_progress_callback=self._log,
@@ -409,10 +415,10 @@ class LoCoMoEvaluator:
                     level="WARNING",
                 )
                 self._batch_fallback_logged = True
-            query_results = [
-                self._evaluate_query(query, unit.context_id)
-                for query in unit.queries_to_evaluate
-            ]
+            query_results = self._evaluate_realtime_queries(
+                unit.queries_to_evaluate,
+                unit.context_id,
+            )
 
         for result in query_results:
             result.memory_construction_time = memory_time_per_query
@@ -429,6 +435,24 @@ class LoCoMoEvaluator:
             and self.agent_manager
             and self.agent_manager.supports_batch_queries()
         )
+
+    def _evaluate_realtime_queries(
+        self,
+        queries: List[LoCoMoQuery],
+        context_id: Any,
+    ) -> List[MetricResult]:
+        """Run independent real-time query evaluations with bounded concurrency."""
+        if len(queries) < 2 or self.workers == 1:
+            return [self._evaluate_query(query, context_id) for query in queries]
+
+        worker_count = min(self.workers, len(queries))
+        self._log(f"  [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            # executor.map preserves dataset order for deterministic reports.
+            return list(executor.map(
+                lambda query: self._evaluate_query(query, context_id),
+                queries,
+            ))
 
     def _get_batch_client(self) -> VertexBatchClient:
         if self._batch_client is None:
@@ -537,6 +561,7 @@ class LoCoMoEvaluator:
         batch_client = self._get_batch_client()
         prepared_count = 0
 
+        query_items = []
         for query in unit.queries_to_evaluate:
             request_id = make_request_id(
                 "query",
@@ -549,19 +574,33 @@ class LoCoMoEvaluator:
                 else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             )
             prepared = restore_prepared_query(saved_request) if saved_request else None
-            if prepared is None:
-                formatted_question = self.prompt_manager.format_query(
-                    question=query.question,
-                    query_type=query.query_type,
-                )
-                prepared = self.agent_manager.prepare_batch_query(
-                    formatted_question,
-                    query_id=query.query_id,
-                    context_id=unit.context_id,
-                    batch_request_time=batch_request_time,
-                    raw_question=query.question,
-                    query_type=query.query_type,
-                )
+            query_items.append((query, request_id, saved_request, batch_request_time, prepared))
+
+        def prepare_item(item):
+            query, _, _, batch_request_time, prepared = item
+            if prepared is not None:
+                return prepared
+            formatted_question = self.prompt_manager.format_query(
+                question=query.question, query_type=query.query_type
+            )
+            return self.agent_manager.prepare_batch_query(
+                formatted_question,
+                query_id=query.query_id,
+                context_id=unit.context_id,
+                batch_request_time=batch_request_time,
+                raw_question=query.question,
+                query_type=query.query_type,
+            )
+
+        worker_count = getattr(self, "workers", 1)
+        if worker_count > 1 and len(query_items) > 1:
+            with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
+                prepared_items = list(executor.map(prepare_item, query_items))
+        else:
+            prepared_items = [prepare_item(item) for item in query_items]
+
+        for item, prepared in zip(query_items, prepared_items):
+            query, request_id, saved_request, batch_request_time, _ = item
 
             request = saved_request or BatchChatRequest(
                 request_id=request_id,
@@ -846,6 +885,7 @@ def evaluate_locomo(
     batch_api: bool = False,
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
+    workers: int = 1,
     **kwargs
 ) -> EvaluationReport:
     if execution_stage != "all":
@@ -862,5 +902,6 @@ def evaluate_locomo(
         batch_api=batch_api,
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
+        workers=workers,
     )
     return evaluator.evaluate()

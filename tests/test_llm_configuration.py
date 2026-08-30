@@ -1,5 +1,6 @@
 """Regression tests for configurable first-party LLM generation settings."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from utils.llm_client import (
     OpenRouterClient,
     create_llm_client,
     extract_usage_token_counts,
+    TruncatedLLMResponseError,
 )
 from utils.openrouter_batch import OpenRouterBatchClient
 
@@ -270,6 +272,114 @@ def test_openai_and_openrouter_reasoning_effort_request_mapping():
     router.client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
     router.chat([{"role": "user", "content": "hi"}])
     assert calls[-1]["extra_body"]["reasoning"] == {"effort": "low"}
+
+
+def test_nim_thinking_yaml_maps_to_bifrost_passthrough_fields():
+    config = MethodConfig.from_dict({
+        "method_name": "amem_test",
+        "method_type": "agentic_memory",
+        "model": {
+            "provider": "openai",
+            "name": "NIM/nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nim": {"enable_thinking": False, "reasoning_budget": 0},
+        },
+    })
+    manager = object.__new__(AgentManager)
+    manager.method_config = config
+    manager.dataset_config = DatasetConfig(dataset_name="medmemorybench")
+    manager._api_config = APIConfig(openai_api_key="key")
+    manager._batch_api = False
+    manager._batch_gcs_uri = manager._batch_manifest_dir = None
+    manager._batch_wait = False
+    manager._batch_config_hash = ""
+    manager._batch_progress_callback = None
+
+    assert manager._build_agent_params("amem_test")["llm_client_kwargs"] == {
+        "nim_thinking_enabled": False,
+        "nim_reasoning_budget": 0,
+    }
+
+    captured = {}
+    client = object.__new__(OpenAIClient)
+    client.model, client.temperature, client.max_tokens = config.model.name, 0.0, 100
+    client.reasoning_effort = None
+    client.nim_thinking_enabled = False
+    client.nim_reasoning_budget = 0
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: captured.update(kwargs) or SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content="9.8", refusal=None),
+                        finish_reason="stop",
+                    )],
+                    usage=SimpleNamespace(prompt_tokens=4, completion_tokens=4),
+                )
+            )
+        )
+    )
+
+    OpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "hello"}])
+
+    assert captured["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "reasoning_budget": 0,
+    }
+    assert captured["extra_headers"] == {
+        "x-bf-passthrough-extra-params": "true",
+    }
+
+
+@pytest.mark.parametrize(
+    ("nim", "message"),
+    [
+        (True, "model.nim must be a mapping"),
+        ({"enable_thinking": "false"}, "model.nim.enable_thinking must be a boolean"),
+        ({"reasoning_budget": 1.5}, "model.nim.reasoning_budget must be an integer"),
+        ({"reasoning_budget": 32769}, "model.nim.reasoning_budget must be between -1 and 32768"),
+    ],
+)
+def test_nim_yaml_options_validate_types_and_budget(nim, message):
+    with pytest.raises(ValueError, match=message):
+        MethodConfig.from_dict({
+            "method_name": "long_context",
+            "method_type": "baseline",
+            "model": {"name": "NIM/nvidia/nemotron-3.5-lightning-30b-a3b", "nim": nim},
+        })
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
+def test_openai_rejects_truncated_reasoning_response(finish_reason, caplog):
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="Here is an unfinished analysis",
+                refusal=None,
+                reasoning="internal reasoning",
+                reasoning_content="provider reasoning",
+            ),
+            finish_reason=finish_reason,
+        )],
+        usage=SimpleNamespace(prompt_tokens=4, completion_tokens=10),
+    )
+    client = object.__new__(OpenAIClient)
+    client.model = "NIM/nvidia/nemotron-3.5-lightning-30b-a3b"
+    client.temperature = 0.0
+    client.max_tokens = 100
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: response)
+        )
+    )
+
+    caplog.set_level(logging.DEBUG, logger="utils.llm_client")
+    with pytest.raises(TruncatedLLMResponseError):
+        OpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "hello"}])
+
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "finish_reason" in messages
+    assert "message.reasoning" in messages
+    assert "message.reasoning_content" in messages
 
 
 def test_anthropic_reasoning_effort_uses_output_config():

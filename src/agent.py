@@ -46,6 +46,8 @@ class AgentManager:
         batch_manifest_dir: Optional[Path] = None,
         batch_config_hash: str = "",
         batch_progress_callback: Optional[Callable[[str], None]] = None,
+        workers: int = 1,
+        query_only: bool = False,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -56,6 +58,8 @@ class AgentManager:
         self._batch_manifest_dir = batch_manifest_dir
         self._batch_config_hash = batch_config_hash
         self._batch_progress_callback = batch_progress_callback
+        self._workers = max(1, int(workers))
+        self._query_only = bool(query_only)
 
         self._api_config = get_api_config()
 
@@ -91,6 +95,8 @@ class AgentManager:
         batch_wait: bool = False,
         batch_manifest_dir: Optional[Path] = None,
         batch_config_hash: str = "",
+        query_only: bool = False,
+        workers: int = 1,
     ) -> tuple[str, Dict[str, Any]]:
         """Resolve adapter kwargs without constructing an agent or making provider calls."""
         manager = cls.__new__(cls)
@@ -103,6 +109,8 @@ class AgentManager:
         manager._batch_manifest_dir = batch_manifest_dir
         manager._batch_config_hash = batch_config_hash
         manager._batch_progress_callback = None
+        manager._workers = max(1, int(workers))
+        manager._query_only = bool(query_only)
         manager._api_config = get_api_config()
         method_key = cls._matched_method_key(manager.method_name)
         return method_key, manager._build_agent_params(method_key)
@@ -142,6 +150,12 @@ class AgentManager:
         reasoning_effort = getattr(model_config, "reasoning_effort", None)
         if reasoning_effort is not None:
             client_kwargs["reasoning_effort"] = reasoning_effort
+        nim_thinking_enabled = getattr(model_config, "nim_thinking_enabled", None)
+        if nim_thinking_enabled is not None:
+            client_kwargs["nim_thinking_enabled"] = nim_thinking_enabled
+        nim_reasoning_budget = getattr(model_config, "nim_reasoning_budget", None)
+        if nim_reasoning_budget is not None:
+            client_kwargs["nim_reasoning_budget"] = nim_reasoning_budget
         if provider == "openrouter":
             if model_config.openrouter_provider is not None:
                 client_kwargs["provider_routing"] = dict(
@@ -331,6 +345,8 @@ class AgentManager:
                     "amem_original_evolution", True
                 ),
                 "amem_typed_relations": agent_params.get("amem_typed_relations", True),
+                "amem_workers": getattr(self, "_workers", 1),
+                "amem_query_only": getattr(self, "_query_only", False),
                 "amem_typed_retrieval": agent_params.get(
                     "amem_typed_retrieval",
                     bool(agent_params.get("amem_typed_relations", True)),
@@ -955,6 +971,7 @@ class AgentManager:
                 "output_tokens": getattr(response, "output_tokens", 0),
                 "visible_output_tokens": getattr(response, "visible_output_tokens", 0),
                 "thinking_tokens": getattr(response, "thinking_tokens", 0),
+                "finish_reason": getattr(response, "finish_reason", None),
                 "duration_seconds": getattr(response, "latency", None),
             },
         }

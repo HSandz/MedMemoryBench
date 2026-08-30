@@ -65,6 +65,7 @@ class AMemAgent(BaseAgent):
         amem_build_max_context_tokens: int = 200000,
         amem_max_context_tokens: int = 200000,
         amem_chunk_size_tokens: Optional[int] = None,
+        amem_query_only: bool = False,
         **kwargs,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -83,6 +84,7 @@ class AMemAgent(BaseAgent):
         )
         self.amem_max_context_tokens = amem_max_context_tokens
         self.amem_chunk_size_tokens = amem_chunk_size_tokens or self.DEFAULT_CHUNK_SIZE_TOKENS
+        self.amem_query_only = bool(amem_query_only)
         self._amem_backend = self.amem_backend
         self._amem_model = self.amem_model
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
@@ -305,7 +307,15 @@ class AMemAgent(BaseAgent):
         # Older snapshots included the query context budget in this state
         # record; it is deliberately ignored now because it is retrieval-only.
         if stored_config.get("config_version") == 2:
-            config_matches = stored_config == current_config
+            if getattr(self, "amem_query_only", False):
+                # Querying only needs the serialized index embedding and the
+                # same agent class; build controller settings are irrelevant.
+                config_matches = all(
+                    stored_config.get(key) == current_config.get(key)
+                    for key in ("config_version", "agent_class", "embedding_model")
+                )
+            else:
+                config_matches = stored_config == current_config
         else:
             legacy_current_config = {
                 "agent_class": current_config["agent_class"],
@@ -315,7 +325,13 @@ class AMemAgent(BaseAgent):
             }
             legacy_config = dict(stored_config) if isinstance(stored_config, dict) else {}
             legacy_config.pop("max_context_tokens", None)
-            config_matches = legacy_config == legacy_current_config
+            if getattr(self, "amem_query_only", False):
+                config_matches = all(
+                    legacy_config.get(key) == legacy_current_config.get(key)
+                    for key in ("agent_class", "embedding_model")
+                )
+            else:
+                config_matches = legacy_config == legacy_current_config
         if not config_matches:
             raise ValueError("A-MEM memory snapshot configuration does not match the agent")
 

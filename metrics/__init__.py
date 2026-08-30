@@ -1,5 +1,6 @@
 """Evaluation metrics module."""
 
+import threading
 from typing import Dict, List, Any, Type, Optional
 
 from .base import BaseMetric, MetricResult
@@ -55,6 +56,7 @@ class MetricsCalculator:
         if custom_mapping:
             self.metric_mapping.update(custom_mapping)
         self._metric_instances: Dict[str, BaseMetric] = {}
+        self._metric_lock = threading.RLock()
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
@@ -67,26 +69,28 @@ class MetricsCalculator:
         self._language = language
 
     def _get_metric(self, metric_name: str) -> BaseMetric:
-        if metric_name not in self._metric_instances:
-            metric_class = METRIC_REGISTRY.get(metric_name)
-            if metric_class is None:
-                raise ValueError(f"Unknown metric: {metric_name}, available: {list(METRIC_REGISTRY.keys())}")
-            if metric_name in ("llm_judge", "eem_judge", "llm_judge_mcd"):
-                self._metric_instances[metric_name] = metric_class(
-                    dataset=self._dataset,
-                    judge_model=self._judge_model,
-                    judge_api_key=self._judge_api_key,
-                    judge_base_url=self._judge_base_url,
-                    judge_temperature=self._judge_temperature,
-                    judge_reasoning_effort=self._judge_reasoning_effort,
-                    judge_client_max_tokens=self._judge_client_max_tokens,
-                    judge_max_tokens=self._judge_max_tokens,
-                    judge_mcd_max_tokens=self._judge_mcd_max_tokens,
-                    language=self._language,
-                )
-            else:
-                self._metric_instances[metric_name] = metric_class()
-        return self._metric_instances[metric_name]
+        # Worker threads share this calculator; create each metric/client once.
+        with self._metric_lock:
+            if metric_name not in self._metric_instances:
+                metric_class = METRIC_REGISTRY.get(metric_name)
+                if metric_class is None:
+                    raise ValueError(f"Unknown metric: {metric_name}, available: {list(METRIC_REGISTRY.keys())}")
+                if metric_name in ("llm_judge", "eem_judge", "llm_judge_mcd"):
+                    self._metric_instances[metric_name] = metric_class(
+                        dataset=self._dataset,
+                        judge_model=self._judge_model,
+                        judge_api_key=self._judge_api_key,
+                        judge_base_url=self._judge_base_url,
+                        judge_temperature=self._judge_temperature,
+                        judge_reasoning_effort=self._judge_reasoning_effort,
+                        judge_client_max_tokens=self._judge_client_max_tokens,
+                        judge_max_tokens=self._judge_max_tokens,
+                        judge_mcd_max_tokens=self._judge_mcd_max_tokens,
+                        language=self._language,
+                    )
+                else:
+                    self._metric_instances[metric_name] = metric_class()
+            return self._metric_instances[metric_name]
 
     def compute(
         self,

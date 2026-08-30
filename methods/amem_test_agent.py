@@ -78,6 +78,7 @@ class AMemTestAgent(AMemFixAgent):
         amem_chain_path_weight: float = 0.75,
         amem_chain_temporal_weight: float = 0.5,
         amem_chain_redundancy_weight: float = 0.25,
+        amem_workers: int = 1,
         **kwargs,
     ):
         note_level = str(amem_note_level).strip().lower()
@@ -157,6 +158,7 @@ class AMemTestAgent(AMemFixAgent):
             "temporal": max(0.0, float(amem_chain_temporal_weight)),
             "redundancy": max(0.0, float(amem_chain_redundancy_weight)),
         }
+        self.amem_workers = max(1, int(amem_workers))
         if self.amem_temporal_state and not self.amem_typed_relations:
             raise ValueError(
                 "amem_temporal_state requires amem_typed_relations=true because "
@@ -204,6 +206,163 @@ class AMemTestAgent(AMemFixAgent):
             sys.path.insert(0, amem_dir_str)
         module = importlib.import_module("memory_layer_typed")
         return getattr(module, "TypedRelationMemorySystem")
+
+    def _parallel_build_enabled(self, memory_system: Any) -> bool:
+        return bool(
+            getattr(self, "amem_workers", 1) > 1
+            and not self.amem_original_evolution
+            and self.amem_typed_relations
+            and callable(getattr(memory_system, "add_notes_parallel", None))
+        )
+
+    def _parallel_metadata_enabled(self, memory_system: Any, specs: Sequence[Dict[str, Any]]) -> bool:
+        return bool(
+            getattr(self, "amem_workers", 1) > 1
+            and len(specs) > 1
+            and callable(getattr(memory_system, "prepare_note_metadata", None))
+        )
+
+    def _prepare_parallel_metadata(
+        self,
+        memory_system: Any,
+        specs: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self._parallel_metadata_enabled(memory_system, specs):
+            return specs
+        analyses = memory_system.prepare_note_metadata(
+            [spec["content"] for spec in specs],
+            getattr(self, "amem_workers", 1),
+        )
+        prepared = []
+        for spec, analysis in zip(specs, analyses):
+            copied = dict(spec)
+            options = dict(spec.get("kwargs") or {})
+            options["_prepared_analysis"] = analysis
+            copied["kwargs"] = options
+            prepared.append(copied)
+        return prepared
+
+    def _ordinary_note_specs(
+        self,
+        text: str,
+        **kwargs,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Build the same timestamped atomic chunks as the serial AMemFix path."""
+        notes = self._atomic_notes(
+            text,
+            memory_items=kwargs.get("memory_items"),
+            timestamp=kwargs.get("timestamp"),
+        )
+        specs: List[Dict[str, Any]] = []
+        for note_data in notes:
+            parts = self._split_text_into_chunks(
+                note_data["content"], self.amem_chunk_size_tokens
+            )
+            for part in parts:
+                specs.append({
+                    "content": part,
+                    "time": note_data["timestamp"] or None,
+                    "kwargs": {},
+                })
+        return notes, specs
+
+    def _memorize_parallel_chunks(self, text: str, **kwargs) -> MemoryBuildResult:
+        """Build ordinary turn chunks through the deterministic typed pipeline."""
+        context_id = self._get_context_id()
+        memory_system = self._get_memory_system(context_id)
+        with get_usage_tracker().scope("amem.base.chunking"):
+            notes, specs = self._ordinary_note_specs(text, **kwargs)
+        note_ids = memory_system.add_notes_parallel(specs, self.amem_workers)
+        chunks = [spec["content"] for spec in specs]
+        memory_entries = []
+        offset = 0
+        for turn_index, note_data in enumerate(notes):
+            parts = self._split_text_into_chunks(
+                note_data["content"], self.amem_chunk_size_tokens
+            )
+            for part_index, part in enumerate(parts):
+                memory_entries.append({
+                    "event": "ADD",
+                    "memory": part[:400],
+                    "id": note_ids[offset],
+                    "turn_index": turn_index,
+                    "part_index": part_index,
+                    "timestamp": note_data["timestamp"] or None,
+                })
+                offset += 1
+        self._memory_chunks.extend(chunks)
+        self._is_initialized = True
+        return MemoryBuildResult(
+            success=True,
+            method="amem_test",
+            action="add_atomic_notes_with_optional_typed_relations",
+            input_content=text,
+            stored_content="\n\n".join(chunks),
+            memory_entries=memory_entries,
+            all_passages=list(memory_entries),
+            chunk_count=len(self._memory_chunks),
+            extra={
+                "context_id": context_id,
+                "retrieve_num": self.retrieve_num,
+                "chunks_created": len(chunks),
+                "turns_received": len(notes),
+                "note_ids": note_ids,
+                "inserted_count": len(note_ids),
+            },
+        )
+
+    def _memorize_metadata_chunks(self, text: str, **kwargs) -> MemoryBuildResult:
+        """Precompute metadata concurrently, then preserve serial evolution."""
+        context_id = self._get_context_id()
+        memory_system = self._get_memory_system(context_id)
+        with get_usage_tracker().scope("amem.base.chunking"):
+            notes, specs = self._ordinary_note_specs(text, **kwargs)
+        specs = self._prepare_parallel_metadata(memory_system, specs)
+        note_ids = [
+            str(memory_system.add_note(
+                content=spec["content"],
+                time=spec.get("time"),
+                **spec.get("kwargs", {}),
+            ))
+            for spec in specs
+        ]
+        chunks = [spec["content"] for spec in specs]
+        self._memory_chunks.extend(chunks)
+        self._is_initialized = True
+        entries = []
+        offset = 0
+        for turn_index, note_data in enumerate(notes):
+            parts = self._split_text_into_chunks(
+                note_data["content"], self.amem_chunk_size_tokens
+            )
+            for part_index, part in enumerate(parts):
+                entries.append({
+                    "event": "ADD",
+                    "memory": part[:400],
+                    "id": note_ids[offset],
+                    "turn_index": turn_index,
+                    "part_index": part_index,
+                    "timestamp": note_data["timestamp"] or None,
+                })
+                offset += 1
+        return MemoryBuildResult(
+            success=True,
+            method="amem_test",
+            action="add_atomic_notes_with_optional_typed_relations",
+            input_content=text,
+            stored_content="\n\n".join(chunks),
+            memory_entries=entries,
+            all_passages=list(entries),
+            chunk_count=len(self._memory_chunks),
+            extra={
+                "context_id": context_id,
+                "retrieve_num": self.retrieve_num,
+                "chunks_created": len(chunks),
+                "turns_received": len(notes),
+                "note_ids": note_ids,
+                "inserted_count": len(note_ids),
+            },
+        )
 
     def _get_memory_system(self, context_id: int):
         system = self._amem_systems.get(context_id)
@@ -271,6 +430,7 @@ class AMemTestAgent(AMemFixAgent):
             relation_candidate_count=self.amem_relation_candidate_count,
             relation_temperature=getattr(self, "amem_relation_temperature", 0.2),
             temporal_min_confidence=self.amem_temporal_transition_min_confidence,
+            parallel_workers=self.amem_workers,
         )
         self._amem_systems[context_id] = system
         logger.info(
@@ -466,7 +626,7 @@ class AMemTestAgent(AMemFixAgent):
             timestamp=kwargs.get("timestamp"),
         )
 
-        note_ids: List[str] = []
+        note_specs: List[Dict[str, Any]] = []
         memory_entries: List[Dict[str, Any]] = []
         stored_notes: List[str] = []
         for note_data in notes:
@@ -476,22 +636,41 @@ class AMemTestAgent(AMemFixAgent):
                 content, self.amem_chunk_size_tokens
             )
             for part_index, part in enumerate(parts):
-                note_id = str(memory_system.add_note(
-                    content=part,
-                    time=source_timestamp,
-                    source_session_id=kwargs.get("source_session_id"),
-                    source_session_index=kwargs.get("source_session_index"),
+                note_specs.append({
+                    "content": part,
+                    "time": source_timestamp,
+                    "kwargs": {
+                        "source_session_id": kwargs.get("source_session_id"),
+                        "source_session_index": kwargs.get("source_session_index"),
+                    },
+                })
+        if not self._parallel_build_enabled(memory_system):
+            note_specs = self._prepare_parallel_metadata(memory_system, note_specs)
+        if self._parallel_build_enabled(memory_system):
+            note_ids = memory_system.add_notes_parallel(note_specs, self.amem_workers)
+        else:
+            note_ids = [
+                str(memory_system.add_note(
+                    content=spec["content"],
+                    time=spec.get("time"),
+                    **spec.get("kwargs", {}),
                 ))
-                note_ids.append(note_id)
+                for spec in note_specs
+            ]
+        offset = 0
+        for note_data in notes:
+            parts = self._split_text_into_chunks(
+                note_data["content"], self.amem_chunk_size_tokens
+            )
+            for part_index, part in enumerate(parts):
+                note_id = note_ids[offset]
+                offset += 1
                 stored_notes.append(part)
                 self._memory_chunks.append(part)
                 memory_entries.append({
-                    "event": "ADD",
-                    "memory": part[:400],
-                    "id": note_id,
+                    "event": "ADD", "memory": part[:400], "id": note_id,
                     "session_index": kwargs.get("source_session_index"),
-                    "part_index": part_index,
-                    "timestamp": source_timestamp,
+                    "part_index": part_index, "timestamp": note_data["timestamp"] or None,
                 })
 
         self._is_initialized = True
@@ -682,7 +861,7 @@ class AMemTestAgent(AMemFixAgent):
                 )
                 turn_count = len(notes)
 
-        note_ids: List[str] = []
+        note_specs: List[Dict[str, Any]] = []
         memory_entries: List[Dict[str, Any]] = []
         stored_notes: List[str] = []
         note_level = getattr(self, "amem_note_level", "turn")
@@ -698,8 +877,6 @@ class AMemTestAgent(AMemFixAgent):
                     "source_session" if note_level == "session" else "source_turn",
                 )
                 add_note_kwargs = {
-                    "content": part,
-                    "time": source_timestamp,
                     "source_timestamp": source_timestamp,
                     "source_evidence": source_evidence,
                     "provenance_part_index": part_index,
@@ -709,25 +886,35 @@ class AMemTestAgent(AMemFixAgent):
                         "source_session_id": kwargs.get("source_session_id"),
                         "source_session_index": kwargs.get("source_session_index"),
                     })
-                note_id = str(memory_system.add_note(
-                    **add_note_kwargs,
-                ))
-                note_ids.append(note_id)
+                note_specs.append({"content": part, "time": source_timestamp, "kwargs": add_note_kwargs})
                 stored_notes.append(part)
+        if not self._parallel_build_enabled(memory_system):
+            note_specs = self._prepare_parallel_metadata(memory_system, note_specs)
+        if self._parallel_build_enabled(memory_system):
+            note_ids = memory_system.add_notes_parallel(note_specs, self.amem_workers)
+        else:
+            note_ids = [
+                str(memory_system.add_note(
+                    content=spec["content"],
+                    time=spec.get("time"),
+                    **spec.get("kwargs", {}),
+                ))
+                for spec in note_specs
+            ]
+        offset = 0
+        for note_index, note_data in enumerate(notes):
+            parts = self._split_text_into_chunks(note_data["content"], self.amem_chunk_size_tokens)
+            for part_index, part in enumerate(parts):
+                note_id = note_ids[offset]
+                offset += 1
                 self._memory_chunks.append(part)
                 memory_entry = {
-                    "event": "ADD",
-                    "memory": part[:400],
-                    "id": note_id,
-                    "part_index": part_index,
-                    "timestamp": source_timestamp,
+                    "event": "ADD", "memory": part[:400], "id": note_id,
+                    "part_index": part_index, "timestamp": note_data["timestamp"] or None,
                 }
-                if note_level == "session":
-                    memory_entry["session_index"] = kwargs.get(
-                        "source_session_index"
-                    )
-                else:
-                    memory_entry["turn_index"] = note_index
+                memory_entry["session_index" if note_level == "session" else "turn_index"] = (
+                    kwargs.get("source_session_index") if note_level == "session" else note_index
+                )
                 memory_entries.append(memory_entry)
 
         self._is_initialized = True
@@ -761,6 +948,10 @@ class AMemTestAgent(AMemFixAgent):
             result = self._memorize_with_provenance(text, **kwargs)
         elif getattr(self, "amem_note_level", "turn") == "session":
             result = self._memorize_session(text, **kwargs)
+        elif self._parallel_build_enabled(self._get_memory_system(self._get_context_id())):
+            result = self._memorize_parallel_chunks(text, **kwargs)
+        elif getattr(self, "amem_workers", 1) > 1:
+            result = self._memorize_metadata_chunks(text, **kwargs)
         else:
             result = super().memorize(text, **kwargs)
         result.method = "amem_test"
@@ -779,6 +970,9 @@ class AMemTestAgent(AMemFixAgent):
         })
 
         memory_system = self._get_memory_system(self._get_context_id())
+        drain_failures = getattr(memory_system, "drain_api_failure_events", None)
+        if callable(drain_failures):
+            result.extra["api_failures"] = drain_failures()
         if self.amem_typed_relations:
             relation_count = 0
             for entry in result.memory_entries:

@@ -34,6 +34,8 @@ GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY=1
 GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS=1
 GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES=3
 LLM_MAX_RETRIES=100
+LLM_REQUEST_TIMEOUT_SECONDS=180
+LLM_TRUNCATION_MAX_TOKENS=32768
 JUDGE_PROVIDER=vertex
 JUDGE_MODEL=gemini-2.5-flash
 DEFAULT_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
@@ -60,6 +62,33 @@ model/value combinations fail before submission. Other providers pass the
 documented value through for the provider API to validate.
 The optional `memorize_model.reasoning_effort` applies independently to A-MEM
 build calls. Judge calls use `JUDGE_REASONING_EFFORT` in `.env`.
+
+For `NIM/nvidia/nemotron-*` models served through Bifrost, configure the
+NVIDIA reasoning controls with the model's `nim` block:
+
+```yaml
+model:
+  provider: openai
+  name: NIM/nvidia/nemotron-3.5-lightning-30b-a3b
+  nim:
+    enable_thinking: false
+    reasoning_budget: 0
+```
+
+The OpenAI-compatible client sends `chat_template_kwargs.enable_thinking` and
+`reasoning_budget` at the request top level through Bifrost, with
+`x-bf-passthrough-extra-params: true`. `reasoning_budget` must be an integer
+from `-1` through `32768`. Set `enable_thinking: true` and a positive budget
+only when visible reasoning is intended; benchmark answer runs should normally
+disable it.
+
+For `--stage query --memory-run`, compatibility is checked against snapshot
+invariants only: the adapter, query-time embedding/index identity, serialized
+snapshot feature flags, and dataset/query-unit identity. Retrieval options are
+query-time controls and may be changed in the YAML; build-only settings such as
+the memorization model, chunking, evolution thresholds, and build token budgets
+are also ignored. The query LLM may therefore be changed while reusing an
+existing memory snapshot.
 
 Authoritative references: [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning),
 [Gemini thinking](https://ai.google.dev/gemini-api/docs/thinking), and
@@ -103,6 +132,12 @@ at `LLM_RETRY_MIN_DELAY=1` second and are capped at 100 seconds;
 `LLM_RETRY_MAX_DELAY` may lower that cap but cannot raise it above 100. The old
 `GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES` setting is accepted only as a fallback
 when `LLM_MAX_RETRIES` is absent; migrate to the general setting.
+
+`LLM_REQUEST_TIMEOUT_SECONDS` controls the client-side timeout for
+OpenAI-compatible realtime requests, including OpenAI, OpenRouter, and Modal.
+It defaults to `180` seconds. The connection and write timeouts remain fixed at
+30 seconds. A timeout raises a retryable SDK exception and is handled by the
+shared retry policy.
 
 OpenRouter uses the same OpenAI-compatible request, retry, failure handling,
 and usage tracking as the `openai` provider. Set `OPENROUTER_API_KEY`; the base
@@ -257,10 +292,11 @@ python main.py --stage query --memory-run APPEND_RUN
 For eligible Vertex Gemini or OpenRouter stages, run:
 
 ```bash
-python main.py -m METHOD -d DATASET --batch-api --batch-wait
+python main.py -m METHOD -d DATASET --batch-api
 ```
 
-Without `--batch-wait`, resume a submitted job with `--resume --batch-api`.
+Batch jobs are waited on by default. Use `--no-batch-wait` to submit and exit,
+then resume a submitted job with `--resume --batch-api`.
 Batch mode does not batch stateful memory construction or local retrieval; it
 only batches supported immutable LLM stages and LLM-judge requests.
 Batch eligibility is evaluated independently for query answering and judging:
@@ -282,11 +318,57 @@ OpenRouter Batch is asynchronous and text-only. The current implementation uses
 its chat-completions shape and correlates results by `custom_id`. See the
 [OpenRouter Batch API quickstart](https://openrouter.ai/docs/batch-quickstart).
 
+## Parallel Query Workers
+
+Use `--workers N` to run up to `N` independent real-time query evaluations at
+once. The default is `1`, which preserves sequential execution:
+
+```bash
+python main.py -m METHOD -d DATASET --workers 4
+```
+
+Each worker owns one question until its answer and real-time metric scoring are
+complete, then takes another question. This keeps a question's answer and
+judge calls together while bounding concurrent provider requests. Memory
+construction, result collection, and checkpoint writes remain coordinated by the
+main evaluator; completed reports retain dataset order. In Batch API mode,
+query rewriting and read-only retrieval preparation are also worker-bounded.
+
+The evaluator displays one run-wide `Query progress` bar for pending questions.
+It advances as each question reaches a result or terminal API failure, regardless
+of completion order, and therefore works for both serial and worker-parallel
+execution. Batch-judged questions advance after their judge result is finalized.
+
+When running `--stage query` against completed A-MEM snapshots, independent
+unit contexts can initialize without waiting for earlier units. Each unit uses
+an isolated agent/memory context, while `N` remains a single global cap across
+all real-time queries, not a per-unit cap. Result, batch, deferred-judge, and
+checkpoint commits retain dataset order. This optimization requires query-stage
+snapshots and does not change serial behavior for `N = 1`.
+
+`--batch-api` takes precedence for every eligible query-answer or judge stage.
+When both options are supplied, eligible stages use their provider's Batch API;
+real-time stages use the configured workers instead. For example, this uses
+workers for an unsupported answer provider while still batching an eligible
+judge provider:
+
+```bash
+python main.py -m METHOD -d DATASET --batch-api --workers 4
+```
+
+Choose `N` within the provider's rate and concurrency limits. `N` must be at
+least `1`.
+
 ## Outputs and Troubleshooting
 
 Runs are organized as `outputs/<method-model>/<timestamp>/`, with `run_config.json`, `evaluation.log`, memory artifacts, checkpoints, and query answers. Explicit query reruns and append runs are nested under the source run's `query_runs/`.
 
 Result JSON files report `duration_seconds` as total evaluation wall time. `true_duration_seconds` subtracts measured failed API-attempt time and retry waits, including failures that later recover and terminal API failures; successful API-call time remains included. The matching `llm_usage` totals expose the measured retry/error time as `failure_duration_seconds`.
+
+Runs with failed API attempts also write a separate `*_api_failures.json` file.
+It lists terminal failures that affected the run and includes aggregate counts
+for failed attempts and retries by phase, including failures that recovered
+within the retry policy.
 
 Usage entries preserve the provider-reported total in `output_tokens` and add
 `visible_output_tokens` and `thinking_tokens`. OpenAI-compatible APIs and
@@ -294,8 +376,16 @@ Gemini populate the split when their response usage contains a reasoning or
 thought-token count. Providers that expose only aggregate output usage report
 that count as visible output with `thinking_tokens: 0`.
 
+OpenAI-compatible reasoning models may return `finish_reason: "length"` when
+the output budget is consumed by reasoning before a final answer is produced.
+The client logs `finish_reason`, bounded previews of `message.reasoning`, and
+`message.reasoning_content`, then retries with a doubled `max_tokens` budget.
+Retries stop at `LLM_TRUNCATION_MAX_TOKENS` (default `32768`); raise that value
+or the model's configured output budget when truncation persists.
+
 - Missing API credentials: check `.env` and the provider named in the method YAML.
 - Missing embedding model: use a valid local path or allow the configured Hugging Face model to download.
 - Stale or incompatible resume: use the original method/dataset config and inspect `run_config.json`; do not overwrite a completed run.
-- Batch job pending: rerun with `--resume --batch-api`, or use `--batch-wait` initially.
+- Batch job pending: rerun with `--resume --batch-api`; use `--no-batch-wait`
+  only when submission should exit immediately.
 - Method import failure: run `python main.py --list-agents` and verify the adapter and YAML exist.

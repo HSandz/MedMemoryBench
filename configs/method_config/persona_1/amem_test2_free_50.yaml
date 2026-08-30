@@ -2,10 +2,13 @@ method_name: amem_test
 method_type: agentic_memory
 description: Typed-relation A-MEM without original evolution or untyped link retrieval
 model:
-  provider: ai_studio
-  name: gemini-3.5-flash-lite
+  provider: openai
+  name: NIM/nvidia/nemotron-3.5-lightning-30b-a3b
   temperature: 0.0
   max_completion_tokens: 32000
+  nim:
+    enable_thinking: true
+    reasoning_budget: 5000
 memorize_model:
   provider: ai_studio
   name: gemini-3.5-flash-lite
@@ -54,7 +57,7 @@ retrieval_config:
   amem_chain_temporal_weight: 0.5
   amem_chain_redundancy_weight: 0.25
   # Experimental query-only retrieval controls. Defaults preserve fixed BFS.
-  amem_hybrid_retrieval: true
+  amem_hybrid_retrieval: false
   amem_hybrid_candidate_count: 50
   amem_hybrid_rrf_k: 60.0
   amem_hybrid_dense_weight: 1.0

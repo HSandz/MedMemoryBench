@@ -276,6 +276,10 @@ class LLMUsageTracker:
         with self._lock:
             return self._operation_bucket().call_count
 
+    def current_operation(self) -> str:
+        """Return the logical operation active in the current execution context."""
+        return self._current_operation.get()
+
     def record_success_without_usage(self) -> None:
         """Count a successful call when a backend exposes no token metadata."""
         with self._lock:
@@ -440,6 +444,14 @@ LLM_RETRY_MAX_DELAY = min(
     max(float(os.environ.get("LLM_RETRY_MAX_DELAY", "100.0")), 0.0),
     LLM_RETRY_DELAY_CAP_SECONDS,
 )
+LLM_REQUEST_TIMEOUT_SECONDS = max(
+    float(os.environ.get("LLM_REQUEST_TIMEOUT_SECONDS", "180.0")),
+    0.0,
+)
+LLM_TRUNCATION_MAX_TOKENS = max(
+    int(os.environ.get("LLM_TRUNCATION_MAX_TOKENS", "32768")),
+    0,
+)
 AI_STUDIO_KEY_ROTATION_DELAY_SECONDS = 2.0
 AI_STUDIO_ROTATION_ERROR_MAX_LENGTH = 120
 AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES_DEFAULT = 3
@@ -503,6 +515,14 @@ class EmptyGeminiResponseError(EmptyLLMResponseError):
 
 class InvalidLLMResponseError(RetryableLLMAPIError):
     """A completed provider request with a transiently unusable payload."""
+
+
+class TruncatedLLMResponseError(RetryableLLMAPIError):
+    """A provider response cut off before producing a usable final answer."""
+
+    def __init__(self, message: str, max_tokens: Optional[int] = None):
+        super().__init__(message)
+        self.max_tokens = max_tokens
 
 
 _RETRYABLE_EXCEPTION_TYPES = frozenset({
@@ -600,6 +620,17 @@ def _is_retryable_exception(exc: Exception) -> Tuple[bool, str]:
     exc_type = type(exc).__name__
     exc_message = str(exc).lower()
 
+    if isinstance(exc, TruncatedLLMResponseError):
+        if (
+            exc.max_tokens is not None
+            and exc.max_tokens >= LLM_TRUNCATION_MAX_TOKENS
+        ):
+            return False, (
+                "Truncation retry limit reached; increase the request's "
+                "max_tokens or LLM_TRUNCATION_MAX_TOKENS"
+            )
+        return True, "Response reached the output token limit"
+
     if isinstance(exc, RetryableLLMAPIError):
         return True, f"Retryable LLM response failure: {exc_type}"
 
@@ -652,6 +683,8 @@ def _is_retryable_exception(exc: Exception) -> Tuple[bool, str]:
 
 def _get_retry_failure_type(exc: Exception) -> str:
     """Normalize retryable failures into independent retry-budget pools."""
+    if isinstance(exc, TruncatedLLMResponseError):
+        return "truncated_response"
     if isinstance(exc, EmptyLLMResponseError):
         return "empty_response"
     if isinstance(exc, InvalidLLMResponseError):
@@ -725,6 +758,30 @@ def _sleep_after_failure(delay: float) -> None:
         time.sleep(delay)
     finally:
         get_usage_tracker().record_failure_duration(time.perf_counter() - started_at)
+
+
+def _increase_truncation_token_limit(
+    args: tuple,
+    kwargs: Dict[str, Any],
+    exc: TruncatedLLMResponseError,
+) -> Tuple[tuple, Dict[str, Any], Optional[int]]:
+    """Increase max tokens for the next retry after a truncated response."""
+    if not args or not hasattr(args[0], "max_tokens"):
+        return args, kwargs, None
+    current_limit = exc.max_tokens
+    if current_limit is None or current_limit <= 0:
+        return args, kwargs, None
+    next_limit = min(current_limit * 2, LLM_TRUNCATION_MAX_TOKENS)
+    if next_limit <= current_limit:
+        return args, kwargs, None
+
+    retry_kwargs = dict(kwargs)
+    if len(args) >= 3 and args[2] is not None:
+        retry_args = (*args[:2], next_limit, *args[3:])
+    else:
+        retry_args = args
+        retry_kwargs["max_tokens"] = next_limit
+    return retry_args, retry_kwargs, next_limit
 
 
 def _log_retry_attempt(
@@ -899,7 +956,10 @@ def with_retry(
 
                     if not is_retryable:
                         # Non-retryable exception, raise immediately
-                        logger.error(f"API call failed (non-retryable): {type(exc).__name__}: {exc}")
+                        logger.error(
+                            f"API call failed (non-retryable): {type(exc).__name__}: {exc}; "
+                            f"Reason: {reason}"
+                        )
                         raise
 
                     failure_type = _get_retry_failure_type(exc)
@@ -920,6 +980,18 @@ def with_retry(
                             failure_type=failure_type,
                             retry_counts=failure_counts,
                         ) from exc
+
+                    if isinstance(exc, TruncatedLLMResponseError):
+                        args, kwargs, next_limit = _increase_truncation_token_limit(
+                            args,
+                            kwargs,
+                            exc,
+                        )
+                        if next_limit is not None:
+                            logger.warning(
+                                "Retrying truncated response with max_tokens=%d.",
+                                next_limit,
+                            )
 
                     if exponential_backoff:
                         delay = _get_exponential_retry_delay(
@@ -1061,6 +1133,7 @@ class LLMResponse:
     raw_response: Any = None
     visible_output_tokens: Optional[int] = None
     thinking_tokens: int = 0
+    finish_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.input_tokens = max(int(self.input_tokens or 0), 0)
@@ -1085,12 +1158,16 @@ class BaseLLMClient:
         temperature: float = 1.0,
         max_tokens: int = 2000,
         reasoning_effort: Optional[Union[str, int]] = None,
+        nim_thinking_enabled: Optional[bool] = None,
+        nim_reasoning_budget: Optional[int] = None,
         **kwargs
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.nim_thinking_enabled = nim_thinking_enabled
+        self.nim_reasoning_budget = nim_reasoning_budget
 
         # Tokenizer (prefer local model, fallback to tiktoken)
         self._tokenizer: TokenizerProtocol = get_tokenizer(
@@ -1118,6 +1195,21 @@ class BaseLLMClient:
         return any(p in self.model.lower() for p in new_patterns)
 
 
+def _summarize_log_text(value: Any, limit: int = 500) -> str:
+    """Bound provider reasoning text before writing it to logs."""
+    if value is None:
+        return "<none>"
+    text = str(value).replace("\n", "\\n")
+    if len(text) > limit:
+        return repr(text[:limit] + "...")
+    return repr(text)
+
+
+def _is_nim_nemotron_model(model: str) -> bool:
+    """Return whether a model uses NIM Nemotron's Bifrost controls."""
+    return str(model or "").lower().startswith("nim/nvidia/nemotron-")
+
+
 class OpenAIClient(BaseLLMClient):
     """OpenAI client."""
 
@@ -1138,9 +1230,9 @@ class OpenAIClient(BaseLLMClient):
 
         # Extended timeout for long-text generation (e.g. gist extraction)
         timeout = httpx.Timeout(
-            timeout=180.0,
+            timeout=LLM_REQUEST_TIMEOUT_SECONDS,
             connect=30.0,
-            read=180.0,
+            read=LLM_REQUEST_TIMEOUT_SECONDS,
             write=30.0,
         )
 
@@ -1196,14 +1288,57 @@ class OpenAIClient(BaseLLMClient):
         reasoning_effort = kwargs.pop("reasoning_effort", getattr(self, "reasoning_effort", None))
         if reasoning_effort is not None:
             params["reasoning_effort"] = reasoning_effort
+        if _is_nim_nemotron_model(self.model) and (
+            getattr(self, "nim_thinking_enabled", None) is not None
+            or getattr(self, "nim_reasoning_budget", None) is not None
+        ):
+            extra_body = dict(kwargs.pop("extra_body", {}) or {})
+            template_kwargs = dict(extra_body.get("chat_template_kwargs", {}) or {})
+            if getattr(self, "nim_thinking_enabled", None) is not None:
+                template_kwargs["enable_thinking"] = self.nim_thinking_enabled
+            if template_kwargs:
+                extra_body["chat_template_kwargs"] = template_kwargs
+            if getattr(self, "nim_reasoning_budget", None) is not None:
+                extra_body["reasoning_budget"] = self.nim_reasoning_budget
+            params["extra_body"] = extra_body
+
+            extra_headers = dict(kwargs.pop("extra_headers", {}) or {})
+            extra_headers["x-bf-passthrough-extra-params"] = "true"
+            params["extra_headers"] = extra_headers
         params.update(kwargs)
 
         response = self.client.chat.completions.create(**params)
         latency = time.time() - start_time
 
-        content = response.choices[0].message.content or ""
+        message = response.choices[0].message
+        content = message.content or ""
         finish_reason = response.choices[0].finish_reason
-        refusal = getattr(response.choices[0].message, 'refusal', None)
+        refusal = getattr(message, "refusal", None)
+        reasoning = getattr(message, "reasoning", None)
+        reasoning_content = getattr(message, "reasoning_content", None)
+        logger.debug(
+            "OpenAI response metadata: finish_reason=%r, message.reasoning=%s, "
+            "message.reasoning_content=%s",
+            finish_reason,
+            _summarize_log_text(reasoning),
+            _summarize_log_text(reasoning_content),
+        )
+
+        if str(finish_reason or "").lower() in {"length", "max_tokens"}:
+            logger.warning(
+                "OpenAI response truncated: finish_reason=%r, "
+                "message.reasoning=%s, message.reasoning_content=%s, model=%s",
+                finish_reason,
+                _summarize_log_text(reasoning),
+                _summarize_log_text(reasoning_content),
+                self.model,
+            )
+            raise TruncatedLLMResponseError(
+                "OpenAI response reached its output token limit "
+                f"(finish_reason={finish_reason}, max_tokens={token_limit}, "
+                f"model={self.model}).",
+                max_tokens=token_limit,
+            )
 
         if not content.strip():
             raise EmptyLLMResponseError(
@@ -1223,6 +1358,7 @@ class OpenAIClient(BaseLLMClient):
             latency=latency,
             model=self.model,
             raw_response=response,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
         )
         get_usage_tracker().record(llm_response)
         return llm_response
@@ -2758,6 +2894,7 @@ __all__ = [
     "EmptyLLMResponseError",
     "EmptyGeminiResponseError",
     "InvalidLLMResponseError",
+    "TruncatedLLMResponseError",
     # Factory functions
     "create_llm_client",
     "extract_usage_token_counts",
@@ -2767,6 +2904,8 @@ __all__ = [
     "LLM_RETRY_INITIAL_DELAY",
     "LLM_RETRY_MAX_DELAY",
     "LLM_RETRY_DELAY_CAP_SECONDS",
+    "LLM_REQUEST_TIMEOUT_SECONDS",
+    "LLM_TRUNCATION_MAX_TOKENS",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_RETRY_MIN_DELAY",
     "DEFAULT_RETRY_MAX_DELAY",

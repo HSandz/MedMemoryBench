@@ -113,8 +113,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-wait",
-        action="store_true",
-        help="Poll batch jobs instead of exiting for --resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wait for Batch API jobs to complete (default: true)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Maximum concurrent workers for independent query/build preparation "
+            "tasks (default: 1)"
+        ),
     )
 
     args = parser.parse_args()
@@ -136,6 +147,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--persona and --unit must be non-negative")
     if not args.append and (args.persona is not None or args.unit is not None):
         parser.error("--persona and --unit require --append")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
     return args
 
 
@@ -547,6 +560,7 @@ def main() -> int:
             batch_api=args.batch_api,
             batch_gcs_uri=args.batch_gcs_uri,
             batch_wait=args.batch_wait,
+            workers=args.workers,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}")
