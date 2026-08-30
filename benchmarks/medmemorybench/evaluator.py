@@ -986,7 +986,7 @@ class MedMemoryBenchEvaluator:
         self._log(f"[DEBUG] Context ID set to {context_id}")
 
     def _batch_config_hash(self) -> str:
-        if self.execution_stage == "query":
+        if getattr(self, "execution_stage", "all") == "query":
             return compute_query_config_hash(self.method_config, self.dataset_config)
         return compute_config_hash(self.method_config, self.dataset_config)
 
