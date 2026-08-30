@@ -226,6 +226,7 @@ class EventStateAgent(BaseAgent):
                 if operation == "NEW" and claim.confidence < self._build_config["update_min_confidence"]:
                     counts["low_confidence_new_count"] += 1
                 compiler.update_llm_calls = 0
+                compiler.update_parse_failures = 0
         self._memory_chunks = [episode.summary for episode in store.episodes.values()]
         self._is_initialized = bool(store.episodes or store.claims)
         return MemoryBuildResult(
