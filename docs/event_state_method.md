@@ -7,6 +7,12 @@ unresolved contradictions remain contested. Retrieval independently searches
 claims and episode summaries, fuses ranks, and selects a small top-k/MMR
 evidence set. Optional typed PPR is query-only and does not alter snapshots.
 
+Snapshots use schema version 2. Version 1 snapshots are rejected rather than
+silently reinterpreted; rebuild the memory when upgrading from the prototype
+format. Claims retain canonical subject IDs and lifecycle statuses (`active`,
+`superseded`, `refined`, `contested`, or `standalone`) together with their
+evidence references.
+
 ## Configuration
 
 Start with `configs/method_config/event_state_gemini.yaml` (or the
@@ -36,3 +42,11 @@ To compare PPR policies on the same build, use a query-stage YAML override
 with `retrieval_config.ppr_enabled: false` and then `true`; no extraction or
 embedding calls are required after the snapshot is imported. No benchmark
 annotations are passed to the method during memory construction or retrieval.
+
+Query diagnostics keep dense, fusion, PPR, final, and selection scores
+separate, and report `selected_ids` independently from `included_ids`. State
+claims expose `all_provenance_evidence` for complete lineage and
+`included_provenance_evidence` for evidence that survived context budgeting.
+When enabled, source expansion follows claim references to compact turn
+excerpts, prefers referenced turn IDs, and deduplicates episodes already in
+the selected context.

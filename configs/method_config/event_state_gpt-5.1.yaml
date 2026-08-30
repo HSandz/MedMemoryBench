@@ -19,7 +19,10 @@ build_config:
   enable_state_claims: true
   enable_state_compilation: true
   extraction_max_tokens: 1800
+  extraction_temperature: 0.0
   max_claims_per_episode: 20
+  update_temperature: 0.0
+  update_max_tokens: 800
   state_candidate_top_k: 5
   state_candidate_min_similarity: 0.45
   update_min_confidence: 0.55
@@ -37,6 +40,11 @@ retrieval_config:
   claim_retrieval_weight: 1.0
   episode_retrieval_weight: 1.0
   ppr_enabled: false
+  ppr_alpha: 0.85
+  ppr_max_iterations: 20
+  ppr_tolerance: 0.000001
+  ppr_expand_hops: 2
+  ppr_mix_weight: 0.35
   selector_mode: state_mmr
   evidence_count: 8
   mmr_lambda: 0.7

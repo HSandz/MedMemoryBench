@@ -243,6 +243,25 @@ class MedMemoryBenchEvaluator:
                 if hasattr(method_config, "snapshot_build_config")
                 else {}
             )
+        if method_name.lower() == "event_state":
+            features = {
+                "episode_archive": bool(build_config.get("enable_episodes", True)),
+                "claim_extraction": bool(build_config.get("enable_state_claims", True)),
+                "state_compilation": bool(build_config.get("enable_state_compilation", True)),
+                "bitemporal_state": bool(build_config.get("enable_bitemporal_time", True)),
+                "provenance": bool(build_config.get("preserve_turn_evidence", True)),
+            }
+            enabled = [name for name, enabled_flag in features.items() if enabled_flag]
+            return {
+                "schema_version": 2,
+                "method_name": method_name,
+                "combination_id": "+".join(enabled) if enabled else "none",
+                "enabled_features": enabled,
+                "features": features,
+                "dependencies": [],
+                "build_config_hash": self._batch_config_hash() if hasattr(self, "dataset_config") else "",
+                "build_config": copy.deepcopy(build_config),
+            }
         is_experimental = method_name.lower().startswith("amem_test")
         features = {
             "base_memory": True,
@@ -319,6 +338,8 @@ class MedMemoryBenchEvaluator:
         parts = str(operation).split(".")
         if len(parts) >= 2 and parts[0] == "amem":
             return parts[1]
+        if len(parts) >= 2 and parts[0] == "event_state":
+            return {"extract": "claim_extraction", "extract_repair": "claim_extraction", "update_classify": "state_compilation", "embedding": "embedding"}.get(parts[1], parts[1])
         return "unscoped"
 
     def _build_metrics_report(

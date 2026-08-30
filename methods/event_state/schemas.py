@@ -13,6 +13,26 @@ class TurnEvidence:
     role: Optional[str]
     text: str
     timestamp: Optional[str] = None
+    image_caption: Optional[str] = None
+    source_session_id: Optional[Any] = None
+    source_session_index: Optional[int] = None
+    source_event_id: Optional[Any] = None
+
+
+@dataclass
+class NormalizedTurn:
+    """Canonical turn form shared by extraction, storage, and provenance."""
+
+    source_turn_id: Optional[Any]
+    source_session_id: Optional[Any]
+    source_session_index: Optional[int]
+    source_event_id: Optional[Any]
+    role: Optional[str]
+    speaker: str
+    canonical_speaker_id: str
+    text: str
+    image_caption: Optional[str]
+    timestamp: Optional[str]
 
 
 @dataclass
@@ -37,6 +57,14 @@ class Episode:
     summary: str
     turn_evidence: List[TurnEvidence] = field(default_factory=list)
 
+    def retrieval_text(self) -> str:
+        """Return an information-dense but bounded embedding representation."""
+        salient = " ".join(
+            f"{turn.speaker}: {turn.text} {turn.image_caption or ''}".strip()
+            for turn in self.turn_evidence[:8]
+        )
+        return f"{self.summary} {salient}".strip()[:4000]
+
 
 @dataclass
 class Claim:
@@ -56,10 +84,12 @@ class Claim:
     status: str = "active"
     evidence: List[EvidenceRef] = field(default_factory=list)
     confidence: float = 1.0
+    # Added at the end to preserve compatibility with early positional callers.
+    subject_id: str = ""
 
     def semantic_text(self) -> str:
         qualifiers = ", ".join(f"{key}: {value}" for key, value in self.qualifiers.items())
-        return f"Subject: {self.subject}. Predicate: {self.predicate}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}."
+        return f"Subject: {self.subject}. Subject ID: {self.subject_id or self.subject_key}. Predicate: {self.predicate}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}. Modality: {self.modality}. Persistence: {self.persistence}."
 
 
 @dataclass
@@ -86,4 +116,6 @@ def episode_from_dict(value: Dict[str, Any]) -> Episode:
 
 def claim_from_dict(value: Dict[str, Any]) -> Claim:
     evidence = [EvidenceRef(**item) for item in value.get("evidence", [])]
+    value = dict(value)
+    value.setdefault("subject_id", value.get("subject_key", ""))
     return Claim(**{**value, "evidence": evidence})

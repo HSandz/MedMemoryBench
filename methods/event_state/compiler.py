@@ -22,39 +22,59 @@ def normalized_subject(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().casefold())
 
 
-def normalized_content(claim: Claim) -> Tuple[str, str, str, str, str]:
+def normalized_content(claim: Claim) -> Tuple[str, str, str, str, str, str, str]:
+    qualifiers = json.dumps(claim.qualifiers or {}, ensure_ascii=True, sort_keys=True, default=str)
     return tuple(normalized_subject(value) for value in (
-        claim.subject_key, claim.predicate, claim.value, claim.polarity, claim.modality
+        claim.subject_id or claim.subject_key,
+        claim.predicate,
+        claim.value,
+        qualifiers,
+        claim.polarity,
+        claim.modality,
+        claim.persistence,
     ))
 
 
 class StateCompiler:
     """Applies auditable operations while favoring preservation over compression."""
 
-    def __init__(self, store: EventStateStore, embedder: Any, llm_client: Any, candidate_top_k: int = 5, min_similarity: float = 0.45, min_confidence: float = 0.55) -> None:
+    def __init__(self, store: EventStateStore, embedder: Any, llm_client: Any, candidate_top_k: int = 5, min_similarity: float = 0.45, min_confidence: float = 0.55, update_temperature: float = 0.0, update_max_tokens: int = 800) -> None:
         self.store, self.embedder, self.llm_client = store, embedder, llm_client
         self.candidate_top_k = max(1, int(candidate_top_k))
         self.min_similarity, self.min_confidence = float(min_similarity), float(min_confidence)
+        self.update_temperature, self.update_max_tokens = float(update_temperature), int(update_max_tokens)
         self.update_llm_calls = 0
+        self.update_parse_failures = 0
 
     def _candidates(self, claim: Claim, embedding: Sequence[float]) -> List[Tuple[Claim, float]]:
         matches = []
         for candidate_id, candidate in self.store.claims.items():
-            if candidate.subject_key != claim.subject_key:
+            if (candidate.subject_id or candidate.subject_key) != (claim.subject_id or claim.subject_key):
+                continue
+            if candidate.persistence != "state" or candidate.modality in NON_OBSERVATION_MODALITIES:
+                continue
+            if claim.persistence != "state" or claim.modality in NON_OBSERVATION_MODALITIES:
                 continue
             similarity = cosine(embedding, self.store.claim_embeddings.get(candidate_id, []))
             if similarity >= self.min_similarity:
                 matches.append((candidate, similarity))
-        return sorted(matches, key=lambda item: (-item[1], item[0].claim_id))[:self.candidate_top_k]
+        return sorted(matches, key=lambda item: (0 if item[0].status in {"active", "contested"} else 1, -item[1], item[0].claim_id))[:self.candidate_top_k]
 
     def _classify(self, claim: Claim, candidates: Sequence[Tuple[Claim, float]]) -> Dict[str, Any]:
         payload = {"new_claim": asdict(claim), "candidates": [{"claim": asdict(item), "similarity": score} for item, score in candidates]}
         self.update_llm_calls += 1
         with get_usage_tracker().scope("event_state.update_classify"):
-            response = self.llm_client.chat(format_messages(json.dumps(payload, ensure_ascii=True), UPDATE_SYSTEM_PROMPT))
+            messages = format_messages(json.dumps(payload, ensure_ascii=True), UPDATE_SYSTEM_PROMPT)
+            try:
+                response = self.llm_client.chat(messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
+                    raise
+                response = self.llm_client.chat(messages)
         try:
             parsed = parse_json(response.content)
         except ValueError:
+            self.update_parse_failures += 1
             return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response"}
         operation = str(parsed.get("operation", "NEW")).upper()
         if operation not in OPERATIONS:
@@ -63,7 +83,11 @@ class StateCompiler:
         known_ids = {item.claim_id for item, _ in candidates}
         if matched not in known_ids:
             matched = None
-        return {"matched_claim_id": matched, "operation": operation, "confidence": float(parsed.get("confidence", 0.0) or 0.0), "rationale": str(parsed.get("rationale", ""))[:500]}
+        try:
+            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500]}
 
     def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float]) -> str:
         """Compile one observation and return the operation applied."""
@@ -76,6 +100,8 @@ class StateCompiler:
             support_type = "duplicate" if any(ref.episode_id == episode_id for ref in matched.evidence) else "corroboration"
             operation = "DUPLICATE" if support_type == "duplicate" else "CORROBORATE"
             self._attach_evidence(matched, claim.evidence[0], support_type)
+            self.store.add_edge(matched.claim_id, claim.evidence[0].episode_id, "CLAIM_SUPPORTED_BY_EPISODE")
+            self.store.add_edge(claim.evidence[0].episode_id, matched.claim_id, "EPISODE_SUPPORTS_CLAIM")
             return self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
         if not candidates:
             return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate")
@@ -93,9 +119,12 @@ class StateCompiler:
         if matched_id:
             old = self.store.claims[matched_id]
             if operation == "SUPERSEDE":
-                old.status, old.valid_to = "historical", claim.valid_from or claim.recorded_at
+                old.status = "superseded"
+                if claim.valid_from or claim.recorded_at:
+                    old.valid_to = claim.valid_from or claim.recorded_at
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "SUPERSEDES")
             elif operation == "REFINE":
+                old.status = "refined"
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "REFINES")
             elif operation == "CONFLICT":
                 old.status = claim.status = "contested"
@@ -104,7 +133,10 @@ class StateCompiler:
 
     def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str) -> str:
         if operation == "EPISODIC":
-            claim.status = "episodic"
+            claim.persistence = "episode"
+            claim.status = "standalone"
+        elif claim.persistence == "history":
+            claim.status = "standalone"
         self.store.add_claim(claim, list(embedding))
         return self._audit(claim, episode_id, None, claim.claim_id, operation, 1.0, rationale)
 

@@ -21,6 +21,8 @@ build_config:
   extraction_max_tokens: 1800
   extraction_temperature: 0.0
   max_claims_per_episode: 20
+  update_temperature: 0.0
+  update_max_tokens: 800
   state_candidate_top_k: 5
   state_candidate_min_similarity: 0.45
   update_min_confidence: 0.55
@@ -46,8 +48,8 @@ retrieval_config:
   ppr_weight_refines: 1.0
   ppr_weight_conflict: 0.8
   ppr_weight_evidence: 0.7
-  ppr_weight_same_episode: 0.5
-  ppr_weight_temporal_neighbor: 0.3
+  ppr_expand_hops: 2
+  ppr_mix_weight: 0.35
   selector_mode: state_mmr
   evidence_count: 8
   mmr_lambda: 0.7
