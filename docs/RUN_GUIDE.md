@@ -80,10 +80,7 @@ The OpenAI-compatible client sends `chat_template_kwargs.enable_thinking` and
 `x-bf-passthrough-extra-params: true`. `reasoning_budget` must be an integer
 from `-1` through `32768`. Set `enable_thinking: true` and a positive budget
 only when visible reasoning is intended; benchmark answer runs should normally
-disable it. For OpenAI-compatible responses, if the provider returns the same
-reasoning in a structured reasoning field and final answer content, the client
-rejects that response as invalid and retries it under the normal LLM retry
-policy.
+disable it.
 
 For `--stage query --memory-run`, compatibility is checked against snapshot
 invariants only: the adapter, query-time embedding/index identity, serialized

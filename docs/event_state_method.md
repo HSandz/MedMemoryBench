@@ -74,11 +74,11 @@ and turn labels. Each turn receives a share of the budget and long turns
 preserve both their beginning and ending text, so late-session information is
 not silently discarded.
 
-Snapshots use schema version 4 plus the Event-State build semantic version. The
-state-slot builder is semantic version `2.4`; snapshots built without that version
-do not match the build compatibility hash and must be rebuilt. Version 1 and 2
-snapshots are rejected rather than silently reinterpreted. Claims retain canonical
-subject IDs and lifecycle statuses (`active`,
+Snapshots use schema version 4 plus the Event-State build semantic version.
+Semantic version `2.5` separates claim-retrieval embeddings, slot-only compiler
+embeddings, and answer context; `2.4` snapshots use the older embedding
+representation and must be rebuilt. Version 1 and 2 snapshots are rejected
+rather than silently reinterpreted. Claims retain canonical subject IDs and lifecycle statuses (`active`,
 `superseded`, `refined`, `contested`, or `standalone`) together with their
 evidence references.
 

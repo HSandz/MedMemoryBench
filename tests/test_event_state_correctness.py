@@ -119,14 +119,14 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    snapshot["semantic_version"] = "2.3"
+    snapshot["semantic_version"] = "2.4"
     try:
         EventStateStore.from_export(snapshot)
     except ValueError as exc:
         assert "semantic version" in str(exc)
     else:
         raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.4"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.5"
 
 
 def test_event_state_semantic_version_changes_build_hash_only():
@@ -143,7 +143,34 @@ def test_event_state_semantic_version_changes_build_hash_only():
             return self.build_config
 
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.3"), dataset) != compute_build_config_hash(Config("2.4"), dataset)
+    assert compute_build_config_hash(Config("2.4"), dataset) != compute_build_config_hash(Config("2.5"), dataset)
+
+
+def test_preparation_omits_slot_embeddings_for_non_state_claims():
+    class RecordingEmbedder(Embedder):
+        def __init__(self):
+            self.document_calls = []
+
+        def embed_documents(self, texts):
+            self.document_calls.append(list(texts))
+            return super().embed_documents(texts)
+
+    class LLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content=json.dumps({
+                "episode_summary": "state and history",
+                "claims": [
+                    {"subject": "User", "predicate": "lives_in", "value": "Boston", "persistence": "state", "state_slot": "residence_location", "source_turn_ids": ["u1"]},
+                    {"subject": "User", "predicate": "former_employer", "value": "Acme", "persistence": "history", "source_turn_ids": ["u1"]},
+                ],
+            }))
+
+    embedder = RecordingEmbedder()
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=embedder)
+    prepared = agent.prepare_memory_sessions("", source_session_id="s1", memory_items=[{"speaker": "User", "text": "I live in Boston and formerly worked at Acme.", "source_turn_id": "u1"}])[0]
+    history_index = next(index for index, claim in enumerate(prepared.claims) if claim.persistence == "history")
+    assert prepared.claim_slot_embeddings[history_index] == []
+    assert "" not in [text for call in embedder.document_calls for text in call]
 
 
 def test_state_slot_is_compiler_only_metadata():

@@ -121,4 +121,7 @@ def claim_from_dict(value: Dict[str, Any]) -> Claim:
     value = dict(value)
     value.setdefault("subject_id", value.get("subject_key", ""))
     value.setdefault("state_slot", None)
-    return Claim(**{**value, "evidence": evidence})
+    claim = Claim(**{**value, "evidence": evidence})
+    if claim.persistence == "history":
+        claim.state_slot = None
+    return claim

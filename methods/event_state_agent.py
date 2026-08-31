@@ -411,11 +411,15 @@ class EventStateAgent(BaseAgent):
                 episode_embedding = self._embedder.embed_documents([episode.retrieval_text()])[0]
         else:
             episode_embedding = []
-        claim_embeddings, claim_slot_embeddings = [], []
+        claim_embeddings, claim_slot_embeddings = [], [[] for _ in claims]
         if self.enable_state_claims:
             with get_usage_tracker().scope("event_state.embedding"):
                 claim_embeddings = self._embedder.embed_documents([claim.semantic_text() for claim in claims])
-                claim_slot_embeddings = self._embedder.embed_documents([StateCompiler.slot_text(claim) if claim.persistence == "state" else "" for claim in claims])
+                state_slot_items = [(index, StateCompiler.slot_text(claim)) for index, claim in enumerate(claims) if claim.persistence == "state"]
+                if state_slot_items:
+                    state_slot_embeddings = self._embedder.embed_documents([text for _, text in state_slot_items])
+                    for (index, _), slot_embedding in zip(state_slot_items, state_slot_embeddings):
+                        claim_slot_embeddings[index] = list(slot_embedding)
         return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), claims, [list(item) for item in claim_embeddings], [list(item) for item in claim_slot_embeddings])
 
     def prepare_memory_sessions(self, text: str, **kwargs) -> List[PreparedMemorySession]:

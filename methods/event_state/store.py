@@ -15,7 +15,7 @@ class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
     SCHEMA_VERSION = 4
-    SEMANTIC_VERSION = "2.4"
+    SEMANTIC_VERSION = "2.5"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id
@@ -38,7 +38,9 @@ class EventStateStore:
             self.episode_embeddings[episode.episode_id] = list(embedding)
 
     def add_claim(self, claim: Claim, embedding: List[float], slot_embedding: Optional[List[float]] = None) -> None:
-        if claim.persistence == "state" and not claim.state_slot:
+        if claim.persistence == "history":
+            claim.state_slot = None
+        elif claim.persistence == "state" and not claim.state_slot:
             claim.state_slot = normalize_state_slot(claim.predicate)
         self.claims[claim.claim_id] = claim
         self.claim_embeddings[claim.claim_id] = list(embedding)

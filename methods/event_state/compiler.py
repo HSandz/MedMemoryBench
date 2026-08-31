@@ -275,6 +275,9 @@ class StateCompiler:
 
     def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float], slot_embedding: Optional[Sequence[float]] = None) -> CompileResult:
         """Compile one observation and return the operation applied."""
+        if claim.persistence == "history":
+            claim.state_slot = None
+            return self._record_new(claim, episode_id, embedding, "NEW", "historical background", "non_state_history")
         if claim.persistence == "episode" or claim.modality in NON_OBSERVATION_MODALITIES:
             return self._record_new(claim, episode_id, embedding, "EPISODIC", "non-persistent or non-observation claim", slot_embedding=slot_embedding)
         if not claim.state_slot:

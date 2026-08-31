@@ -31,6 +31,37 @@ def test_stable_ids_and_snapshot_round_trip_preserve_vectors():
     assert restored.claim_slot_embeddings[c.claim_id] == [0.0, 1.0]
 
 
+def test_history_claim_bypasses_state_compilation_and_slot_storage():
+    store = EventStateStore("patient")
+    store.add_claim(Claim("STATE", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0], [1.0, 0.0])
+    calls = []
+    compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda *args, **kwargs: calls.append((args, kwargs))))
+    history = Claim("HISTORY", "Alice", "alice", "former_employer", "Acme", persistence="history", state_slot="former_employer", evidence=[EvidenceRef("s2", "s2", [2])])
+
+    result = compiler.apply(history, "s2", [0.0, 1.0])
+
+    assert result.operation == "NEW"
+    assert history.status == "standalone"
+    assert history.state_slot is None
+    assert "HISTORY" not in store.claim_slot_embeddings
+    assert compiler.state_candidate_queries == 0
+    assert compiler.state_candidate_no_match_count == 0
+    assert compiler.update_llm_calls == 0
+    assert not calls
+    restored = EventStateStore.from_export(store.export())
+    assert restored.claims["HISTORY"].state_slot is None
+    assert "HISTORY" not in restored.claim_slot_embeddings
+
+
+def test_state_claim_without_slot_still_falls_back_to_predicate():
+    store = EventStateStore("patient")
+    claim = Claim("STATE", "Alice", "alice", "preferred_language", "English", evidence=[EvidenceRef("s1", "s1", [1])])
+    result = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda *args, **kwargs: None)).apply(claim, "s1", [1.0, 0.0])
+    assert result.operation == "NEW"
+    assert claim.state_slot == "preferred_language"
+    assert "STATE" in store.claim_slot_embeddings
+
+
 def test_same_session_duplicate_and_later_corroboration_share_one_claim():
     store = EventStateStore("p")
     compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{}')))
