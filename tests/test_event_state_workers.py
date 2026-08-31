@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from types import SimpleNamespace
 
 from methods.event_state_agent import EventStateAgent
+from methods.event_state.embeddings import DenseEmbedder
+from utils.llm_client import get_usage_tracker
+from benchmarks.base import EvaluationUnit
+from benchmarks.medmemorybench.dataset import MedSession
+from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from methods.base import MemoryBuildResult
 
 
 class FakeEmbedder:
@@ -14,9 +21,10 @@ class FakeEmbedder:
 
 
 class FakeLLM:
-    def __init__(self, *, delay=False, repair_once=False):
+    def __init__(self, *, delay=False, repair_once=False, barrier=None):
         self.delay = delay
         self.repair_once = repair_once
+        self.barrier = barrier
         self.calls = 0
         self.active = 0
         self.max_active = 0
@@ -29,6 +37,8 @@ class FakeLLM:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
+            if self.barrier is not None and "new_claim" not in prompt and "Repair this extraction" not in prompt:
+                self.barrier.wait(timeout=2)
             if self.delay:
                 time.sleep(0.02 if "session-0" not in prompt else 0.06)
             if "Repair this extraction" in prompt:
@@ -77,7 +87,7 @@ def test_workers_preserve_exported_event_state_semantics():
 
 
 def test_preparation_overlaps_and_commits_in_source_order():
-    llm = FakeLLM(delay=True)
+    llm = FakeLLM(barrier=threading.Barrier(3))
     agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=FakeEmbedder(), event_state_workers=3)
     agent.set_context_id("ctx")
     items = [{"source_session_id": f"session-{i}", "source_session_index": i, "source_turn_id": 0, "speaker": "User", "content": "Boston"} for i in range(3)]
@@ -118,3 +128,98 @@ def test_preparation_failure_prevents_any_later_commit():
     except RuntimeError:
         pass
     assert agent.export_memory_state("ctx")["episodes"] == []
+
+
+def test_mixed_source_scopes_are_isolated_and_deterministic():
+    def build(workers, staged):
+        llm = FakeLLM()
+        agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=FakeEmbedder(), event_state_workers=workers)
+        agent.set_context_id("ctx")
+        sessions = [
+            (1, "primary_user", "Boston"),
+            (2, "third_party:bob", "Bob has diabetes"),
+            (3, "general_non_personal", "General medical guidance"),
+            (4, "primary_user", "Tokyo"),
+        ]
+        if staged:
+            items = [{"source_session_id": sid, "source_session_index": index, "source_turn_id": 0, "speaker": "User", "content": content, "conversation_scope": scope} for index, (sid, scope, content) in enumerate(sessions)]
+            agent.memorize("", context_id="ctx", memory_items=items)
+        else:
+            for index, (sid, scope, content) in enumerate(sessions):
+                agent.memorize(content, context_id="ctx", source_session_id=sid, source_session_index=index, conversation_scope=scope, memory_items=[{"source_turn_id": 0, "speaker": "User", "content": content}])
+        return agent.export_memory_state("ctx")
+
+    serial = build(1, False)
+    staged = build(4, True)
+    assert [item["conversation_scope"] for item in serial["episodes"]] == ["primary_user", "third_party:bob", "general_non_personal", "primary_user"]
+    assert [item["conversation_scope"] for item in staged["episodes"]] == ["primary_user", "third_party:bob", "general_non_personal", "primary_user"]
+    assert serial == staged
+
+
+def test_worker_usage_scopes_are_recorded_in_memorize_phase():
+    tracker = get_usage_tracker()
+    tracker.reset()
+    agent = EventStateAgent(llm_client=FakeLLM(), memory_llm_client=FakeLLM(), embedding_client=FakeEmbedder(), event_state_workers=2)
+    agent.set_context_id("ctx")
+    items = [{"source_session_id": i, "source_turn_id": 0, "speaker": "User", "content": "Boston"} for i in range(3)]
+    agent.memorize("", context_id="ctx", memory_items=items)
+    operations = tracker.get_stats()["operations"]
+    assert "event_state.extract" in operations.get("memorize", {})
+    assert "event_state.embedding" in operations.get("memorize", {})
+    assert "event_state.extract" not in operations.get("query", {})
+
+
+def test_dense_embedder_initializes_backend_once_under_concurrent_first_use(monkeypatch):
+    count = 0
+    count_lock = threading.Lock()
+
+    class Backend:
+        def __init__(self, model):
+            nonlocal count
+            with count_lock:
+                count += 1
+
+        def encode(self, texts, normalize_embeddings=True):
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Backend))
+    embedder = DenseEmbedder(provider="local", model="fake")
+    threads = [threading.Thread(target=embedder.embed_documents, args=(["text"],)) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert count == 1
+
+
+def test_medmemorybench_staged_unit_wall_time_includes_preparation_and_commit():
+    class Manager:
+        def supports_staged_memory(self):
+            return True
+
+        def prepare_memory_sessions(self, **kwargs):
+            time.sleep(0.02)
+            return [SimpleNamespace(session={"source_session_id": sid, "source_session_index": index, "text": ""}) for index, sid in enumerate((1, 2))]
+
+        def commit_prepared_memory(self, prepared, **kwargs):
+            time.sleep(0.01)
+            return MemoryBuildResult(method="event_state", all_passages=[])
+
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(method_name="event_state", build_config={})
+    evaluator.force_resume = False
+    evaluator.dry_run = False
+    evaluator.batch_api = False
+    evaluator.execution_stage = "memory"
+    evaluator._checkpoint_manager = None
+    evaluator._memory_build_logs = []
+    evaluator._deferred_judges = []
+    evaluator._log = lambda *args, **kwargs: None
+    evaluator.agent_manager = Manager()
+    evaluator._restore_completed_unit_for_resume = lambda unit: None
+    evaluator._save_and_restore_unit_memory = lambda *args, **kwargs: None
+    unit = EvaluationUnit(unit_id=1, context_id=1, sessions_to_inject=[MedSession(session_id=1, content="one"), MedSession(session_id=2, content="two")], queries_to_evaluate=[])
+
+    evaluator._evaluate_unit_with_checkpoint(unit)
+    metrics = evaluator._memory_build_logs[0]["build_metrics"]
+    assert metrics["wall_time_seconds"] >= 0.04

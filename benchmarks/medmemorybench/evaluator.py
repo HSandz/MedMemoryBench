@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
 from src.agent import AgentManager, AgentResponse, MemoryBuildResult
+from methods.event_state.subjects import normalize_scope
 from src.result import EvaluationReport, ResultCollector
 from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery, MedSession
 from benchmarks.base import EvaluationUnit
@@ -2673,6 +2674,7 @@ class MedMemoryBenchEvaluator:
 
         memory_build_failed = False
         total_memory_time = 0.0
+        staged_build_wall_time = None
         session_build_results = []  # Store per-session build results
         restored_payload = self._restore_completed_unit_for_resume(unit)
         restored_completed_unit = restored_payload is not None
@@ -2704,6 +2706,7 @@ class MedMemoryBenchEvaluator:
                     if session.session_id not in pending_ids:
                         continue
                     session_ids.append(session.session_id)
+                    session_scope = normalize_scope(session.to_memory_text())
                     source_messages = session.metadata.get("messages", []) or [{"speaker": "Unknown", "content": session.content, "source_turn_id": None}]
                     for turn_index, item in enumerate(source_messages):
                         staged_item = dict(item)
@@ -2712,6 +2715,7 @@ class MedMemoryBenchEvaluator:
                         staged_item.setdefault("source_turn_id", item.get("turn_id", item.get("dia_id", turn_index)))
                         staged_item.setdefault("source_event_id", session.metadata.get("event_id"))
                         staged_item.setdefault("timestamp", session.timestamp)
+                        staged_item.setdefault("conversation_scope", session_scope)
                         staged_items.append(staged_item)
                     marker = getattr(self._checkpoint_manager, "mark_session_started", None)
                     if callable(marker):
@@ -2750,12 +2754,20 @@ class MedMemoryBenchEvaluator:
                         session_build_results[0]["build_metrics"]["usage"] = diff_usage_stats(
                             get_usage_tracker().get_stats(), staged_usage_before
                         )
+                    staged_build_wall_time = time.perf_counter() - staged_start
                     sessions_to_process = []
                 except Exception as exc:
-                    if not isinstance(exc, LLMAPIError):
-                        raise
                     memory_build_failed = True
                     self._log(f"        [ERROR] Event-State staged preparation failed: {exc}", level="ERROR")
+                    rollback_incomplete = getattr(
+                        self._checkpoint_manager,
+                        "rollback_incomplete_session",
+                        None,
+                    )
+                    if callable(rollback_incomplete):
+                        rollback_incomplete()
+                    if not isinstance(exc, LLMAPIError):
+                        raise
                     sessions_to_process = []
 
             for idx, session in enumerate(sessions_to_process):
@@ -2920,7 +2932,7 @@ class MedMemoryBenchEvaluator:
                     for record in session_build_results
                 ])
                 unit_build_metrics = {
-                    "wall_time_seconds": sum(
+                    "wall_time_seconds": staged_build_wall_time if staged_build_wall_time is not None else sum(
                         float(record.get("wall_time_seconds", 0.0) or 0.0)
                         for record in session_build_results
                     ),

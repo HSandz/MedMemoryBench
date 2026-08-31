@@ -61,12 +61,17 @@ python main.py --stage query --memory-run <memory-run-directory>
 Use the existing global worker option, for example `--workers 4`, with Event-State.
 Each source session performs extraction, repair/validation, episode construction,
 subject resolution, and episode/claim embedding in a bounded preparation pool.
+Conversation scope is resolved independently from each source session's turns (or
+its explicit scope metadata), so mixed primary-user, third-party, and general
+sessions remain isolated during staging.
 Prepared sessions are then committed to one store strictly in original session
 order; candidate generation, update classification, and every state/provenance
 mutation remain serial. `--workers 1` follows the same staged path without a
 pool, and workers greater than one are intended to be semantically equivalent.
 LoCoMo multi-session chunks use the same ordered preparation/commit split, while
 query workers continue to use the evaluator's existing global query limit.
+MedMemoryBench unit build telemetry reports wall-clock preparation plus ordered
+commit time (parallel worker durations are not summed).
 Worker count is an execution setting and is not included in snapshot or config
 identity hashes.
 

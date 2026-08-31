@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -159,10 +160,14 @@ class EventStateAgent(BaseAgent):
         if not groups:
             groups[top_session] = [{"speaker": "Unknown", "text": text, "source_turn_id": None, "timestamp": metadata.get("timestamp")}]
             order = [top_session]
-        scope = normalize_scope(text, metadata.get("conversation_scope"))
         sessions = []
         for index, session_id in enumerate(order):
             turns = groups[session_id]
+            session_text = "\n".join(str(item.get("text", item.get("content", "")) or "") for item in turns)
+            explicit_scope = turns[0].get("conversation_scope")
+            if explicit_scope is None and len(order) == 1:
+                explicit_scope = metadata.get("conversation_scope")
+            scope = normalize_scope(text if len(order) == 1 else session_text, explicit_scope)
             sessions.append({"source_session_id": session_id, "source_session_index": turns[0].get("source_session_index", metadata.get("source_session_index", index)), "source_event_id": turns[0].get("source_event_id", metadata.get("source_event_id")), "timestamp": turns[0].get("timestamp", metadata.get("timestamp")), "conversation_scope": scope, "turns": turns})
         return sessions
 
@@ -291,13 +296,23 @@ class EventStateAgent(BaseAgent):
 
     def prepare_memory_sessions(self, text: str, **kwargs) -> List[PreparedMemorySession]:
         """Prepare independent source sessions concurrently, preserving source order."""
+        get_usage_tracker().set_phase("memorize")
         context_id = kwargs.get("context_id", self._context_id)
         sessions = self._normalize_source_sessions(text, kwargs.get("memory_items"), kwargs)
         if self.event_state_workers == 1 or len(sessions) < 2:
             return [self._prepare_session(session, context_id) for session in sessions]
         worker_count = min(self.event_state_workers, len(sessions))
+        def prepare_in_worker(session: Dict[str, Any]) -> PreparedMemorySession:
+            worker_context = contextvars.copy_context()
+
+            def run() -> PreparedMemorySession:
+                get_usage_tracker().set_phase("memorize")
+                return self._prepare_session(session, context_id)
+
+            return worker_context.run(run)
+
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            return list(executor.map(lambda session: self._prepare_session(session, context_id), sessions))
+            return list(executor.map(prepare_in_worker, sessions))
 
     def _commit_prepared(self, prepared: PreparedMemorySession, store: EventStateStore, counts: Dict[str, int], added_records: List[Dict[str, Any]]) -> None:
         extracted = prepared.extracted
