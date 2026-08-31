@@ -230,6 +230,60 @@ def test_numeric_and_string_turn_ids_share_one_grounding_contract():
     assert result.extra["extract_repair_calls"] == 0 and llm.calls == 1
 
 
+def test_production_role_content_items_generate_grounded_fallback_ids():
+    captured = []
+
+    class LLM:
+        def chat(self, messages, **kwargs):
+            captured.append(messages[-1]["content"])
+            return SimpleNamespace(content='{"episode_summary":"medication","claims":[{"subject":"User","subject_id":"primary_user","predicate":"takes_medication","value":"metformin","source_turn_ids":[0]}]}')
+
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    result = agent.memorize("", memory_items=[
+        {"role": "user", "content": "I take metformin every day."},
+        {"role": "assistant", "content": "Understood."},
+    ], source_session_id=1)
+    claim = next(iter(agent._store().claims.values()))
+    episode = next(iter(agent._store().episodes.values()))
+    assert result.extra["accepted_claim_count"] == 1
+    assert result.extra["total_claim_count"] == 1
+    assert result.extra["primary_user_claim_count"] == 1
+    assert result.extra["unknown_source_turn_id_claim_count"] == 0
+    assert result.extra["extract_repair_calls"] == 0
+    assert result.extra["extract_repair_failures"] == 0
+    assert claim.evidence[0].source_turn_ids == ["0"]
+    assert [turn.turn_id for turn in episode.turn_evidence] == ["0", "1"]
+    assert "[turn_id=0]" in captured[0] and "[turn_id=1]" in captured[0]
+
+
+def test_claim_limit_skips_invalid_excess_claims_and_allows_zero():
+    valid = '{"subject":"patient","predicate":"fact","value":"x","source_turn_ids":["0"]}'
+    invalid = '{"subject":"patient","predicate":"bad","value":"x","source_turn_ids":["missing"]}'
+
+    class LLM:
+        def __init__(self, content):
+            self.content, self.calls = content, 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(content=self.content)
+
+    limited_llm = LLM('{"episode_summary":"s","claims":[' + valid + ',' + invalid + ']}')
+    limited = EventStateAgent(llm_client=limited_llm, memory_llm_client=limited_llm, embedding_client=Embedder(), max_claims_per_episode=1)
+    result = limited.memorize("x", memory_items=[{"role": "user", "content": "x"}], source_session_id=1)
+    assert result.extra["accepted_claim_count"] == 1
+    assert result.extra["excess_claim_count"] == 1
+    assert result.extra["unknown_source_turn_id_claim_count"] == 0
+    assert result.extra["extract_repair_calls"] == 0 and limited_llm.calls == 1
+
+    zero_llm = LLM('{"episode_summary":"s","claims":[' + valid + ']}')
+    zero = EventStateAgent(llm_client=zero_llm, memory_llm_client=zero_llm, embedding_client=Embedder(), max_claims_per_episode=0)
+    result = zero.memorize("x", memory_items=[{"role": "user", "content": "x"}], source_session_id=1)
+    assert result.extra["accepted_claim_count"] == 0
+    assert result.extra["excess_claim_count"] == 1
+    assert result.extra["extract_repair_calls"] == 0 and zero_llm.calls == 1
+
+
 def test_canonical_turn_id_collision_is_namespaced_before_extraction():
     turns = EventStateAgent.normalize_turns({"source_session_id": 1, "turns": [
         {"speaker": "User", "text": "first", "source_turn_id": 1},

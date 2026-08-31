@@ -33,6 +33,9 @@ evidence (for example, numeric `0` becomes `"0"`); equivalent JSON
 representations do not trigger repair. Duplicate canonical IDs within a session
 are deterministically namespaced. Build telemetry exposes allowed IDs, capped
 invalid-ID samples, and claim-limit overflow counts.
+The configured `max_claims_per_episode` is applied before claim validation;
+claims beyond the limit are ignored in source order and counted only as excess.
+Setting it to `0` retains the episode while accepting no state claims.
 When non-identical claims share an episode, classification receives only the
 exact cited turns for the new and candidate claims (bounded to four turns per
 side), so unrelated dialogue cannot affect correction/restatement decisions.

@@ -252,10 +252,13 @@ class EventStateAgent(BaseAgent):
             if summary is not None and not isinstance(summary, str):
                 structure_failure = True
                 raise ValueError("episode_summary must be a string")
+            if record_telemetry:
+                excess_claim_count += max(0, len(raw_claims) - self.max_claims_per_episode)
+            claims_to_validate = raw_claims[:self.max_claims_per_episode]
             claims = []
             invalid_grounding = False
             valid_grounding_keys = set()
-            for raw in raw_claims:
+            for raw in claims_to_validate:
                 if isinstance(raw, dict):
                     claim_key = tuple(str(raw.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value"))
                     supplied = raw.get("source_turn_ids")
@@ -301,13 +304,10 @@ class EventStateAgent(BaseAgent):
             if invalid_grounding:
                 structure_failure = True
                 raise ValueError("claims must cite valid visible source_turn_ids")
-            if raw_claims and not any(item is not None for item in claims):
+            if claims_to_validate and not any(item is not None for item in claims):
                 structure_failure = True
                 raise ValueError("all claim objects failed schema validation")
             accepted = [item for item in claims if item is not None]
-            if len(accepted) > self.max_claims_per_episode:
-                excess_claim_count += len(accepted) - self.max_claims_per_episode
-                accepted = accepted[:self.max_claims_per_episode]
             return {"episode_summary": summary, "claims": accepted, "valid_grounding_keys": valid_grounding_keys}
 
         try:
