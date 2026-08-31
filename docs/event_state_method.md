@@ -13,7 +13,13 @@ superseded value creates a new version and never reactivates the historical
 node. Evidence references and claim/episode graph edges are maintained through
 one store operation.
 
-Snapshots use schema version 2. Version 1 snapshots are rejected rather than
+LLM-proposed subject IDs are checked against source speakers and the visible
+conversation scope; ambiguous multi-speaker self-references are discarded.
+State compilation always reserves up to three active or contested same-subject
+claims for classification, even when their embedding similarity is below the
+historical candidate threshold.
+
+Snapshots use schema version 3. Version 1 and 2 snapshots are rejected rather than
 silently reinterpreted; rebuild the memory when upgrading from the prototype
 format. Claims retain canonical subject IDs and lifecycle statuses (`active`,
 `superseded`, `refined`, `contested`, or `standalone`) together with their
@@ -27,6 +33,9 @@ Start with `configs/method_config/event_state_gemini.yaml` (or the
 `memorize_model` controls extraction and state classification, while `model`
 controls final answers. The embedding backend supports repository-compatible
 local/HuggingFace and OpenAI configurations.
+
+The default `state_current_candidate_top_k` is `3`; lower it only when the
+classifier prompt budget requires fewer current-state candidates.
 
 ## Commands
 

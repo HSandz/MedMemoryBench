@@ -21,9 +21,10 @@ class FakeLLM:
 
 
 def test_normalization_groups_locomo_sessions_and_preserves_turn_provenance():
-    sessions = EventStateAgent._normalize_source_sessions("", [{"source_session_id": 2, "speaker": "Bob", "content": "b", "dia_id": "d2"}, {"source_session_id": 1, "speaker": "Alice", "content": "a", "dia_id": "d1"}], {})
+    sessions = EventStateAgent._normalize_source_sessions("", [{"source_session_id": 2, "source_session_index": 42, "speaker": "Bob", "content": "b", "dia_id": "d2"}, {"source_session_id": 1, "source_session_index": 7, "speaker": "Alice", "content": "a", "dia_id": "d1"}], {})
     assert [item["source_session_id"] for item in sessions] == [2, 1]
     assert sessions[0]["turns"][0]["source_turn_id"] == "d2"
+    assert [item["source_session_index"] for item in sessions] == [42, 7]
 
 
 def test_agent_build_query_snapshot_and_provenance(monkeypatch):

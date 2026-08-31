@@ -160,3 +160,18 @@ def test_store_invariant_checker_reports_missing_nodes_and_embeddings():
     assert any("missing node" in error for error in errors)
     assert any("missing claim embedding" in error for error in errors)
     assert any("missing evidence episode" in error for error in errors)
+
+
+def test_current_state_candidate_is_reserved_below_similarity_threshold():
+    captured = []
+    class LLM:
+        def chat(self, messages, **kwargs):
+            captured.append(messages[-1]["content"])
+            return SimpleNamespace(content='{"matched_claim_id":"TOKYO","operation":"SUPERSEDE","confidence":0.9}')
+    store = EventStateStore("p")
+    store.add_claim(Claim("BOSTON", "Alice", "alice", "city", "Boston", status="superseded", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0])
+    store.add_claim(Claim("TOKYO", "Alice", "alice", "city", "Tokyo", status="active", evidence=[EvidenceRef("s2", "s2", [2])]), [0.0, 1.0])
+    compiler = StateCompiler(store, FakeEmbedder(), LLM(), candidate_top_k=2, current_candidate_top_k=1, min_similarity=0.9)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s3", "s3", [3])]), "s3", [1.0, 0.0])
+    assert result.operation == "SUPERSEDE"
+    assert "TOKYO" in captured[0]

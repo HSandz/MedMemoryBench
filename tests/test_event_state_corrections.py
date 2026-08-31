@@ -63,6 +63,27 @@ def test_locomo_self_references_are_scoped_to_their_source_speaker():
     assert subjects == {"visited": "speaker:alice", "moved": "speaker:bob"}
 
 
+def test_incorrect_llm_subject_id_cannot_override_source_speaker_or_family_scope():
+    class LLM:
+        def __init__(self, content): self.content = content
+        def chat(self, messages, **kwargs): return SimpleNamespace(content=self.content)
+    bob_agent = EventStateAgent(llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"I","subject_id":"speaker:alice","predicate":"moved","value":"Seattle","source_turn_ids":["b"]}]}'), memory_llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"I","subject_id":"speaker:alice","predicate":"moved","value":"Seattle","source_turn_ids":["b"]}]}'), embedding_client=Embedder())
+    bob_agent.memorize("", memory_items=[{"speaker":"Alice","text":"hello","source_turn_id":"a"},{"speaker":"Bob","text":"I moved","source_turn_id":"b"}], source_session_id=1)
+    assert next(iter(bob_agent._store().claims.values())).subject_id == "speaker:bob"
+    family_agent = EventStateAgent(llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"Mary","subject_id":"primary_user","predicate":"dose","value":"10 mg"}]}'), memory_llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"Mary","subject_id":"primary_user","predicate":"dose","value":"10 mg"}]}'), embedding_client=Embedder())
+    family_agent.memorize("[Health consultation record about Mary(mother)]", source_session_id=2)
+    assert next(iter(family_agent._store().claims.values())).subject_id == "third_party:mary"
+
+
+def test_ambiguous_multi_speaker_self_reference_is_dropped():
+    class LLM:
+        def chat(self, messages, **kwargs): return SimpleNamespace(content='{"episode_summary":"s","claims":[{"subject":"I","predicate":"travelled","value":"often","source_turn_ids":["a","b"]}]}')
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    result = agent.memorize("", memory_items=[{"speaker":"Alice","text":"I travel","source_turn_id":"a"},{"speaker":"Bob","text":"I travel","source_turn_id":"b"}], source_session_id=1)
+    assert not agent._store().claims
+    assert result.extra["ambiguous_subject_claim_count"] == 1
+
+
 def test_extraction_prompt_contains_turn_role_speaker_and_ids(monkeypatch):
     captured = []
 
@@ -122,6 +143,35 @@ def test_malformed_extraction_repairs_but_provider_error_propagates():
         failing.memorize("text", source_session_id=1)
 
 
+def test_structural_extraction_failures_repair_once_but_empty_claims_are_valid():
+    class Structural:
+        def __init__(self): self.calls = 0
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content='{"episode_summary":"s","claims":{}}')
+            return SimpleNamespace(content='{"episode_summary":"s","claims":[]}')
+    client = Structural()
+    agent = EventStateAgent(llm_client=client, memory_llm_client=client, embedding_client=Embedder())
+    result = agent.memorize("text", source_session_id=1)
+    assert client.calls == 2 and result.extra["extract_structure_failures"] == 1
+
+    class Empty:
+        def chat(self, messages, **kwargs): return SimpleNamespace(content='{"episode_summary":"s","claims":[]}')
+    empty = EventStateAgent(llm_client=Empty(), memory_llm_client=Empty(), embedding_client=Embedder())
+    result = empty.memorize("text", source_session_id=1)
+    assert result.extra["extract_repair_calls"] == 0 and result.extra["extract_structure_failures"] == 0
+
+
+def test_bitemporal_disabled_clears_normalized_boundaries():
+    class LLM:
+        def chat(self, messages, **kwargs): return SimpleNamespace(content='{"episode_summary":"s","claims":[{"subject":"patient","predicate":"dose","value":"10 mg","valid_from":"2024-01-01","valid_to":"2024-02-01","valid_time_text":"last month"}]}')
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder(), enable_bitemporal_time=False)
+    agent.memorize("text", source_session_id=1)
+    claim = next(iter(agent._store().claims.values()))
+    assert claim.valid_from is None and claim.valid_to is None and claim.valid_time_text == "last month"
+
+
 def test_state_claims_require_episode_archive_for_provenance():
     with pytest.raises(ValueError, match="requires enable_episodes"):
         EventStateAgent(enable_episodes=False, enable_state_claims=True, embedding_client=Embedder())
@@ -131,6 +181,8 @@ def test_schema_v1_is_rejected_and_context_fallback_uses_stored_id():
     store = EventStateStore("stored")
     with pytest.raises(ValueError, match="schema v1"):
         EventStateStore.from_export({"method": "event_state", "schema_version": 1})
+    with pytest.raises(ValueError, match="schema v2"):
+        EventStateStore.from_export({"method": "event_state", "schema_version": 2})
     agent = EventStateAgent(llm_client=SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(content="ok")), memory_llm_client=SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(content="ok")), embedding_client=Embedder())
     state = store.export()
     agent.import_memory_state(state)
@@ -157,6 +209,7 @@ def test_source_evidence_is_expanded_and_budget_keeps_question_intact():
     prepared = agent.prepare_batch_query("What dose does the user take?", raw_question="What dose does the user take?")
     assert prepared["messages"][-1]["content"].endswith("What dose does the user take?")
     assert prepared["extra"]["included_provenance_evidence"]
+    assert all("included_in_context" in record for record in prepared["retrieved_memories"])
 
 
 def test_context_budget_accounts_for_instruction_system_question_and_reserve():

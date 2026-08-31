@@ -52,16 +52,17 @@ def normalized_content(claim: Claim) -> Tuple[str, str, str, str, str, str, str]
 class StateCompiler:
     """Applies auditable operations while favoring preservation over compression."""
 
-    def __init__(self, store: EventStateStore, embedder: Any, llm_client: Any, candidate_top_k: int = 5, min_similarity: float = 0.45, min_confidence: float = 0.55, update_temperature: float = 0.0, update_max_tokens: int = 800) -> None:
+    def __init__(self, store: EventStateStore, embedder: Any, llm_client: Any, candidate_top_k: int = 5, min_similarity: float = 0.45, min_confidence: float = 0.55, update_temperature: float = 0.0, update_max_tokens: int = 800, current_candidate_top_k: int = 3) -> None:
         self.store, self.embedder, self.llm_client = store, embedder, llm_client
         self.candidate_top_k = max(1, int(candidate_top_k))
+        self.current_candidate_top_k = max(1, int(current_candidate_top_k))
         self.min_similarity, self.min_confidence = float(min_similarity), float(min_confidence)
         self.update_temperature, self.update_max_tokens = float(update_temperature), int(update_max_tokens)
         self.update_llm_calls = 0
         self.update_parse_failures = 0
 
     def _candidates(self, claim: Claim, embedding: Sequence[float]) -> List[Tuple[Claim, float]]:
-        matches = []
+        current, historical = [], []
         for candidate_id, candidate in self.store.claims.items():
             if (candidate.subject_id or candidate.subject_key) != (claim.subject_id or claim.subject_key):
                 continue
@@ -70,9 +71,11 @@ class StateCompiler:
             if claim.persistence != "state" or claim.modality in NON_OBSERVATION_MODALITIES:
                 continue
             similarity = cosine(embedding, self.store.claim_embeddings.get(candidate_id, []))
-            if similarity >= self.min_similarity:
-                matches.append((candidate, similarity))
-        return sorted(matches, key=lambda item: (0 if item[0].status in {"active", "contested"} else 1, -item[1], item[0].claim_id))[:self.candidate_top_k]
+            target = current if candidate.status in {"active", "contested"} else historical
+            target.append((candidate, similarity))
+        current = sorted(current, key=lambda item: (-item[1], item[0].claim_id))[:self.current_candidate_top_k]
+        historical = sorted((item for item in historical if item[1] >= self.min_similarity), key=lambda item: (-item[1], item[0].claim_id))
+        return (current + historical)[:self.candidate_top_k]
 
     def _classify(self, claim: Claim, candidates: Sequence[Tuple[Claim, float]]) -> Dict[str, Any]:
         payload = {"new_claim": asdict(claim), "candidates": [{"claim": asdict(item), "similarity": score} for item, score in candidates]}

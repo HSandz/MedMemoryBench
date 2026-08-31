@@ -253,7 +253,7 @@ class MedMemoryBenchEvaluator:
             }
             enabled = [name for name, enabled_flag in features.items() if enabled_flag]
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "method_name": method_name,
                 "combination_id": "+".join(enabled) if enabled else "none",
                 "enabled_features": enabled,
@@ -325,7 +325,11 @@ class MedMemoryBenchEvaluator:
         for record in retrieved_memories:
             copied = copy.deepcopy(record)
             if copied.get("type") == "state_claim":
+                if not copied.get("included_in_context", False):
+                    copied["source_session_id"] = None
                 copied["provenance_evidence"] = copied.get("included_provenance_evidence", [])
+            elif not copied.get("included_in_context", False):
+                continue
             visible_records.append(copied)
         lineage_records = []
         for record in retrieved_memories:
