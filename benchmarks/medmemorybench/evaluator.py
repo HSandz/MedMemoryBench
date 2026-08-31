@@ -325,9 +325,19 @@ class MedMemoryBenchEvaluator:
         for record in retrieved_memories:
             copied = copy.deepcopy(record)
             if copied.get("type") == "state_claim":
-                if not copied.get("included_in_context", False):
+                included_in_context = bool(copied.get("included_in_context", False))
+                included_provenance = copied.get("included_provenance_evidence", [])
+                if not isinstance(included_provenance, list):
+                    included_provenance = []
+                if not included_in_context and not included_provenance:
+                    continue
+                if not included_in_context:
                     copied["source_session_id"] = None
-                copied["provenance_evidence"] = copied.get("included_provenance_evidence", [])
+                # Answer visibility is limited to prompt-visible state or excerpts.
+                copied.pop("provenance", None)
+                copied.pop("raw_evidence_added", None)
+                copied.pop("retrieval_audit", None)
+                copied["provenance_evidence"] = included_provenance
             elif not copied.get("included_in_context", False):
                 continue
             visible_records.append(copied)

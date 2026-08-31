@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from methods.event_state.compiler import StateCompiler
 from methods.event_state.embeddings import cosine
 from methods.event_state.schemas import Claim, EvidenceRef
@@ -150,6 +152,55 @@ def test_classifier_cannot_reactivate_historical_claim_via_duplicate():
     result = compiler.apply(Claim("NEW", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
     assert result.operation == "NEW"
     assert len(store.claims["OLD"].evidence) == 1
+
+
+def test_historical_supersede_target_falls_back_to_new_without_mutating_history():
+    store = EventStateStore("p")
+    old_boston = Claim("BOSTON_OLD", "Alice", "alice", "city", "Boston", status="superseded", evidence=[EvidenceRef("s1", "s1", [1])])
+    tokyo = Claim("TOKYO", "Alice", "alice", "city", "Tokyo", evidence=[EvidenceRef("s2", "s2", [2])])
+    store.add_claim(old_boston, [1.0, 0.0])
+    store.add_claim(tokyo, [0.0, 1.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"BOSTON_OLD","operation":"SUPERSEDE","confidence":0.9}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, candidate_top_k=2, current_candidate_top_k=1, min_similarity=0.9)
+
+    result = compiler.apply(Claim("BOSTON_NEW", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s3", "s3", [3])]), "s3", [1.0, 0.0])
+
+    assert result.operation == "NEW"
+    assert result.matched_claim_id is None
+    assert result.fallback_reason == "historical_transition_target"
+    assert old_boston.status == "superseded"
+    assert tokyo.status == "active"
+    assert store.claims["BOSTON_NEW"].status == "active"
+    assert not any(
+        edge["source_id"] == "BOSTON_NEW"
+        and edge["relation_type"] in {"SUPERSEDES", "REFINES", "CONFLICTS_WITH"}
+        for edge in store.edges
+    )
+    assert store.operations[-1].matched_claim_id is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "historical_status"),
+    [("REFINE", "refined"), ("CONFLICT", "standalone")],
+)
+def test_historical_transition_targets_are_rejected(operation, historical_status):
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "city", "Boston", status=historical_status, evidence=[EvidenceRef("s1", "s1", [1])])
+    store.add_claim(old, [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content=f'{{"matched_claim_id":"OLD","operation":"{operation}","confidence":0.9}}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
+
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "city", "Paris", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
+
+    assert result.operation == "NEW"
+    assert result.matched_claim_id is None
+    assert result.fallback_reason == "historical_transition_target"
+    assert old.status == historical_status
+    assert store.claims["NEW"].status == "active"
+    assert not any(
+        edge["relation_type"] in {"SUPERSEDES", "REFINES", "CONFLICTS_WITH"}
+        for edge in store.edges
+    )
 
 
 def test_store_invariant_checker_reports_missing_nodes_and_embeddings():

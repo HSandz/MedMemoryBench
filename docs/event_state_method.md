@@ -10,8 +10,11 @@ evidence set. Optional typed PPR is query-only and does not alter snapshots.
 Claim self-references are resolved from cited source turns, so alternating
 named speakers remain separate subject namespaces. Repeating an older
 superseded value creates a new version and never reactivates the historical
-node. Evidence references and claim/episode graph edges are maintained through
-one store operation.
+node. `SUPERSEDE`, `REFINE`, and `CONFLICT` may target only active or contested
+claims; an LLM attempt to transition historical state is recorded as a new
+claim with the `historical_transition_target` fallback reason. Evidence
+references and claim/episode graph edges are maintained through one store
+operation.
 
 LLM-proposed subject IDs are checked against source speakers and the visible
 conversation scope; ambiguous multi-speaker self-references are discarded.
@@ -68,4 +71,8 @@ the selected context.
 
 The evaluator keeps the legacy session metric for compatibility and adds
 Event-State `claim_lineage` (all evidence attached to selected claims) and
-`answer_visible` (only evidence present in the final prompt) diagnostics.
+`answer_visible` diagnostics. `answer_visible` includes selected episodes only
+when their full block fits the final prompt. A state claim contributes its
+direct origin only when its compact state block fits; otherwise, it contributes
+only included provenance excerpts, and is excluded entirely when neither is
+visible.

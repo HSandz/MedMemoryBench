@@ -127,9 +127,17 @@ class StateCompiler:
         decision = self._classify(claim, candidates)
         operation, matched_id = decision["operation"], decision["matched_claim_id"]
         fallback_reason = decision.get("fallback_reason")
+        historical_target = False
+        if operation in {"SUPERSEDE", "REFINE", "CONFLICT"} and matched_id:
+            matched = self.store.claims[matched_id]
+            if matched.status not in {"active", "contested"}:
+                operation, matched_id = "NEW", None
+                fallback_reason = "historical_transition_target"
+                historical_target = True
         if decision["confidence"] < self.min_confidence:
             operation, matched_id = "NEW", None
-            fallback_reason = "below_confidence_threshold"
+            if not historical_target:
+                fallback_reason = "below_confidence_threshold"
         elif matched_id is None and operation != "NEW":
             operation = "NEW"
             fallback_reason = fallback_reason or "unknown_matched_claim"
