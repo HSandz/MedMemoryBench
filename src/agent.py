@@ -476,6 +476,7 @@ class AgentManager:
         elif method_key == "event_state":
             params.update(agent_params)
             params.update({
+                "event_state_workers": getattr(self, "_workers", 1),
                 "memory_model": build_model_config.name if build_model_config else model_config.name,
                 "memory_provider": build_model_config.provider if build_model_config else model_config.provider,
                 "memory_temperature": build_model_config.temperature if build_model_config else model_config.temperature,
@@ -1055,6 +1056,29 @@ class AgentManager:
             chunk_count=self._agent.memory_size,
             time_cost=memory_time,
         )
+
+    def supports_staged_memory(self) -> bool:
+        """Return whether memory construction exposes preparation and commit stages."""
+        return bool(
+            hasattr(self._agent, "prepare_memory_sessions")
+            and hasattr(self._agent, "commit_prepared_memory")
+        )
+
+    def prepare_memory_sessions(self, message: str, **kwargs):
+        if not self.supports_staged_memory():
+            raise RuntimeError(f"{self.method_name} does not support staged memory")
+        context_id = kwargs.get("context_id")
+        if context_id is not None and context_id != self._context_id:
+            self._context_id = context_id
+            self._agent.set_context_id(context_id)
+        get_usage_tracker().set_phase("memorize")
+        return self._agent.prepare_memory_sessions(message, **kwargs)
+
+    def commit_prepared_memory(self, prepared_sessions, **kwargs):
+        if not self.supports_staged_memory():
+            raise RuntimeError(f"{self.method_name} does not support staged memory")
+        get_usage_tracker().set_phase("memorize")
+        return self._agent.commit_prepared_memory(prepared_sessions, **kwargs)
 
     def _handle_query(self, message: str, **kwargs) -> Dict[str, Any]:
         get_usage_tracker().set_phase("query")

@@ -2685,7 +2685,75 @@ class MedMemoryBenchEvaluator:
             total_sessions = len(unit.sessions_to_inject)
             session_ids = []
 
-            for idx, session in enumerate(unit.sessions_to_inject):
+            method_name = str(getattr(getattr(self, "method_config", None), "method_name", "")).lower()
+            pending_sessions = list(unit.sessions_to_inject)
+            if self._session_level_force_resume() and not self._supports_memory_snapshots() and self._checkpoint_manager:
+                pending_sessions = [
+                    session for session in pending_sessions
+                    if not self._checkpoint_manager.is_session_injected(session.session_id, persona_id=unit.context_id)
+                ]
+            supports_staged_memory = getattr(self.agent_manager, "supports_staged_memory", None)
+            staged_event_state = "event_state" in method_name and len(pending_sessions) > 1 and callable(supports_staged_memory) and supports_staged_memory()
+            sessions_to_process = unit.sessions_to_inject
+            if staged_event_state and not restored_completed_unit:
+                # Extraction and embedding are independent per source session;
+                # the returned preparations are committed below in source order.
+                staged_items = []
+                pending_ids = {session.session_id for session in pending_sessions}
+                for idx, session in enumerate(unit.sessions_to_inject):
+                    if session.session_id not in pending_ids:
+                        continue
+                    session_ids.append(session.session_id)
+                    source_messages = session.metadata.get("messages", []) or [{"speaker": "Unknown", "content": session.content, "source_turn_id": None}]
+                    for turn_index, item in enumerate(source_messages):
+                        staged_item = dict(item)
+                        staged_item.setdefault("source_session_id", session.session_id)
+                        staged_item.setdefault("source_session_index", idx)
+                        staged_item.setdefault("source_turn_id", item.get("turn_id", item.get("dia_id", turn_index)))
+                        staged_item.setdefault("source_event_id", session.metadata.get("event_id"))
+                        staged_item.setdefault("timestamp", session.timestamp)
+                        staged_items.append(staged_item)
+                    marker = getattr(self._checkpoint_manager, "mark_session_started", None)
+                    if callable(marker):
+                        marker(session.session_id, unit.unit_id)
+                staged_start = time.perf_counter()
+                try:
+                    staged_text = "\n\n".join(session.to_memory_text() for session in pending_sessions)
+                    prepared = self.agent_manager.prepare_memory_sessions(
+                        message=staged_text,
+                        context_id=unit.context_id,
+                        memory_items=staged_items,
+                        timestamp=None,
+                    )
+                    total_memory_time += time.perf_counter() - staged_start
+                    for prepared_session in prepared:
+                        session_start = time.perf_counter()
+                        memory_result = self.agent_manager.commit_prepared_memory(
+                            [prepared_session],
+                            text=prepared_session.session.get("text", ""),
+                            context_id=unit.context_id,
+                        )
+                        session_id = prepared_session.session.get("source_session_id")
+                        session_index = prepared_session.session.get("source_session_index")
+                        session_build_results.append({
+                            "session_id": session_id,
+                            "session_index": session_index,
+                            "build_result": memory_result.to_dict(),
+                            "wall_time_seconds": time.perf_counter() - session_start,
+                            "build_metrics": {"wall_time_seconds": time.perf_counter() - session_start, "usage": {}},
+                        })
+                        total_memory_time += time.perf_counter() - session_start
+                        if self._checkpoint_manager:
+                            self._checkpoint_manager.mark_session_injected(session_id)
+                    sessions_to_process = []
+                except Exception as exc:
+                    if not isinstance(exc, LLMAPIError):
+                        raise
+                    memory_build_failed = True
+                    self._log(f"        [ERROR] Event-State staged preparation failed: {exc}", level="ERROR")
+                    sessions_to_process = []
+
+            for idx, session in enumerate(sessions_to_process):
                 session_ids.append(session.session_id)
                 if restored_completed_unit:
                     self._log(

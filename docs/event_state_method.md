@@ -56,6 +56,20 @@ python main.py -m event_state_gemini -d medmemorybench --stage memory
 python main.py --stage query --memory-run <memory-run-directory>
 ```
 
+### Parallel memory construction
+
+Use the existing global worker option, for example `--workers 4`, with Event-State.
+Each source session performs extraction, repair/validation, episode construction,
+subject resolution, and episode/claim embedding in a bounded preparation pool.
+Prepared sessions are then committed to one store strictly in original session
+order; candidate generation, update classification, and every state/provenance
+mutation remain serial. `--workers 1` follows the same staged path without a
+pool, and workers greater than one are intended to be semantically equivalent.
+LoCoMo multi-session chunks use the same ordered preparation/commit split, while
+query workers continue to use the evaluator's existing global query limit.
+Worker count is an execution setting and is not included in snapshot or config
+identity hashes.
+
 To compare PPR policies on the same build, use a query-stage YAML override
 with `retrieval_config.ppr_enabled: false` and then `true`; no extraction or
 embedding calls are required after the snapshot is imported. No benchmark

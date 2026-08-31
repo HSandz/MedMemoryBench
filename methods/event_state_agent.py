@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -35,12 +36,26 @@ class SubjectResolution:
     conflict_detected: bool = False
 
 
+@dataclass
+class PreparedMemorySession:
+    """State-independent Event-State work ready for ordered compilation."""
+
+    context_id: Any
+    session: Dict[str, Any]
+    normalized_turns: List[NormalizedTurn]
+    extracted: Dict[str, Any]
+    episode: Episode
+    episode_embedding: List[float]
+    claims: List[Claim]
+    claim_embeddings: List[List[float]]
+
+
 class EventStateAgent(BaseAgent):
     """Lossless episodes plus conservative, versioned semantic claims."""
 
     METHOD_TYPE = "agentic_memory"
 
-    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, claim_top_k=30, episode_top_k=20, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, **kwargs):
+    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, claim_top_k=30, episode_top_k=20, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, event_state_workers=1, **kwargs):
         super().__init__(model, temperature, max_tokens, **kwargs)
         if fusion_mode != "rrf":
             raise ValueError("Event-State fusion_mode currently supports only 'rrf'")
@@ -61,6 +76,7 @@ class EventStateAgent(BaseAgent):
         self.enable_episodes, self.enable_state_claims, self.enable_state_compilation = bool(enable_episodes), bool(enable_state_claims), bool(enable_state_compilation)
         self.store_raw_episode_text, self.enable_bitemporal_time, self.preserve_turn_evidence = bool(store_raw_episode_text), bool(enable_bitemporal_time), bool(preserve_turn_evidence)
         self.inject_source_evidence, self.max_source_excerpts_per_claim = bool(inject_source_evidence), max(0, int(max_source_excerpts_per_claim))
+        self.event_state_workers = max(1, int(event_state_workers))
         self._llm_client: BaseLLMClient = llm_client or create_llm_client(provider=provider, model=model, temperature=temperature, max_tokens=max_tokens, api_key=api_key, base_url=base_url, **(llm_client_kwargs or {}))
         self._memory_llm_client: BaseLLMClient = memory_llm_client or create_llm_client(provider=memory_provider or provider, model=memory_model or model, temperature=memory_temperature if memory_model else temperature, max_tokens=memory_max_tokens if memory_model else max_tokens, api_key=memory_api_key if memory_model else api_key, base_url=memory_base_url if memory_model else base_url, **(memory_llm_client_kwargs or {}))
         self._embedder = embedding_client or DenseEmbedder(embedding_provider, embedding_model, embedding_model_path, embedding_api_key or api_key, embedding_base_url or base_url)
@@ -244,96 +260,104 @@ class EventStateAgent(BaseAgent):
     def truncate_to_tokens(self, text: str, limit: int) -> str:
         return self._tokenizer.decode(self._tokenizer.encode(text)[:max(0, int(limit))])
 
+    def _prepare_session(self, session: Dict[str, Any], context_id: Any) -> PreparedMemorySession:
+        extracted = self._extract(session)
+        normalized = [self.normalize_turn(item, index, session) for index, item in enumerate(session["turns"])]
+        raw_lines = [f"[turn_id={turn.source_turn_id}] [role={turn.role or 'unknown'}] [speaker={turn.speaker}]\n{turn.text}" + (f"\n[Shared image: {turn.image_caption}]" if turn.image_caption else "") for turn in normalized]
+        raw = f"[conversation_scope={session['conversation_scope']}]\n[recorded_at={session.get('timestamp') or 'unknown'}]\n\n" + "\n\n".join(raw_lines)
+        episode_id = self._store(context_id).stable_id("E", [context_id, session["source_session_id"], raw])
+        episode = Episode(episode_id, context_id, session["source_session_id"], session["source_session_index"], session["source_event_id"], session.get("timestamp"), sorted({turn.speaker for turn in normalized}), session["conversation_scope"], raw if self.store_raw_episode_text else "", extracted["episode_summary"], [TurnEvidence(turn.source_turn_id, turn.speaker, turn.role, turn.text, turn.timestamp, turn.image_caption, turn.source_session_id, turn.source_session_index, turn.source_event_id) for turn in normalized] if self.preserve_turn_evidence else [])
+        claims: List[Claim] = []
+        if self.enable_state_claims:
+            for index, raw_claim in enumerate(extracted["claims"]):
+                resolution = self.resolve_claim_subject(raw_claim, normalized, session["conversation_scope"])
+                if resolution is None:
+                    continue
+                persistence = raw_claim["persistence"]
+                valid_from = self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time)
+                valid_to = raw_claim.get("valid_to") if self.enable_bitemporal_time else None
+                claims.append(Claim(self._store(context_id).stable_id("C", [episode_id, index, resolution.subject_id, raw_claim["predicate"], raw_claim["value"]]), resolution.subject_display, resolution.subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), valid_from, valid_to, raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], resolution.subject_id))
+        if self.enable_episodes:
+            with get_usage_tracker().scope("event_state.embedding"):
+                episode_embedding = self._embedder.embed_documents([episode.retrieval_text()])[0]
+        else:
+            episode_embedding = []
+        claim_embeddings = []
+        if self.enable_state_claims:
+            for claim in claims:
+                with get_usage_tracker().scope("event_state.embedding"):
+                    claim_embeddings.append(self._embedder.embed_documents([claim.semantic_text()])[0])
+        return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), claims, [list(item) for item in claim_embeddings])
+
+    def prepare_memory_sessions(self, text: str, **kwargs) -> List[PreparedMemorySession]:
+        """Prepare independent source sessions concurrently, preserving source order."""
+        context_id = kwargs.get("context_id", self._context_id)
+        sessions = self._normalize_source_sessions(text, kwargs.get("memory_items"), kwargs)
+        if self.event_state_workers == 1 or len(sessions) < 2:
+            return [self._prepare_session(session, context_id) for session in sessions]
+        worker_count = min(self.event_state_workers, len(sessions))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            return list(executor.map(lambda session: self._prepare_session(session, context_id), sessions))
+
+    def _commit_prepared(self, prepared: PreparedMemorySession, store: EventStateStore, counts: Dict[str, int], added_records: List[Dict[str, Any]]) -> None:
+        extracted = prepared.extracted
+        counts["extract_parse_failures"] += int(extracted.get("parse_failure", False))
+        counts["extract_json_parse_failures"] += int(extracted.get("json_parse_failure", False))
+        counts["extract_structure_failures"] += int(extracted.get("structure_failure", False))
+        counts["extract_claim_validation_failures"] += int(extracted.get("claim_validation_failures", 0))
+        counts["extract_repair_failures"] += int(extracted.get("repair_failure", False))
+        counts["extract_repair_calls"] += int(extracted.get("repair_calls", 0))
+        episode = prepared.episode
+        if self.enable_episodes:
+            store.add_episode(episode, prepared.episode_embedding)
+            counts["episodes_added"] += 1
+            added_records.append({"id": episode.episode_id, "type": "episode", "memory": episode.summary, "source_session_id": episode.source_session_id})
+        if not self.enable_state_claims:
+            return
+        counts["ambiguous_subject_claim_count"] += max(0, len(prepared.extracted.get("claims", [])) - len(prepared.claims))
+        counts["claims_extracted"] += len(prepared.claims)
+        compiler = StateCompiler(store, self._embedder, self._memory_llm_client, candidate_top_k=self._build_config["state_candidate_top_k"], current_candidate_top_k=self._build_config["state_current_candidate_top_k"], min_similarity=self._build_config["state_candidate_min_similarity"], min_confidence=self._build_config["update_min_confidence"], update_temperature=self._build_config["update_temperature"], update_max_tokens=self._build_config["update_max_tokens"])
+        for claim, claim_embedding in zip(prepared.claims, prepared.claim_embeddings):
+            if claim.confidence < 0.55:
+                counts["low_extraction_confidence_count"] += 1
+            if not self.enable_state_compilation:
+                store.add_claim(claim, claim_embedding)
+                counts["uncompiled_claim_count"] += 1
+                counts["new_count"] += 1
+                added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": episode.source_session_id})
+                continue
+            compile_result = compiler.apply(claim, episode.episode_id, claim_embedding)
+            operation = compile_result.operation
+            counts["update_llm_calls"] += compiler.update_llm_calls
+            counts["update_parse_failures"] += compiler.update_parse_failures
+            counts[f"{operation.casefold()}_count"] = counts.get(f"{operation.casefold()}_count", 0) + 1
+            if operation in {"NEW", "REFINE", "SUPERSEDE", "CONFLICT"}:
+                counts["canonical_claims_added"] += 1
+                added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": episode.source_session_id})
+            if operation == "EPISODIC":
+                counts["episodic_claims_added"] += 1
+            if operation == "NEW" and compile_result.fallback_reason == "below_confidence_threshold":
+                counts["low_confidence_new_count"] += 1
+            compiler.update_llm_calls = 0
+            compiler.update_parse_failures = 0
+
+    def commit_prepared_memory(self, prepared_sessions: List[PreparedMemorySession], text: str = "", context_id: Any = None) -> MemoryBuildResult:
+        context_id = self._context_id if context_id is None else context_id
+        store = self._store(context_id)
+        counts = {"episodes_added": 0, "claims_extracted": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        added_records: List[Dict[str, Any]] = []
+        for prepared in prepared_sessions:
+            self._commit_prepared(prepared, store, counts, added_records)
+        self._memory_chunks = [episode.summary for episode in store.episodes.values()]
+        self._is_initialized = bool(store.episodes or store.claims)
+        return MemoryBuildResult(success=True, method="event_state", action="compile", input_content=text, stored_content="\n".join(item["memory"] for item in added_records), memory_entries=added_records, chunk_count=len(added_records), extra={**counts, **store.claim_counts(), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values())}, all_passages=added_records)
+
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
         context_id = kwargs.get("context_id", self._context_id)
         if context_id != self._context_id:
             self.set_context_id(context_id)
-        store = self._store(context_id)
-        sessions = self._normalize_source_sessions(text, kwargs.get("memory_items"), kwargs)
-        counts = {"episodes_added": 0, "claims_extracted": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
-        added_records: List[Dict[str, Any]] = []
-        for session in sessions:
-            extracted = self._extract(session)
-            counts["extract_parse_failures"] += int(extracted.get("parse_failure", False))
-            counts["extract_json_parse_failures"] += int(extracted.get("json_parse_failure", False))
-            counts["extract_structure_failures"] += int(extracted.get("structure_failure", False))
-            counts["extract_claim_validation_failures"] += int(extracted.get("claim_validation_failures", 0))
-            counts["extract_repair_failures"] += int(extracted.get("repair_failure", False))
-            counts["extract_repair_calls"] += int(extracted.get("repair_calls", 0))
-            normalized = [self.normalize_turn(item, index, session) for index, item in enumerate(session["turns"])]
-            raw_lines = [f"[turn_id={turn.source_turn_id}] [role={turn.role or 'unknown'}] [speaker={turn.speaker}]\n{turn.text}" + (f"\n[Shared image: {turn.image_caption}]" if turn.image_caption else "") for turn in normalized]
-            raw = f"[conversation_scope={session['conversation_scope']}]\n[recorded_at={session.get('timestamp') or 'unknown'}]\n\n" + "\n\n".join(raw_lines)
-            episode_id = store.stable_id("E", [context_id, session["source_session_id"], raw])
-            episode = Episode(episode_id, context_id, session["source_session_id"], session["source_session_index"], session["source_event_id"], session.get("timestamp"), sorted({turn.speaker for turn in normalized}), session["conversation_scope"], raw if self.store_raw_episode_text else "", extracted["episode_summary"], [TurnEvidence(turn.source_turn_id, turn.speaker, turn.role, turn.text, turn.timestamp, turn.image_caption, turn.source_session_id, turn.source_session_index, turn.source_event_id) for turn in normalized] if self.preserve_turn_evidence else [])
-            if self.enable_episodes:
-                with get_usage_tracker().scope("event_state.embedding"):
-                    episode_embedding = self._embedder.embed_documents([episode.retrieval_text()])[0]
-                store.add_episode(episode, episode_embedding)
-                counts["episodes_added"] += 1
-                added_records.append({"id": episode.episode_id, "type": "episode", "memory": episode.summary, "source_session_id": episode.source_session_id})
-            if not self.enable_state_claims:
-                continue
-            claims: List[Claim] = []
-            for index, raw_claim in enumerate(extracted["claims"]):
-                resolution = self.resolve_claim_subject(raw_claim, normalized, session["conversation_scope"])
-                if resolution is None:
-                    counts["ambiguous_subject_claim_count"] += 1
-                    continue
-                subject_id = resolution.subject_id
-                persistence = raw_claim["persistence"]
-                valid_from = self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time)
-                valid_to = raw_claim.get("valid_to") if self.enable_bitemporal_time else None
-                claims.append(Claim(store.stable_id("C", [episode_id, index, subject_id, raw_claim["predicate"], raw_claim["value"]]), resolution.subject_display, subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), valid_from, valid_to, raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], subject_id))
-            counts["claims_extracted"] += len(claims)
-            compiler = StateCompiler(
-                store,
-                self._embedder,
-                self._memory_llm_client,
-                candidate_top_k=self._build_config["state_candidate_top_k"],
-                current_candidate_top_k=self._build_config["state_current_candidate_top_k"],
-                min_similarity=self._build_config["state_candidate_min_similarity"],
-                min_confidence=self._build_config["update_min_confidence"],
-                update_temperature=self._build_config["update_temperature"],
-                update_max_tokens=self._build_config["update_max_tokens"],
-            )
-            for claim in claims:
-                if claim.confidence < 0.55:
-                    counts["low_extraction_confidence_count"] += 1
-                with get_usage_tracker().scope("event_state.embedding"):
-                    claim_embedding = self._embedder.embed_documents([claim.semantic_text()])[0]
-                if not self.enable_state_compilation:
-                    store.add_claim(claim, claim_embedding)
-                    counts["uncompiled_claim_count"] += 1
-                    counts["new_count"] += 1
-                    added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": session["source_session_id"]})
-                    continue
-                compile_result = compiler.apply(claim, episode_id, claim_embedding)
-                operation = compile_result.operation
-                counts["update_llm_calls"] += compiler.update_llm_calls
-                counts["update_parse_failures"] += compiler.update_parse_failures
-                counts[f"{operation.casefold()}_count"] = counts.get(f"{operation.casefold()}_count", 0) + 1
-                if operation in {"NEW", "REFINE", "SUPERSEDE", "CONFLICT"}:
-                    counts["canonical_claims_added"] += 1
-                    added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": session["source_session_id"]})
-                if operation == "EPISODIC":
-                    counts["episodic_claims_added"] += 1
-                if operation == "NEW" and compile_result.fallback_reason == "below_confidence_threshold":
-                    counts["low_confidence_new_count"] += 1
-                compiler.update_llm_calls = 0
-                compiler.update_parse_failures = 0
-        self._memory_chunks = [episode.summary for episode in store.episodes.values()]
-        self._is_initialized = bool(store.episodes or store.claims)
-        return MemoryBuildResult(
-            success=True,
-            method="event_state",
-            action="compile",
-            input_content=text,
-            stored_content="\n".join(item["memory"] for item in added_records),
-            memory_entries=added_records,
-            chunk_count=len(added_records),
-            extra={**counts, **store.claim_counts(), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values())},
-            all_passages=added_records,
-        )
+        prepared_sessions = self.prepare_memory_sessions(text, **kwargs)
+        return self.commit_prepared_memory(prepared_sessions, text=text, context_id=context_id)
 
     def _record(self, store: EventStateStore, item: Dict[str, Any]) -> Dict[str, Any]:
         if item["type"] == "episode":
