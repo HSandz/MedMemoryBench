@@ -40,9 +40,21 @@ def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str]
     prefix, _, proposed_name = canonical.partition(":")
     key = normalize_name(proposed_name if prefix in {"speaker", "third_party"} else raw)
     aliases = {"i", "me", "myself", "self", "user", "the_user", "patient", "the_patient", "primary_user", "primary_patient"}
+    generic_roles = {"user", "assistant", "system", "patient", "doctor", "unknown"}
     participant_map = {normalize_name(name): name for name in participants if name}
-    visible_speakers = {key for key in participant_map if key not in {"user", "assistant", "system", "unknown"}}
-    if key in participant_map and (prefix != "third_party" or key in visible_speakers):
+    visible_speakers = {name for name in participant_map if name not in generic_roles}
+
+    # Scope and self/role aliases have priority over the participant labels
+    # commonly emitted as generic roles (User, Assistant, Patient, ...).
+    if scope.startswith("third_party:") and (key in aliases or key in generic_roles or not raw):
+        return scope.casefold()
+    if scope == "general_non_personal" and (key in aliases or key in generic_roles or not raw):
+        return "general_non_personal"
+    if scope == "primary_user" and canonical in {"primary_user", "general_non_personal"}:
+        return canonical
+    if scope == "primary_user" and key in {"user", "patient", "the_user", "the_patient", "primary_user", "primary_patient"}:
+        return "primary_user"
+    if key in participant_map and key in visible_speakers:
         return "speaker:" + normalize_name(participant_map[key])
     if scope == "general_non_personal":
         # Unknown names and attributes remain non-personal. Capitalization or
@@ -54,7 +66,7 @@ def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str]
         # participant evidence identifies a different person above.
         return "third_party:" + target
     if canonical == "general_non_personal":
-        return "primary_user"
+        return "general_non_personal" if scope == "general_non_personal" else "primary_user"
     if canonical == "primary_user" or key in aliases or not raw:
         if speaker and normalize_name(speaker) in visible_speakers:
             return "speaker:" + normalize_name(speaker)
@@ -73,6 +85,22 @@ def is_visible_subject_identity(raw_subject: Any, participants: Iterable[str]) -
     prefix, _, name = raw.partition(":")
     key = normalize_name(name if prefix in {"speaker", "third_party"} else raw)
     return key in {normalize_name(participant) for participant in participants if participant}
+
+
+def is_valid_canonical_subject_proposal(value: Any, scope: str, participants: Iterable[str]) -> bool:
+    """Validate an LLM canonical-ID proposal against visible identity evidence."""
+    raw = str(value or "").strip().casefold()
+    if raw in {"primary_user", "general_non_personal"}:
+        return raw == scope or (raw == "primary_user" and scope == "primary_user")
+    prefix, _, name = raw.partition(":")
+    key = normalize_name(name)
+    participant_keys = {normalize_name(participant) for participant in participants if participant}
+    generic_roles = {"user", "assistant", "system", "patient", "doctor", "unknown"}
+    if prefix == "speaker":
+        return key in participant_keys and key not in generic_roles
+    if prefix == "third_party":
+        return scope.startswith("third_party:") and key == scope.split(":", 1)[1]
+    return False
 
 
 def display_subject(subject_id: str, fallback: str = "User") -> str:

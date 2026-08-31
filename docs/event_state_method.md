@@ -34,7 +34,7 @@ side), so unrelated dialogue cannot affect correction/restatement decisions.
 Exact normalized duplicates remain deterministic.
 
 Snapshots use schema version 3 plus the Event-State build semantic version. The
-corrected builder is semantic version `2.0`; snapshots built without that version
+corrected builder is semantic version `2.1`; snapshots built without that version
 do not match the build compatibility hash and must be rebuilt. Version 1 and 2
 snapshots are rejected rather than silently reinterpreted. Claims retain canonical
 subject IDs and lifecycle statuses (`active`,

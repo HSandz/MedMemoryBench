@@ -6,6 +6,7 @@ from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidenc
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
 from methods.event_state_agent import EventStateAgent
+from benchmarks.medmemorybench.checkpoint import compute_build_config_hash
 
 
 class Embedder:
@@ -111,13 +112,31 @@ def test_parse_json_ignores_reasoning_blocks_and_selects_structured_payload():
 def test_pre_fix_snapshot_semantic_version_is_rejected():
     store = EventStateStore("p")
     snapshot = store.export()
-    snapshot.pop("semantic_version")
+    snapshot["semantic_version"] = "2.0"
     try:
         EventStateStore.from_export(snapshot)
     except ValueError as exc:
         assert "semantic version" in str(exc)
     else:
         raise AssertionError("pre-fix snapshot was accepted")
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.1"
+
+
+def test_event_state_semantic_version_changes_build_hash_only():
+    class Config:
+        method_name = "event_state"
+        method_type = "agentic_memory"
+        embedding = None
+        memorize_model = None
+
+        def __init__(self, version):
+            self.build_config = {"event_state_semantic_version": version}
+
+        def snapshot_build_config(self):
+            return self.build_config
+
+    dataset = SimpleNamespace(dataset_name="synthetic")
+    assert compute_build_config_hash(Config("2.0"), dataset) != compute_build_config_hash(Config("2.1"), dataset)
 
 
 def test_ungrounded_claim_is_dropped_but_episode_is_retained():

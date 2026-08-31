@@ -20,7 +20,7 @@ from .event_state.prompts import EXTRACTION_SYSTEM_PROMPT
 from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
-from .event_state.subjects import display_subject, is_canonical_subject_id, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
+from .event_state.subjects import display_subject, is_canonical_subject_id, is_valid_canonical_subject_proposal, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
 from .event_state.validation import is_meta_claim, validated_claim
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,9 @@ class EventStateAgent(BaseAgent):
 
         derived = resolve_subject_id(raw_subject, conversation_scope, participants, source_speaker)
         proposed = raw_claim.get("subject_id")
-        proposed_id = resolve_subject_id(proposed, conversation_scope, participants, source_speaker) if is_canonical_subject_id(proposed) else None
+        proposal_is_canonical = is_canonical_subject_id(proposed)
+        proposal_is_valid = proposal_is_canonical and is_valid_canonical_subject_proposal(proposed, conversation_scope, participants)
+        proposed_id = resolve_subject_id(proposed, conversation_scope, participants, source_speaker) if proposal_is_valid else None
         compatible = proposed_id == derived
         if conversation_scope.startswith("third_party:") and (is_self_reference or raw_key in {"she", "he", "patient", "the_patient", "user", "the_user"}):
             derived = conversation_scope
@@ -141,7 +143,7 @@ class EventStateAgent(BaseAgent):
         elif conversation_scope == "general_non_personal" and proposed_id == "primary_user":
             compatible = False
         display = raw_subject if is_visible_subject_identity(raw_subject, participants) else display_subject(derived)
-        return SubjectResolution(derived, display, source_speaker, "visible_evidence", bool(proposed_id and not compatible))
+        return SubjectResolution(derived, display, source_speaker, "visible_evidence", bool((proposal_is_canonical and not proposal_is_valid) or (proposed_id and not compatible)))
 
     @staticmethod
     def _normalize_source_sessions(text: str, memory_items: Optional[List[Dict[str, Any]]], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -187,11 +189,11 @@ class EventStateAgent(BaseAgent):
         repaired_source_turn_id_claim_count = 0
         rejected_ungrounded_claim_count = 0
         meta_claim_rejected_count = 0
-        grounding_repair_needed = 0
+        grounding_invalid_keys = set()
         allowed_ids = {turn.source_turn_id for turn in normalized}
 
         def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
-            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, meta_claim_rejected_count, repaired_source_turn_id_claim_count, grounding_repair_needed
+            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, meta_claim_rejected_count, repaired_source_turn_id_claim_count, grounding_invalid_keys
             value = parse_json(content)
             raw_claims = value.get("claims")
             if not isinstance(raw_claims, list):
@@ -203,14 +205,14 @@ class EventStateAgent(BaseAgent):
                 raise ValueError("episode_summary must be a string")
             claims = []
             invalid_grounding = False
-            grounding_issues = 0
+            valid_grounding_keys = set()
             for raw in raw_claims:
                 if isinstance(raw, dict):
+                    claim_key = tuple(str(raw.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value"))
                     supplied = raw.get("source_turn_ids")
                     if not isinstance(supplied, list) or not supplied:
                         if record_telemetry:
                             missing_source_turn_id_claim_count += 1
-                        grounding_issues += 1
                         # With exactly one visible turn, the evidence target is
                         # deterministic and can be repaired without guessing.
                         if len(allowed_ids) == 1:
@@ -219,27 +221,30 @@ class EventStateAgent(BaseAgent):
                                 repaired_source_turn_id_claim_count += 1
                         else:
                             invalid_grounding = True
+                            if record_telemetry:
+                                grounding_invalid_keys.add(claim_key)
                     elif any(item not in allowed_ids for item in supplied):
                         if record_telemetry:
                             unknown_source_turn_id_claim_count += 1
-                        grounding_issues += 1
                         invalid_grounding = True
+                        if record_telemetry:
+                            grounding_invalid_keys.add(claim_key)
                     if is_meta_claim(raw):
                         if record_telemetry:
                             meta_claim_rejected_count += 1
                         continue
                 item = validated_claim(raw, allowed_ids, allowed_ids)
                 claims.append(item)
+                if item is not None:
+                    valid_grounding_keys.add(tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value")))
             validation_failures += sum(item is None for item in claims)
             if invalid_grounding:
-                if record_telemetry:
-                    grounding_repair_needed = grounding_issues
                 structure_failure = True
                 raise ValueError("claims must cite valid visible source_turn_ids")
             if raw_claims and not any(item is not None for item in claims):
                 structure_failure = True
                 raise ValueError("all claim objects failed schema validation")
-            return {"episode_summary": summary, "claims": [item for item in claims if item is not None]}
+            return {"episode_summary": summary, "claims": [item for item in claims if item is not None], "valid_grounding_keys": valid_grounding_keys}
 
         try:
             with get_usage_tracker().scope("event_state.extract"):
@@ -265,8 +270,7 @@ class EventStateAgent(BaseAgent):
                         response = self._memory_llm_client.chat(messages)
                 repaired = True
                 parsed = parse_and_validate(response.content, record_telemetry=False)
-                if grounding_repair_needed:
-                    repaired_source_turn_id_claim_count += min(grounding_repair_needed, len(parsed["claims"]))
+                repaired_source_turn_id_claim_count += len(grounding_invalid_keys.intersection(parsed.get("valid_grounding_keys", set())))
             except Exception as repair_exc:
                 if self._is_provider_error(repair_exc):
                     raise
@@ -417,7 +421,7 @@ class EventStateAgent(BaseAgent):
             self._commit_prepared(prepared, store, counts, added_records)
         self._memory_chunks = [episode.summary for episode in store.episodes.values()]
         self._is_initialized = bool(store.episodes or store.claims)
-        extra = {**counts, **store.claim_counts(), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
+        extra = {**counts, **store.claim_counts(), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
         return MemoryBuildResult(success=True, method="event_state", action="compile", input_content=text, stored_content="\n".join(item["memory"] for item in added_records), memory_entries=added_records, chunk_count=len(added_records), extra=extra, all_passages=added_records)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
