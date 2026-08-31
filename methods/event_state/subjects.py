@@ -37,49 +37,42 @@ def is_canonical_subject_id(value: Any) -> bool:
 def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str] = (), speaker: Optional[str] = None) -> str:
     raw = str(raw_subject or "").strip()
     canonical = raw.casefold()
-    if canonical in {"primary_user", "general_non_personal"}:
-        return canonical
-    for prefix in ("speaker:", "third_party:"):
-        if canonical.startswith(prefix):
-            return prefix + normalize_name(raw.split(":", 1)[1])
-    key = normalize_name(raw)
+    prefix, _, proposed_name = canonical.partition(":")
+    key = normalize_name(proposed_name if prefix in {"speaker", "third_party"} else raw)
     aliases = {"i", "me", "myself", "self", "user", "the_user", "patient", "the_patient", "primary_user", "primary_patient"}
     participant_map = {normalize_name(name): name for name in participants if name}
+    visible_speakers = {key for key in participant_map if key not in {"user", "assistant", "system", "unknown"}}
+    if key in participant_map and (prefix != "third_party" or key in visible_speakers):
+        return "speaker:" + normalize_name(participant_map[key])
     if scope == "general_non_personal":
-        if key in aliases:
-            return "general_non_personal"
-        if key in participant_map:
-            return "speaker:" + normalize_name(participant_map[key])
-        if raw[:1].isupper():
-            return "third_party:" + key
-        # Generic consultations must never create synthetic people from an
-        # attribute or predicate proposed by the extractor.
+        # Unknown names and attributes remain non-personal. Capitalization or
+        # an extractor-supplied prefix is not proof of a third-party identity.
         return "general_non_personal"
     if scope.startswith("third_party:"):
         target = scope.split(":", 1)[1]
-        if key in aliases or not raw:
-            return "third_party:" + target
-        return "third_party:" + key
-    if key in aliases or not raw:
-        if speaker and normalize_name(speaker) not in {"user", "assistant", "system", "unknown"}:
+        # The consultation target owns patient-centric claims unless visible
+        # participant evidence identifies a different person above.
+        return "third_party:" + target
+    if canonical == "general_non_personal":
+        return "primary_user"
+    if canonical == "primary_user" or key in aliases or not raw:
+        if speaker and normalize_name(speaker) in visible_speakers:
             return "speaker:" + normalize_name(speaker)
         return "primary_user"
-    if key in participant_map:
-        return "speaker:" + normalize_name(participant_map[key])
     # Explicit family/third-party references must not contaminate user state.
     if key in {"father", "mother", "spouse", "partner", "friend", "brother", "sister", "child", "doctor"}:
         return "third_party:" + key
-    if speaker and key == normalize_name(speaker):
-        return "speaker:" + key
-    # An unrecognized subject is not evidence of a person. In primary scope,
-    # attribute-like proposals are conservatively attributed to the user when
-    # the source turn is the primary user's turn; otherwise they remain user
-    # scoped rather than becoming a fabricated speaker identity.
-    if speaker and normalize_name(speaker) in {"user", "assistant", "system", "unknown"}:
-        return "primary_user"
-    if speaker and normalize_name(speaker) in participant_map:
+    if speaker and normalize_name(speaker) in visible_speakers:
         return "speaker:" + normalize_name(speaker)
     return "primary_user"
+
+
+def is_visible_subject_identity(raw_subject: Any, participants: Iterable[str]) -> bool:
+    """Return whether a raw subject names a visible participant."""
+    raw = str(raw_subject or "").strip().casefold()
+    prefix, _, name = raw.partition(":")
+    key = normalize_name(name if prefix in {"speaker", "third_party"} else raw)
+    return key in {normalize_name(participant) for participant in participants if participant}
 
 
 def display_subject(subject_id: str, fallback: str = "User") -> str:

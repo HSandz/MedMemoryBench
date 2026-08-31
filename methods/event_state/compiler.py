@@ -78,7 +78,22 @@ class StateCompiler:
         return (current + historical)[:self.candidate_top_k]
 
     def _classify(self, claim: Claim, candidates: Sequence[Tuple[Claim, float]]) -> Dict[str, Any]:
-        payload = {"new_claim": asdict(claim), "candidates": [{"claim": asdict(item), "similarity": score} for item, score in candidates]}
+        same_session = any(
+            any(ref.episode_id == ref_new.episode_id for ref in candidate.evidence for ref_new in claim.evidence)
+            for candidate, _ in candidates
+        )
+        payload = {
+            "new_claim": asdict(claim),
+            "new_claim_source_turns": self._source_turns(claim) if same_session else [],
+            "candidates": [
+                {
+                    "claim": asdict(candidate),
+                    "similarity": score,
+                    "candidate_claim_source_turns": self._source_turns(candidate, episode_ids={ref.episode_id for ref in claim.evidence}) if any(ref.episode_id in {item.episode_id for item in claim.evidence} for ref in candidate.evidence) else [],
+                }
+                for candidate, score in candidates
+            ],
+        }
         self.update_llm_calls += 1
         with get_usage_tracker().scope("event_state.update_classify"):
             messages = format_messages(json.dumps(payload, ensure_ascii=True), UPDATE_SYSTEM_PROMPT)
@@ -108,6 +123,23 @@ class StateCompiler:
             confidence = 0.0
         return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason}
 
+    def _source_turns(self, claim: Claim, episode_ids: Optional[set[str]] = None) -> List[Dict[str, Any]]:
+        """Return bounded, exact claim provenance for same-session decisions."""
+        turns: List[Dict[str, Any]] = []
+        for ref in claim.evidence:
+            if episode_ids is not None and ref.episode_id not in episode_ids:
+                continue
+            episode = self.store.episodes.get(ref.episode_id)
+            if not episode:
+                continue
+            for turn in episode.turn_evidence:
+                if turn.turn_id not in ref.source_turn_ids:
+                    continue
+                turns.append({"turn_id": turn.turn_id, "speaker": turn.speaker, "role": turn.role, "text": turn.text})
+                if len(turns) == 4:
+                    return turns
+        return turns
+
     def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float]) -> CompileResult:
         """Compile one observation and return the operation applied."""
         if claim.persistence == "episode" or claim.modality in NON_OBSERVATION_MODALITIES:
@@ -122,25 +154,6 @@ class StateCompiler:
             self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], support_type)
             self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
             return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration")
-        # Restatements within one episode are not independent evidence. Keep
-        # explicit correction language eligible for normal classification.
-        same_session = [item for item, _ in current if any(ref.episode_id == episode_id for ref in item.evidence)]
-        for matched in same_session:
-            if matched.predicate.casefold() != claim.predicate.casefold():
-                continue
-            episode = self.store.episodes.get(episode_id)
-            turns = episode.turn_evidence if episode else []
-            texts = " ".join(turn.text for turn in turns).casefold()
-            correction_markers = ("sorry", "i meant", "actually", "correction", "instead", "not ")
-            restatement_markers = ("recalled", "mentioned again", "as noted", "same", "again")
-            if any(marker in texts for marker in correction_markers):
-                continue
-            source_turns = [turn for turn in turns if turn.turn_id in (claim.evidence[0].source_turn_ids if claim.evidence else [])]
-            assistant_paraphrase = bool(source_turns) and all((turn.role or "").casefold() == "assistant" for turn in source_turns)
-            if assistant_paraphrase or any(marker in texts for marker in restatement_markers):
-                self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], "duplicate")
-                self._audit(claim, episode_id, matched.claim_id, matched.claim_id, "DUPLICATE", 1.0, "same-session restatement")
-                return CompileResult("DUPLICATE", matched.claim_id, matched.claim_id, 1.0, False, "same_session_restatement")
         if not candidates:
             return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate", "no_candidate")
         decision = self._classify(claim, candidates)

@@ -34,12 +34,12 @@ def test_scope_and_subject_aliases_do_not_contaminate_primary_user():
     assert normalize_scope("[Health consultation record]") == "general_non_personal"
     assert resolve_subject_id("patient", "primary_user") == "primary_user"
     assert resolve_subject_id("the patient", "primary_user") == "primary_user"
-    assert resolve_subject_id("Mary", "general_non_personal") == "third_party:mary"
+    assert resolve_subject_id("Mary", "general_non_personal") == "general_non_personal"
     assert resolve_subject_id("I", "primary_user", ["Alice"], "Alice") == "speaker:alice"
     assert resolve_subject_id("primary_user", "primary_user") == "primary_user"
     assert resolve_subject_id("the user", "primary_user") == "primary_user"
-    assert resolve_subject_id("speaker:Alice", "primary_user") == "speaker:alice"
-    assert resolve_subject_id("third_party:Mary", "primary_user") == "third_party:mary"
+    assert resolve_subject_id("speaker:Alice", "primary_user") == "primary_user"
+    assert resolve_subject_id("third_party:Mary", "primary_user") == "primary_user"
 
 
 def test_claim_source_speaker_comes_from_referenced_turns():

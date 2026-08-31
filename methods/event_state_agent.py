@@ -20,7 +20,7 @@ from .event_state.prompts import EXTRACTION_SYSTEM_PROMPT
 from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
-from .event_state.subjects import is_canonical_subject_id, normalize_name, normalize_scope, resolve_subject_id
+from .event_state.subjects import display_subject, is_canonical_subject_id, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
 from .event_state.validation import is_meta_claim, validated_claim
 
 logger = logging.getLogger(__name__)
@@ -140,9 +140,8 @@ class EventStateAgent(BaseAgent):
             compatible = proposed_id == derived
         elif conversation_scope == "general_non_personal" and proposed_id == "primary_user":
             compatible = False
-        if proposed_id and compatible:
-            return SubjectResolution(proposed_id, raw_subject or proposed_id, source_speaker, "llm_subject_id")
-        return SubjectResolution(derived, raw_subject or derived, source_speaker, "visible_evidence", bool(proposed_id and not compatible))
+        display = raw_subject if is_visible_subject_identity(raw_subject, participants) else display_subject(derived)
+        return SubjectResolution(derived, display, source_speaker, "visible_evidence", bool(proposed_id and not compatible))
 
     @staticmethod
     def _normalize_source_sessions(text: str, memory_items: Optional[List[Dict[str, Any]]], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -188,10 +187,11 @@ class EventStateAgent(BaseAgent):
         repaired_source_turn_id_claim_count = 0
         rejected_ungrounded_claim_count = 0
         meta_claim_rejected_count = 0
+        grounding_repair_needed = 0
         allowed_ids = {turn.source_turn_id for turn in normalized}
 
-        def parse_and_validate(content: str) -> Dict[str, Any]:
-            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, meta_claim_rejected_count, repaired_source_turn_id_claim_count
+        def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
+            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, meta_claim_rejected_count, repaired_source_turn_id_claim_count, grounding_repair_needed
             value = parse_json(content)
             raw_claims = value.get("claims")
             if not isinstance(raw_claims, list):
@@ -203,28 +203,37 @@ class EventStateAgent(BaseAgent):
                 raise ValueError("episode_summary must be a string")
             claims = []
             invalid_grounding = False
+            grounding_issues = 0
             for raw in raw_claims:
                 if isinstance(raw, dict):
                     supplied = raw.get("source_turn_ids")
                     if not isinstance(supplied, list) or not supplied:
-                        missing_source_turn_id_claim_count += 1
+                        if record_telemetry:
+                            missing_source_turn_id_claim_count += 1
+                        grounding_issues += 1
                         # With exactly one visible turn, the evidence target is
                         # deterministic and can be repaired without guessing.
                         if len(allowed_ids) == 1:
                             raw = {**raw, "source_turn_ids": [next(iter(allowed_ids))]}
-                            repaired_source_turn_id_claim_count += 1
+                            if record_telemetry:
+                                repaired_source_turn_id_claim_count += 1
                         else:
                             invalid_grounding = True
                     elif any(item not in allowed_ids for item in supplied):
-                        unknown_source_turn_id_claim_count += 1
+                        if record_telemetry:
+                            unknown_source_turn_id_claim_count += 1
+                        grounding_issues += 1
                         invalid_grounding = True
                     if is_meta_claim(raw):
-                        meta_claim_rejected_count += 1
+                        if record_telemetry:
+                            meta_claim_rejected_count += 1
                         continue
                 item = validated_claim(raw, allowed_ids, allowed_ids)
                 claims.append(item)
             validation_failures += sum(item is None for item in claims)
             if invalid_grounding:
+                if record_telemetry:
+                    grounding_repair_needed = grounding_issues
                 structure_failure = True
                 raise ValueError("claims must cite valid visible source_turn_ids")
             if raw_claims and not any(item is not None for item in claims):
@@ -255,7 +264,9 @@ class EventStateAgent(BaseAgent):
                             raise
                         response = self._memory_llm_client.chat(messages)
                 repaired = True
-                parsed = parse_and_validate(response.content)
+                parsed = parse_and_validate(response.content, record_telemetry=False)
+                if grounding_repair_needed:
+                    repaired_source_turn_id_claim_count += min(grounding_repair_needed, len(parsed["claims"]))
             except Exception as repair_exc:
                 if self._is_provider_error(repair_exc):
                     raise
@@ -264,13 +275,7 @@ class EventStateAgent(BaseAgent):
             if self._is_provider_error(exc):
                 raise
             raise
-        parsed_claims = parsed["claims"]
-        # A single visible turn is unambiguous grounding; fill it only after
-        # the required repair path has had a chance to correct the output.
-        if repaired and not parsed_claims and normalized:
-            parsed_claims = []
-        repaired_source_turn_id_claim_count += sum(bool(item.get("source_turn_ids")) for item in parsed_claims) if repaired else 0
-        return {"episode_summary": parsed.get("episode_summary") or " ".join(turn.text for turn in normalized)[:1000], "claims": parsed_claims[:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count}
+        return {"episode_summary": parsed.get("episode_summary") or " ".join(turn.text for turn in normalized)[:1000], "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count}
 
     @staticmethod
     def _is_provider_error(exc: Exception) -> bool:
@@ -378,7 +383,6 @@ class EventStateAgent(BaseAgent):
         counts["third_party_claim_count"] += sum(claim.subject_id.startswith("third_party:") for claim in prepared.claims)
         counts["general_non_personal_claim_count"] += sum(claim.subject_id == "general_non_personal" for claim in prepared.claims)
         counts["real_speaker_claim_count"] += sum(claim.subject_id.startswith("speaker:") for claim in prepared.claims)
-        counts["claims_with_multiple_provenance_refs"] += sum(len(claim.evidence[0].source_turn_ids) > 1 for claim in prepared.claims if claim.evidence)
         compiler = StateCompiler(store, self._embedder, self._memory_llm_client, candidate_top_k=self._build_config["state_candidate_top_k"], current_candidate_top_k=self._build_config["state_current_candidate_top_k"], min_similarity=self._build_config["state_candidate_min_similarity"], min_confidence=self._build_config["update_min_confidence"], update_temperature=self._build_config["update_temperature"], update_max_tokens=self._build_config["update_max_tokens"])
         for claim, claim_embedding in zip(prepared.claims, prepared.claim_embeddings):
             if claim.confidence < 0.55:
@@ -407,7 +411,7 @@ class EventStateAgent(BaseAgent):
     def commit_prepared_memory(self, prepared_sessions: List[PreparedMemorySession], text: str = "", context_id: Any = None) -> MemoryBuildResult:
         context_id = self._context_id if context_id is None else context_id
         store = self._store(context_id)
-        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "claims_with_multiple_provenance_refs": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
         added_records: List[Dict[str, Any]] = []
         for prepared in prepared_sessions:
             self._commit_prepared(prepared, store, counts, added_records)

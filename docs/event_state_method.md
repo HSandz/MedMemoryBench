@@ -28,6 +28,10 @@ In primary-user scope, unrecognized attribute-like subjects resolve to
 Generic consultations remain `general_non_personal`, and third-party scopes stay
 isolated. Claims must cite valid source turn IDs; malformed or ungrounded claims
 are repaired once and then dropped while the episode archive is retained.
+When non-identical claims share an episode, classification receives only the
+exact cited turns for the new and candidate claims (bounded to four turns per
+side), so unrelated dialogue cannot affect correction/restatement decisions.
+Exact normalized duplicates remain deterministic.
 
 Snapshots use schema version 3 plus the Event-State build semantic version. The
 corrected builder is semantic version `2.0`; snapshots built without that version
@@ -52,6 +56,11 @@ classifier prompt budget requires fewer current-state candidates.
 Structured memory construction uses bounded completion budgets (3,200 extraction
 tokens and 1,600 update-classification tokens in the Persona-1 configuration) and
 disables model thinking for those JSON-only calls.
+
+The Persona-1 NIM comparison configuration keeps thinking enabled only for final
+answer generation (`reasoning_budget: 5000`); its `memorize_model` disables
+thinking. The Persona-1 Gemini configuration uses `gemini-2.5-flash` for both
+answering and memory construction.
 
 ## Commands
 
