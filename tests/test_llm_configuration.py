@@ -15,6 +15,7 @@ from utils.llm_client import (
     AnthropicClient,
     OpenAIClient,
     OpenRouterClient,
+    ReasoningLeakLLMResponseError,
     create_llm_client,
     extract_usage_token_counts,
     TruncatedLLMResponseError,
@@ -380,6 +381,75 @@ def test_openai_rejects_truncated_reasoning_response(finish_reason, caplog):
     assert "finish_reason" in messages
     assert "message.reasoning" in messages
     assert "message.reasoning_content" in messages
+
+
+def test_retries_when_reasoning_is_returned_as_answer_content(monkeypatch, caplog):
+    leaked_response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="provider reasoning",
+                refusal=None,
+                reasoning="provider reasoning",
+                reasoning_content="provider reasoning",
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=4, completion_tokens=10),
+    )
+    valid_response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="final answer",
+                refusal=None,
+                reasoning="provider reasoning",
+                reasoning_content="provider reasoning",
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=4, completion_tokens=12),
+    )
+    responses = iter((leaked_response, valid_response))
+    client = object.__new__(OpenAIClient)
+    client.model = "gpt-4o"
+    client.temperature = 0.0
+    client.max_tokens = 100
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: next(responses))
+        )
+    )
+    monkeypatch.setattr("utils.llm_client._sleep_after_failure", lambda delay: None)
+
+    caplog.set_level(logging.WARNING, logger="utils.llm_client")
+    result = client.chat([{"role": "user", "content": "hello"}])
+
+    assert result.content == "final answer"
+    assert "LLM response leaked provider reasoning" in caplog.text
+
+
+def test_rejects_matching_reasoning_content_without_retry():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content="provider reasoning\n",
+                refusal=None,
+                reasoning=None,
+                reasoning_content="provider reasoning",
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=4, completion_tokens=10),
+    )
+    client = object.__new__(OpenAIClient)
+    client.model = "gpt-4o"
+    client.temperature = 0.0
+    client.max_tokens = 100
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response))
+    )
+
+    with pytest.raises(ReasoningLeakLLMResponseError):
+        OpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "hello"}])
 
 
 def test_anthropic_reasoning_effort_uses_output_config():

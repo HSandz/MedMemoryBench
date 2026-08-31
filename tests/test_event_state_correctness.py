@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from methods.event_state.compiler import StateCompiler, parse_json
 from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
@@ -60,7 +62,7 @@ def test_same_session_correction_and_unrelated_markers_reach_classifier():
     class LLM:
         def chat(self, messages, **kwargs):
             payloads.append(json.loads(messages[-1]["content"]))
-            return SimpleNamespace(content='{"operation":"SUPERSEDE","matched_claim_id":"OLD","same_episode_relation":"correction","confidence":1}')
+            return SimpleNamespace(content='{"operation":"SUPERSEDE","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
 
     compiler = StateCompiler(store, Embedder(), LLM())
     result = compiler.apply(Claim("NEW", "User", "primary_user", "dose", "10 mg", evidence=[EvidenceRef("s1", "s1", [2])]), "s1", [1.0, 0.0])
@@ -112,6 +114,11 @@ def test_parse_json_ignores_reasoning_blocks_and_selects_structured_payload():
 def test_pre_fix_snapshot_semantic_version_is_rejected():
     store = EventStateStore("p")
     snapshot = store.export()
+    snapshot["schema_version"] = 3
+    snapshot["semantic_version"] = "2.3"
+    with pytest.raises(ValueError):
+        EventStateStore.from_export(snapshot)
+    snapshot["schema_version"] = 4
     snapshot["semantic_version"] = "2.2"
     try:
         EventStateStore.from_export(snapshot)
@@ -119,7 +126,7 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
         assert "semantic version" in str(exc)
     else:
         raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.3"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.4"
 
 
 def test_event_state_semantic_version_changes_build_hash_only():
@@ -166,7 +173,7 @@ def test_same_session_restatement_is_classified_from_source_turns():
     from methods.event_state.schemas import Episode, TurnEvidence
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["User"], "primary_user", "", "", [TurnEvidence(1, "User", "user", "mild retinal changes are present"), TurnEvidence(2, "User", "user", "the retinal changes were recalled")]), [1.0, 0.0])
     captured = []
-    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","matched_claim_id":"OLD","confidence":1}'))))
+    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","matched_claim_id":"OLD","same_state_dimension":true,"confidence":1}'))))
     repeated = Claim("NEW", "User", "primary_user", "retinal_status", "recalled", evidence=[EvidenceRef("s1", "s1", [2])])
     assert compiler.apply(repeated, "s1", [1.0, 0.0]).operation == "DUPLICATE"
     assert "new_claim_source_turns" in captured[0]

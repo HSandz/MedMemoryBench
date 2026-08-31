@@ -11,16 +11,18 @@ Claim self-references are resolved from cited source turns, so alternating
 named speakers remain separate subject namespaces. Repeating an older
 superseded value creates a new version and never reactivates the historical
 node. `SUPERSEDE`, `REFINE`, and `CONFLICT` may target only active or contested
-claims; an LLM attempt to transition historical state is recorded as a new
-claim with the `historical_transition_target` fallback reason. Evidence
+claims; historical versions are excluded before classification, so a new claim
+with no active/contested compatible target is recorded as `NEW`. Evidence
 references and claim/episode graph edges are maintained through one store
 operation.
 
 LLM-proposed subject IDs are checked against source speakers and the visible
 conversation scope; ambiguous multi-speaker self-references are discarded.
-State compilation always reserves up to three active or contested same-subject
-claims for classification, even when their embedding similarity is below the
-historical candidate threshold.
+State claims carry a value-independent `state_slot` (for example,
+`residence_location`), and only active or contested same-subject claims with an
+exact slot match or slot cosine similarity at least `state_candidate_min_similarity`
+are sent to the update classifier. Superseded/refined versions remain history,
+not mutation targets.
 
 Canonical subjects are derived from visible scope, participants, and cited turns.
 In primary-user scope, unrecognized attribute-like subjects resolve to
@@ -70,8 +72,8 @@ and turn labels. Each turn receives a share of the budget and long turns
 preserve both their beginning and ending text, so late-session information is
 not silently discarded.
 
-Snapshots use schema version 3 plus the Event-State build semantic version. The
-corrected builder is semantic version `2.3`; snapshots built without that version
+Snapshots use schema version 4 plus the Event-State build semantic version. The
+state-slot builder is semantic version `2.4`; snapshots built without that version
 do not match the build compatibility hash and must be rebuilt. Version 1 and 2
 snapshots are rejected rather than silently reinterpreted. Claims retain canonical
 subject IDs and lifecycle statuses (`active`,

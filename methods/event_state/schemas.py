@@ -86,10 +86,12 @@ class Claim:
     confidence: float = 1.0
     # Added at the end to preserve compatibility with early positional callers.
     subject_id: str = ""
+    # A value-independent semantic variable used only by state compilation.
+    state_slot: Optional[str] = None
 
     def semantic_text(self) -> str:
         qualifiers = ", ".join(f"{key}: {value}" for key, value in self.qualifiers.items())
-        return f"Subject: {self.subject}. Subject ID: {self.subject_id or self.subject_key}. Predicate: {self.predicate}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}. Modality: {self.modality}. Persistence: {self.persistence}."
+        return f"Subject: {self.subject}. Subject ID: {self.subject_id or self.subject_key}. Predicate: {self.predicate}. State slot: {self.state_slot or ''}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}. Modality: {self.modality}. Persistence: {self.persistence}."
 
 
 @dataclass
@@ -118,4 +120,5 @@ def claim_from_dict(value: Dict[str, Any]) -> Claim:
     evidence = [EvidenceRef(**item) for item in value.get("evidence", [])]
     value = dict(value)
     value.setdefault("subject_id", value.get("subject_key", ""))
+    value.setdefault("state_slot", None)
     return Claim(**{**value, "evidence": evidence})

@@ -55,6 +55,7 @@ def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str
         f"Recorded: {claim.recorded_at or 'unknown'}",
         f"Valid from: {claim.valid_from or 'unknown'}",
         f"Valid to: {claim.valid_to or 'unknown'}",
+        f"State slot: {claim.state_slot or 'unknown'}",
         f"Claim: {claim.predicate} = {claim.value}",
         f"Qualifiers: {claim.qualifiers or 'none'}",
         "Relations:\n" + ("\n".join(f"  {item}" for item in relations) if relations else "  none"),

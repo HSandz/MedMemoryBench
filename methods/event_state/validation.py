@@ -11,6 +11,17 @@ ENUMS = {
     "modality": {"asserted", "observed", "planned", "recommended", "hypothetical"},
     "persistence": {"state", "episode", "history"},
 }
+NO_INFORMATION_VALUES = {"", "unknown", "unspecified", "not specified", "not provided", "n/a"}
+
+
+def normalize_state_slot(value: Any) -> str:
+    """Normalize a short, value-independent state dimension label."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+
+
+def is_no_information_value(value: Any) -> bool:
+    """Reject only explicit absence-of-information placeholders."""
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold()) in NO_INFORMATION_VALUES
 
 
 def canonical_turn_id(value: Any, fallback_index: Any) -> str:
@@ -76,6 +87,9 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
         "polarity": enum(raw.get("polarity"), "polarity", "positive"),
         "modality": enum(raw.get("modality"), "modality", "asserted"),
         "persistence": enum(raw.get("persistence"), "persistence", "state"),
+        "state_slot": normalize_state_slot(raw.get("state_slot"))
+        if enum(raw.get("persistence"), "persistence", "state") == "state"
+        else None,
         "source_turn_ids": supplied,
         "confidence": max(0.0, min(1.0, confidence if math.isfinite(confidence) else 0.0)),
         "valid_from": raw.get("valid_from") if isinstance(raw.get("valid_from"), str) else None,

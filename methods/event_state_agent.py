@@ -21,7 +21,7 @@ from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
 from .event_state.subjects import display_subject, is_canonical_subject_id, is_valid_canonical_subject_proposal, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
-from .event_state.validation import canonical_turn_id, is_meta_claim, validated_claim
+from .event_state.validation import canonical_turn_id, is_meta_claim, is_no_information_value, normalize_state_slot, validated_claim
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ class PreparedMemorySession:
     episode_embedding: List[float]
     claims: List[Claim]
     claim_embeddings: List[List[float]]
+    claim_slot_embeddings: List[List[float]]
 
 
 class EventStateAgent(BaseAgent):
@@ -233,6 +234,7 @@ class EventStateAgent(BaseAgent):
         repaired_source_turn_id_claim_count = 0
         rejected_ungrounded_claim_count = 0
         meta_claim_rejected_count = 0
+        no_information_claim_rejected_count = 0
         grounding_invalid_keys = set()
         invalid_source_turn_id_samples: List[Dict[str, Any]] = []
         invalid_source_turn_id_sample_types: List[str] = []
@@ -242,7 +244,7 @@ class EventStateAgent(BaseAgent):
         turn_id_collision_count = len(raw_turn_ids) - len(set(raw_turn_ids))
 
         def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
-            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count
+            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, no_information_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count
             value = parse_json(content)
             raw_claims = value.get("claims")
             if not isinstance(raw_claims, list):
@@ -296,6 +298,10 @@ class EventStateAgent(BaseAgent):
                         if record_telemetry:
                             meta_claim_rejected_count += 1
                         continue
+                    if is_no_information_value(raw.get("value")):
+                        if record_telemetry:
+                            no_information_claim_rejected_count += 1
+                        continue
                 item = validated_claim(raw, allowed_ids, allowed_ids)
                 claims.append(item)
                 if item is not None:
@@ -304,7 +310,7 @@ class EventStateAgent(BaseAgent):
             if invalid_grounding:
                 structure_failure = True
                 raise ValueError("claims must cite valid visible source_turn_ids")
-            if claims_to_validate and not any(item is not None for item in claims):
+            if claims_to_validate and not any(item is not None for item in claims) and not no_information_claim_rejected_count:
                 structure_failure = True
                 raise ValueError("all claim objects failed schema validation")
             accepted = [item for item in claims if item is not None]
@@ -340,12 +346,12 @@ class EventStateAgent(BaseAgent):
             except Exception as repair_exc:
                 if self._is_provider_error(repair_exc):
                     raise
-                return {"episode_summary": self.fallback_episode_summary(normalized), "claims": [], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": True, "repair_calls": 1, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
+                return {"episode_summary": self.fallback_episode_summary(normalized), "claims": [], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": True, "repair_calls": 1, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
         except Exception as exc:
             if self._is_provider_error(exc):
                 raise
             raise
-        return {"episode_summary": parsed.get("episode_summary") or self.fallback_episode_summary(normalized), "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
+        return {"episode_summary": parsed.get("episode_summary") or self.fallback_episode_summary(normalized), "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
 
     @staticmethod
     def _is_provider_error(exc: Exception) -> bool:
@@ -395,18 +401,22 @@ class EventStateAgent(BaseAgent):
                 persistence = raw_claim["persistence"]
                 valid_from = self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time)
                 valid_to = raw_claim.get("valid_to") if self.enable_bitemporal_time else None
-                claims.append(Claim(self._store(context_id).stable_id("C", [episode_id, index, resolution.subject_id, raw_claim["predicate"], raw_claim["value"]]), resolution.subject_display, resolution.subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), valid_from, valid_to, raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], resolution.subject_id))
+                state_slot = raw_claim.get("state_slot") if persistence == "state" else None
+                if persistence == "state" and not state_slot:
+                    state_slot = normalize_state_slot(raw_claim["predicate"])
+                    extracted["state_claim_slot_fallback_count"] = extracted.get("state_claim_slot_fallback_count", 0) + 1
+                claims.append(Claim(self._store(context_id).stable_id("C", [episode_id, index, resolution.subject_id, raw_claim["predicate"], raw_claim["value"]]), resolution.subject_display, resolution.subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), valid_from, valid_to, raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], resolution.subject_id, state_slot))
         if self.enable_episodes:
             with get_usage_tracker().scope("event_state.embedding"):
                 episode_embedding = self._embedder.embed_documents([episode.retrieval_text()])[0]
         else:
             episode_embedding = []
-        claim_embeddings = []
+        claim_embeddings, claim_slot_embeddings = [], []
         if self.enable_state_claims:
-            for claim in claims:
-                with get_usage_tracker().scope("event_state.embedding"):
-                    claim_embeddings.append(self._embedder.embed_documents([claim.semantic_text()])[0])
-        return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), claims, [list(item) for item in claim_embeddings])
+            with get_usage_tracker().scope("event_state.embedding"):
+                claim_embeddings = self._embedder.embed_documents([claim.semantic_text() for claim in claims])
+                claim_slot_embeddings = self._embedder.embed_documents([StateCompiler.slot_text(claim) if claim.persistence == "state" else "" for claim in claims])
+        return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), claims, [list(item) for item in claim_embeddings], [list(item) for item in claim_slot_embeddings])
 
     def prepare_memory_sessions(self, text: str, **kwargs) -> List[PreparedMemorySession]:
         """Prepare independent source sessions concurrently, preserving source order."""
@@ -439,7 +449,7 @@ class EventStateAgent(BaseAgent):
         counts["extracted_state_claim_count"] += sum(item.get("persistence") == "state" for item in extracted.get("claims", []))
         counts["extracted_history_claim_count"] += sum(item.get("persistence") == "history" for item in extracted.get("claims", []))
         counts["extracted_episode_claim_count"] += sum(item.get("persistence") == "episode" for item in extracted.get("claims", []))
-        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
+        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "no_information_claim_rejected_count", "state_claim_slot_fallback_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
             counts[key] += int(extracted.get(key, 0))
         counts["invalid_source_turn_id_samples"].extend(extracted.get("invalid_source_turn_id_samples", []))
         counts["invalid_source_turn_id_sample_types"].extend(extracted.get("invalid_source_turn_id_sample_types", []))
@@ -460,19 +470,30 @@ class EventStateAgent(BaseAgent):
         counts["general_non_personal_claim_count"] += sum(claim.subject_id == "general_non_personal" for claim in prepared.claims)
         counts["real_speaker_claim_count"] += sum(claim.subject_id.startswith("speaker:") for claim in prepared.claims)
         compiler = StateCompiler(store, self._embedder, self._memory_llm_client, candidate_top_k=self._build_config["state_candidate_top_k"], current_candidate_top_k=self._build_config["state_current_candidate_top_k"], min_similarity=self._build_config["state_candidate_min_similarity"], min_confidence=self._build_config["update_min_confidence"], update_temperature=self._build_config["update_temperature"], update_max_tokens=self._build_config["update_max_tokens"])
-        for claim, claim_embedding in zip(prepared.claims, prepared.claim_embeddings):
+        for claim, claim_embedding, slot_embedding in zip(prepared.claims, prepared.claim_embeddings, prepared.claim_slot_embeddings):
             if claim.confidence < 0.55:
                 counts["low_extraction_confidence_count"] += 1
             if not self.enable_state_compilation:
-                store.add_claim(claim, claim_embedding)
+                store.add_claim(claim, claim_embedding, slot_embedding)
                 counts["uncompiled_claim_count"] += 1
                 counts["new_count"] += 1
                 added_records.append({"id": claim.claim_id, "type": "state_claim", "memory": claim.semantic_text(), "source_session_id": episode.source_session_id})
                 continue
-            compile_result = compiler.apply(claim, episode.episode_id, claim_embedding)
+            compile_result = compiler.apply(claim, episode.episode_id, claim_embedding, slot_embedding)
             operation = compile_result.operation
             counts["update_llm_calls"] += compiler.update_llm_calls
             counts["update_parse_failures"] += compiler.update_parse_failures
+            counts["update_repair_calls"] += compiler.update_repair_calls
+            counts["update_repair_successes"] += compiler.update_repair_successes
+            counts["update_repair_failures"] += compiler.update_repair_failures
+            counts["invalid_update_output_previews"].extend(compiler.invalid_update_output_previews)
+            counts["invalid_update_output_sha256"].extend(compiler.invalid_update_output_sha256)
+            counts["state_candidate_queries"] += compiler.state_candidate_queries
+            counts["state_candidate_no_match_count"] += compiler.state_candidate_no_match_count
+            counts["state_candidate_exact_slot_match_count"] += compiler.state_candidate_exact_slot_match_count
+            counts["state_candidate_semantic_slot_match_count"] += compiler.state_candidate_semantic_slot_match_count
+            counts["state_candidates_rejected_below_threshold"] += compiler.state_candidates_rejected_below_threshold
+            counts["different_state_dimension_guard_count"] += compiler.different_state_dimension_guard_count
             counts[f"{operation.casefold()}_count"] = counts.get(f"{operation.casefold()}_count", 0) + 1
             if compile_result.same_session:
                 counts[f"same_session_{operation.casefold()}_count"] = counts.get(f"same_session_{operation.casefold()}_count", 0) + 1
@@ -501,17 +522,23 @@ class EventStateAgent(BaseAgent):
                 counts["low_confidence_new_count"] += 1
             compiler.update_llm_calls = 0
             compiler.update_parse_failures = 0
+            compiler.update_repair_calls = compiler.update_repair_successes = compiler.update_repair_failures = 0
+            compiler.invalid_update_output_previews.clear()
+            compiler.invalid_update_output_sha256.clear()
+            compiler.state_candidate_queries = compiler.state_candidate_no_match_count = 0
+            compiler.state_candidate_exact_slot_match_count = compiler.state_candidate_semantic_slot_match_count = 0
+            compiler.state_candidates_rejected_below_threshold = compiler.different_state_dimension_guard_count = 0
 
     def commit_prepared_memory(self, prepared_sessions: List[PreparedMemorySession], text: str = "", context_id: Any = None) -> MemoryBuildResult:
         context_id = self._context_id if context_id is None else context_id
         store = self._store(context_id)
-        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extracted_state_claim_count": 0, "extracted_history_claim_count": 0, "extracted_episode_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "excess_claim_count": 0, "turn_id_collision_count": 0, "invalid_source_turn_id_samples": [], "invalid_source_turn_id_sample_types": [], "allowed_source_turn_ids": [], "same_session_transition_guard_count": 0, "same_session_supersede_guard_count": 0, "same_session_refine_guard_count": 0, "same_session_conflict_guard_count": 0, "same_session_corrob_downgraded_to_duplicate_count": 0, "same_session_duplicate_count": 0, "same_session_corroborate_count": 0, "same_session_corrob_count": 0, "same_session_refine_count": 0, "same_session_supersede_count": 0, "same_session_conflict_count": 0, "cross_session_duplicate_count": 0, "cross_session_corroborate_count": 0, "cross_session_corrob_count": 0, "cross_session_refine_count": 0, "cross_session_supersede_count": 0, "cross_session_conflict_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extracted_state_claim_count": 0, "extracted_history_claim_count": 0, "extracted_episode_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "no_information_claim_rejected_count": 0, "state_claim_slot_fallback_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "excess_claim_count": 0, "turn_id_collision_count": 0, "invalid_source_turn_id_samples": [], "invalid_source_turn_id_sample_types": [], "allowed_source_turn_ids": [], "invalid_update_output_previews": [], "invalid_update_output_sha256": [], "same_session_transition_guard_count": 0, "same_session_supersede_guard_count": 0, "same_session_refine_guard_count": 0, "same_session_conflict_guard_count": 0, "same_session_corrob_downgraded_to_duplicate_count": 0, "same_session_duplicate_count": 0, "same_session_corroborate_count": 0, "same_session_corrob_count": 0, "same_session_refine_count": 0, "same_session_supersede_count": 0, "same_session_conflict_count": 0, "cross_session_duplicate_count": 0, "cross_session_corroborate_count": 0, "cross_session_corrob_count": 0, "cross_session_refine_count": 0, "cross_session_supersede_count": 0, "cross_session_conflict_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "update_repair_calls": 0, "update_repair_successes": 0, "update_repair_failures": 0, "state_candidate_queries": 0, "state_candidate_no_match_count": 0, "state_candidate_exact_slot_match_count": 0, "state_candidate_semantic_slot_match_count": 0, "state_candidates_rejected_below_threshold": 0, "different_state_dimension_guard_count": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
         added_records: List[Dict[str, Any]] = []
         for prepared in prepared_sessions:
             self._commit_prepared(prepared, store, counts, added_records)
         self._memory_chunks = [episode.summary for episode in store.episodes.values()]
         self._is_initialized = bool(store.episodes or store.claims)
-        extra = {**counts, **store.claim_counts(), "invalid_source_turn_id_samples": counts["invalid_source_turn_id_samples"][:5], "invalid_source_turn_id_sample_types": sorted(set(counts["invalid_source_turn_id_sample_types"][:5])), "allowed_source_turn_ids": sorted(set(counts["allowed_source_turn_ids"])), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "standalone_history_count": sum(claim.status == "standalone" and claim.persistence == "history" for claim in store.claims.values()), "standalone_episode_count": sum(claim.status == "standalone" and claim.persistence == "episode" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
+        extra = {**counts, **store.claim_counts(), "invalid_update_output_previews": counts["invalid_update_output_previews"][:3], "invalid_update_output_preview": counts["invalid_update_output_previews"][:3], "invalid_update_output_sha256": counts["invalid_update_output_sha256"][:3], "state_claim_count_with_slot": sum(claim.persistence == "state" and bool(claim.state_slot) for claim in store.claims.values()), "distinct_active_state_slot_count": len({claim.state_slot for claim in store.claims.values() if claim.persistence == "state" and claim.status in {"active", "contested"} and claim.state_slot}), "invalid_source_turn_id_samples": counts["invalid_source_turn_id_samples"][:5], "invalid_source_turn_id_sample_types": sorted(set(counts["invalid_source_turn_id_sample_types"][:5])), "allowed_source_turn_ids": sorted(set(counts["allowed_source_turn_ids"])), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "standalone_history_count": sum(claim.status == "standalone" and claim.persistence == "history" for claim in store.claims.values()), "standalone_episode_count": sum(claim.status == "standalone" and claim.persistence == "episode" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
         return MemoryBuildResult(success=True, method="event_state", action="compile", input_content=text, stored_content="\n".join(item["memory"] for item in added_records), memory_entries=added_records, chunk_count=len(added_records), extra=extra, all_passages=added_records)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:

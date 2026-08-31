@@ -57,3 +57,25 @@ def test_agent_routes_low_confidence_classifier_fallback_separately_from_extract
     result = agent.memorize("two", source_session_id=2)
     assert result.extra["low_confidence_new_count"] == 1
     assert result.extra["low_extraction_confidence_count"] == 0
+
+
+def test_extraction_rejects_absence_placeholders_but_keeps_explicit_negatives():
+    class ExtractionLLM:
+        def chat(self, messages, **kwargs):
+            if "Extract conversational memory" in messages[0]["content"]:
+                return SimpleNamespace(content=(
+                    '{"episode_summary":"preferences", "claims":['
+                    '{"subject":"Alice","predicate":"lives_in","state_slot":"residence_location","value":"not specified","persistence":"state","source_turn_ids":["0"]},'
+                    '{"subject":"Alice","predicate":"owns_car","state_slot":"car_ownership","value":"no","polarity":"negative","persistence":"state","source_turn_ids":["0"]},'
+                    '{"subject":"Alice","predicate":"notification_preference","state_slot":"notification_preference","value":"none","persistence":"state","source_turn_ids":["0"]}'
+                    ']}'))
+            return SimpleNamespace(content='{"operation":"NEW","confidence":1}')
+
+    agent = EventStateAgent(llm_client=ExtractionLLM(), memory_llm_client=ExtractionLLM(), embedding_client=FakeEmbedder())
+    agent.set_context_id("ctx")
+    result = agent.memorize("I do not own a car and have no notification preference.", context_id="ctx")
+
+    claims = agent.export_memory_state("ctx")["claims"]
+    assert {item["predicate"] for item in claims} == {"owns_car", "notification_preference"}
+    assert result.extra["no_information_claim_rejected_count"] == 1
+    assert result.extra["state_claim_count_with_slot"] == 2

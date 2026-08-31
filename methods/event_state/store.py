@@ -8,13 +8,14 @@ from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional
 
 from .schemas import Claim, Episode, StateOperation, claim_from_dict, episode_from_dict
+from .validation import normalize_state_slot
 
 
 class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
-    SCHEMA_VERSION = 3
-    SEMANTIC_VERSION = "2.3"
+    SCHEMA_VERSION = 4
+    SEMANTIC_VERSION = "2.4"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id
@@ -24,6 +25,7 @@ class EventStateStore:
         self.edges: List[Dict[str, Any]] = []
         self.episode_embeddings: Dict[str, List[float]] = {}
         self.claim_embeddings: Dict[str, List[float]] = {}
+        self.claim_slot_embeddings: Dict[str, List[float]] = {}
 
     @staticmethod
     def stable_id(prefix: str, value: Any) -> str:
@@ -35,9 +37,13 @@ class EventStateStore:
             self.episodes[episode.episode_id] = episode
             self.episode_embeddings[episode.episode_id] = list(embedding)
 
-    def add_claim(self, claim: Claim, embedding: List[float]) -> None:
+    def add_claim(self, claim: Claim, embedding: List[float], slot_embedding: Optional[List[float]] = None) -> None:
+        if claim.persistence == "state" and not claim.state_slot:
+            claim.state_slot = normalize_state_slot(claim.predicate)
         self.claims[claim.claim_id] = claim
         self.claim_embeddings[claim.claim_id] = list(embedding)
+        if claim.persistence == "state":
+            self.claim_slot_embeddings[claim.claim_id] = list(slot_embedding if slot_embedding is not None else embedding)
         for evidence in claim.evidence:
             self.attach_claim_evidence(claim.claim_id, evidence, evidence.support_type)
 
@@ -72,6 +78,8 @@ class EventStateStore:
         for claim_id, claim in self.claims.items():
             if claim_id not in self.claim_embeddings:
                 errors.append(f"missing claim embedding: {claim_id}")
+            if claim.persistence == "state" and claim_id not in self.claim_slot_embeddings:
+                errors.append(f"missing claim slot embedding: {claim_id}")
             for ref in claim.evidence:
                 if ref.episode_id not in self.episodes:
                     errors.append(f"missing evidence episode: {claim_id}->{ref.episode_id}")
@@ -149,7 +157,7 @@ class EventStateStore:
         }
 
     def export(self) -> Dict[str, Any]:
-        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "claim_embeddings": self.claim_embeddings}
+        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "claim_embeddings": self.claim_embeddings, "claim_slot_embeddings": self.claim_slot_embeddings}
 
     @classmethod
     def from_export(cls, state: Dict[str, Any]) -> "EventStateStore":
@@ -157,7 +165,7 @@ class EventStateStore:
             raise ValueError("Not an Event-State Hybrid Memory snapshot")
         if state.get("schema_version") != cls.SCHEMA_VERSION:
             raise ValueError(
-                f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v3; rebuild the memory snapshot."
+                f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v4; rebuild the memory snapshot."
             )
         if state.get("semantic_version") != cls.SEMANTIC_VERSION:
             raise ValueError("Event-State snapshot semantic version is incompatible; rebuild the memory snapshot.")
@@ -168,4 +176,5 @@ class EventStateStore:
         store.edges = list(state.get("edges", []))
         store.episode_embeddings = {key: list(value) for key, value in state.get("episode_embeddings", {}).items()}
         store.claim_embeddings = {key: list(value) for key, value in state.get("claim_embeddings", {}).items()}
+        store.claim_slot_embeddings = {key: list(value) for key, value in state.get("claim_slot_embeddings", {}).items()}
         return store

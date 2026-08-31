@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -11,6 +12,7 @@ from .embeddings import cosine
 from .prompts import UPDATE_SYSTEM_PROMPT
 from .schemas import Claim, EvidenceRef, StateOperation
 from .store import EventStateStore
+from .validation import normalize_state_slot
 from utils.llm_client import format_messages, get_usage_tracker
 
 
@@ -53,6 +55,19 @@ def normalized_content(claim: Claim) -> Tuple[str, str, str, str, str, str, str]
     ))
 
 
+def normalized_state_content(claim: Claim) -> Tuple[str, str, str, str, str, str]:
+    """Compare exact state values without requiring predicate wording to match."""
+    qualifiers = json.dumps(claim.qualifiers or {}, ensure_ascii=True, sort_keys=True, default=str)
+    return tuple(normalized_subject(value) for value in (
+        claim.subject_id or claim.subject_key,
+        normalize_state_slot(claim.state_slot),
+        claim.value,
+        qualifiers,
+        claim.polarity,
+        claim.modality,
+    ))
+
+
 class StateCompiler:
     """Applies auditable operations while favoring preservation over compression."""
 
@@ -64,27 +79,62 @@ class StateCompiler:
         self.update_temperature, self.update_max_tokens = float(update_temperature), int(update_max_tokens)
         self.update_llm_calls = 0
         self.update_parse_failures = 0
+        self.update_repair_calls = 0
+        self.update_repair_successes = 0
+        self.update_repair_failures = 0
+        self.state_candidate_queries = 0
+        self.state_candidate_no_match_count = 0
+        self.state_candidate_exact_slot_match_count = 0
+        self.state_candidate_semantic_slot_match_count = 0
+        self.state_candidates_rejected_below_threshold = 0
+        self.different_state_dimension_guard_count = 0
+        self.invalid_update_output_previews: List[str] = []
+        # Singular alias retained for callers that expose one diagnostic field.
+        self.invalid_update_output_preview = self.invalid_update_output_previews
+        self.invalid_update_output_sha256: List[str] = []
 
-    def _candidates(self, claim: Claim, embedding: Sequence[float]) -> List[Tuple[Claim, float]]:
-        current, historical = [], []
+    @staticmethod
+    def slot_text(claim: Claim) -> str:
+        return f"State slot: {normalize_state_slot(claim.state_slot)}"
+
+    def _slot_embedding(self, claim: Claim, supplied: Optional[Sequence[float]]) -> List[float]:
+        if supplied:
+            return list(supplied)
+        return list(self.embedder.embed_documents([self.slot_text(claim)])[0])
+
+    def _candidates(self, claim: Claim, embedding: Sequence[float], slot_embedding: Sequence[float]) -> List[Tuple[Claim, float, float, bool]]:
+        self.state_candidate_queries += 1
+        eligible = []
+        claim_slot = normalize_state_slot(claim.state_slot)
         for candidate_id, candidate in self.store.claims.items():
             if (candidate.subject_id or candidate.subject_key) != (claim.subject_id or claim.subject_key):
                 continue
-            if candidate.persistence != "state" or candidate.modality in NON_OBSERVATION_MODALITIES:
+            if candidate.persistence != "state" or candidate.status not in {"active", "contested"} or candidate.modality in NON_OBSERVATION_MODALITIES:
                 continue
             if claim.persistence != "state" or claim.modality in NON_OBSERVATION_MODALITIES:
                 continue
-            similarity = cosine(embedding, self.store.claim_embeddings.get(candidate_id, []))
-            target = current if candidate.status in {"active", "contested"} else historical
-            target.append((candidate, similarity))
-        current = sorted(current, key=lambda item: (-item[1], item[0].claim_id))[:self.current_candidate_top_k]
-        historical = sorted((item for item in historical if item[1] >= self.min_similarity), key=lambda item: (-item[1], item[0].claim_id))
-        return (current + historical)[:self.candidate_top_k]
+            candidate_slot = normalize_state_slot(candidate.state_slot)
+            exact_slot = bool(claim_slot and claim_slot == candidate_slot)
+            slot_similarity = cosine(slot_embedding, self.store.claim_slot_embeddings.get(candidate_id, []))
+            if not exact_slot and slot_similarity < self.min_similarity:
+                self.state_candidates_rejected_below_threshold += 1
+                continue
+            if exact_slot:
+                self.state_candidate_exact_slot_match_count += 1
+            else:
+                self.state_candidate_semantic_slot_match_count += 1
+            full_similarity = cosine(embedding, self.store.claim_embeddings.get(candidate_id, []))
+            eligible.append((candidate, slot_similarity, full_similarity, exact_slot))
+        eligible.sort(key=lambda item: (-int(item[3]), -item[1], -item[2], item[0].claim_id))
+        result = eligible[:min(self.candidate_top_k, self.current_candidate_top_k)]
+        if not result:
+            self.state_candidate_no_match_count += 1
+        return result
 
-    def _classify(self, claim: Claim, candidates: Sequence[Tuple[Claim, float]]) -> Dict[str, Any]:
+    def _classify(self, claim: Claim, candidates: Sequence[Tuple[Claim, float, float, bool]]) -> Dict[str, Any]:
         same_session = any(
             any(ref.episode_id == ref_new.episode_id for ref in candidate.evidence for ref_new in claim.evidence)
-            for candidate, _ in candidates
+            for candidate, _, _, _ in candidates
         )
         payload = {
             "new_claim": asdict(claim),
@@ -92,41 +142,70 @@ class StateCompiler:
             "candidates": [
                 {
                     "claim": asdict(candidate),
-                    "similarity": score,
+                    "slot_similarity": slot_score,
+                    "full_claim_similarity": full_score,
+                    "exact_state_slot_match": exact_slot,
                     "candidate_claim_source_turns": self._source_turns(candidate, episode_ids={ref.episode_id for ref in claim.evidence}) if any(ref.episode_id in {item.episode_id for item in claim.evidence} for ref in candidate.evidence) else [],
                 }
-                for candidate, score in candidates
+                for candidate, slot_score, full_score, exact_slot in candidates
             ],
         }
         self.update_llm_calls += 1
+        raw_content = ""
         with get_usage_tracker().scope("event_state.update_classify"):
             messages = format_messages(json.dumps(payload, ensure_ascii=True), UPDATE_SYSTEM_PROMPT)
             try:
-                response = self.llm_client.chat(messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens)
+                response = self.llm_client.chat(messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
             except TypeError as exc:
                 if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
                     raise
                 response = self.llm_client.chat(messages)
+            raw_content = str(getattr(response, "content", "") or "")
         try:
-            parsed = parse_json(response.content)
+            parsed = parse_json(raw_content)
         except ValueError:
             self.update_parse_failures += 1
-            return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none"}
+            self.update_repair_calls += 1
+            repair_prompt = (
+                "Repair the previous classifier output into one valid JSON object only. "
+                "Do not reconsider the decision or add facts. Required schema: "
+                '{"matched_claim_id": string|null, "operation": "NEW|DUPLICATE|CORROBORATE|REFINE|SUPERSEDE|CONFLICT|EPISODIC", '
+                '"same_state_dimension": boolean, "same_episode_relation": "restatement|correction|state_change|refinement|contradiction|none", '
+                '"confidence": number, "rationale": string}. Previous output:\n' + raw_content
+            )
+            try:
+                with get_usage_tracker().scope("event_state.update_repair"):
+                    try:
+                        repaired = self.llm_client.chat(format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT), temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
+                    except TypeError as exc:
+                        if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
+                            raise
+                        repaired = self.llm_client.chat(format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT))
+                parsed = parse_json(str(getattr(repaired, "content", "") or ""))
+                self.update_repair_successes += 1
+            except (TypeError, ValueError):
+                self.update_repair_failures += 1
+                if len(self.invalid_update_output_previews) < 3:
+                    self.invalid_update_output_previews.append(raw_content[:500])
+                    self.invalid_update_output_sha256.append(hashlib.sha256(raw_content.encode("utf-8")).hexdigest())
+                return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none", "same_state_dimension": False}
         operation = str(parsed.get("operation", "NEW")).upper()
         if operation not in OPERATIONS:
             operation = "NEW"
         matched = parsed.get("matched_claim_id")
-        known_ids = {item.claim_id for item, _ in candidates}
+        known_ids = {item.claim_id for item, _, _, _ in candidates}
         fallback_reason = None
         if matched not in known_ids:
             fallback_reason = "unknown_matched_claim" if matched is not None else None
+            matched = None
+        if operation == "NEW":
             matched = None
         try:
             confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
         except (TypeError, ValueError):
             confidence = 0.0
         relation = str(parsed.get("same_episode_relation", "none") or "none").strip().casefold()
-        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason, "same_episode_relation": relation if relation in SAME_EPISODE_RELATIONS else "none"}
+        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason, "same_episode_relation": relation if relation in SAME_EPISODE_RELATIONS else "none", "same_state_dimension": parsed.get("same_state_dimension") is True}
 
     @staticmethod
     def _shared_episode_ids(left: Claim, right: Claim) -> set[str]:
@@ -186,13 +265,15 @@ class StateCompiler:
                     return turns
         return turns
 
-    def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float]) -> CompileResult:
+    def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float], slot_embedding: Optional[Sequence[float]] = None) -> CompileResult:
         """Compile one observation and return the operation applied."""
         if claim.persistence == "episode" or claim.modality in NON_OBSERVATION_MODALITIES:
-            return self._record_new(claim, episode_id, embedding, "EPISODIC", "non-persistent or non-observation claim")
-        candidates = self._candidates(claim, embedding)
-        current = [(item, score) for item, score in candidates if item.status in {"active", "contested"}]
-        same_content = [item for item, _ in current if normalized_content(item) == normalized_content(claim)]
+            return self._record_new(claim, episode_id, embedding, "EPISODIC", "non-persistent or non-observation claim", slot_embedding=slot_embedding)
+        if not claim.state_slot:
+            claim.state_slot = normalize_state_slot(claim.predicate)
+        resolved_slot_embedding = self._slot_embedding(claim, slot_embedding)
+        candidates = self._candidates(claim, embedding, resolved_slot_embedding)
+        same_content = [item for item, _, _, exact_slot in candidates if exact_slot and normalized_state_content(item) == normalized_state_content(claim)]
         if same_content:
             matched = same_content[0]
             support_type = "duplicate" if any(ref.episode_id == episode_id for ref in matched.evidence) else "corroboration"
@@ -201,7 +282,7 @@ class StateCompiler:
             self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
             return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration", operation == "DUPLICATE")
         if not candidates:
-            return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate", "no_candidate")
+            return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject state-slot candidate", "no_candidate", resolved_slot_embedding)
         decision = self._classify(claim, candidates)
         operation, matched_id = decision["operation"], decision["matched_claim_id"]
         same_session = False
@@ -221,6 +302,10 @@ class StateCompiler:
         elif matched_id is None and operation != "NEW":
             operation = "NEW"
             fallback_reason = fallback_reason or "unknown_matched_claim"
+        elif operation in {"DUPLICATE", "CORROBORATE", "REFINE", "SUPERSEDE", "CONFLICT"} and not decision.get("same_state_dimension", False):
+            operation, matched_id = "NEW", None
+            fallback_reason = "different_state_dimension"
+            self.different_state_dimension_guard_count += 1
         if matched_id:
             matched = self.store.claims[matched_id]
             same_session = bool(self._shared_episode_ids(claim, matched))
@@ -238,8 +323,8 @@ class StateCompiler:
                 self._audit(claim, episode_id, matched_id, matched_id, operation, decision["confidence"], decision["rationale"])
                 return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason, same_session, decision.get("same_episode_relation", "none"), transition_guard)
         if operation == "EPISODIC":
-            return self._record_new(claim, episode_id, embedding, operation, decision["rationale"], "non_observation")
-        self.store.add_claim(claim, list(embedding))
+            return self._record_new(claim, episode_id, embedding, operation, decision["rationale"], "non_observation", resolved_slot_embedding)
+        self.store.add_claim(claim, list(embedding), resolved_slot_embedding)
         if matched_id:
             old = self.store.claims[matched_id]
             if operation == "SUPERSEDE":
@@ -256,13 +341,13 @@ class StateCompiler:
         self._audit(claim, episode_id, matched_id, claim.claim_id, operation, decision["confidence"], decision["rationale"])
         return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason, same_session, decision.get("same_episode_relation", "none"), transition_guard)
 
-    def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str, fallback_reason: Optional[str] = None) -> CompileResult:
+    def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str, fallback_reason: Optional[str] = None, slot_embedding: Optional[Sequence[float]] = None) -> CompileResult:
         if operation == "EPISODIC":
             claim.persistence = "episode"
             claim.status = "standalone"
         elif claim.persistence == "history":
             claim.status = "standalone"
-        self.store.add_claim(claim, list(embedding))
+        self.store.add_claim(claim, list(embedding), list(slot_embedding) if slot_embedding is not None else None)
         self._audit(claim, episode_id, None, claim.claim_id, operation, 1.0, rationale)
         return CompileResult(operation, None, claim.claim_id, 1.0, False, fallback_reason)
 

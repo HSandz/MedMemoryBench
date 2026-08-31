@@ -15,7 +15,7 @@ embedding:
   provider: local
   model: sentence-transformers/all-MiniLM-L6-v2
 build_config:
-  event_state_semantic_version: "2.3"
+  event_state_semantic_version: "2.4"
   enable_episodes: true
   enable_state_claims: true
   enable_state_compilation: true
