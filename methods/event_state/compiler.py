@@ -209,7 +209,6 @@ def parse_json(content: str) -> Dict[str, Any]:
     cleaned = re.sub(r"<(?:(?:think|thinking|reasoning))>.*?</(?:(?:think|thinking|reasoning))>", "", content or "", flags=re.I | re.S).strip()
     fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.I | re.S)
     candidates = fenced or [cleaned]
-    decoder = json.JSONDecoder()
     for candidate in reversed(candidates):
         try:
             if candidate is cleaned:
@@ -220,14 +219,4 @@ def parse_json(content: str) -> Dict[str, Any]:
                 return value
         except (TypeError, json.JSONDecodeError):
             continue
-    # Some providers prepend a short reasoning line before the final object.
-    # Only accept a complete JSON object decoded from a candidate start, and
-    # choose the last valid object so earlier brace examples cannot win.
-    for start in reversed([match.start() for match in re.finditer(r"\{", cleaned)]):
-        try:
-            value, end = decoder.raw_decode(cleaned[start:])
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(value, dict):
-            return value
     raise ValueError("missing JSON object")
