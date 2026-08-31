@@ -19,10 +19,12 @@ operation.
 LLM-proposed subject IDs are checked against source speakers and the visible
 conversation scope; ambiguous multi-speaker self-references are discarded.
 State claims carry a value-independent `state_slot` (for example,
-`residence_location`), and only active or contested same-subject claims with an
-exact slot match or slot cosine similarity at least `state_candidate_min_similarity`
-are sent to the update classifier. Superseded/refined versions remain history,
-not mutation targets.
+`residence_location`) as internal compiler metadata. It is kept out of claim
+retrieval text and final answer context; slot-only naturalized labels are used
+for compiler matching. Only active or contested same-subject claims with an
+exact slot match or slot cosine similarity at least
+`state_candidate_min_similarity` are sent to the update classifier.
+Superseded/refined versions remain history, not mutation targets.
 
 Canonical subjects are derived from visible scope, participants, and cited turns.
 In primary-user scope, unrecognized attribute-like subjects resolve to

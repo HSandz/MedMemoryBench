@@ -91,7 +91,7 @@ class Claim:
 
     def semantic_text(self) -> str:
         qualifiers = ", ".join(f"{key}: {value}" for key, value in self.qualifiers.items())
-        return f"Subject: {self.subject}. Subject ID: {self.subject_id or self.subject_key}. Predicate: {self.predicate}. State slot: {self.state_slot or ''}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}. Modality: {self.modality}. Persistence: {self.persistence}."
+        return f"Subject: {self.subject}. Subject ID: {self.subject_id or self.subject_key}. Predicate: {self.predicate}. Value: {self.value}. Qualifiers: {qualifiers}. Polarity: {self.polarity}. Modality: {self.modality}. Persistence: {self.persistence}."
 
 
 @dataclass

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from methods.event_state.compiler import StateCompiler, parse_json
+from methods.event_state.context import render_claim
 from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
@@ -115,11 +116,10 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     store = EventStateStore("p")
     snapshot = store.export()
     snapshot["schema_version"] = 3
-    snapshot["semantic_version"] = "2.3"
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    snapshot["semantic_version"] = "2.2"
+    snapshot["semantic_version"] = "2.3"
     try:
         EventStateStore.from_export(snapshot)
     except ValueError as exc:
@@ -143,7 +143,66 @@ def test_event_state_semantic_version_changes_build_hash_only():
             return self.build_config
 
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.2"), dataset) != compute_build_config_hash(Config("2.3"), dataset)
+    assert compute_build_config_hash(Config("2.3"), dataset) != compute_build_config_hash(Config("2.4"), dataset)
+
+
+def test_state_slot_is_compiler_only_metadata():
+    claim = Claim("C", "User", "primary_user", "lives_in", "Boston", state_slot="residence_location")
+    assert "State slot" not in claim.semantic_text()
+    assert StateCompiler.slot_text(claim) == "residence location"
+    assert "State slot" not in render_claim(claim, [], {claim.claim_id: claim})
+
+
+def test_update_response_format_fallback_preserves_generation_settings():
+    calls = []
+
+    class Client:
+        def chat(self, messages, **kwargs):
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise TypeError("response_format is unsupported")
+            return SimpleNamespace(content=json.dumps({
+                "matched_claim_id": "OLD",
+                "operation": "SUPERSEDE",
+                "same_state_dimension": True,
+                "same_episode_relation": "none",
+                "confidence": 1.0,
+                "rationale": "changed",
+            }))
+
+    store = EventStateStore("p")
+    store.add_claim(Claim("OLD", "User", "primary_user", "city", "Boston", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0], [1.0, 0.0])
+    compiler = StateCompiler(store, Embedder(), Client(), min_similarity=0.1, update_temperature=0.2, update_max_tokens=123)
+    result = compiler.apply(Claim("NEW", "User", "primary_user", "city", "Tokyo", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0], [1.0, 0.0])
+    assert result.operation == "SUPERSEDE"
+    assert calls[0]["temperature"] == 0.2 and calls[0]["max_tokens"] == 123
+    assert "response_format" not in calls[1]
+    assert calls[1]["temperature"] == 0.2 and calls[1]["max_tokens"] == 123
+
+
+def test_update_repair_response_format_fallback_preserves_generation_settings():
+    calls = []
+
+    class Client:
+        def chat(self, messages, **kwargs):
+            calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise TypeError("response_format is unsupported")
+            content = "not json" if len(calls) == 2 else json.dumps({
+                "matched_claim_id": "OLD", "operation": "SUPERSEDE",
+                "same_state_dimension": True, "same_episode_relation": "none",
+                "confidence": 1.0, "rationale": "changed",
+            })
+            return SimpleNamespace(content=content)
+
+    store = EventStateStore("p")
+    store.add_claim(Claim("OLD", "User", "primary_user", "city", "Boston", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0], [1.0, 0.0])
+    compiler = StateCompiler(store, Embedder(), Client(), min_similarity=0.1, update_temperature=0.2, update_max_tokens=123)
+    result = compiler.apply(Claim("NEW", "User", "primary_user", "city", "Tokyo", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0], [1.0, 0.0])
+    assert result.operation == "SUPERSEDE"
+    assert calls[2]["temperature"] == 0.2 and calls[2]["max_tokens"] == 123
+    assert "response_format" not in calls[3]
+    assert calls[3]["temperature"] == 0.2 and calls[3]["max_tokens"] == 123
 
 
 def test_ungrounded_claim_is_dropped_but_episode_is_retained():
@@ -173,7 +232,7 @@ def test_same_session_restatement_is_classified_from_source_turns():
     from methods.event_state.schemas import Episode, TurnEvidence
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["User"], "primary_user", "", "", [TurnEvidence(1, "User", "user", "mild retinal changes are present"), TurnEvidence(2, "User", "user", "the retinal changes were recalled")]), [1.0, 0.0])
     captured = []
-    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","matched_claim_id":"OLD","same_state_dimension":true,"confidence":1}'))))
+    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"restatement","confidence":1}'))))
     repeated = Claim("NEW", "User", "primary_user", "retinal_status", "recalled", evidence=[EvidenceRef("s1", "s1", [2])])
     assert compiler.apply(repeated, "s1", [1.0, 0.0]).operation == "DUPLICATE"
     assert "new_claim_source_turns" in captured[0]

@@ -518,10 +518,6 @@ class InvalidLLMResponseError(RetryableLLMAPIError):
     """A completed provider request with a transiently unusable payload."""
 
 
-class ReasoningLeakLLMResponseError(InvalidLLMResponseError):
-    """A response that returned provider reasoning as answer content."""
-
-
 class TruncatedLLMResponseError(RetryableLLMAPIError):
     """A provider response cut off before producing a usable final answer."""
 
@@ -1215,22 +1211,6 @@ def _is_nim_nemotron_model(model: str) -> bool:
     return str(model or "").lower().startswith("nim/nvidia/nemotron-")
 
 
-def _reasoning_matches_content(
-    content: str,
-    reasoning: Any,
-    reasoning_content: Any,
-) -> bool:
-    """Return whether structured provider reasoning matches final content."""
-    normalized_content = content.strip()
-    if not normalized_content:
-        return False
-    return any(
-        normalized_content == str(candidate).strip()
-        for candidate in (reasoning, reasoning_content)
-        if candidate is not None
-    )
-
-
 class OpenAIClient(BaseLLMClient):
     """OpenAI client."""
 
@@ -1359,24 +1339,6 @@ class OpenAIClient(BaseLLMClient):
                 f"(finish_reason={finish_reason}, max_tokens={token_limit}, "
                 f"model={self.model}).",
                 max_tokens=token_limit,
-            )
-
-        if _reasoning_matches_content(
-            content,
-            reasoning,
-            reasoning_content,
-        ):
-            logger.warning(
-                "LLM response leaked provider reasoning into answer content; "
-                "retrying: finish_reason=%r, message.reasoning=%s, "
-                "message.reasoning_content=%s, model=%s",
-                finish_reason,
-                _summarize_log_text(reasoning),
-                _summarize_log_text(reasoning_content),
-                self.model,
-            )
-            raise ReasoningLeakLLMResponseError(
-                "LLM returned provider reasoning as the final answer content."
             )
 
         if not content.strip():
@@ -1627,20 +1589,6 @@ class AzureOpenAIClient(BaseLLMClient):
         refusal = getattr(message, "refusal", None)
         reasoning = getattr(message, "reasoning", None)
         reasoning_content = getattr(message, "reasoning_content", None)
-
-        if _reasoning_matches_content(content, reasoning, reasoning_content):
-            logger.warning(
-                "LLM response leaked provider reasoning into answer content; "
-                "retrying: finish_reason=%r, message.reasoning=%s, "
-                "message.reasoning_content=%s, model=%s",
-                finish_reason,
-                _summarize_log_text(reasoning),
-                _summarize_log_text(reasoning_content),
-                self.deployment,
-            )
-            raise ReasoningLeakLLMResponseError(
-                "LLM returned provider reasoning as the final answer content."
-            )
 
         if not content.strip():
             raise EmptyLLMResponseError(
@@ -2952,7 +2900,6 @@ __all__ = [
     "EmptyLLMResponseError",
     "EmptyGeminiResponseError",
     "InvalidLLMResponseError",
-    "ReasoningLeakLLMResponseError",
     "TruncatedLLMResponseError",
     # Factory functions
     "create_llm_client",

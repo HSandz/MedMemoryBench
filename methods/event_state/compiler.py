@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -95,7 +96,7 @@ class StateCompiler:
 
     @staticmethod
     def slot_text(claim: Claim) -> str:
-        return f"State slot: {normalize_state_slot(claim.state_slot)}"
+        return normalize_state_slot(claim.state_slot).replace("_", " ")
 
     def _slot_embedding(self, claim: Claim, supplied: Optional[Sequence[float]]) -> List[float]:
         if supplied:
@@ -157,18 +158,26 @@ class StateCompiler:
             try:
                 response = self.llm_client.chat(messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
             except TypeError as exc:
-                if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
+                if "response_format" not in str(exc).lower() and "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
                     raise
-                response = self.llm_client.chat(messages)
+                try:
+                    response = self.llm_client.chat(messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens)
+                except TypeError as fallback_exc:
+                    # Keep compatibility with minimal test/dummy clients while
+                    # retaining configured settings for providers that support them.
+                    if "temperature" not in str(fallback_exc).lower() and "max_tokens" not in str(fallback_exc).lower() and "unexpected keyword" not in str(fallback_exc).lower():
+                        raise
+                    response = self.llm_client.chat(messages)
             raw_content = str(getattr(response, "content", "") or "")
         try:
-            parsed = parse_json(raw_content)
+            parsed = validate_update_decision(parse_json(raw_content))
         except ValueError:
             self.update_parse_failures += 1
             self.update_repair_calls += 1
             repair_prompt = (
-                "Repair the previous classifier output into one valid JSON object only. "
-                "Do not reconsider the decision or add facts. Required schema: "
+                "Convert the previous classifier output to the required schema. "
+                "Do not reconsider evidence, invent a new semantic judgment, or add facts. "
+                "Return one valid JSON object only. Required schema: "
                 '{"matched_claim_id": string|null, "operation": "NEW|DUPLICATE|CORROBORATE|REFINE|SUPERSEDE|CONFLICT|EPISODIC", '
                 '"same_state_dimension": boolean, "same_episode_relation": "restatement|correction|state_change|refinement|contradiction|none", '
                 '"confidence": number, "rationale": string}. Previous output:\n' + raw_content
@@ -178,10 +187,16 @@ class StateCompiler:
                     try:
                         repaired = self.llm_client.chat(format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT), temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
                     except TypeError as exc:
-                        if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
+                        if "response_format" not in str(exc).lower() and "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
                             raise
-                        repaired = self.llm_client.chat(format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT))
-                parsed = parse_json(str(getattr(repaired, "content", "") or ""))
+                        repair_messages = format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT)
+                        try:
+                            repaired = self.llm_client.chat(repair_messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens)
+                        except TypeError as fallback_exc:
+                            if "temperature" not in str(fallback_exc).lower() and "max_tokens" not in str(fallback_exc).lower() and "unexpected keyword" not in str(fallback_exc).lower():
+                                raise
+                            repaired = self.llm_client.chat(repair_messages)
+                parsed = validate_update_decision(parse_json(str(getattr(repaired, "content", "") or "")))
                 self.update_repair_successes += 1
             except (TypeError, ValueError):
                 self.update_repair_failures += 1
@@ -189,9 +204,7 @@ class StateCompiler:
                     self.invalid_update_output_previews.append(raw_content[:500])
                     self.invalid_update_output_sha256.append(hashlib.sha256(raw_content.encode("utf-8")).hexdigest())
                 return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none", "same_state_dimension": False}
-        operation = str(parsed.get("operation", "NEW")).upper()
-        if operation not in OPERATIONS:
-            operation = "NEW"
+        operation = parsed["operation"]
         matched = parsed.get("matched_claim_id")
         known_ids = {item.claim_id for item, _, _, _ in candidates}
         fallback_reason = None
@@ -200,12 +213,7 @@ class StateCompiler:
             matched = None
         if operation == "NEW":
             matched = None
-        try:
-            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        relation = str(parsed.get("same_episode_relation", "none") or "none").strip().casefold()
-        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason, "same_episode_relation": relation if relation in SAME_EPISODE_RELATIONS else "none", "same_state_dimension": parsed.get("same_state_dimension") is True}
+        return {"matched_claim_id": matched, "operation": operation, "confidence": parsed["confidence"], "rationale": parsed["rationale"][:500], "fallback_reason": fallback_reason, "same_episode_relation": parsed["same_episode_relation"], "same_state_dimension": parsed["same_state_dimension"]}
 
     @staticmethod
     def _shared_episode_ids(left: Claim, right: Claim) -> set[str]:
@@ -373,3 +381,46 @@ def parse_json(content: str) -> Dict[str, Any]:
         except (TypeError, json.JSONDecodeError):
             continue
     raise ValueError("missing JSON object")
+
+
+def validate_update_decision(value: Any) -> Dict[str, Any]:
+    """Validate and normalize the classifier decision schema."""
+    if not isinstance(value, dict):
+        raise ValueError("classifier decision must be an object")
+    operation = value.get("operation")
+    if not isinstance(operation, str) or operation.upper() not in OPERATIONS:
+        raise ValueError("invalid classifier operation")
+    if "matched_claim_id" not in value:
+        raise ValueError("matched_claim_id is required")
+    matched = value.get("matched_claim_id")
+    if matched is not None and not isinstance(matched, str):
+        raise ValueError("matched_claim_id must be a string or null")
+    if "same_state_dimension" not in value:
+        raise ValueError("same_state_dimension is required")
+    same_state_dimension = value.get("same_state_dimension")
+    if not isinstance(same_state_dimension, bool):
+        raise ValueError("same_state_dimension must be boolean")
+    if "same_episode_relation" not in value:
+        raise ValueError("same_episode_relation is required")
+    relation = value.get("same_episode_relation")
+    if "confidence" not in value:
+        raise ValueError("confidence is required")
+    if not isinstance(relation, str) or relation.casefold() not in SAME_EPISODE_RELATIONS:
+        raise ValueError("invalid same_episode_relation")
+    confidence = value.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ValueError("confidence must be numeric")
+    confidence = float(confidence)
+    if not math.isfinite(confidence):
+        raise ValueError("confidence must be finite")
+    rationale = value.get("rationale", "")
+    if not isinstance(rationale, str):
+        raise ValueError("rationale must be a string")
+    return {
+        "operation": operation.upper(),
+        "matched_claim_id": matched,
+        "same_state_dimension": same_state_dimension,
+        "same_episode_relation": relation.casefold(),
+        "confidence": max(0.0, min(1.0, confidence)),
+        "rationale": rationale,
+    }
