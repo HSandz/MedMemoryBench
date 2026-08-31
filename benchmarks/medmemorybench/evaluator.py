@@ -2717,6 +2717,7 @@ class MedMemoryBenchEvaluator:
                     if callable(marker):
                         marker(session.session_id, unit.unit_id)
                 staged_start = time.perf_counter()
+                staged_usage_before = get_usage_tracker().get_stats()
                 try:
                     staged_text = "\n\n".join(session.to_memory_text() for session in pending_sessions)
                     prepared = self.agent_manager.prepare_memory_sessions(
@@ -2745,6 +2746,10 @@ class MedMemoryBenchEvaluator:
                         total_memory_time += time.perf_counter() - session_start
                         if self._checkpoint_manager:
                             self._checkpoint_manager.mark_session_injected(session_id)
+                    if session_build_results:
+                        session_build_results[0]["build_metrics"]["usage"] = diff_usage_stats(
+                            get_usage_tracker().get_stats(), staged_usage_before
+                        )
                     sessions_to_process = []
                 except Exception as exc:
                     if not isinstance(exc, LLMAPIError):
