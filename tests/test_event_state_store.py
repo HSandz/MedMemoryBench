@@ -4,7 +4,7 @@ import pytest
 
 from methods.event_state.compiler import StateCompiler
 from methods.event_state.embeddings import cosine
-from methods.event_state.schemas import Claim, EvidenceRef
+from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 
 
@@ -39,6 +39,27 @@ def test_same_session_duplicate_and_later_corroboration_share_one_claim():
     assert compiler.apply(later, "s2", [1.0, 0.0]) == "CORROBORATE"
     assert len(store.claims) == 1
     assert len(store.claims[first.claim_id].evidence) == 2
+
+
+def test_same_session_corroboration_is_downgraded_to_duplicate():
+    store = EventStateStore("p")
+    store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["Alice"], "primary_user", "", "", [TurnEvidence("1", "Alice", "user", "I work remotely.") , TurnEvidence("2", "Alice", "user", "My job is fully remote.")]), [1.0, 0.0])
+    old = Claim("OLD", "Alice", "alice", "work_style", "remote", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","same_episode_relation":"restatement","confidence":1}'))
+    result = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1).apply(Claim("NEW", "Alice", "alice", "work_style", "fully remote", evidence=[EvidenceRef("s1", "s1", ["2"])]), "s1", [1.0, 0.0])
+    assert result.operation == "DUPLICATE"
+    assert old.status == "active" and len(old.evidence) == 2
+
+
+def test_same_session_transition_requires_explicit_relation_and_later_evidence():
+    store = EventStateStore("p")
+    store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["Alice"], "primary_user", "", "", [TurnEvidence("1", "Alice", "user", "I live in Boston."), TurnEvidence("2", "Alice", "user", "I moved to Tokyo.")]), [1.0, 0.0])
+    old = Claim("OLD", "Alice", "alice", "lives_in", "Boston", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_episode_relation":"none","confidence":1}'))
+    result = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1).apply(Claim("NEW", "Alice", "alice", "lives_in", "Tokyo", evidence=[EvidenceRef("s1", "s1", ["2"])]), "s1", [1.0, 0.0])
+    assert result.operation == "NEW" and old.status == "active"
 
 
 def test_classifier_operations_preserve_history_and_conflicts():

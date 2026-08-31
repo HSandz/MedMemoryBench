@@ -325,6 +325,23 @@ def test_failed_extraction_fallback_covers_late_turns_and_is_bounded():
     assert len(summary) <= 1000
 
 
+def test_extraction_lifecycle_telemetry_is_reported_before_compilation():
+    class LLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content='{"episode_summary":"summary","claims":['
+                '{"subject":"User","predicate":"lives_in","value":"Boston","persistence":"state","source_turn_ids":["0"]},'
+                '{"subject":"User","predicate":"worked_at","value":"Acme","persistence":"history","source_turn_ids":["0"]},'
+                '{"subject":"User","predicate":"visited","value":"Paris","persistence":"episode","source_turn_ids":["0"]}]}')
+
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    result = agent.memorize("facts", memory_items=[{"role": "user", "content": "facts", "source_turn_id": "0"}], source_session_id=1)
+    assert result.extra["extracted_state_claim_count"] == 1
+    assert result.extra["extracted_history_claim_count"] == 1
+    assert result.extra["extracted_episode_claim_count"] == 1
+    assert result.extra["standalone_history_count"] == 1
+    assert result.extra["standalone_episode_count"] == 1
+
+
 def test_context_budget_accounts_for_instruction_system_question_and_reserve():
     count = lambda text: len(text.split())
     truncate = lambda text, limit: " ".join(text.split()[:limit])

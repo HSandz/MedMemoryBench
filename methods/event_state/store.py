@@ -14,7 +14,7 @@ class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
     SCHEMA_VERSION = 3
-    SEMANTIC_VERSION = "2.2"
+    SEMANTIC_VERSION = "2.3"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id
@@ -59,6 +59,7 @@ class EventStateStore:
         errors: List[str] = []
         node_ids = set(self.claims) | set(self.episodes)
         seen_edges = set()
+        version_edges = []
         for edge in self.edges:
             key = tuple(edge.get(field) for field in ("source_id", "target_id", "relation_type", "weight"))
             if key in seen_edges:
@@ -66,6 +67,8 @@ class EventStateStore:
             seen_edges.add(key)
             if edge.get("source_id") not in node_ids or edge.get("target_id") not in node_ids:
                 errors.append(f"edge references missing node: {edge}")
+            if edge.get("relation_type") in {"SUPERSEDES", "REFINES"}:
+                version_edges.append(edge)
         for claim_id, claim in self.claims.items():
             if claim_id not in self.claim_embeddings:
                 errors.append(f"missing claim embedding: {claim_id}")
@@ -75,6 +78,43 @@ class EventStateStore:
         for episode_id in self.episodes:
             if episode_id not in self.episode_embeddings:
                 errors.append(f"missing episode embedding: {episode_id}")
+        adjacency: Dict[str, List[str]] = {}
+        for edge in version_edges:
+            adjacency.setdefault(edge["source_id"], []).append(edge["target_id"])
+        visiting, visited = set(), set()
+
+        def visit(node: str) -> None:
+            if node in visiting:
+                errors.append(f"version cycle detected at: {node}")
+                return
+            if node in visited:
+                return
+            visiting.add(node)
+            for target in adjacency.get(node, []):
+                visit(target)
+            visiting.remove(node)
+            visited.add(node)
+
+        for node in adjacency:
+            visit(node)
+
+        components: Dict[str, set[str]] = {}
+        for edge in version_edges:
+            components.setdefault(edge["source_id"], set()).update((edge["source_id"], edge["target_id"]))
+            components.setdefault(edge["target_id"], set()).update((edge["source_id"], edge["target_id"]))
+        for members in components.values():
+            active = [claim_id for claim_id in members if claim_id in self.claims and self.claims[claim_id].persistence == "state" and self.claims[claim_id].status == "active"]
+            if len(active) > 1 and not any(self.claims[claim_id].status == "contested" for claim_id in members if claim_id in self.claims):
+                errors.append(f"version chain has multiple active terminals: {sorted(active)}")
+
+        for operation in self.operations:
+            if operation.operation != "CORROBORATE":
+                continue
+            matched = self.claims.get(operation.matched_claim_id)
+            prior_episode_ids = {ref.episode_id for ref in matched.evidence if ref.episode_id != operation.episode_id} if matched else set()
+            if matched and not prior_episode_ids:
+                errors.append(f"same-session corroboration remains: {operation.operation_id}")
+
         for edge in self.edges:
             if edge.get("relation_type") in {"SUPERSEDES", "REFINES"}:
                 newer = self.claims.get(edge.get("source_id"))

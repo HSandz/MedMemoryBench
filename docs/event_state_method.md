@@ -41,6 +41,29 @@ exact cited turns for the new and candidate claims (bounded to four turns per
 side), so unrelated dialogue cannot affect correction/restatement decisions.
 Exact normalized duplicates remain deterministic.
 
+Extraction lifecycle labels are semantic: `state` is a currently true or
+ongoing proposition worth carrying forward (even if it began long ago),
+`history` is former or completed background no longer asserted as current, and
+`episode` is a bounded occurrence, action, recommendation, measurement, or
+other transient event. Assistant generic explanations and paraphrases are not
+stored as user facts; explicit conversation-specific instructions,
+recommendations, decisions, corrections, or status assertions may be retained.
+Build telemetry reports extracted counts for each lifecycle and separately
+reports final active, superseded, refined, contested, standalone-history, and
+standalone-episode counts.
+
+Within one episode, `CORROBORATE` is deterministically downgraded to
+`DUPLICATE`. `SUPERSEDE`, `REFINE`, and `CONFLICT` require an explicit
+same-episode evidence relation and source-turn ordering from the episode's
+chronological turn evidence. Invalid transitions preserve the old state and
+fall back to `DUPLICATE` for explicit restatements or `NEW` otherwise.
+
+Direct claim retrieval exposes active/contested state representatives and
+standalone historical claims. Superseded and refined state versions remain in
+the store and are rendered as a bounded, predecessor-first `Prior states` section
+when their current representative is shown; they do not independently compete
+in the current-state claim pool.
+
 If extraction and its single repair attempt both fail, the retained episode
 summary is a bounded chronological rendering of all visible turns with speaker
 and turn labels. Each turn receives a share of the budget and long turns
@@ -48,7 +71,7 @@ preserve both their beginning and ending text, so late-session information is
 not silently discarded.
 
 Snapshots use schema version 3 plus the Event-State build semantic version. The
-corrected builder is semantic version `2.2`; snapshots built without that version
+corrected builder is semantic version `2.3`; snapshots built without that version
 do not match the build compatibility hash and must be rebuilt. Version 1 and 2
 snapshots are rejected rather than silently reinterpreted. Claims retain canonical
 subject IDs and lifecycle statuses (`active`,

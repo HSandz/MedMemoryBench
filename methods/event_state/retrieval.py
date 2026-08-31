@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .embeddings import cosine
@@ -30,11 +30,13 @@ class EventStateRetriever:
 
     def retrieve(self, question: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         query_vector = self.embedder.embed_query(question)
-        claim_rank = dense_rank(query_vector, self.store.claim_embeddings, self.config.get("claim_top_k", 30)) if self.config.get("retrieve_claims", True) else []
+        claim_vectors, hidden_prior_state_count = self._visible_claim_vectors()
+        claim_rank = dense_rank(query_vector, claim_vectors, self.config.get("claim_top_k", 30)) if self.config.get("retrieve_claims", True) else []
         episode_rank = dense_rank(query_vector, self.store.episode_embeddings, self.config.get("episode_top_k", 20)) if self.config.get("retrieve_episodes", True) else []
         candidates = self._rrf(claim_rank, episode_rank)
         if self.config.get("ppr_enabled", False):
             candidates = self._ppr(candidates)
+        candidates = [item for item in candidates if item["type"] != "state_claim" or self._claim_is_directly_visible(item["id"])]
         values = normalize_scores([item.get("score", 0.0) for item in candidates])
         for item, final_score in zip(candidates, values):
             item["final_score"] = final_score
@@ -42,6 +44,8 @@ class EventStateRetriever:
         candidate_count = int(self.config.get("candidate_count", 40))
         candidates = candidates[:candidate_count]
         selected = self._select(candidates, int(self.config.get("evidence_count", 8)))
+        claim_candidate_statuses = Counter(self.store.claims[identifier].status for identifier, _ in claim_rank)
+        selected_claims = [self.store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
         return selected, {
             "claim_candidates": len(claim_rank),
             "episode_candidates": len(episode_rank),
@@ -49,7 +53,25 @@ class EventStateRetriever:
             "ppr_enabled": bool(self.config.get("ppr_enabled", False)),
             "selector_mode": self.config.get("selector_mode", "state_mmr"),
             "selected_ids": [item["id"] for item in selected],
+            "claim_candidate_status_counts": dict(sorted(claim_candidate_statuses.items())),
+            "selected_claim_status_counts": dict(sorted(Counter(claim.status for claim in selected_claims).items())),
+            "selected_claim_persistence_counts": dict(sorted(Counter(claim.persistence for claim in selected_claims).items())),
+            "hidden_prior_state_candidate_count": hidden_prior_state_count,
         }
+
+    def _claim_is_directly_visible(self, claim_id: str) -> bool:
+        claim = self.store.claims.get(claim_id)
+        return bool(claim and (claim.persistence != "state" or claim.status in {"active", "contested"}))
+
+    def _visible_claim_vectors(self) -> Tuple[Dict[str, Sequence[float]], int]:
+        vectors = {}
+        hidden = 0
+        for claim_id, embedding in self.store.claim_embeddings.items():
+            if self._claim_is_directly_visible(claim_id):
+                vectors[claim_id] = embedding
+            elif self.store.claims.get(claim_id) and self.store.claims[claim_id].status in {"superseded", "refined"}:
+                hidden += 1
+        return vectors, hidden
 
     def _rrf(self, claims: Sequence[Tuple[str, float]], episodes: Sequence[Tuple[str, float]]) -> List[Dict[str, Any]]:
         values: Dict[str, Dict[str, Any]] = {}

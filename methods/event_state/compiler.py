@@ -16,6 +16,7 @@ from utils.llm_client import format_messages, get_usage_tracker
 
 OPERATIONS = {"NEW", "DUPLICATE", "CORROBORATE", "REFINE", "SUPERSEDE", "CONFLICT", "EPISODIC"}
 NON_OBSERVATION_MODALITIES = {"planned", "recommended", "hypothetical"}
+SAME_EPISODE_RELATIONS = {"restatement", "correction", "state_change", "refinement", "contradiction", "none"}
 
 
 @dataclass
@@ -26,6 +27,9 @@ class CompileResult:
     decision_confidence: Optional[float] = None
     used_update_llm: bool = False
     fallback_reason: Optional[str] = None
+    same_session: bool = False
+    same_session_relation: str = "none"
+    transition_guard: Optional[str] = None
 
     def __eq__(self, other: Any) -> bool:
         return self.operation == (other.operation if isinstance(other, CompileResult) else other)
@@ -121,7 +125,49 @@ class StateCompiler:
             confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0) or 0.0)))
         except (TypeError, ValueError):
             confidence = 0.0
-        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason}
+        relation = str(parsed.get("same_episode_relation", "none") or "none").strip().casefold()
+        return {"matched_claim_id": matched, "operation": operation, "confidence": confidence, "rationale": str(parsed.get("rationale", ""))[:500], "fallback_reason": fallback_reason, "same_episode_relation": relation if relation in SAME_EPISODE_RELATIONS else "none"}
+
+    @staticmethod
+    def _shared_episode_ids(left: Claim, right: Claim) -> set[str]:
+        return {ref.episode_id for ref in left.evidence}.intersection(ref.episode_id for ref in right.evidence)
+
+    def evidence_turn_positions(self, claim: Claim, episode_id: str) -> List[int]:
+        """Resolve cited evidence order from immutable episode turns, never ID text."""
+        episode = self.store.episodes.get(episode_id)
+        if not episode:
+            return []
+        cited = {turn_id for ref in claim.evidence if ref.episode_id == episode_id for turn_id in ref.source_turn_ids}
+        return [index for index, turn in enumerate(episode.turn_evidence) if turn.turn_id in cited]
+
+    def _new_evidence_is_later(self, claim: Claim, matched: Claim, episode_ids: set[str], allow_same: bool = False) -> bool:
+        for episode_id in sorted(episode_ids):
+            new_positions = self.evidence_turn_positions(claim, episode_id)
+            old_positions = self.evidence_turn_positions(matched, episode_id)
+            if new_positions and old_positions:
+                return min(new_positions) >= min(old_positions) if allow_same else min(new_positions) > max(old_positions)
+        return False
+
+    def _guard_same_session_transition(self, operation: str, claim: Claim, matched: Claim, relation: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Protect state lifecycle from unsupported within-episode mutations."""
+        shared = self._shared_episode_ids(claim, matched)
+        if not shared:
+            return operation, matched.claim_id, None
+        if operation == "CORROBORATE":
+            return "DUPLICATE", matched.claim_id, "same_session_corrob_downgraded"
+        if operation == "SUPERSEDE":
+            if relation in {"correction", "state_change"} and self._new_evidence_is_later(claim, matched, shared):
+                return operation, matched.claim_id, None
+            return ("DUPLICATE", matched.claim_id, "same_session_supersede_guard") if relation == "restatement" else ("NEW", None, "same_session_supersede_guard")
+        if operation == "REFINE":
+            if relation in {"refinement", "correction", "state_change"} and self._new_evidence_is_later(claim, matched, shared, allow_same=True):
+                return operation, matched.claim_id, None
+            return ("DUPLICATE", matched.claim_id, "same_session_refine_guard") if relation == "restatement" else ("NEW", None, "same_session_refine_guard")
+        if operation == "CONFLICT":
+            if relation == "contradiction":
+                return operation, matched.claim_id, None
+            return ("DUPLICATE", matched.claim_id, "same_session_conflict_guard") if relation == "restatement" else ("NEW", None, "same_session_conflict_guard")
+        return operation, matched.claim_id, None
 
     def _source_turns(self, claim: Claim, episode_ids: Optional[set[str]] = None) -> List[Dict[str, Any]]:
         """Return bounded, exact claim provenance for same-session decisions."""
@@ -153,11 +199,13 @@ class StateCompiler:
             operation = "DUPLICATE" if support_type == "duplicate" else "CORROBORATE"
             self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], support_type)
             self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
-            return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration")
+            return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration", operation == "DUPLICATE")
         if not candidates:
             return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate", "no_candidate")
         decision = self._classify(claim, candidates)
         operation, matched_id = decision["operation"], decision["matched_claim_id"]
+        same_session = False
+        transition_guard = None
         fallback_reason = decision.get("fallback_reason")
         historical_target = False
         if operation in {"SUPERSEDE", "REFINE", "CONFLICT"} and matched_id:
@@ -173,6 +221,13 @@ class StateCompiler:
         elif matched_id is None and operation != "NEW":
             operation = "NEW"
             fallback_reason = fallback_reason or "unknown_matched_claim"
+        if matched_id:
+            matched = self.store.claims[matched_id]
+            same_session = bool(self._shared_episode_ids(claim, matched))
+            if same_session:
+                operation, matched_id, transition_guard = self._guard_same_session_transition(operation, claim, matched, decision["same_episode_relation"])
+                if transition_guard:
+                    fallback_reason = transition_guard
         if operation in {"DUPLICATE", "CORROBORATE"} and matched_id:
             matched = self.store.claims[matched_id]
             if matched.status not in {"active", "contested"}:
@@ -181,7 +236,7 @@ class StateCompiler:
             else:
                 self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], "duplicate" if operation == "DUPLICATE" else "corroboration")
                 self._audit(claim, episode_id, matched_id, matched_id, operation, decision["confidence"], decision["rationale"])
-                return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason)
+                return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason, same_session, decision["same_episode_relation"], transition_guard)
         if operation == "EPISODIC":
             return self._record_new(claim, episode_id, embedding, operation, decision["rationale"], "non_observation")
         self.store.add_claim(claim, list(embedding))
@@ -199,7 +254,7 @@ class StateCompiler:
                 old.status = claim.status = "contested"
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "CONFLICTS_WITH")
         self._audit(claim, episode_id, matched_id, claim.claim_id, operation, decision["confidence"], decision["rationale"])
-        return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason)
+        return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason, same_session, decision["same_episode_relation"], transition_guard)
 
     def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str, fallback_reason: Optional[str] = None) -> CompileResult:
         if operation == "EPISODIC":

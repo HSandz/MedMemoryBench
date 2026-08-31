@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from methods.event_state.retrieval import EventStateRetriever
-from methods.event_state.schemas import Episode
+from methods.event_state.schemas import Claim, Episode, EvidenceRef
 from methods.event_state.store import EventStateStore
 
 
@@ -53,3 +53,20 @@ def test_ppr_follows_claim_episode_claim_and_excludes_disconnected_component():
     retriever = EventStateRetriever(store, Embedder(), ppr_expand_hops=2)
     result = retriever._ppr_impl([{"id": "C1", "type": "state_claim", "score": 1.0}])
     assert {item["id"] for item in result} == {"C1", "E1", "C2"}
+
+
+def test_retrieval_hides_superseded_state_versions_but_keeps_history_and_reports_statuses():
+    store = EventStateStore("ctx")
+    store.claims = {
+        "OLD": Claim("OLD", "Alice", "alice", "lives_in", "Boston", persistence="state", status="superseded", evidence=[EvidenceRef("E1", "s1", ["1"])]),
+        "CURRENT": Claim("CURRENT", "Alice", "alice", "lives_in", "Tokyo", persistence="state", status="active", evidence=[EvidenceRef("E2", "s2", ["1"])]),
+        "HISTORY": Claim("HISTORY", "Alice", "alice", "worked_at", "Acme", persistence="history", status="standalone", evidence=[EvidenceRef("E3", "s3", ["1"])]),
+    }
+    store.claim_embeddings = {key: [1.0, 0.0] for key in store.claims}
+    store.add_edge("CURRENT", "OLD", "SUPERSEDES")
+    retriever = EventStateRetriever(store, Embedder(), claim_top_k=10, episode_top_k=0, candidate_count=10, evidence_count=10, retrieve_episodes=False)
+    selected, extra = retriever.retrieve("where does Alice live")
+    ids = {item["id"] for item in selected}
+    assert "CURRENT" in ids and "HISTORY" in ids and "OLD" not in ids
+    assert extra["hidden_prior_state_candidate_count"] == 1
+    assert extra["claim_candidate_status_counts"]["active"] == 1

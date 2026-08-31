@@ -16,10 +16,35 @@ def relation_lines(claim_id: str, edges: Sequence[Dict[str, Any]]) -> List[str]:
     return lines
 
 
-def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]]) -> str:
+def prior_state_lines(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str, Claim], limit: int = 3) -> List[str]:
+    """Follow direct version predecessors from current to older states."""
+    lines, visited, frontier = [], {claim.claim_id}, [claim.claim_id]
+    while frontier and len(lines) < max(0, limit):
+        current = frontier.pop(0)
+        predecessors = sorted(
+            edge["target_id"]
+            for edge in edges
+            if edge["source_id"] == current and edge["relation_type"] in {"SUPERSEDES", "REFINES"}
+        )
+        for claim_id in predecessors:
+            if claim_id in visited:
+                continue
+            visited.add(claim_id)
+            prior = claims.get(claim_id)
+            if not prior:
+                continue
+            lines.append(f"  {prior.predicate} = {prior.value}; recorded {prior.recorded_at or 'unknown'}; valid to {prior.valid_to or 'unknown'}")
+            frontier.append(claim_id)
+            if len(lines) == max(0, limit):
+                break
+    return lines
+
+
+def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str, Claim] | None = None) -> str:
     relations = relation_lines(claim.claim_id, edges)
     evidence = "\n".join(f"  session {ref.source_session_id} ({ref.support_type})" for ref in claim.evidence)
-    return "\n".join([
+    prior_states = prior_state_lines(claim, edges, claims or {})
+    lines = [
         f"[State {claim.claim_id}]",
         f"Subject: {display_subject(claim.subject_id or claim.subject_key, claim.subject)}",
         f"Subject ID: {claim.subject_id or claim.subject_key}",
@@ -33,8 +58,10 @@ def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]]) -> str:
         f"Claim: {claim.predicate} = {claim.value}",
         f"Qualifiers: {claim.qualifiers or 'none'}",
         "Relations:\n" + ("\n".join(f"  {item}" for item in relations) if relations else "  none"),
+        "Prior states:\n" + ("\n".join(prior_states) if prior_states else "  none"),
         "Evidence:\n" + (evidence or "  none"),
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def render_episode(episode: Episode) -> str:
