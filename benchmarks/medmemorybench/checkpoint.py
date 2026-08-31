@@ -577,12 +577,18 @@ def compute_build_config_hash(method_config, dataset_config) -> str:
             if hasattr(method_config, "snapshot_build_config")
             else getattr(method_config, "agent_params", {})
         )
+        build_semantic_version = None
+        if getattr(method_config, "method_name", "") == "event_state":
+            # Event-State semantic fixes invalidate pre-fix scientific builds;
+            # keep this separate from execution settings such as worker count.
+            build_semantic_version = build_config.get("event_state_semantic_version", "legacy")
         content = json.dumps({
             "method_name": getattr(method_config, "method_name", ""),
             "method_type": getattr(method_config, "method_type", ""),
             "embedding": vars(embedding) if embedding is not None else None,
             "memorize_model": _snapshot_model_config(memorize_model),
             "build_config": build_config,
+            "semantic_version": build_semantic_version,
             "dataset": _snapshot_dataset_config(dataset_config),
         }, sort_keys=True, default=str)
         return hashlib.md5(content.encode()).hexdigest()[:16]

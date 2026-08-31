@@ -22,9 +22,18 @@ State compilation always reserves up to three active or contested same-subject
 claims for classification, even when their embedding similarity is below the
 historical candidate threshold.
 
-Snapshots use schema version 3. Version 1 and 2 snapshots are rejected rather than
-silently reinterpreted; rebuild the memory when upgrading from the prototype
-format. Claims retain canonical subject IDs and lifecycle statuses (`active`,
+Canonical subjects are derived from visible scope, participants, and cited turns.
+In primary-user scope, unrecognized attribute-like subjects resolve to
+`primary_user`; `speaker:<name>` is emitted only for a visible participant.
+Generic consultations remain `general_non_personal`, and third-party scopes stay
+isolated. Claims must cite valid source turn IDs; malformed or ungrounded claims
+are repaired once and then dropped while the episode archive is retained.
+
+Snapshots use schema version 3 plus the Event-State build semantic version. The
+corrected builder is semantic version `2.0`; snapshots built without that version
+do not match the build compatibility hash and must be rebuilt. Version 1 and 2
+snapshots are rejected rather than silently reinterpreted. Claims retain canonical
+subject IDs and lifecycle statuses (`active`,
 `superseded`, `refined`, `contested`, or `standalone`) together with their
 evidence references.
 
@@ -39,6 +48,10 @@ local/HuggingFace and OpenAI configurations.
 
 The default `state_current_candidate_top_k` is `3`; lower it only when the
 classifier prompt budget requires fewer current-state candidates.
+
+Structured memory construction uses bounded completion budgets (3,200 extraction
+tokens and 1,600 update-classification tokens in the Persona-1 configuration) and
+disables model thinking for those JSON-only calls.
 
 ## Commands
 

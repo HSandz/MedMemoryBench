@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 ENUMS = {
@@ -45,11 +46,11 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
     qualifiers = safe_qualifiers(raw.get("qualifiers"))
     if qualifiers is None:
         return None
-    supplied = raw.get("source_turn_ids", list(source_turn_ids))
-    if not isinstance(supplied, list):
-        supplied = []
-    if allowed_turn_ids:
-        supplied = [item for item in supplied if item in allowed_turn_ids]
+    supplied = raw.get("source_turn_ids")
+    if not isinstance(supplied, list) or not supplied:
+        return None
+    if allowed_turn_ids and any(item not in allowed_turn_ids for item in supplied):
+        return None
     confidence = raw.get("confidence", 1.0)
     try:
         confidence = float(confidence)
@@ -71,3 +72,20 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
         "valid_to": raw.get("valid_to") if isinstance(raw.get("valid_to"), str) else None,
         "valid_time_text": raw.get("valid_time_text") if isinstance(raw.get("valid_time_text"), str) else None,
     }
+
+
+_META_MARKERS = (
+    "request for concise",
+    "single-sentence state",
+    "asked for summary",
+    "question only",
+    "not an observation",
+    "formatting request",
+)
+
+
+def is_meta_claim(raw: Dict[str, Any]) -> bool:
+    """Reject a small set of unambiguous conversation-act pseudo-memories."""
+    text = " ".join(str(raw.get(key) or "") for key in ("subject", "predicate", "value")).casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    return any(marker in text for marker in _META_MARKERS)

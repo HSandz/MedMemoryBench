@@ -50,7 +50,11 @@ def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str]
             return "general_non_personal"
         if key in participant_map:
             return "speaker:" + normalize_name(participant_map[key])
-        return "third_party:" + key
+        if raw[:1].isupper():
+            return "third_party:" + key
+        # Generic consultations must never create synthetic people from an
+        # attribute or predicate proposed by the extractor.
+        return "general_non_personal"
     if scope.startswith("third_party:"):
         target = scope.split(":", 1)[1]
         if key in aliases or not raw:
@@ -67,7 +71,15 @@ def resolve_subject_id(raw_subject: Any, scope: str, participants: Iterable[str]
         return "third_party:" + key
     if speaker and key == normalize_name(speaker):
         return "speaker:" + key
-    return "speaker:" + key
+    # An unrecognized subject is not evidence of a person. In primary scope,
+    # attribute-like proposals are conservatively attributed to the user when
+    # the source turn is the primary user's turn; otherwise they remain user
+    # scoped rather than becoming a fabricated speaker identity.
+    if speaker and normalize_name(speaker) in {"user", "assistant", "system", "unknown"}:
+        return "primary_user"
+    if speaker and normalize_name(speaker) in participant_map:
+        return "speaker:" + normalize_name(speaker)
+    return "primary_user"
 
 
 def display_subject(subject_id: str, fallback: str = "User") -> str:

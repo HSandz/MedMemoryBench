@@ -14,6 +14,7 @@ class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
     SCHEMA_VERSION = 3
+    SEMANTIC_VERSION = "2.0"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id
@@ -108,7 +109,7 @@ class EventStateStore:
         }
 
     def export(self) -> Dict[str, Any]:
-        return {"schema_version": self.SCHEMA_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "claim_embeddings": self.claim_embeddings}
+        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "claim_embeddings": self.claim_embeddings}
 
     @classmethod
     def from_export(cls, state: Dict[str, Any]) -> "EventStateStore":
@@ -118,6 +119,8 @@ class EventStateStore:
             raise ValueError(
                 f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v3; rebuild the memory snapshot."
             )
+        if state.get("semantic_version") != cls.SEMANTIC_VERSION:
+            raise ValueError("Event-State snapshot semantic version is incompatible; rebuild the memory snapshot.")
         store = cls(state.get("context_id"))
         store.episodes = {item["episode_id"]: episode_from_dict(item) for item in state.get("episodes", [])}
         store.claims = {item["claim_id"]: claim_from_dict(item) for item in state.get("claims", [])}

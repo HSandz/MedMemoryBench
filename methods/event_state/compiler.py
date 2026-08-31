@@ -122,6 +122,25 @@ class StateCompiler:
             self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], support_type)
             self._audit(claim, episode_id, matched.claim_id, matched.claim_id, operation, 1.0, "identical normalized semantic content")
             return CompileResult(operation, matched.claim_id, matched.claim_id, 1.0, False, "exact_duplicate" if operation == "DUPLICATE" else "exact_corroboration")
+        # Restatements within one episode are not independent evidence. Keep
+        # explicit correction language eligible for normal classification.
+        same_session = [item for item, _ in current if any(ref.episode_id == episode_id for ref in item.evidence)]
+        for matched in same_session:
+            if matched.predicate.casefold() != claim.predicate.casefold():
+                continue
+            episode = self.store.episodes.get(episode_id)
+            turns = episode.turn_evidence if episode else []
+            texts = " ".join(turn.text for turn in turns).casefold()
+            correction_markers = ("sorry", "i meant", "actually", "correction", "instead", "not ")
+            restatement_markers = ("recalled", "mentioned again", "as noted", "same", "again")
+            if any(marker in texts for marker in correction_markers):
+                continue
+            source_turns = [turn for turn in turns if turn.turn_id in (claim.evidence[0].source_turn_ids if claim.evidence else [])]
+            assistant_paraphrase = bool(source_turns) and all((turn.role or "").casefold() == "assistant" for turn in source_turns)
+            if assistant_paraphrase or any(marker in texts for marker in restatement_markers):
+                self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], "duplicate")
+                self._audit(claim, episode_id, matched.claim_id, matched.claim_id, "DUPLICATE", 1.0, "same-session restatement")
+                return CompileResult("DUPLICATE", matched.claim_id, matched.claim_id, 1.0, False, "same_session_restatement")
         if not candidates:
             return self._record_new(claim, episode_id, embedding, "NEW", "no same-subject semantic candidate", "no_candidate")
         decision = self._classify(claim, candidates)
@@ -186,13 +205,29 @@ class StateCompiler:
 
 
 def parse_json(content: str) -> Dict[str, Any]:
-    """Parse an LLM JSON object, accepting code fences but not arbitrary prose."""
-    cleaned = (content or "").strip()
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("missing JSON object")
-    value = json.loads(cleaned[start:end + 1])
-    if not isinstance(value, dict):
-        raise ValueError("JSON result is not an object")
-    return value
+    """Parse the final structured JSON payload without trusting reasoning prose."""
+    cleaned = re.sub(r"<(?:(?:think|thinking|reasoning))>.*?</(?:(?:think|thinking|reasoning))>", "", content or "", flags=re.I | re.S).strip()
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.I | re.S)
+    candidates = fenced or [cleaned]
+    decoder = json.JSONDecoder()
+    for candidate in reversed(candidates):
+        try:
+            if candidate is cleaned:
+                value = json.loads(candidate)
+            else:
+                value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except (TypeError, json.JSONDecodeError):
+            continue
+    # Some providers prepend a short reasoning line before the final object.
+    # Only accept a complete JSON object decoded from a candidate start, and
+    # choose the last valid object so earlier brace examples cannot win.
+    for start in reversed([match.start() for match in re.finditer(r"\{", cleaned)]):
+        try:
+            value, end = decoder.raw_decode(cleaned[start:])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("missing JSON object")
