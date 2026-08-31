@@ -26,6 +26,7 @@ from utils.vertex_batch import (
     make_request_id,
     scoped_manifest_path,
 )
+from utils.logger import truncate_error_message
 
 
 LLM_JUDGE_METRICS = {"llm_judge", "eem_judge", "llm_judge_mcd"}
@@ -146,7 +147,9 @@ def _hydrate_retrieved_memories(
         try:
             records_payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read retrieval records {path}: {exc}") from exc
+            raise ValueError(
+                f"Cannot read retrieval records {path}: {truncate_error_message(exc)}"
+            ) from exc
         for record in records_payload.get("records", []):
             if isinstance(record, dict) and isinstance(record.get("retrieved_memories"), list):
                 records_by_id[str(record.get("query_id", ""))] = record["retrieved_memories"]
@@ -176,7 +179,9 @@ def _hydrate_retrieved_memories(
                 try:
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
-                    raise ValueError(f"Cannot read answer batch manifest {manifest_path}: {exc}") from exc
+                    raise ValueError(
+                        f"Cannot read answer batch manifest {manifest_path}: {truncate_error_message(exc)}"
+                    ) from exc
                 batch_requests[manifest_path] = {
                     str(request.get("request_id")): request
                     for job in manifest.get("jobs", {}).values()
@@ -588,7 +593,7 @@ def rejudge_medmemorybench(
             if response is None or response.status or not response.content:
                 error = response.status if response is not None else "No output row returned"
                 raise VertexBatchError(
-                    f"Batch rejudge failed for {item['prepared_metric']['prepared']['query_id']}: {error}"
+                    f"Batch rejudge failed for {item['prepared_metric']['prepared']['query_id']}: {truncate_error_message(error)}"
                 )
             result = calculator.finalize_batch(
                 item["prepared_metric"], response.content

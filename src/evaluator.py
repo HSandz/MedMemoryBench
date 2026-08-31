@@ -22,7 +22,7 @@ from utils.llm_client import (
     is_google_ai_studio_provider,
     is_vertex_batch_provider,
 )
-from utils.logger import get_eval_logger
+from utils.logger import get_eval_logger, truncate_error_message
 from utils.vertex_batch import VertexBatchPending
 
 
@@ -271,7 +271,7 @@ class Evaluator:
             ) from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(
-                f"Cannot read memory manifest {manifest_path}: {exc}"
+                f"Cannot read memory manifest {manifest_path}: {truncate_error_message(exc)}"
             ) from exc
 
         from benchmarks.medmemorybench.checkpoint import (
@@ -491,6 +491,8 @@ class Evaluator:
                 os.close(directory_descriptor)
 
     def _log(self, message: str, level: str = "INFO") -> None:
+        if level.upper() in {"ERROR", "WARNING"}:
+            message = truncate_error_message(message)
         if self.verbose:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         self.logger.info(message)
@@ -586,7 +588,7 @@ class Evaluator:
         except BaseException as exc:
             self._write_run_config(
                 status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
-                error={"type": type(exc).__name__, "message": str(exc)},
+                error={"type": type(exc).__name__, "message": truncate_error_message(exc)},
             )
             raise
 

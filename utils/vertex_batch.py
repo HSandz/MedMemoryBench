@@ -23,6 +23,7 @@ from utils.llm_client import (
     extract_usage_token_counts,
     get_usage_tracker,
 )
+from utils.logger import truncate_error_message
 
 
 MANIFEST_VERSION = 2
@@ -717,7 +718,9 @@ class VertexBatchClient:
             except Exception as exc:
                 responses[request.request_id] = BatchChatResponse(
                     request_id=request.request_id,
-                    status=f"{type(exc).__name__}: {exc}",
+                    status=truncate_error_message(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
                     duration_seconds=time.perf_counter() - started_at,
                 )
 

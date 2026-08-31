@@ -34,6 +34,7 @@ from utils.vertex_batch import (
     VertexBatchPending,
     _utc_now,
 )
+from utils.logger import truncate_error_message
 
 
 OPENROUTER_TERMINAL_STATES = {"completed", "failed", "expired", "cancelled"}
@@ -63,7 +64,11 @@ class OpenRouterBatchPending(VertexBatchPending):
 
 class _OpenRouterHTTPError(OpenRouterBatchError):
     def __init__(self, status_code: int, message: str):
-        super().__init__(f"OpenRouter Batch API returned HTTP {status_code}: {message}")
+        super().__init__(
+            truncate_error_message(
+                f"OpenRouter Batch API returned HTTP {status_code}: {message}"
+            )
+        )
         self.status_code = status_code
 
 
@@ -205,7 +210,7 @@ class OpenRouterBatchClient(VertexBatchClient):
                         message = getattr(response, "text", "") or "request failed"
                     error = _OpenRouterHTTPError(response.status_code, message)
                     if response.status_code in {400, 404, 422}:
-                        raise OpenRouterBatchUnsupported(str(error)) from error
+                        raise OpenRouterBatchUnsupported(truncate_error_message(error)) from error
                     raise error
                 payload = response.json()
                 if not isinstance(payload, dict):
@@ -259,12 +264,12 @@ class OpenRouterBatchClient(VertexBatchClient):
                 timeout=15.0,
             )
         except OpenRouterBatchUnsupported as exc:
-            self._support = (False, str(exc))
+            self._support = (False, truncate_error_message(exc))
             return self._support
         except Exception as exc:
             self._support = (
                 False,
-                f"batch support could not be confirmed ({type(exc).__name__}: {exc})",
+                f"batch support could not be confirmed ({type(exc).__name__}: {truncate_error_message(exc)})",
             )
             return self._support
 
@@ -481,7 +486,7 @@ class OpenRouterBatchClient(VertexBatchClient):
             message = (
                 json.dumps(error, ensure_ascii=False)
                 if isinstance(error, dict)
-                else str(error)
+                else truncate_error_message(error)
             )
             lowered = message.lower()
             if any(
@@ -597,7 +602,9 @@ class OpenRouterBatchClient(VertexBatchClient):
             except Exception as exc:
                 responses[request.request_id] = BatchChatResponse(
                     request_id=request.request_id,
-                    status=f"{type(exc).__name__}: {exc}",
+                    status=truncate_error_message(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
                     duration_seconds=time.perf_counter() - started_at,
                 )
         return responses
@@ -622,10 +629,10 @@ class OpenRouterBatchClient(VertexBatchClient):
             job_entry = manifest.get("jobs", {}).get(stage)
             if isinstance(job_entry, dict):
                 job_entry["state"] = "failed"
-                job_entry["fallback_reason"] = str(exc)
+                job_entry["fallback_reason"] = truncate_error_message(exc)
                 self._save_manifest(manifest)
             self._progress(
-                f"Stage '{stage}': batch route is unsupported ({exc}); using real-time calls."
+                f"Stage '{stage}': batch route is unsupported ({truncate_error_message(exc)}); using real-time calls."
             )
             return self._run_direct(stage, requests)
 

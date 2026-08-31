@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from functools import wraps
 
 from utils.tokenizer import get_tokenizer, TokenizerProtocol
+from utils.logger import truncate_error_message
 
 try:
     from dotenv import load_dotenv
@@ -796,7 +797,7 @@ def _log_retry_attempt(
     attempt_label = f"{failure_type} attempt" if failure_type else "attempt"
     logger.warning(
         f"API call failed ({attempt_label} {attempt}/{max_retries}): "
-        f"{type(exc).__name__}: {exc}\n"
+        f"{type(exc).__name__}: {truncate_error_message(exc)}\n"
         f"Reason: {reason}\n"
         f"Will retry in {delay:.1f} seconds..."
     )
@@ -957,7 +958,7 @@ def with_retry(
                     if not is_retryable:
                         # Non-retryable exception, raise immediately
                         logger.error(
-                            f"API call failed (non-retryable): {type(exc).__name__}: {exc}; "
+                            f"API call failed (non-retryable): {type(exc).__name__}: {truncate_error_message(exc)}; "
                             f"Reason: {reason}"
                         )
                         raise
@@ -970,7 +971,7 @@ def with_retry(
                             f"API call retry exhausted for {failure_type} "
                             f"({failure_attempt}/{max_retries}, "
                             f"{total_attempts} total attempts): "
-                            f"{type(exc).__name__}: {exc}"
+                            f"{type(exc).__name__}: {truncate_error_message(exc)}"
                         )
                         raise LLMRetryExhaustedError(
                             f"API call still failed after {max_retries} "
@@ -1476,7 +1477,9 @@ class OpenAIModelReadinessGate:
                         else "the endpoint returned no models"
                     )
                 except Exception as exc:
-                    last_status = f"{type(exc).__name__}: {exc}"
+                    last_status = (
+                        f"{type(exc).__name__}: {truncate_error_message(exc)}"
+                    )
 
                 if time.monotonic() >= deadline:
                     raise ModalModelNotReadyError(
@@ -2056,7 +2059,7 @@ class GeminiVertexClient(BaseGeminiClient):
                         account_index + 1,
                         len(self._vertex_accounts),
                         type(exc).__name__,
-                        exc,
+                        truncate_error_message(exc),
                     )
                     raise
 
@@ -2493,7 +2496,7 @@ class GeminiAIStudioClient(BaseGeminiClient):
                     except OSError as file_exc:
                         logger.error(
                             "Failed to remove a permanently invalid AI Studio key from its file: %s",
-                            file_exc,
+                            truncate_error_message(file_exc),
                         )
                         removed_from_file = False
 
@@ -2519,7 +2522,7 @@ class GeminiAIStudioClient(BaseGeminiClient):
                 if not retryable:
                     logger.error(
                         f"Google AI Studio call failed (non-retryable): "
-                        f"{type(exc).__name__}: {exc}"
+                        f"{type(exc).__name__}: {truncate_error_message(exc)}"
                     )
                     raise
 
@@ -2782,7 +2785,7 @@ class GeminiHybridClient(BaseGeminiClient):
                         "Gemini %s call failed (non-retryable): %s: %s",
                         transport_name,
                         type(exc).__name__,
-                        exc,
+                        truncate_error_message(exc),
                     )
                     raise
 

@@ -2,12 +2,54 @@
 
 import logging
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+ERROR_MESSAGE_MAX_LENGTH = 1000
+
+
+def truncate_error_message(error: object, limit: int = ERROR_MESSAGE_MAX_LENGTH) -> str:
+    """Return an error message small enough for logs and run artifacts."""
+    message = str(error)
+    if len(message) <= limit:
+        return message
+    if limit <= 3:
+        return "." * limit
+    return message[:limit - 3] + "..."
+
+
+def format_limited_traceback(error: BaseException) -> str:
+    """Format a traceback without allowing an exception message to dominate it."""
+    formatted = traceback.TracebackException(
+        type(error), error, error.__traceback__, capture_locals=False
+    )
+    pending = [formatted]
+    while pending:
+        exception = pending.pop()
+        if isinstance(getattr(exception, "_str", None), str):
+            exception._str = truncate_error_message(exception._str)
+        for nested in (
+            getattr(exception, "__cause__", None),
+            getattr(exception, "__context__", None),
+        ):
+            if nested is not None:
+                pending.append(nested)
+        pending.extend(getattr(exception, "exceptions", None) or [])
+    return "".join(formatted.format())
+
+
+class _ErrorMessageLimitFilter(logging.Filter):
+    """Bound messages emitted at ERROR level by configured experiment loggers."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            record.msg = truncate_error_message(record.getMessage())
+            record.args = ()
+        return True
 
 
 def setup_logger(
@@ -34,6 +76,7 @@ def setup_logger(
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(level)
         console_handler.setFormatter(formatter)
+        console_handler.addFilter(_ErrorMessageLimitFilter())
         logger.addHandler(console_handler)
 
     # File output
@@ -42,6 +85,7 @@ def setup_logger(
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
+        file_handler.addFilter(_ErrorMessageLimitFilter())
         logger.addHandler(file_handler)
 
     return logger

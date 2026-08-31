@@ -31,6 +31,7 @@ from metrics.retrieval_quality import (
     compute_session_retrieval_quality,
 )
 from utils.templates import get_prompt_manager
+from utils.logger import truncate_error_message
 from utils.batch_client import create_batch_client
 from utils.llm_client import (
     LLMAPIError,
@@ -176,6 +177,8 @@ class MedMemoryBenchEvaluator:
             self._init_checkpoint_manager()
 
     def _log(self, message: str, level: str = "INFO") -> None:
+        if level.upper() in {"ERROR", "WARNING"}:
+            message = truncate_error_message(message)
         if self.verbose:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
@@ -611,9 +614,9 @@ class MedMemoryBenchEvaluator:
                 else type(error).__name__
             ),
             "error_message": (
-                structured.get("error_message", "")
+                truncate_error_message(structured.get("error_message", ""))
                 if structured is not None
-                else str(error)
+                else truncate_error_message(error)
             ),
             **{key: value for key, value in context.items() if value is not None},
         }
@@ -630,9 +633,12 @@ class MedMemoryBenchEvaluator:
             ):
                 if structured.get(key) is not None:
                     failure[key] = structured[key]
+            for key in ("error_message", "root_error_message"):
+                if key in failure:
+                    failure[key] = truncate_error_message(failure[key])
         else:
             failure["root_error_type"] = type(root_error).__name__
-            failure["root_error_message"] = str(root_error)
+            failure["root_error_message"] = truncate_error_message(root_error)
         if isinstance(error, LLMRetryExhaustedError):
             failure["attempts"] = error.attempts
             if error.failure_type:
@@ -768,7 +774,9 @@ class MedMemoryBenchEvaluator:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read append source manifest {manifest_path}: {exc}") from exc
+            raise ValueError(
+                f"Cannot read append source manifest {manifest_path}: {truncate_error_message(exc)}"
+            ) from exc
         if (
             not isinstance(manifest, dict)
             or manifest.get("format") != "medmemorybench.memory_manifest"
@@ -980,7 +988,7 @@ class MedMemoryBenchEvaluator:
                     time.sleep(1.0)
                     self._log(f"[DEBUG] Sleep done, creating new agent...")
                 except Exception as e:
-                    self._log(f"Warning: Failed to reset old agent: {e}")
+                    self._log(f"Warning: Failed to reset old agent: {truncate_error_message(e)}")
 
             self._log(f"[DEBUG] Creating AgentManager for context {context_id}...")
             self.agent_manager = AgentManager(
@@ -1402,7 +1410,9 @@ class MedMemoryBenchEvaluator:
         try:
             payload = json.loads(source_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read saved memory source {source_path}: {exc}") from exc
+            raise ValueError(
+                f"Cannot read saved memory source {source_path}: {truncate_error_message(exc)}"
+            ) from exc
         manifest_value = payload.get("manifest_path")
         if not isinstance(manifest_value, str) or not manifest_value:
             raise ValueError(f"Saved memory source is invalid: {source_path}")
@@ -1907,7 +1917,9 @@ class MedMemoryBenchEvaluator:
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Cannot read A-MEM snapshot {path}: {exc}") from exc
+            raise RuntimeError(
+                f"Cannot read A-MEM snapshot {path}: {truncate_error_message(exc)}"
+            ) from exc
         if (
             payload.get("format") != "medmemorybench.memory_snapshot"
             or payload.get("version") != 1
@@ -2185,7 +2197,9 @@ class MedMemoryBenchEvaluator:
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            raise VertexBatchError(f"Cannot read deferred judge state {path}: {exc}") from exc
+            raise VertexBatchError(
+                f"Cannot read deferred judge state {path}: {truncate_error_message(exc)}"
+            ) from exc
         if (
             payload.get("version") != 1
             or payload.get("config_hash") != self._judge_batch_config_hash()
@@ -2758,7 +2772,10 @@ class MedMemoryBenchEvaluator:
                     sessions_to_process = []
                 except Exception as exc:
                     memory_build_failed = True
-                    self._log(f"        [ERROR] Event-State staged preparation failed: {exc}", level="ERROR")
+                    self._log(
+                        f"        [ERROR] Event-State staged preparation failed: {truncate_error_message(exc)}",
+                        level="ERROR",
+                    )
                     rollback_incomplete = getattr(
                         self._checkpoint_manager,
                         "rollback_incomplete_session",
@@ -2868,9 +2885,9 @@ class MedMemoryBenchEvaluator:
                         session_build_record["build_result"] = memory_result.to_dict()
 
                 except LLMAPIError as e:
-                    session_build_record["error"] = str(e)
+                    session_build_record["error"] = truncate_error_message(e)
                     self._log(
-                        f"        [API ERROR] Session {session.session_id} failed: {e}",
+                        f"        [API ERROR] Session {session.session_id} failed: {truncate_error_message(e)}",
                         level="ERROR"
                     )
                     memory_build_failed = True
@@ -3237,7 +3254,7 @@ class MedMemoryBenchEvaluator:
                 except LLMAPIError as e:
                     self._log(
                         f"    [API ERROR] {query.query_id}: query preparation failed; "
-                        f"skipping this query. Error: {e}",
+                        f"skipping this query. Error: {truncate_error_message(e)}",
                         level="ERROR",
                     )
                     self._record_api_failure(
@@ -3300,7 +3317,7 @@ class MedMemoryBenchEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 self._record_batch_api_failure(
                     query,
-                    f"Batch request failed: {error}",
+                    f"Batch request failed: {truncate_error_message(error)}",
                     failure_duration_seconds=(
                         getattr(batch_response, "duration_seconds", 0.0)
                         if batch_response is not None else 0.0
@@ -3343,7 +3360,7 @@ class MedMemoryBenchEvaluator:
             except LLMAPIError as e:
                 self._log(
                     f"    [API ERROR] {query.query_id}: judge API call failed; "
-                    f"skipping this query. Error: {e}",
+                    f"skipping this query. Error: {truncate_error_message(e)}",
                     level="ERROR",
                 )
                 self._record_api_failure(
@@ -3522,7 +3539,7 @@ class MedMemoryBenchEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 self._record_batch_api_failure(
                     query,
-                    f"Batch request failed: {error}",
+                    f"Batch request failed: {truncate_error_message(error)}",
                     failure_duration_seconds=(
                         getattr(batch_response, "duration_seconds", 0.0)
                         if batch_response is not None else 0.0
@@ -3565,7 +3582,7 @@ class MedMemoryBenchEvaluator:
             except LLMAPIError as e:
                 self._log(
                     f"[API ERROR] {query.query_id}: judge API call failed; "
-                    f"skipping this query. Error: {e}",
+                    f"skipping this query. Error: {truncate_error_message(e)}",
                     level="ERROR",
                 )
                 self._record_api_failure(
@@ -3640,7 +3657,7 @@ class MedMemoryBenchEvaluator:
         except LLMAPIError as e:
             self._log(
                 f"    [API ERROR] {query.query_id}: answer API call failed, "
-                f"skipping this query. Error: {e}",
+                f"skipping this query. Error: {truncate_error_message(e)}",
                 level="ERROR"
             )
             self._record_api_failure(
@@ -3671,7 +3688,7 @@ class MedMemoryBenchEvaluator:
         except LLMAPIError as e:
             self._log(
                 f"    [API ERROR] {query.query_id}: judge API call failed, "
-                f"skipping this query. Error: {e}",
+                f"skipping this query. Error: {truncate_error_message(e)}",
                 level="ERROR"
             )
             self._record_api_failure(
@@ -3711,7 +3728,7 @@ class MedMemoryBenchEvaluator:
         except LLMAPIError as e:
             self._log(
                 f"    [API ERROR] {query.query_id}: answer API call failed, "
-                f"skipping this query. Error: {e}",
+                f"skipping this query. Error: {truncate_error_message(e)}",
                 level="ERROR",
             )
             self._record_api_failure(
@@ -3742,7 +3759,7 @@ class MedMemoryBenchEvaluator:
         except LLMAPIError as e:
             self._log(
                 f"    [API ERROR] {query.query_id}: judge API call failed, "
-                f"skipping this query. Error: {e}",
+                f"skipping this query. Error: {truncate_error_message(e)}",
                 level="ERROR",
             )
             self._record_api_failure(
@@ -3951,12 +3968,12 @@ class MedMemoryBenchEvaluator:
                 error = response.status if response else "No output row returned"
                 self._log(
                     f"[API ERROR] Batch judge failed for {item['query_id']}; "
-                    f"no metric result recorded. Error: {error}",
+                    f"no metric result recorded. Error: {truncate_error_message(error)}",
                     level="ERROR",
                 )
                 self._record_api_failure(
                     "batch_judge",
-                    VertexBatchError(str(error)),
+                    VertexBatchError(truncate_error_message(error)),
                     failure_duration_seconds=(
                         getattr(response, "duration_seconds", 0.0)
                         if response is not None else 0.0
@@ -3979,7 +3996,7 @@ class MedMemoryBenchEvaluator:
             except LLMAPIError as e:
                 self._log(
                     f"[API ERROR] Batch judge returned an unusable response for "
-                    f"{item['query_id']}; no metric result recorded. Error: {e}",
+                    f"{item['query_id']}; no metric result recorded. Error: {truncate_error_message(e)}",
                     level="ERROR",
                 )
                 self._record_api_failure(

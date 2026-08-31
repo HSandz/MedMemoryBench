@@ -18,6 +18,7 @@ from benchmarks.base import EvaluationUnit
 from methods.base import MemoryBuildResult
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from utils.templates import get_prompt_manager
+from utils.logger import truncate_error_message
 from utils.batch_client import create_batch_client
 from utils.llm_client import get_usage_tracker
 from utils.vertex_batch import (
@@ -112,6 +113,8 @@ class LoCoMoEvaluator:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
     def _log(self, message: str, level: str = "INFO") -> None:
+        if level.upper() in {"ERROR", "WARNING"}:
+            message = truncate_error_message(message)
         if self.verbose:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
@@ -146,7 +149,10 @@ class LoCoMoEvaluator:
                 try:
                     self.agent_manager.reset()
                 except Exception as e:
-                    self._log(f"Warning: Failed to reset old agent: {e}", level="WARNING")
+                    self._log(
+                        f"Warning: Failed to reset old agent: {truncate_error_message(e)}",
+                        level="WARNING",
+                    )
 
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
@@ -344,7 +350,10 @@ class LoCoMoEvaluator:
 
                 except Exception as e:
                     chunk_time = time.time() - chunk_start_time
-                    self._log(f"      [ERROR] Chunk {chunk_idx + 1} failed: {e}", level="ERROR")
+                    self._log(
+                        f"      [ERROR] Chunk {chunk_idx + 1} failed: {truncate_error_message(e)}",
+                        level="ERROR",
+                    )
 
                     chunk_build_results.append({
                         "chunk_index": chunk_idx,
@@ -353,7 +362,7 @@ class LoCoMoEvaluator:
                         "input_chars": chunk_chars,
                         "input_tokens_est": chunk_tokens_est,
                         "time_cost": chunk_time,
-                        "error": str(e),
+                        "error": truncate_error_message(e),
                     })
 
             # Calculate summary stats
@@ -540,7 +549,11 @@ class LoCoMoEvaluator:
             batch_response = responses.get(request_id)
             if batch_response is None or batch_response.status:
                 error = batch_response.status if batch_response else "No output row returned"
-                results.append(self._api_error_result(query, f"Batch request failed: {error}"))
+                results.append(
+                    self._api_error_result(
+                        query, f"Batch request failed: {truncate_error_message(error)}"
+                    )
+                )
                 continue
             response = self.agent_manager.finalize_batch_query(
                 prepared,
@@ -660,7 +673,7 @@ class LoCoMoEvaluator:
                 error = batch_response.status if batch_response else "No output row returned"
                 result = self._api_error_result(
                     query,
-                    f"Batch request failed: {error}",
+                    f"Batch request failed: {truncate_error_message(error)}",
                 )
             else:
                 response = self.agent_manager.finalize_batch_query(
@@ -721,7 +734,10 @@ class LoCoMoEvaluator:
             model_output="[API_ERROR] Batch request failed",
             expected_answer=", ".join(query.get_correct_answers()),
             question=query.question,
-            details={"api_error": True, "error_message": error_message},
+            details={
+                "api_error": True,
+                "error_message": truncate_error_message(error_message),
+            },
         )
 
     def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
