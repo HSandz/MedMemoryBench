@@ -52,6 +52,16 @@ def test_same_session_corroboration_is_downgraded_to_duplicate():
     assert old.status == "active" and len(old.evidence) == 2
 
 
+def test_invalid_classifier_fallback_supplies_default_same_episode_relation():
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "work_style", "office", evidence=[EvidenceRef("s1", "s1", [1])])
+    store.add_claim(old, [1.0, 0.0])
+    compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content="not json")), min_similarity=0.1)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "work_style", "hybrid", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
+    assert result.operation == "NEW"
+    assert compiler.update_parse_failures == 1
+
+
 def test_same_session_transition_requires_explicit_relation_and_later_evidence():
     store = EventStateStore("p")
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["Alice"], "primary_user", "", "", [TurnEvidence("1", "Alice", "user", "I live in Boston."), TurnEvidence("2", "Alice", "user", "I moved to Tokyo.")]), [1.0, 0.0])

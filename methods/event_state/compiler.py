@@ -111,7 +111,7 @@ class StateCompiler:
             parsed = parse_json(response.content)
         except ValueError:
             self.update_parse_failures += 1
-            return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response"}
+            return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none"}
         operation = str(parsed.get("operation", "NEW")).upper()
         if operation not in OPERATIONS:
             operation = "NEW"
@@ -225,7 +225,7 @@ class StateCompiler:
             matched = self.store.claims[matched_id]
             same_session = bool(self._shared_episode_ids(claim, matched))
             if same_session:
-                operation, matched_id, transition_guard = self._guard_same_session_transition(operation, claim, matched, decision["same_episode_relation"])
+                operation, matched_id, transition_guard = self._guard_same_session_transition(operation, claim, matched, decision.get("same_episode_relation", "none"))
                 if transition_guard:
                     fallback_reason = transition_guard
         if operation in {"DUPLICATE", "CORROBORATE"} and matched_id:
@@ -236,7 +236,7 @@ class StateCompiler:
             else:
                 self.store.attach_claim_evidence(matched.claim_id, claim.evidence[0], "duplicate" if operation == "DUPLICATE" else "corroboration")
                 self._audit(claim, episode_id, matched_id, matched_id, operation, decision["confidence"], decision["rationale"])
-                return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason, same_session, decision["same_episode_relation"], transition_guard)
+                return CompileResult(operation, matched_id, matched_id, decision["confidence"], True, fallback_reason, same_session, decision.get("same_episode_relation", "none"), transition_guard)
         if operation == "EPISODIC":
             return self._record_new(claim, episode_id, embedding, operation, decision["rationale"], "non_observation")
         self.store.add_claim(claim, list(embedding))
@@ -254,7 +254,7 @@ class StateCompiler:
                 old.status = claim.status = "contested"
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "CONFLICTS_WITH")
         self._audit(claim, episode_id, matched_id, claim.claim_id, operation, decision["confidence"], decision["rationale"])
-        return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason, same_session, decision["same_episode_relation"], transition_guard)
+        return CompileResult(operation, matched_id, claim.claim_id, decision["confidence"], True, fallback_reason, same_session, decision.get("same_episode_relation", "none"), transition_guard)
 
     def _record_new(self, claim: Claim, episode_id: str, embedding: Sequence[float], operation: str, rationale: str, fallback_reason: Optional[str] = None) -> CompileResult:
         if operation == "EPISODIC":
