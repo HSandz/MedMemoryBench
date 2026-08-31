@@ -212,6 +212,65 @@ def test_source_evidence_is_expanded_and_budget_keeps_question_intact():
     assert all("included_in_context" in record for record in prepared["retrieved_memories"])
 
 
+def test_numeric_and_string_turn_ids_share_one_grounding_contract():
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(content='{"episode_summary":"summary","claims":[{"subject":"patient","predicate":"dose","value":"10 mg","source_turn_ids":[0]}]}')
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder())
+    result = agent.memorize("dose", memory_items=[{"role": "user", "content": "dose", "source_turn_id": "0"}], source_session_id=1)
+    claim = next(iter(agent._store().claims.values()))
+    assert claim.evidence[0].source_turn_ids == ["0"]
+    assert result.extra["unknown_source_turn_id_claim_count"] == 0
+    assert result.extra["extract_repair_calls"] == 0 and llm.calls == 1
+
+
+def test_canonical_turn_id_collision_is_namespaced_before_extraction():
+    turns = EventStateAgent.normalize_turns({"source_session_id": 1, "turns": [
+        {"speaker": "User", "text": "first", "source_turn_id": 1},
+        {"speaker": "User", "text": "second", "source_turn_id": "1"},
+    ]})
+    assert [turn.source_turn_id for turn in turns] == ["1", "1__turn_1"]
+
+
+def test_extraction_claim_limit_is_deterministic_without_repair():
+    claims = ",".join('{"subject":"patient","predicate":"fact%d","value":"x","source_turn_ids":["0"]}' % i for i in range(4))
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(content='{"episode_summary":"summary","claims":[' + claims + ']}')
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), max_claims_per_episode=2, enable_state_compilation=False)
+    result = agent.memorize("facts", memory_items=[{"role": "user", "content": "facts", "source_turn_id": "0"}], source_session_id=1)
+    assert result.extra["claims_extracted"] == 2
+    assert result.extra["excess_claim_count"] == 2
+    assert result.extra["extract_repair_calls"] == 0 and llm.calls == 1
+
+
+def test_failed_extraction_fallback_covers_late_turns_and_is_bounded():
+    class LLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content="not json")
+
+    items = [{"role": "user", "content": f"turn {index} " + ("x" * 220)} for index in range(6)]
+    items[-1]["content"] += " FINAL-LATE-PHRASE"
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    agent.memorize("wrapper", memory_items=items, source_session_id=1)
+    summary = next(iter(agent._store().episodes.values())).summary
+    assert "FINAL-LATE-PHRASE" in summary
+    assert len(summary) <= 1000
+
+
 def test_context_budget_accounts_for_instruction_system_question_and_reserve():
     count = lambda text: len(text.split())
     truncate = lambda text, limit: " ".join(text.split()[:limit])

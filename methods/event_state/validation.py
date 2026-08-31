@@ -13,6 +13,12 @@ ENUMS = {
 }
 
 
+def canonical_turn_id(value: Any, fallback_index: Any) -> str:
+    """Return the single string representation used for turn provenance."""
+    text = str(value).strip() if value is not None else ""
+    return text or str(fallback_index)
+
+
 def enum(value: Any, field: str, default: str) -> str:
     normalized = str(value or default).strip().casefold()
     return normalized if normalized in ENUMS[field] else default
@@ -49,7 +55,11 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
     supplied = raw.get("source_turn_ids")
     if not isinstance(supplied, list) or not supplied:
         return None
-    if allowed_turn_ids and any(item not in allowed_turn_ids for item in supplied):
+    # JSON producers may emit numeric IDs while the normalized episode uses
+    # strings.  Validate and persist one canonical representation.
+    supplied = [canonical_turn_id(item, "") for item in supplied]
+    allowed = {canonical_turn_id(item, "") for item in allowed_turn_ids}
+    if allowed and any(item not in allowed for item in supplied):
         return None
     confidence = raw.get("confidence", 1.0)
     try:

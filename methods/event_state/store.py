@@ -14,7 +14,7 @@ class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
     SCHEMA_VERSION = 3
-    SEMANTIC_VERSION = "2.1"
+    SEMANTIC_VERSION = "2.2"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id

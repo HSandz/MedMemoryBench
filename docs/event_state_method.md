@@ -28,13 +28,24 @@ In primary-user scope, unrecognized attribute-like subjects resolve to
 Generic consultations remain `general_non_personal`, and third-party scopes stay
 isolated. Claims must cite valid source turn IDs; malformed or ungrounded claims
 are repaired once and then dropped while the episode archive is retained.
+Turn IDs are canonical strings throughout prompts, validation, and persisted
+evidence (for example, numeric `0` becomes `"0"`); equivalent JSON
+representations do not trigger repair. Duplicate canonical IDs within a session
+are deterministically namespaced. Build telemetry exposes allowed IDs, capped
+invalid-ID samples, and claim-limit overflow counts.
 When non-identical claims share an episode, classification receives only the
 exact cited turns for the new and candidate claims (bounded to four turns per
 side), so unrelated dialogue cannot affect correction/restatement decisions.
 Exact normalized duplicates remain deterministic.
 
+If extraction and its single repair attempt both fail, the retained episode
+summary is a bounded chronological rendering of all visible turns with speaker
+and turn labels. Each turn receives a share of the budget and long turns
+preserve both their beginning and ending text, so late-session information is
+not silently discarded.
+
 Snapshots use schema version 3 plus the Event-State build semantic version. The
-corrected builder is semantic version `2.1`; snapshots built without that version
+corrected builder is semantic version `2.2`; snapshots built without that version
 do not match the build compatibility hash and must be rebuilt. Version 1 and 2
 snapshots are rejected rather than silently reinterpreted. Claims retain canonical
 subject IDs and lifecycle statuses (`active`,

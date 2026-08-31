@@ -21,7 +21,7 @@ from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
 from .event_state.subjects import display_subject, is_canonical_subject_id, is_valid_canonical_subject_proposal, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
-from .event_state.validation import is_meta_claim, validated_claim
+from .event_state.validation import canonical_turn_id, is_meta_claim, validated_claim
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,51 @@ class EventStateAgent(BaseAgent):
     def normalize_turn(item: Dict[str, Any], fallback_index: int, session: Dict[str, Any]) -> NormalizedTurn:
         role = str(item.get("role")).casefold() if item.get("role") else None
         speaker = item.get("speaker") or {"user": "User", "assistant": "Assistant", "system": "System"}.get(role, "Unknown")
-        return NormalizedTurn(item.get("source_turn_id", item.get("turn_id", item.get("dia_id", fallback_index))), session.get("source_session_id"), session.get("source_session_index"), item.get("source_event_id", session.get("source_event_id")), role, str(speaker), "speaker:" + normalize_name(str(speaker)), str(item.get("text", item.get("content", "")) or ""), item.get("image_caption", item.get("blip_caption")), item.get("timestamp", session.get("timestamp")))
+        return NormalizedTurn(canonical_turn_id(item.get("source_turn_id", item.get("turn_id", item.get("dia_id"))), fallback_index), session.get("source_session_id"), session.get("source_session_index"), item.get("source_event_id", session.get("source_event_id")), role, str(speaker), "speaker:" + normalize_name(str(speaker)), str(item.get("text", item.get("content", "")) or ""), item.get("image_caption", item.get("blip_caption")), item.get("timestamp", session.get("timestamp")))
+
+    @classmethod
+    def normalize_turns(cls, session: Dict[str, Any]) -> List[NormalizedTurn]:
+        """Normalize IDs once and namespace accidental per-session collisions."""
+        turns = [cls.normalize_turn(item, index, session) for index, item in enumerate(session["turns"])]
+        seen: Dict[str, int] = {}
+        used = set()
+        for index, turn in enumerate(turns):
+            count = seen.get(turn.source_turn_id, 0)
+            seen[turn.source_turn_id] = count + 1
+            if count:
+                base = turn.source_turn_id
+                candidate = f"{base}__turn_{index}"
+                suffix = 1
+                while candidate in used:
+                    candidate = f"{base}__turn_{index}__dup_{suffix}"
+                    suffix += 1
+                turn.source_turn_id = candidate
+            used.add(turn.source_turn_id)
+        return turns
+
+    @staticmethod
+    def fallback_episode_summary(normalized: List[NormalizedTurn], limit: int = 1000) -> str:
+        """Build a bounded chronological summary when extraction cannot be trusted."""
+        if not normalized or limit <= 0:
+            return ""
+        labels = [f"{turn.speaker} (turn {turn.source_turn_id}): " for turn in normalized]
+        separators = max(0, len(normalized) - 1) * 2
+        body_budget = max(0, limit - separators - sum(len(label) for label in labels))
+        per_turn = body_budget // len(normalized)
+        remainder = body_budget % len(normalized)
+        parts = []
+        for index, (turn, label) in enumerate(zip(normalized, labels)):
+            chars = per_turn + (1 if index < remainder else 0)
+            text = turn.text.strip()
+            if turn.image_caption:
+                text = f"{text} [Shared image: {turn.image_caption}]".strip()
+            if len(text) > chars:
+                # Keep both ends so late-turn conclusions survive truncation.
+                head = max(1, (chars - 3) // 2)
+                tail = max(0, chars - head - 3)
+                text = text[:head] + "..." + text[-tail:] if tail else text[:chars]
+            parts.append(label + text)
+        return "\n\n".join(parts)[:limit]
 
     @staticmethod
     def resolve_claim_source_speaker(raw_claim: Dict[str, Any], normalized_turns: List[NormalizedTurn]) -> Optional[str]:
@@ -173,13 +217,13 @@ class EventStateAgent(BaseAgent):
         return sessions
 
     def _extract(self, session: Dict[str, Any]) -> Dict[str, Any]:
-        normalized = [self.normalize_turn(item, index, session) for index, item in enumerate(session["turns"])]
+        normalized = self.normalize_turns(session)
         participants = sorted({turn.speaker for turn in normalized})
         turn_text = "\n".join(f"[turn_id={turn.source_turn_id}] [role={turn.role or 'unknown'}] [speaker={turn.speaker}]\n{turn.text}{(' [Shared image: ' + turn.image_caption + ']') if turn.image_caption else ''}" for turn in normalized)
         allowed_subjects = ["primary_user", "general_non_personal"] + ["speaker:" + normalize_name(name) for name in participants]
         if session.get("conversation_scope", "").startswith("third_party:"):
             allowed_subjects.append(session["conversation_scope"])
-        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\n{turn_text}"
+        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\nExtract at most {self.max_claims_per_episode} claims. Prioritize distinct high-value long-term propositions; do not create low-value claims to fill the limit.\n{turn_text}"
         repaired = False
         parse_failure = False
         structure_failure = False
@@ -190,10 +234,15 @@ class EventStateAgent(BaseAgent):
         rejected_ungrounded_claim_count = 0
         meta_claim_rejected_count = 0
         grounding_invalid_keys = set()
+        invalid_source_turn_id_samples: List[Dict[str, Any]] = []
+        invalid_source_turn_id_sample_types: List[str] = []
+        excess_claim_count = 0
         allowed_ids = {turn.source_turn_id for turn in normalized}
+        raw_turn_ids = [canonical_turn_id(item.get("source_turn_id", item.get("turn_id", item.get("dia_id"))), index) for index, item in enumerate(session["turns"])]
+        turn_id_collision_count = len(raw_turn_ids) - len(set(raw_turn_ids))
 
         def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
-            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, meta_claim_rejected_count, repaired_source_turn_id_claim_count, grounding_invalid_keys
+            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count
             value = parse_json(content)
             raw_claims = value.get("claims")
             if not isinstance(raw_claims, list):
@@ -223,12 +272,23 @@ class EventStateAgent(BaseAgent):
                             invalid_grounding = True
                             if record_telemetry:
                                 grounding_invalid_keys.add(claim_key)
-                    elif any(item not in allowed_ids for item in supplied):
-                        if record_telemetry:
-                            unknown_source_turn_id_claim_count += 1
-                        invalid_grounding = True
-                        if record_telemetry:
-                            grounding_invalid_keys.add(claim_key)
+                                rejected_ungrounded_claim_count += 1
+                    else:
+                        original_supplied = supplied
+                        supplied = [canonical_turn_id(item, "") for item in supplied]
+                        raw = {**raw, "source_turn_ids": supplied}
+                        unknown = [item for item in supplied if item not in allowed_ids]
+                        if unknown:
+                            if record_telemetry:
+                                unknown_source_turn_id_claim_count += 1
+                            invalid_grounding = True
+                            for item, normalized_id in zip(original_supplied, supplied):
+                                if normalized_id not in allowed_ids and len(invalid_source_turn_id_samples) < 5:
+                                    invalid_source_turn_id_samples.append({"value": item, "type": type(item).__name__})
+                                    invalid_source_turn_id_sample_types.append(type(item).__name__)
+                            if record_telemetry:
+                                grounding_invalid_keys.add(claim_key)
+                                rejected_ungrounded_claim_count += 1
                     if is_meta_claim(raw):
                         if record_telemetry:
                             meta_claim_rejected_count += 1
@@ -244,7 +304,11 @@ class EventStateAgent(BaseAgent):
             if raw_claims and not any(item is not None for item in claims):
                 structure_failure = True
                 raise ValueError("all claim objects failed schema validation")
-            return {"episode_summary": summary, "claims": [item for item in claims if item is not None], "valid_grounding_keys": valid_grounding_keys}
+            accepted = [item for item in claims if item is not None]
+            if len(accepted) > self.max_claims_per_episode:
+                excess_claim_count += len(accepted) - self.max_claims_per_episode
+                accepted = accepted[:self.max_claims_per_episode]
+            return {"episode_summary": summary, "claims": accepted, "valid_grounding_keys": valid_grounding_keys}
 
         try:
             with get_usage_tracker().scope("event_state.extract"):
@@ -270,16 +334,18 @@ class EventStateAgent(BaseAgent):
                         response = self._memory_llm_client.chat(messages)
                 repaired = True
                 parsed = parse_and_validate(response.content, record_telemetry=False)
-                repaired_source_turn_id_claim_count += len(grounding_invalid_keys.intersection(parsed.get("valid_grounding_keys", set())))
+                repaired_count = len(grounding_invalid_keys.intersection(parsed.get("valid_grounding_keys", set())))
+                repaired_source_turn_id_claim_count += repaired_count
+                rejected_ungrounded_claim_count = max(0, rejected_ungrounded_claim_count - repaired_count)
             except Exception as repair_exc:
                 if self._is_provider_error(repair_exc):
                     raise
-                return {"episode_summary": " ".join(turn.text for turn in normalized)[:1000], "claims": [], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": True, "repair_calls": 1, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": missing_source_turn_id_claim_count + unknown_source_turn_id_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count}
+                return {"episode_summary": self.fallback_episode_summary(normalized), "claims": [], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": True, "repair_calls": 1, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
         except Exception as exc:
             if self._is_provider_error(exc):
                 raise
             raise
-        return {"episode_summary": parsed.get("episode_summary") or " ".join(turn.text for turn in normalized)[:1000], "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count}
+        return {"episode_summary": parsed.get("episode_summary") or self.fallback_episode_summary(normalized), "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
 
     @staticmethod
     def _is_provider_error(exc: Exception) -> bool:
@@ -311,7 +377,7 @@ class EventStateAgent(BaseAgent):
 
     def _prepare_session(self, session: Dict[str, Any], context_id: Any) -> PreparedMemorySession:
         extracted = self._extract(session)
-        normalized = [self.normalize_turn(item, index, session) for index, item in enumerate(session["turns"])]
+        normalized = self.normalize_turns(session)
         raw_lines = [f"[turn_id={turn.source_turn_id}] [role={turn.role or 'unknown'}] [speaker={turn.speaker}]\n{turn.text}" + (f"\n[Shared image: {turn.image_caption}]" if turn.image_caption else "") for turn in normalized]
         raw = f"[conversation_scope={session['conversation_scope']}]\n[recorded_at={session.get('timestamp') or 'unknown'}]\n\n" + "\n\n".join(raw_lines)
         episode_id = self._store(context_id).stable_id("E", [context_id, session["source_session_id"], raw])
@@ -362,7 +428,7 @@ class EventStateAgent(BaseAgent):
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             return list(executor.map(prepare_in_worker, sessions))
 
-    def _commit_prepared(self, prepared: PreparedMemorySession, store: EventStateStore, counts: Dict[str, int], added_records: List[Dict[str, Any]]) -> None:
+    def _commit_prepared(self, prepared: PreparedMemorySession, store: EventStateStore, counts: Dict[str, Any], added_records: List[Dict[str, Any]]) -> None:
         extracted = prepared.extracted
         counts["extract_parse_failures"] += int(extracted.get("parse_failure", False))
         counts["extract_json_parse_failures"] += int(extracted.get("json_parse_failure", False))
@@ -370,8 +436,11 @@ class EventStateAgent(BaseAgent):
         counts["extract_claim_validation_failures"] += int(extracted.get("claim_validation_failures", 0))
         counts["extract_repair_failures"] += int(extracted.get("repair_failure", False))
         counts["extract_repair_calls"] += int(extracted.get("repair_calls", 0))
-        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count"):
+        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
             counts[key] += int(extracted.get(key, 0))
+        counts["invalid_source_turn_id_samples"].extend(extracted.get("invalid_source_turn_id_samples", []))
+        counts["invalid_source_turn_id_sample_types"].extend(extracted.get("invalid_source_turn_id_sample_types", []))
+        counts["allowed_source_turn_ids"].extend(extracted.get("allowed_source_turn_ids", []))
         episode = prepared.episode
         if self.enable_episodes:
             store.add_episode(episode, prepared.episode_embedding)
@@ -415,13 +484,13 @@ class EventStateAgent(BaseAgent):
     def commit_prepared_memory(self, prepared_sessions: List[PreparedMemorySession], text: str = "", context_id: Any = None) -> MemoryBuildResult:
         context_id = self._context_id if context_id is None else context_id
         store = self._store(context_id)
-        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "excess_claim_count": 0, "turn_id_collision_count": 0, "invalid_source_turn_id_samples": [], "invalid_source_turn_id_sample_types": [], "allowed_source_turn_ids": [], "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
         added_records: List[Dict[str, Any]] = []
         for prepared in prepared_sessions:
             self._commit_prepared(prepared, store, counts, added_records)
         self._memory_chunks = [episode.summary for episode in store.episodes.values()]
         self._is_initialized = bool(store.episodes or store.claims)
-        extra = {**counts, **store.claim_counts(), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
+        extra = {**counts, **store.claim_counts(), "invalid_source_turn_id_samples": counts["invalid_source_turn_id_samples"][:5], "invalid_source_turn_id_sample_types": sorted(set(counts["invalid_source_turn_id_sample_types"][:5])), "allowed_source_turn_ids": sorted(set(counts["allowed_source_turn_ids"])), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
         return MemoryBuildResult(success=True, method="event_state", action="compile", input_content=text, stored_content="\n".join(item["memory"] for item in added_records), memory_entries=added_records, chunk_count=len(added_records), extra=extra, all_passages=added_records)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:

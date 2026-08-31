@@ -139,6 +139,11 @@ It defaults to `180` seconds. The connection and write timeouts remain fixed at
 30 seconds. A timeout raises a retryable SDK exception and is handled by the
 shared retry policy.
 
+Experiment error messages are limited to 1,000 characters wherever they are
+printed, logged, or written to run metadata and API-failure artifacts. Longer
+messages are cut at the limit and end with `...`; the full exception remains
+available to the in-process retry and classification logic.
+
 OpenRouter uses the same OpenAI-compatible request, retry, failure handling,
 and usage tracking as the `openai` provider. Set `OPENROUTER_API_KEY`; the base
 URL defaults to `https://openrouter.ai/api/v1`. Select it in a method config:

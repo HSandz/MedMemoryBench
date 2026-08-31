@@ -112,14 +112,14 @@ def test_parse_json_ignores_reasoning_blocks_and_selects_structured_payload():
 def test_pre_fix_snapshot_semantic_version_is_rejected():
     store = EventStateStore("p")
     snapshot = store.export()
-    snapshot["semantic_version"] = "2.0"
+    snapshot["semantic_version"] = "2.1"
     try:
         EventStateStore.from_export(snapshot)
     except ValueError as exc:
         assert "semantic version" in str(exc)
     else:
         raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.1"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.2"
 
 
 def test_event_state_semantic_version_changes_build_hash_only():
@@ -136,7 +136,7 @@ def test_event_state_semantic_version_changes_build_hash_only():
             return self.build_config
 
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.0"), dataset) != compute_build_config_hash(Config("2.1"), dataset)
+    assert compute_build_config_hash(Config("2.1"), dataset) != compute_build_config_hash(Config("2.2"), dataset)
 
 
 def test_ungrounded_claim_is_dropped_but_episode_is_retained():
