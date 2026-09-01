@@ -25,11 +25,11 @@ build_config:
   enable_episodes: true
   enable_state_claims: true
   enable_state_compilation: true
-  extraction_max_tokens: 6400
+  extraction_max_tokens: 3200
   extraction_temperature: 0.0
   max_claims_per_episode: 20
   update_temperature: 0.0
-  update_max_tokens: 6400
+  update_max_tokens: 1600
   state_candidate_top_k: 5
   state_current_candidate_top_k: 3
   state_candidate_min_similarity: 0.45
