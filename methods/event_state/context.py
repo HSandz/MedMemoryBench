@@ -80,19 +80,80 @@ def episode_turn_embedding_text(turn: Any) -> str:
 
 
 def select_episode_evidence(episode: Episode, query_vector: Sequence[float], embedder: Any, limit: int = 2) -> List[Any]:
-    """Select query-relevant turns, then restore their source conversation order."""
-    if limit <= 0 or not episode.turn_evidence:
-        return []
-    texts = [episode_turn_embedding_text(turn) for turn in episode.turn_evidence]
+    """Select query-relevant turns from one episode in source order.
+
+    This compatibility helper is deliberately local; query assembly uses the
+    global selector below so its source-excerpt budget is not per episode.
+    """
+    selected, _, _ = select_global_episode_evidence(
+        [(0, episode)], query_vector, embedder, limit
+    )
+    return selected.get(episode.episode_id, [])
+
+
+def select_global_episode_evidence(
+    selected_episodes: Sequence[Tuple[int, Episode]],
+    query_vector: Sequence[float],
+    embedder: Any,
+    limit: int = 2,
+    excluded_turns: set[Tuple[str, Any]] | None = None,
+) -> Tuple[Dict[str, List[Any]], int, int]:
+    """Select a small non-duplicate source-evidence set across episodes.
+
+    Similarity decides which turns survive. Rendering order is restored to the
+    selected-memory order and each episode's immutable conversation order.
+    """
+    excluded = excluded_turns or set()
+    candidates: List[Tuple[int, Episode, int, Any]] = []
+    deduplicated = 0
+    for episode_rank, episode in selected_episodes:
+        for turn_index, turn in enumerate(episode.turn_evidence):
+            if (episode.episode_id, turn.turn_id) in excluded:
+                deduplicated += 1
+                continue
+            candidates.append((episode_rank, episode, turn_index, turn))
+    if limit <= 0 or not candidates:
+        return {}, len(candidates), deduplicated
+    texts = [episode_turn_embedding_text(turn) for _, _, _, turn in candidates]
     try:
         vectors = embedder.embed_documents(texts)
     except AttributeError:
         vectors = [embedder.embed_query(text) for text in texts]
     scored = sorted(
-        ((cosine(query_vector, vector), index) for index, vector in enumerate(vectors)),
-        key=lambda item: (-item[0], item[1]),
+        (
+            (
+                cosine(query_vector, vector),
+                episode_rank,
+                turn_index,
+                episode.episode_id,
+                str(turn.turn_id),
+                index,
+            )
+            for index, ((episode_rank, episode, turn_index, turn), vector) in enumerate(zip(candidates, vectors))
+        ),
+        key=lambda item: (-item[0], item[1], item[2], item[3], item[4]),
     )[:limit]
-    return [episode.turn_evidence[index] for _, index in sorted(scored, key=lambda item: item[1])]
+    chosen_indexes = {item[-1] for item in scored}
+    selected: Dict[str, List[Any]] = {}
+    for index, (episode_rank, episode, turn_index, turn) in enumerate(candidates):
+        if index not in chosen_indexes:
+            continue
+        selected.setdefault(episode.episode_id, []).append(turn)
+    return selected, len(candidates), deduplicated
+
+
+def claim_evidence_turn_keys(claim: Claim, episodes: Dict[str, Episode], limit: int) -> set[Tuple[str, Any]]:
+    """Return the exact immutable turns that claim evidence will expose."""
+    keys: set[Tuple[str, Any]] = set()
+    for ref in claim.evidence[:max(0, limit)]:
+        episode = episodes.get(ref.episode_id)
+        if not episode:
+            continue
+        turns = [turn for turn in episode.turn_evidence if not ref.source_turn_ids or turn.turn_id in ref.source_turn_ids]
+        if not turns:
+            turns = episode.turn_evidence[:1]
+        keys.update((episode.episode_id, turn.turn_id) for turn in turns[:3])
+    return keys
 
 
 def render_episode(episode: Episode, evidence_turns: Sequence[Any] = ()) -> str:

@@ -44,7 +44,7 @@ class FakeLLM:
             if "Repair this extraction" in prompt:
                 return SimpleNamespace(content=self._extraction("repaired"))
             if "new_claim" in prompt:
-                return SimpleNamespace(content=json.dumps({"operation": "NEW", "confidence": 1.0}))
+                return SimpleNamespace(content=json.dumps({"operation": "NEW", "state_value_relation": "uncertain", "confidence": 1.0}))
             if self.repair_once and self.calls == 1:
                 return SimpleNamespace(content="not json")
             return SimpleNamespace(content=self._extraction(prompt))

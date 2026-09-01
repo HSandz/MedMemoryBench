@@ -21,6 +21,14 @@ from utils.llm_client import format_messages, get_usage_tracker
 OPERATIONS = {"NEW", "DUPLICATE", "CORROBORATE", "REFINE", "SUPERSEDE", "CONFLICT", "EPISODIC"}
 NON_OBSERVATION_MODALITIES = {"planned", "recommended", "hypothetical"}
 SAME_EPISODE_RELATIONS = {"restatement", "correction", "state_change", "refinement", "contradiction", "none"}
+STATE_VALUE_RELATIONS = {"equivalent", "refinement", "changed", "contradictory", "uncertain"}
+RELATION_OPERATIONS = {
+    "equivalent": {"DUPLICATE", "CORROBORATE"},
+    "refinement": {"REFINE"},
+    "changed": {"SUPERSEDE"},
+    "contradictory": {"CONFLICT"},
+    "uncertain": {"NEW"},
+}
 
 
 @dataclass
@@ -93,6 +101,12 @@ class StateCompiler:
         self.supersede_temporal_guard_count = 0
         self.supersede_record_time_fallback_count = 0
         self.retroactive_correction_applied_count = 0
+        self.state_value_relation_equivalent_count = 0
+        self.state_value_relation_refinement_count = 0
+        self.state_value_relation_changed_count = 0
+        self.state_value_relation_contradictory_count = 0
+        self.state_value_relation_uncertain_count = 0
+        self.state_value_relation_guard_count = 0
         self.invalid_update_output_previews: List[str] = []
         # Singular alias retained for callers that expose one diagnostic field.
         self.invalid_update_output_preview = self.invalid_update_output_previews
@@ -183,7 +197,7 @@ class StateCompiler:
                 "Do not reconsider evidence, invent a new semantic judgment, or add facts. "
                 "Return one valid JSON object only. Required schema: "
                 '{"matched_claim_id": string|null, "operation": "NEW|DUPLICATE|CORROBORATE|REFINE|SUPERSEDE|CONFLICT|EPISODIC", '
-                '"same_state_dimension": boolean, "same_episode_relation": "restatement|correction|state_change|refinement|contradiction|none", '
+                '"same_state_dimension": boolean, "state_value_relation": "equivalent|refinement|changed|contradictory|uncertain", "same_episode_relation": "restatement|correction|state_change|refinement|contradiction|none", '
                 '"confidence": number, "rationale": string}. Previous output:\n' + raw_content
             )
             try:
@@ -207,7 +221,7 @@ class StateCompiler:
                 if len(self.invalid_update_output_previews) < 3:
                     self.invalid_update_output_previews.append(raw_content[:500])
                     self.invalid_update_output_sha256.append(hashlib.sha256(raw_content.encode("utf-8")).hexdigest())
-                return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none", "same_state_dimension": False}
+                return {"matched_claim_id": None, "operation": "NEW", "confidence": 0.0, "rationale": "invalid classifier response", "fallback_reason": "invalid_classifier_response", "same_episode_relation": "none", "same_state_dimension": False, "state_value_relation": "uncertain"}
         operation = parsed["operation"]
         matched = parsed.get("matched_claim_id")
         known_ids = {item.claim_id for item, _, _, _ in candidates}
@@ -217,7 +231,13 @@ class StateCompiler:
             matched = None
         if operation == "NEW":
             matched = None
-        return {"matched_claim_id": matched, "operation": operation, "confidence": parsed["confidence"], "rationale": parsed["rationale"][:500], "fallback_reason": fallback_reason, "same_episode_relation": parsed["same_episode_relation"], "same_state_dimension": parsed["same_state_dimension"]}
+        state_value_relation = parsed["state_value_relation"]
+        setattr(
+            self,
+            f"state_value_relation_{state_value_relation}_count",
+            getattr(self, f"state_value_relation_{state_value_relation}_count") + 1,
+        )
+        return {"matched_claim_id": matched, "operation": operation, "confidence": parsed["confidence"], "rationale": parsed["rationale"][:500], "fallback_reason": fallback_reason, "same_episode_relation": parsed["same_episode_relation"], "same_state_dimension": parsed["same_state_dimension"], "state_value_relation": state_value_relation}
 
     @staticmethod
     def _shared_episode_ids(left: Claim, right: Claim) -> set[str]:
@@ -389,6 +409,10 @@ class StateCompiler:
             operation, matched_id = "NEW", None
             fallback_reason = "different_state_dimension"
             self.different_state_dimension_guard_count += 1
+        elif operation not in RELATION_OPERATIONS[decision["state_value_relation"]]:
+            operation, matched_id = "NEW", None
+            fallback_reason = "state_value_relation_guard"
+            self.state_value_relation_guard_count += 1
         if matched_id:
             matched = self.store.claims[matched_id]
             same_session = bool(self._shared_episode_ids(claim, matched))
@@ -481,6 +505,11 @@ def validate_update_decision(value: Any) -> Dict[str, Any]:
         raise ValueError("confidence is required")
     if not isinstance(relation, str) or relation.casefold() not in SAME_EPISODE_RELATIONS:
         raise ValueError("invalid same_episode_relation")
+    if "state_value_relation" not in value:
+        raise ValueError("state_value_relation is required")
+    state_value_relation = value.get("state_value_relation")
+    if not isinstance(state_value_relation, str) or state_value_relation.casefold() not in STATE_VALUE_RELATIONS:
+        raise ValueError("invalid state_value_relation")
     confidence = value.get("confidence")
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         raise ValueError("confidence must be numeric")
@@ -495,6 +524,7 @@ def validate_update_decision(value: Any) -> Dict[str, Any]:
         "matched_claim_id": matched,
         "same_state_dimension": same_state_dimension,
         "same_episode_relation": relation.casefold(),
+        "state_value_relation": state_value_relation.casefold(),
         "confidence": max(0.0, min(1.0, confidence)),
         "rationale": rationale,
     }

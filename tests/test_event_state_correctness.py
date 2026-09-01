@@ -4,14 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from methods.event_state.compiler import StateCompiler, parse_json
+import methods.event_state_agent as module
+from methods.event_state.compiler import StateCompiler, parse_json, validate_update_decision
 from methods.event_state.context import expand_claim_evidence, render_claim, select_episode_evidence
 from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
 from methods.event_state_agent import EventStateAgent
 from methods.event_state.validation import claim_semantic_fingerprint, resolve_model_turn_reference, resolve_model_turn_reference_with_form
-from benchmarks.medmemorybench.checkpoint import compute_build_config_hash
+from benchmarks.medmemorybench.checkpoint import compute_build_config_hash, compute_query_config_hash
 
 
 class Embedder:
@@ -65,7 +66,7 @@ def test_same_session_correction_and_unrelated_markers_reach_classifier():
     class LLM:
         def chat(self, messages, **kwargs):
             payloads.append(json.loads(messages[-1]["content"]))
-            return SimpleNamespace(content='{"operation":"SUPERSEDE","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
+            return SimpleNamespace(content='{"operation":"SUPERSEDE","state_value_relation":"changed","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
 
     compiler = StateCompiler(store, Embedder(), LLM())
     result = compiler.apply(Claim("NEW", "User", "primary_user", "dose", "10 mg", evidence=[EvidenceRef("s1", "s1", [2])]), "s1", [1.0, 0.0])
@@ -121,7 +122,7 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    for legacy_version in ("2.5", "2.6"):
+    for legacy_version in ("2.5", "2.6", "2.7"):
         snapshot["semantic_version"] = legacy_version
         try:
             EventStateStore.from_export(snapshot)
@@ -129,7 +130,7 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
             assert "semantic version" in str(exc)
         else:
             raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.7"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.8"
 
 
 @pytest.mark.parametrize(
@@ -225,6 +226,78 @@ def test_selected_episode_turn_is_not_repeated_by_claim_provenance():
     assert expand_claim_evidence(claim, {"E": episode}, {("E", "2")}, 2) == []
 
 
+def test_global_episode_evidence_budget_keeps_summaries_and_retrieval_order(monkeypatch):
+    class RankedEmbedder:
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+        def embed_documents(self, texts):
+            scores = {"E1": 1.0, "E2": 4.0, "E3": 3.0, "E4": 2.0}
+            return [[scores[next(key for key in scores if key in text)], 0.0] for text in texts]
+
+    calls = []
+    agent = EventStateAgent(llm_client=SimpleNamespace(chat=lambda *args, **kwargs: calls.append(args) or SimpleNamespace(content="ok")), memory_llm_client=SimpleNamespace(chat=lambda *args, **kwargs: calls.append(args) or SimpleNamespace(content="ok")), embedding_client=RankedEmbedder(), retrieve_claims=False, inject_source_evidence=False, max_episode_source_excerpts_total=2)
+    episodes = [Episode(f"E{index}", "ctx", f"s{index}", index, None, None, ["User"], "primary_user", "", f"summary {index}", [TurnEvidence("1", "User", "user", f"E{index} detail")]) for index in range(1, 5)]
+    for episode in episodes:
+        agent._store().add_episode(episode, [1.0, 0.0])
+    selected = [{"id": episode.episode_id, "type": "episode", "selected_rank": index + 1} for index, episode in enumerate(episodes)]
+    monkeypatch.setattr(module.EventStateRetriever, "retrieve", lambda self, question, query_vector: (selected, {}))
+
+    prepared = agent.prepare_batch_query("Which details matter?")
+    context = prepared["messages"][-1]["content"]
+    assert prepared["extra"]["selected_ids"] == ["E1", "E2", "E3", "E4"]
+    assert prepared["extra"]["selected_episode_evidence_excerpt_count"] == 2
+    assert prepared["extra"]["episode_evidence_candidate_turn_count"] == 4
+    assert "E2 detail" in context and "E3 detail" in context
+    assert "E1 detail" not in context and "E4 detail" not in context
+    assert all(f"summary {index}" in context for index in range(1, 5))
+    assert context.index("E2 detail") < context.index("E3 detail")
+    baseline_ranks = [(record["id"], record["selected_rank"]) for record in prepared["retrieved_memories"]]
+    agent.max_episode_source_excerpts_total = 0
+    without_excerpts = agent.prepare_batch_query("Which details matter?")
+    assert [(record["id"], record["selected_rank"]) for record in without_excerpts["retrieved_memories"]] == baseline_ranks
+    assert not calls
+
+
+def test_claim_provenance_is_excluded_from_global_episode_evidence(monkeypatch):
+    class RankedEmbedder:
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+        def embed_documents(self, texts):
+            return [[3.0 if "cited" in text else 2.0, 0.0] for text in texts]
+
+    agent = EventStateAgent(llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="ok")), memory_llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="ok")), embedding_client=RankedEmbedder(), inject_source_evidence=True, max_episode_source_excerpts_total=1)
+    episode = Episode("E2", "ctx", "s2", 0, None, None, ["User"], "primary_user", "", "summary", [TurnEvidence("5", "User", "user", "cited detail"), TurnEvidence("6", "User", "user", "additional detail")])
+    claim = Claim("C", "User", "primary_user", "employer", "Acme", evidence=[EvidenceRef("E2", "s2", ["5"])])
+    agent._store().add_episode(episode, [1.0, 0.0])
+    agent._store().add_claim(claim, [1.0, 0.0])
+    selected = [{"id": "C", "type": "state_claim", "selected_rank": 1}, {"id": "E2", "type": "episode", "selected_rank": 2}]
+    monkeypatch.setattr(module.EventStateRetriever, "retrieve", lambda self, question, query_vector: (selected, {}))
+
+    prepared = agent.prepare_batch_query("Which employer?")
+    context = prepared["messages"][-1]["content"]
+    assert context.count("cited detail") == 1
+    assert "additional detail" in context
+    assert prepared["extra"]["episode_evidence_deduplicated_against_claim_count"] == 1
+
+
+@pytest.mark.parametrize("relation", ["equivalent", "refinement", "changed", "contradictory", "uncertain"])
+def test_update_schema_accepts_all_state_value_relations(relation):
+    operation = {"equivalent": "CORROBORATE", "refinement": "REFINE", "changed": "SUPERSEDE", "contradictory": "CONFLICT", "uncertain": "NEW"}[relation]
+    decision = validate_update_decision({"matched_claim_id": "C", "operation": operation, "same_state_dimension": True, "state_value_relation": relation, "same_episode_relation": "none", "confidence": 1})
+    assert decision["state_value_relation"] == relation
+
+
+def test_update_schema_requires_valid_state_value_relation():
+    decision = {"matched_claim_id": "C", "operation": "CORROBORATE", "same_state_dimension": True, "same_episode_relation": "none", "confidence": 1}
+    with pytest.raises(ValueError, match="state_value_relation"):
+        validate_update_decision(decision)
+    decision["state_value_relation"] = "paraphrase"
+    with pytest.raises(ValueError, match="state_value_relation"):
+        validate_update_decision(decision)
+
+
 def _temporal_compiler(decision):
     store = EventStateStore("ctx")
     old = Claim("OLD", "User", "primary_user", "city", "Boston", recorded_at="2026-01-10", valid_from="2026-01-10", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", ["0"])])
@@ -234,19 +307,19 @@ def _temporal_compiler(decision):
 
 
 def test_temporal_supersede_guard_uses_record_time_for_inconsistent_backdating():
-    store, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    store, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
     new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-01", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
     compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
     assert old.valid_to == "2026-02-01" and compiler.supersede_record_time_fallback_count == 1
 
 
 def test_temporal_supersede_allows_consistent_valid_time_and_explicit_correction():
-    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
     new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-31", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
     compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
     assert old.valid_to == "2026-01-31"
 
-    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
     old.valid_from, old.recorded_at = "2026-01-01", "2026-01-20"
     correction = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-10", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
     compiler.apply(correction, "s2", [1.0, 0.0], [1.0, 0.0])
@@ -254,7 +327,7 @@ def test_temporal_supersede_allows_consistent_valid_time_and_explicit_correction
 
 
 def test_temporal_supersede_ignores_unparseable_dates_without_crashing():
-    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
     old.valid_from = "not-a-date"
     new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="not-a-date", valid_from="2026-01-01", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
     compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
@@ -335,21 +408,27 @@ def test_repair_validation_is_quiet_and_partial_recovery_is_explicit():
     assert result.extra["invalid_claim_subset_repair_failures"] == 1
 
 
-def test_event_state_semantic_version_changes_build_hash_only():
+def test_event_state_semantic_version_and_query_evidence_budget_hash_ownership():
     class Config:
         method_name = "event_state"
         method_type = "agentic_memory"
         embedding = None
         memorize_model = None
 
-        def __init__(self, version):
+        def __init__(self, version, budget=2):
             self.build_config = {"event_state_semantic_version": version}
+            self.retrieval_config = {"max_episode_source_excerpts_total": budget}
 
         def snapshot_build_config(self):
             return self.build_config
 
+        def query_config(self):
+            return self.retrieval_config
+
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.5"), dataset) != compute_build_config_hash(Config("2.6"), dataset)
+    assert compute_build_config_hash(Config("2.7"), dataset) != compute_build_config_hash(Config("2.8"), dataset)
+    assert compute_build_config_hash(Config("2.8", 2), dataset) == compute_build_config_hash(Config("2.8", 3), dataset)
+    assert compute_query_config_hash(Config("2.8", 2), dataset) != compute_query_config_hash(Config("2.8", 3), dataset)
 
 
 def test_preparation_omits_slot_embeddings_for_non_state_claims():
@@ -396,7 +475,7 @@ def test_update_response_format_fallback_preserves_generation_settings():
                 raise TypeError("response_format is unsupported")
             return SimpleNamespace(content=json.dumps({
                 "matched_claim_id": "OLD",
-                "operation": "SUPERSEDE",
+                "operation": "SUPERSEDE", "state_value_relation": "changed",
                 "same_state_dimension": True,
                 "same_episode_relation": "none",
                 "confidence": 1.0,
@@ -422,7 +501,7 @@ def test_update_repair_response_format_fallback_preserves_generation_settings():
             if "response_format" in kwargs:
                 raise TypeError("response_format is unsupported")
             content = "not json" if len(calls) == 2 else json.dumps({
-                "matched_claim_id": "OLD", "operation": "SUPERSEDE",
+                "matched_claim_id": "OLD", "operation": "SUPERSEDE", "state_value_relation": "changed",
                 "same_state_dimension": True, "same_episode_relation": "none",
                 "confidence": 1.0, "rationale": "changed",
             })
@@ -578,7 +657,7 @@ def test_same_session_restatement_is_classified_from_source_turns():
     from methods.event_state.schemas import Episode, TurnEvidence
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["User"], "primary_user", "", "", [TurnEvidence(1, "User", "user", "mild retinal changes are present"), TurnEvidence(2, "User", "user", "the retinal changes were recalled")]), [1.0, 0.0])
     captured = []
-    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"restatement","confidence":1}'))))
+    compiler = StateCompiler(store, Embedder(), SimpleNamespace(chat=lambda messages, **kwargs: (captured.append(messages[-1]["content"]) or SimpleNamespace(content='{"operation":"DUPLICATE","state_value_relation":"equivalent","matched_claim_id":"OLD","same_state_dimension":true,"same_episode_relation":"restatement","confidence":1}'))))
     repeated = Claim("NEW", "User", "primary_user", "retinal_status", "recalled", evidence=[EvidenceRef("s1", "s1", [2])])
     assert compiler.apply(repeated, "s1", [1.0, 0.0]).operation == "DUPLICATE"
     assert "new_claim_source_turns" in captured[0]

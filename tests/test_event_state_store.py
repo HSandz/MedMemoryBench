@@ -80,7 +80,7 @@ def test_same_session_corroboration_is_downgraded_to_duplicate():
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["Alice"], "primary_user", "", "", [TurnEvidence("1", "Alice", "user", "I work remotely.") , TurnEvidence("2", "Alice", "user", "My job is fully remote.")]), [1.0, 0.0])
     old = Claim("OLD", "Alice", "alice", "work_style", "remote", evidence=[EvidenceRef("s1", "s1", ["1"])])
     store.add_claim(old, [1.0, 0.0])
-    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","same_state_dimension":true,"same_episode_relation":"restatement","confidence":1}'))
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"restatement","confidence":1}'))
     result = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1).apply(Claim("NEW", "Alice", "alice", "work_style", "fully remote", evidence=[EvidenceRef("s1", "s1", ["2"])]), "s1", [1.0, 0.0])
     assert result.operation == "DUPLICATE"
     assert old.status == "active" and len(old.evidence) == 2
@@ -99,7 +99,7 @@ def test_invalid_classifier_fallback_supplies_default_same_episode_relation():
 def test_malformed_classifier_output_gets_one_bounded_structured_repair():
     responses = iter([
         "unfinished reasoning without JSON",
-        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
     ])
 
     class RepairingLLM:
@@ -194,15 +194,15 @@ def test_same_session_transition_requires_explicit_relation_and_later_evidence()
     store.add_episode(Episode("s1", "p", "s1", 0, None, None, ["Alice"], "primary_user", "", "", [TurnEvidence("1", "Alice", "user", "I live in Boston."), TurnEvidence("2", "Alice", "user", "I moved to Tokyo.")]), [1.0, 0.0])
     old = Claim("OLD", "Alice", "alice", "lives_in", "Boston", evidence=[EvidenceRef("s1", "s1", ["1"])])
     store.add_claim(old, [1.0, 0.0])
-    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'))
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'))
     result = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1).apply(Claim("NEW", "Alice", "alice", "lives_in", "Tokyo", evidence=[EvidenceRef("s1", "s1", ["2"])]), "s1", [1.0, 0.0])
     assert result.operation == "NEW" and old.status == "active"
 
 
 def test_classifier_operations_preserve_history_and_conflicts():
     decisions = iter([
-        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9,"rationale":"explicit change"}',
-        '{"matched_claim_id":"OLD2","operation":"CONFLICT","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9,"rationale":"incompatible"}',
+        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9,"rationale":"explicit change"}',
+        '{"matched_claim_id":"OLD2","operation":"CONFLICT","state_value_relation":"contradictory","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9,"rationale":"incompatible"}',
     ])
     llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions)))
     store = EventStateStore("p")
@@ -236,8 +236,8 @@ def test_subject_scope_and_non_observation_claims_are_not_merged():
 
 def test_state_reversion_creates_new_version_instead_of_reactivating_history():
     decisions = iter([
-        '{"matched_claim_id":"C500","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
-        '{"matched_claim_id":"C850","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"C500","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"C850","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
     ])
     store = EventStateStore("p")
     compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
@@ -257,8 +257,8 @@ def test_state_reversion_creates_new_version_instead_of_reactivating_history():
 def test_supersede_only_closes_validity_when_valid_from_is_explicit():
     store = EventStateStore("p")
     decisions = iter([
-        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
-        '{"matched_claim_id":"OLD2","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"OLD2","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
     ])
     compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
     old = Claim("OLD", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s1", "s1", [1])])
@@ -274,8 +274,8 @@ def test_supersede_only_closes_validity_when_valid_from_is_explicit():
 def test_llm_classified_corroboration_and_duplicate_keep_graph_edges():
     store = EventStateStore("p")
     decisions = iter([
-        '{"matched_claim_id":"OLD","operation":"CORROBORATE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
-        '{"matched_claim_id":"OLD","operation":"DUPLICATE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"OLD","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
+        '{"matched_claim_id":"OLD","operation":"DUPLICATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}',
     ])
     compiler = StateCompiler(store, FakeEmbedder(), SimpleNamespace(chat=lambda messages: SimpleNamespace(content=next(decisions))), min_similarity=0.1)
     old = Claim("OLD", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s1", "s1", [1])])
@@ -293,7 +293,7 @@ def test_low_confidence_classifier_falls_back_to_new_with_reason():
     store = EventStateStore("p")
     old = Claim("OLD", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s1", "s1", [1])])
     store.add_claim(old, [1.0, 0.0])
-    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.3}'))
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.3}'))
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1, min_confidence=0.55)
     result = compiler.apply(Claim("NEW", "Alice", "alice", "dose", "850 mg", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
     assert result.operation == "NEW"
@@ -305,7 +305,7 @@ def test_classifier_cannot_reactivate_historical_claim_via_duplicate():
     store = EventStateStore("p")
     old = Claim("OLD", "Alice", "alice", "dose", "500 mg", status="superseded", evidence=[EvidenceRef("s1", "s1", [1])])
     store.add_claim(old, [1.0, 0.0])
-    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}'))
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"OLD","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}'))
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
     result = compiler.apply(Claim("NEW", "Alice", "alice", "dose", "500 mg", evidence=[EvidenceRef("s2", "s2", [2])]), "s2", [1.0, 0.0])
     assert result.operation == "NEW"
@@ -318,7 +318,7 @@ def test_historical_supersede_target_falls_back_to_new_without_mutating_history(
     tokyo = Claim("TOKYO", "Alice", "alice", "city", "Tokyo", evidence=[EvidenceRef("s2", "s2", [2])])
     store.add_claim(old_boston, [1.0, 0.0])
     store.add_claim(tokyo, [0.0, 1.0])
-    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"BOSTON_OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}'))
+    llm = SimpleNamespace(chat=lambda messages: SimpleNamespace(content='{"matched_claim_id":"BOSTON_OLD","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}'))
     compiler = StateCompiler(store, FakeEmbedder(), llm, candidate_top_k=2, current_candidate_top_k=1, min_similarity=0.9)
 
     result = compiler.apply(Claim("BOSTON_NEW", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s3", "s3", [3])]), "s3", [1.0, 0.0])
@@ -376,7 +376,7 @@ def test_current_state_candidate_is_rejected_below_slot_similarity_threshold():
     class LLM:
         def chat(self, messages, **kwargs):
             captured.append(messages[-1]["content"])
-            return SimpleNamespace(content='{"matched_claim_id":"TOKYO","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}')
+            return SimpleNamespace(content='{"matched_claim_id":"TOKYO","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":0.9}')
     store = EventStateStore("p")
     store.add_claim(Claim("BOSTON", "Alice", "alice", "city", "Boston", status="superseded", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0], [1.0, 0.0])
     store.add_claim(Claim("TOKYO", "Alice", "alice", "city", "Tokyo", status="active", evidence=[EvidenceRef("s2", "s2", [2])]), [0.0, 1.0], [0.0, 1.0])
@@ -398,7 +398,7 @@ def test_related_employer_and_job_role_cannot_form_destructive_chain():
     employer, emb, slot_emb = _slot_claim("EMP", "employer", "Acme", "s1")
     store.add_claim(employer, emb, slot_emb)
     llm = SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(
-        content='{"matched_claim_id":"EMP","operation":"SUPERSEDE","same_state_dimension":false,"same_episode_relation":"none","confidence":1}'
+        content='{"matched_claim_id":"EMP","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":false,"same_episode_relation":"none","confidence":1}'
     ))
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
     role, emb, slot_emb = _slot_claim("ROLE", "job_role", "backend engineer", "s2", slot_vector=(1.0, 0.0))
@@ -414,7 +414,7 @@ def test_similar_state_slots_allow_predicate_drift_transition():
     old = Claim("BOS", "Alice", "alice", "lives_in", "Boston", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", [1])])
     store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
     llm = SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(
-        content='{"matched_claim_id":"BOS","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'
+        content='{"matched_claim_id":"BOS","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'
     ))
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.9)
     new = Claim("TOK", "Alice", "alice", "current_city", "Tokyo", state_slot="current_residence", evidence=[EvidenceRef("s2", "s2", [1])])
@@ -437,10 +437,61 @@ def test_exact_slot_value_repeat_corrobates_without_classifier():
     assert {ref.source_session_id for ref in old.evidence} == {"s1", "s2"}
 
 
+def test_cross_session_equivalent_paraphrase_corroborates_and_accumulates_provenance():
+    store = EventStateStore("p")
+    old = Claim("BOS", "Alice", "alice", "lives_in", "Boston", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content='{"matched_claim_id":"BOS","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
+    result = compiler.apply(Claim("BOS2", "Alice", "alice", "current_residence", "still living in Boston", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["2"])]), "s2", [1.0, 0.0], [1.0, 0.0])
+
+    assert result.operation == "CORROBORATE"
+    assert len(store.claims) == 1
+    assert {ref.source_session_id for ref in old.evidence} == {"s1", "s2"}
+    assert compiler.state_value_relation_equivalent_count == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "relation", "expected", "old_status"),
+    [
+        ("REFINE", "refinement", "REFINE", "refined"),
+        ("SUPERSEDE", "changed", "SUPERSEDE", "superseded"),
+        ("CONFLICT", "contradictory", "CONFLICT", "contested"),
+        ("NEW", "uncertain", "NEW", "active"),
+    ],
+)
+def test_state_value_relation_controls_non_exact_lifecycle(operation, relation, expected, old_status):
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "preference", "email", state_slot="contact_preference", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content=f'{{"matched_claim_id":"OLD","operation":"{operation}","state_value_relation":"{relation}","same_state_dimension":true,"same_episode_relation":"none","confidence":1}}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "contact", "work email rather than personal email", state_slot="contact_preference", evidence=[EvidenceRef("s2", "s2", ["2"])]), "s2", [1.0, 0.0], [1.0, 0.0])
+
+    assert result.operation == expected
+    assert old.status == old_status
+    assert getattr(compiler, f"state_value_relation_{relation}_count") == 1
+
+
+@pytest.mark.parametrize(("operation", "relation"), [("SUPERSEDE", "equivalent"), ("CORROBORATE", "changed")])
+def test_inconsistent_state_value_relation_falls_back_to_new_without_mutation(operation, relation):
+    store = EventStateStore("p")
+    old = Claim("OLD", "Alice", "alice", "employer", "Acme", state_slot="employer", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content=f'{{"matched_claim_id":"OLD","operation":"{operation}","state_value_relation":"{relation}","same_state_dimension":true,"same_episode_relation":"none","confidence":1}}'))
+    compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
+    result = compiler.apply(Claim("NEW", "Alice", "alice", "employer", "still employed by Acme", state_slot="employer", evidence=[EvidenceRef("s2", "s2", ["2"])]), "s2", [1.0, 0.0], [1.0, 0.0])
+
+    assert result.operation == "NEW"
+    assert result.fallback_reason == "state_value_relation_guard"
+    assert old.status == "active" and len(old.evidence) == 1
+    assert compiler.state_value_relation_guard_count == 1
+
+
 def test_unrelated_state_slots_skip_classifier_until_same_slot_is_seen():
     calls = []
     llm = SimpleNamespace(chat=lambda *args, **kwargs: calls.append(args) or SimpleNamespace(
-        content='{"matched_claim_id":"S0","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'
+        content='{"matched_claim_id":"S0","operation":"SUPERSEDE","state_value_relation":"changed","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'
     ))
     store = EventStateStore("p")
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.9)

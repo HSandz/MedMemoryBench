@@ -17,7 +17,7 @@ class FakeLLM:
         system = messages[0]["content"]
         if "Extract conversational memory" in system:
             return SimpleNamespace(content='{"episode_summary":"Alice discussed treatment", "claims":[{"subject":"Alice","predicate":"dose","value":"500 mg","source_turn_ids":["t1"]}]}')
-        return SimpleNamespace(content='{"operation":"NEW","matched_claim_id":null,"confidence":1.0,"rationale":"new"}')
+        return SimpleNamespace(content='{"operation":"NEW","state_value_relation":"uncertain","matched_claim_id":null,"confidence":1.0,"rationale":"new"}')
 
 
 def test_normalization_groups_locomo_sessions_and_preserves_turn_provenance():
@@ -51,12 +51,43 @@ def test_agent_routes_low_confidence_classifier_fallback_separately_from_extract
         def chat(self, messages, **kwargs):
             if "Extract conversational memory" in messages[0]["content"]:
                 return SimpleNamespace(content=next(outputs))
-            return SimpleNamespace(content='{"matched_claim_id":"missing","operation":"SUPERSEDE","confidence":0.3}')
+            return SimpleNamespace(content='{"matched_claim_id":"missing","operation":"SUPERSEDE","state_value_relation":"changed","confidence":0.3}')
     agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=FakeEmbedder(), state_candidate_min_similarity=0.1)
     agent.memorize("one", source_session_id=1)
     result = agent.memorize("two", source_session_id=2)
     assert result.extra["low_confidence_new_count"] == 1
     assert result.extra["low_extraction_confidence_count"] == 0
+
+
+def test_agent_reports_cross_session_equivalent_corroboration():
+    extractions = iter([
+        '{"episode_summary":"residence","claims":[{"subject":"User","subject_id":"primary_user","predicate":"lives_in","state_slot":"residence_location","value":"Boston","source_turn_ids":["0"]}]}',
+        '{"episode_summary":"residence","claims":[{"subject":"User","subject_id":"primary_user","predicate":"current_residence","state_slot":"residence_location","value":"still living in Boston","source_turn_ids":["0"]}]}',
+    ])
+
+    class LLM:
+        def chat(self, messages, **kwargs):
+            if "Extract conversational memory" in messages[0]["content"]:
+                return SimpleNamespace(content=next(extractions))
+            return SimpleNamespace(content='{"matched_claim_id":"C8aa3ca6a3e18e442","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":1}')
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=FakeEmbedder(), state_candidate_min_similarity=0.1)
+    first = agent.memorize("Boston", source_session_id=1)
+    claim_id = next(iter(agent._store().claims))
+    class SecondSessionLLM:
+        def chat(self, messages, **kwargs):
+            if "Extract conversational memory" in messages[0]["content"]:
+                return SimpleNamespace(content=next(extractions))
+            return SimpleNamespace(content=f'{{"matched_claim_id":"{claim_id}","operation":"CORROBORATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":1}}')
+
+    agent._memory_llm_client = SecondSessionLLM()
+    second = agent.memorize("Boston again", source_session_id=2)
+
+    assert first.extra["new_count"] == 1
+    assert second.extra["cross_session_corroborate_count"] == 1
+    assert second.extra["claims_with_multiple_provenance_references"] == 1
+    assert second.extra["claims_with_evidence_from_multiple_sessions"] == 1
 
 
 def test_extraction_rejects_absence_placeholders_but_keeps_explicit_negatives():
@@ -69,7 +100,7 @@ def test_extraction_rejects_absence_placeholders_but_keeps_explicit_negatives():
                     '{"subject":"Alice","predicate":"owns_car","state_slot":"car_ownership","value":"no","polarity":"negative","persistence":"state","source_turn_ids":["0"]},'
                     '{"subject":"Alice","predicate":"notification_preference","state_slot":"notification_preference","value":"none","persistence":"state","source_turn_ids":["0"]}'
                     ']}'))
-            return SimpleNamespace(content='{"operation":"NEW","confidence":1}')
+            return SimpleNamespace(content='{"operation":"NEW","state_value_relation":"uncertain","confidence":1}')
 
     agent = EventStateAgent(llm_client=ExtractionLLM(), memory_llm_client=ExtractionLLM(), embedding_client=FakeEmbedder())
     agent.set_context_id("ctx")
