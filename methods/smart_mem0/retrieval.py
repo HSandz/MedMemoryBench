@@ -160,9 +160,18 @@ class RetrievalOperationsMixin:
                 memory["id"]
                 for memory in self._memories
                 if self._memory_satisfies_frame(memory, frame)
+                and self._query_visible_memory(
+                    memory, include_history=bool(frame.dates)
+                )
             ]
             if not candidate_ids:
                 return []
+        else:
+            candidate_ids = [
+                memory["id"]
+                for memory in self._memories
+                if self._query_visible_memory(memory)
+            ]
         candidates = self._hybrid_search(
             question, top_k=top_k, candidate_ids=candidate_ids
         )
@@ -186,12 +195,14 @@ class RetrievalOperationsMixin:
         strategy = str(strategy or "FOCAL").upper()
         if strategy not in VALID_SEARCH_STRATEGIES:
             strategy = "FOCAL"
+        include_history = strategy in {"TRAJECTORY"}
         eligible_ids = {
             memory["id"]
             for memory in self._memories
             if self._memory_satisfies_frame(
                 memory, frame, include_entities=bool(frame.hard_entities)
             )
+            and self._query_visible_memory(memory, include_history=include_history)
         }
         if not eligible_ids:
             return []
@@ -388,6 +399,7 @@ class RetrievalOperationsMixin:
                 memory["id"]
                 for memory in self._memories
                 if self._memory_satisfies_frame(memory, frame)
+                and self._query_visible_memory(memory, include_history=True)
             ]
             if (frame.dates or frame.speaker_role or frame.hard_entities)
             else None

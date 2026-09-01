@@ -189,19 +189,31 @@ class QueryMixin:
         return selected
 
     def _dereference_evidence(
-        self, memory_ids: Iterable[str], limit: int = 3
+        self,
+        memory_ids: Iterable[str],
+        limit: int = 3,
+        per_memory_limit: int = 2,
     ) -> List[Dict[str, Any]]:
-        requested, pointers = set(memory_ids), []
-        for memory in self._memories:
-            if memory["id"] in requested:
-                pointers.extend(memory["evidence_ids"])
+        ordered_ids: List[str] = []
+        for memory_id in memory_ids:
+            if memory_id not in ordered_ids:
+                ordered_ids.append(memory_id)
+        by_memory = {memory["id"]: memory for memory in self._memories}
         by_id, output, seen = {e["id"]: e for e in self._evidence}, [], set()
-        for evidence_id in pointers:
-            if evidence_id in by_id and evidence_id not in seen:
-                output.append(self._snapshot(by_id[evidence_id]))
-                seen.add(evidence_id)
-                if len(output) >= limit:
-                    break
+        per_memory_limit = max(1, int(per_memory_limit))
+        for memory_id in ordered_ids:
+            memory = by_memory.get(memory_id)
+            if not memory:
+                continue
+            # Keep evidence balanced across claims instead of letting one
+            # verbose memory consume the entire global evidence budget.
+            evidence_ids = list(dict.fromkeys(memory.get("evidence_ids") or []))
+            for evidence_id in evidence_ids[:per_memory_limit]:
+                if evidence_id in by_id and evidence_id not in seen:
+                    output.append(self._snapshot(by_id[evidence_id]))
+                    seen.add(evidence_id)
+                    if len(output) >= limit:
+                        return output
         return output
 
     def _format_memory(self, memory: Dict[str, Any]) -> str:
@@ -575,8 +587,37 @@ class QueryMixin:
             linked_evidence_refs = [
                 memory["id"] for memory in beliefs[: self.MAX_EVIDENCE]
             ]
+        # Preserve the planner's evidence pointers first, then reserve a
+        # small, typed quota for every required slot. This avoids a single
+        # topical memory crowding out the claim needed by another slot.
+        evidence_memory_ids: List[str] = []
+
+        def add_evidence_memory(memory_id: str) -> None:
+            if memory_id in final_ids and memory_id not in evidence_memory_ids:
+                evidence_memory_ids.append(memory_id)
+
+        for memory_id in linked_evidence_refs:
+            add_evidence_memory(memory_id)
+        for slot in context_slots:
+            slot_budget = (
+                3
+                if slot.get("type")
+                in {"TEMPORAL", "TRANSITION", "CAUSE_PATH", "COMPARISON"}
+                else 2
+            )
+            for memory_id in slot_support.get(str(slot.get("id") or ""), [])[
+                :slot_budget
+            ]:
+                add_evidence_memory(memory_id)
+        for memory in beliefs:
+            add_evidence_memory(memory["id"])
+        evidence_limit = min(12, max(self.MAX_EVIDENCE, 2 * len(context_slots)))
         evidence = (
-            self._dereference_evidence(linked_evidence_refs, self.MAX_EVIDENCE)
+            self._dereference_evidence(
+                evidence_memory_ids,
+                evidence_limit,
+                per_memory_limit=2,
+            )
             if need_evidence
             else []
         )

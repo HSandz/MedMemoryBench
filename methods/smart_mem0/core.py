@@ -1066,3 +1066,21 @@ class CoreMemoryMixin:
             reverse=True,
         )
         return scored[:top_k]
+
+    def _query_visible_memory(
+        self, memory: Dict[str, Any], *, include_history: bool = False
+    ) -> bool:
+        """Apply the default read visibility policy before ranking.
+
+        Superseded versioned states are useful for explicit temporal/trajectory
+        operations, but they should not compete with current facts during the
+        cheap recall stage. Events and ordinary facts remain visible because
+        they are historical observations rather than state-head versions.
+        """
+        if include_history:
+            return True
+        status = memory.get("_status", self._belief_status.get(memory.get("id"), "active"))
+        return not (
+            status == "superseded"
+            and memory.get("kind") in STATE_LIKE_KINDS
+        )
