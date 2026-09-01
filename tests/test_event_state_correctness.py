@@ -1,15 +1,16 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from methods.event_state.compiler import StateCompiler, parse_json
-from methods.event_state.context import render_claim
+from methods.event_state.context import expand_claim_evidence, render_claim, select_episode_evidence
 from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
 from methods.event_state_agent import EventStateAgent
-from methods.event_state.validation import resolve_model_turn_reference, resolve_model_turn_reference_with_form
+from methods.event_state.validation import claim_semantic_fingerprint, resolve_model_turn_reference, resolve_model_turn_reference_with_form
 from benchmarks.medmemorybench.checkpoint import compute_build_config_hash
 
 
@@ -120,14 +121,15 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    snapshot["semantic_version"] = "2.5"
-    try:
-        EventStateStore.from_export(snapshot)
-    except ValueError as exc:
-        assert "semantic version" in str(exc)
-    else:
-        raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.6"
+    for legacy_version in ("2.5", "2.6"):
+        snapshot["semantic_version"] = legacy_version
+        try:
+            EventStateStore.from_export(snapshot)
+        except ValueError as exc:
+            assert "semantic version" in str(exc)
+        else:
+            raise AssertionError("pre-fix snapshot was accepted")
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.7"
 
 
 @pytest.mark.parametrize(
@@ -153,6 +155,184 @@ def test_model_turn_reference_resolution_rejects_unknown_and_off_by_one():
     assert resolve_model_turn_reference("turn_99", {"0", "1"}) is None
     assert resolve_model_turn_reference("2", {"0", "1"}) is None
     assert resolve_model_turn_reference("turn_id=0", {"0", "id=0"}) is None
+
+
+def test_all_event_state_configs_use_store_semantic_version():
+    paths = list(Path("configs/method_config").glob("event_state*.yaml"))
+    paths += list(Path("configs/method_config/persona_1").glob("event_state*.yaml"))
+    assert paths
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert f'event_state_semantic_version: "{EventStateStore.SEMANTIC_VERSION}"' in text
+
+
+def test_extraction_prompt_allows_literal_wrapper_like_ids():
+    captured = []
+
+    class LLM:
+        def chat(self, messages, **kwargs):
+            captured.append(messages[-1]["content"])
+            return SimpleNamespace(content=json.dumps({"episode_summary": "fact", "claims": []}))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder())
+    agent.memorize("fact", source_session_id=1, memory_items=[{"role": "user", "content": "fact", "source_turn_id": "turn_0"}])
+    assert "copy one of these allowed IDs exactly as written" in captured[0]
+    assert '"turn_0" is valid because it is the actual source ID' in captured[0]
+
+
+class _PatchEmbedder:
+    def embed_query(self, text):
+        return [1.0, 0.0]
+
+    def embed_documents(self, texts):
+        return [[1.0, 0.0] if "Acme" in text else [0.0, 1.0] for text in texts]
+
+
+def _patch_episode():
+    turns = [
+        TurnEvidence("0", "User", "user", "I started a new job this week."),
+        TurnEvidence("1", "Assistant", "assistant", "That sounds exciting."),
+        TurnEvidence("2", "User", "user", "My employer is Acme Systems."),
+    ]
+    return Episode("E", "ctx", "s1", 0, None, "2026-01-01", ["User", "Assistant"], "primary_user", "", "User discusses starting a new job.", turns)
+
+
+def test_selected_episode_exposes_relevant_exact_turn_and_keeps_summary():
+    class DummyLLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content="ok")
+
+    agent = EventStateAgent(llm_client=DummyLLM(), memory_llm_client=DummyLLM(), embedding_client=_PatchEmbedder(), retrieve_claims=False, episode_top_k=1, candidate_count=1, evidence_count=1, inject_source_evidence=False)
+    agent.set_context_id("ctx")
+    episode = _patch_episode()
+    agent._store().add_episode(episode, [1.0, 0.0])
+    prepared = agent.prepare_batch_query("Which company does the user work for?")
+    context = prepared["messages"][-1]["content"]
+    assert episode.summary in context and "My employer is Acme Systems." in context
+    assert prepared["extra"]["selected_episode_evidence_excerpt_count"] == 2
+
+
+def test_episode_evidence_selection_is_top_two_and_source_ordered():
+    episode = _patch_episode()
+    selected = select_episode_evidence(episode, [1.0, 0.0], _PatchEmbedder(), 2)
+    assert [turn.turn_id for turn in selected] == ["0", "2"]
+
+
+def test_selected_episode_turn_is_not_repeated_by_claim_provenance():
+    episode = _patch_episode()
+    claim = Claim("C", "User", "primary_user", "employer", "Acme Systems", evidence=[EvidenceRef("E", "s1", ["2"])])
+    assert expand_claim_evidence(claim, {"E": episode}, {("E", "2")}, 2) == []
+
+
+def _temporal_compiler(decision):
+    store = EventStateStore("ctx")
+    old = Claim("OLD", "User", "primary_user", "city", "Boston", recorded_at="2026-01-10", valid_from="2026-01-10", state_slot="residence_location", evidence=[EvidenceRef("s1", "s1", ["0"])])
+    store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(content=decision))
+    return store, old, StateCompiler(store, _PatchEmbedder(), llm, min_similarity=0.1)
+
+
+def test_temporal_supersede_guard_uses_record_time_for_inconsistent_backdating():
+    store, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-01", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
+    compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
+    assert old.valid_to == "2026-02-01" and compiler.supersede_record_time_fallback_count == 1
+
+
+def test_temporal_supersede_allows_consistent_valid_time_and_explicit_correction():
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-31", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
+    compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
+    assert old.valid_to == "2026-01-31"
+
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"correction","confidence":1}')
+    old.valid_from, old.recorded_at = "2026-01-01", "2026-01-20"
+    correction = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="2026-02-01", valid_from="2026-01-10", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
+    compiler.apply(correction, "s2", [1.0, 0.0], [1.0, 0.0])
+    assert old.valid_to == "2026-01-10" and compiler.retroactive_correction_applied_count == 1
+
+
+def test_temporal_supersede_ignores_unparseable_dates_without_crashing():
+    _, old, compiler = _temporal_compiler('{"matched_claim_id":"OLD","operation":"SUPERSEDE","same_state_dimension":true,"same_episode_relation":"state_change","confidence":1}')
+    old.valid_from = "not-a-date"
+    new = Claim("NEW", "User", "primary_user", "city", "Tokyo", recorded_at="not-a-date", valid_from="2026-01-01", state_slot="residence_location", evidence=[EvidenceRef("s2", "s2", ["0"])])
+    compiler.apply(new, "s2", [1.0, 0.0], [1.0, 0.0])
+    assert old.valid_to is None
+
+
+def test_claim_semantic_fingerprint_is_known_field_and_order_stable():
+    left = {"subject": " User ", "subject_id": "primary_user", "predicate": "city", "value": "Boston", "qualifiers": {"b": " 2 ", "a": "1"}, "polarity": "positive", "persistence": "state", "confidence": 0.1, "random": "ignored"}
+    right = {"random": "different", "confidence": 0.9, "qualifiers": {"a": "1", "b": " 2 "}, "value": "Boston", "predicate": "city", "subject_id": "primary_user", "subject": "User", "polarity": "positive", "persistence": "state"}
+    assert claim_semantic_fingerprint(left) == claim_semantic_fingerprint(right)
+
+
+@pytest.mark.parametrize("field, replacement", [
+    ("polarity", "negative"),
+    ("persistence", "history"),
+    ("qualifiers", {"frequency": "weekly"}),
+    ("state_slot", "travel_destination"),
+    ("valid_from", "2025-01-01"),
+])
+def test_grounding_repair_rejects_semantic_changes(field, replacement):
+    original = {"subject": "User", "subject_id": "primary_user", "predicate": "lives_in", "value": "Boston", "qualifiers": {"frequency": "daily"}, "polarity": "positive", "modality": "observed", "persistence": "state", "state_slot": "residence_location", "valid_from": "2026-01-01", "source_turn_ids": ["turn_99"]}
+    repaired = {**original, field: replacement, "source_turn_ids": ["0"]}
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(content=json.dumps({"episode_summary": "fact", "claims": [original] if self.calls == 1 else [repaired]}))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("fact", source_session_id=1, memory_items=[{"role": "user", "content": "I live in Boston.", "source_turn_id": "0"}, {"role": "user", "content": "later"}])
+    assert not agent._store().claims
+    assert result.extra["grounding_repair_semantic_change_rejected_count"] == 1
+
+
+def test_grounding_repair_accepts_provenance_only_change():
+    claim = {"subject": "User", "subject_id": "primary_user", "predicate": "lives_in", "value": "Boston", "qualifiers": {}, "polarity": "positive", "modality": "observed", "persistence": "state", "state_slot": "residence_location", "source_turn_ids": ["turn_99"]}
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            fixed = {**claim, "source_turn_ids": ["0"]}
+            return SimpleNamespace(content=json.dumps({"episode_summary": "fact", "claims": [claim if self.calls == 1 else fixed]}))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("fact", source_session_id=1, memory_items=[{"role": "user", "content": "I live in Boston.", "source_turn_id": "0"}, {"role": "user", "content": "later"}])
+    assert len(agent._store().claims) == 1
+    assert result.extra["grounding_repair_semantic_change_rejected_count"] == 0
+
+
+def test_repair_validation_is_quiet_and_partial_recovery_is_explicit():
+    valid = {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"]}
+    invalid = {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["turn_99"]}
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content=json.dumps({"episode_summary": "facts", "claims": [valid, invalid]}))
+            return SimpleNamespace(content=json.dumps({"claims": [{"bad": 1}, "malformed", {"value": 4}]}))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("facts", source_session_id=1, memory_items=[{"role": "user", "content": "facts"}, {"role": "user", "content": "more"}])
+    assert len(agent._store().claims) == 1
+    assert result.extra["extract_claim_validation_failures"] == 0
+    assert result.extra["invalid_claim_subset_repair_successes"] == 0
+    assert result.extra["invalid_claim_subset_repair_failures"] == 1
 
 
 def test_event_state_semantic_version_changes_build_hash_only():
@@ -347,7 +527,7 @@ def test_invalid_claim_subset_repair_merges_only_newly_valid_claims():
                     {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["turn_99"]},
                 ]}))
             return SimpleNamespace(content=json.dumps({"claims": [
-                {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"]},
+                {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"], "random_debug": True},
                 {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["1"]},
             ]}))
 

@@ -223,3 +223,24 @@ def test_medmemorybench_staged_unit_wall_time_includes_preparation_and_commit():
     evaluator._evaluate_unit_with_checkpoint(unit)
     metrics = evaluator._memory_build_logs[0]["build_metrics"]
     assert metrics["wall_time_seconds"] >= 0.04
+
+
+def test_event_state_preparation_reports_completed_sessions_and_preserves_order():
+    agent = EventStateAgent.__new__(EventStateAgent)
+    agent.event_state_workers = 2
+    agent._context_id = "ctx"
+    sessions = [{"source_session_id": index} for index in range(3)]
+    agent._normalize_source_sessions = lambda text, memory_items, kwargs: sessions
+    agent._prepare_session = lambda session, context_id: SimpleNamespace(
+        session=session
+    )
+    completed = []
+
+    prepared = agent.prepare_memory_sessions(
+        "",
+        context_id="ctx",
+        progress_callback=lambda: completed.append(1),
+    )
+
+    assert [item.session["source_session_id"] for item in prepared] == [0, 1, 2]
+    assert len(completed) == 3

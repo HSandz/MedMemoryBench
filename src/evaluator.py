@@ -510,16 +510,18 @@ class Evaluator:
             )
 
         start_time = datetime.now()
-        self._log("=" * 60)
-        self._log("Starting evaluation")
-        self._log(f"  Method: {self.method_config.method_name}")
-        self._log(f"  Provider: {self.method_config.model.provider}")
-        self._log(f"  Model: {self.method_config.model.name}")
-        self._log(f"  Dataset: {self.dataset_config.dataset_name}")
-        self._log(f"  Dry Run: {self.dry_run}")
-        self._log(f"  Resume: {self.resume}")
-        self._log(f"  Force Resume: {self.force_resume}")
-        self._log(f"  Execution Stage: {self.execution_stage}")
+        self._log("Evaluation started")
+        self._log(
+            f"Run | method={self.method_config.method_name} | "
+            f"provider={self.method_config.model.provider} | "
+            f"model={self.method_config.model.name} | "
+            f"dataset={self.dataset_config.dataset_name}"
+        )
+        self._log(
+            f"Options | stage={self.execution_stage} | dry_run={self.dry_run} | "
+            f"resume={self.resume} | force_resume={self.force_resume} | "
+            f"batch_api={self.batch_api} | workers={self.workers}"
+        )
         if self.memory_run:
             self._log(f"  Memory Run: {self.memory_run}")
         if self.memory_source_run_dir is not None:
@@ -547,8 +549,6 @@ class Evaluator:
                 "ignoring --batch-gcs-uri.",
                 level="WARNING",
             )
-        self._log(f"  Batch API: {self.batch_api}")
-        self._log("=" * 60)
 
         try:
             if self.batch_api and not self.dry_run:
@@ -595,11 +595,11 @@ class Evaluator:
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
-        self._log("=" * 60)
-        self._log(f"Evaluation completed in {duration:.2f}s")
-        self._log(f"  Total Queries: {report.summary.get('total', 0)}")
-        self._log(f"  Accuracy: {report.summary.get('overall_accuracy', 0):.2%}")
-        self._log("=" * 60)
+        self._log(
+            f"Evaluation complete | duration={duration:.2f}s | "
+            f"queries={report.summary.get('total', 0)} | "
+            f"accuracy={report.summary.get('overall_accuracy', 0):.2%}"
+        )
 
         self._write_run_config(
             status="complete",

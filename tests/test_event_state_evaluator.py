@@ -12,6 +12,13 @@ def _answer_visible_quality(records, session_id):
     return evaluator._session_retrieval_quality(query, records)["answer_visible"]
 
 
+def test_event_state_snapshot_messages_use_the_event_state_label():
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(method_name="event_state")
+
+    assert evaluator._memory_method_label() == "Event-State"
+
+
 def test_answer_visible_ignores_state_excluded_without_visible_provenance():
     quality = _answer_visible_quality([
         {

@@ -177,15 +177,24 @@ class MedMemoryBenchEvaluator:
             self._init_checkpoint_manager()
 
     def _log(self, message: str, level: str = "INFO") -> None:
-        if level.upper() in {"ERROR", "WARNING"}:
+        level = level.upper()
+        if level in {"ERROR", "WARNING"}:
             message = truncate_error_message(message)
         if self.verbose:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
+            rendered = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}"
+            if (
+                getattr(self, "_memory_progress", None) is not None
+                or getattr(self, "_query_progress", None) is not None
+            ):
+                tqdm.write(rendered, file=sys.stdout)
+            else:
+                print(rendered)
         if self.logger:
-            self.logger.info(message)
+            self.logger.log(getattr(logging, level, logging.INFO), message)
 
-    def _start_query_progress(self, units: List[EvaluationUnit]) -> None:
-        """Display one run-wide counter for terminal query processing."""
+    def _configure_query_progress(self, units: List[EvaluationUnit]) -> None:
+        """Count pending questions without rendering a bar before query work begins."""
+        self._query_progress_total = 0
         if getattr(self, "execution_stage", "all") == "memory":
             return
         total = 0
@@ -198,12 +207,21 @@ class MedMemoryBenchEvaluator:
                         query.query_id,
                         persona_id=unit.context_id,
                     )
-                ):
+                ) and not self._is_deferred_judge_query(query.query_id):
                     total += 1
         if not total:
             return
         self._query_progress_lock = threading.Lock()
         self._query_progress_completed = set()
+        self._query_progress_total = total
+
+    def _start_query_progress(self) -> None:
+        """Render the run-wide counter only when query work starts."""
+        if getattr(self, "_query_progress", None) is not None:
+            return
+        total = getattr(self, "_query_progress_total", 0)
+        if not total:
+            return
         self._query_progress = tqdm(
             total=total,
             desc="Query progress",
@@ -212,6 +230,33 @@ class MedMemoryBenchEvaluator:
             file=sys.stdout,
             disable=not getattr(self, "verbose", True),
         )
+
+    def _start_memory_progress(self, total: int) -> None:
+        """Render one per-unit counter while Event-State prepares sessions."""
+        if total <= 0 or getattr(self, "_memory_progress", None) is not None:
+            return
+        self._memory_progress_lock = threading.Lock()
+        self._memory_progress = tqdm(
+            total=total,
+            desc="Memory build",
+            unit="session",
+            dynamic_ncols=True,
+            file=sys.stdout,
+            disable=not getattr(self, "verbose", True),
+        )
+
+    def _advance_memory_progress(self) -> None:
+        progress = getattr(self, "_memory_progress", None)
+        if progress is None:
+            return
+        with self._memory_progress_lock:
+            progress.update(1)
+
+    def _finish_memory_progress(self) -> None:
+        progress = getattr(self, "_memory_progress", None)
+        if progress is not None:
+            progress.close()
+            self._memory_progress = None
 
     def _advance_query_progress(
         self,
@@ -717,10 +762,12 @@ class MedMemoryBenchEvaluator:
         self.dataset.load()
         self._evaluation_units = list(self.dataset.get_evaluation_units())
 
-        self._log(f"  Total Sessions: {self.dataset.get_total_sessions()}")
-        self._log(f"  Total Queries: {self.dataset.get_total_queries()}")
-        self._log(f"  Evaluation Mode: {self.dataset_config.evaluation_mode}")
-        self._log(f"  Evaluation Interval: {self.dataset_config.evaluation_interval}")
+        self._log(
+            f"Dataset ready | sessions={self.dataset.get_total_sessions()} | "
+            f"queries={self.dataset.get_total_queries()} | "
+            f"mode={self.dataset_config.evaluation_mode} | "
+            f"interval={self.dataset_config.evaluation_interval}"
+        )
 
     def _should_enable_checkpoint(self) -> bool:
         return self.dataset_config.evaluation_mode == "independent"
@@ -862,8 +909,9 @@ class MedMemoryBenchEvaluator:
             and (method_name.startswith("amem") or method_name == "event_state")
         ):
             raise ValueError(
-                "Cannot force-resume an A-MEM run after memory-build configuration "
-                "changes. Resume with the stored configuration or start a new run."
+                f"Cannot force-resume a {self._memory_method_label()} run after "
+                "memory-build configuration changes. Resume with the stored "
+                "configuration or start a new run."
             )
         if not config_matches and not force_requested:
             self._log("Config changed, checkpoint invalid, starting from scratch")
@@ -968,10 +1016,8 @@ class MedMemoryBenchEvaluator:
             # Clean up old agent's resources before creating new one
             if self.agent_manager is not None:
                 try:
-                    self._log(f"[DEBUG] Starting reset of old agent...")
                     # Reset releases resources (closes Qdrant client, etc.)
                     self.agent_manager.reset()
-                    self._log(f"[DEBUG] Reset completed")
 
                     # Explicitly delete old agent manager to release all references
                     old_manager = self.agent_manager
@@ -982,15 +1028,15 @@ class MedMemoryBenchEvaluator:
                     import gc
                     gc.collect()
 
-                    self._log(f"[DEBUG] Old agent deleted, sleeping 1s for resource cleanup...")
                     # Give time for resources to be fully released
                     import time
                     time.sleep(1.0)
-                    self._log(f"[DEBUG] Sleep done, creating new agent...")
                 except Exception as e:
-                    self._log(f"Warning: Failed to reset old agent: {truncate_error_message(e)}")
+                    self._log(
+                        f"Failed to reset previous agent: {truncate_error_message(e)}",
+                        level="WARNING",
+                    )
 
-            self._log(f"[DEBUG] Creating AgentManager for context {context_id}...")
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
@@ -1003,10 +1049,8 @@ class MedMemoryBenchEvaluator:
                 batch_progress_callback=self._log,
                 query_only=self.execution_stage == "query",
             )
-            self._log(f"[DEBUG] AgentManager created successfully")
 
         self.agent_manager.set_context_id(context_id)
-        self._log(f"[DEBUG] Context ID set to {context_id}")
 
     def _batch_config_hash(self) -> str:
         if getattr(self, "execution_stage", "all") == "query":
@@ -1056,8 +1100,15 @@ class MedMemoryBenchEvaluator:
 
     def _memory_snapshot_dir(self) -> Path:
         if self._memory_snapshot_run_dir is None:
-            raise RuntimeError("A-MEM memory snapshot run has not been selected")
+            raise RuntimeError(
+                f"{self._memory_method_label()} memory snapshot run has not been selected"
+            )
         return self._memory_snapshot_run_dir
+
+    def _memory_method_label(self) -> str:
+        """Return the user-facing name for the active snapshot-backed method."""
+        method_name = str(getattr(self.method_config, "method_name", "")).lower()
+        return "Event-State" if method_name == "event_state" else "A-MEM"
 
     def _memory_snapshot_path(self, unit: EvaluationUnit) -> Path:
         return self._memory_snapshot_dir() / (
@@ -1543,7 +1594,7 @@ class MedMemoryBenchEvaluator:
         selection = f" '{requested_run}'" if requested_run else ""
         status = "complete" if require_complete else "in-progress"
         raise FileNotFoundError(
-            f"No compatible {status} A-MEM memory run{selection} for experiment "
+            f"No compatible {status} {self._memory_method_label()} memory run{selection} for experiment "
             f"{self._run_scoped_experiment_dir() if getattr(self, 'run_scoped_output', False) else self._memory_snapshot_root()}"
         )
 
@@ -1648,7 +1699,7 @@ class MedMemoryBenchEvaluator:
         }
         self._write_memory_snapshot_manifest()
         self._copy_append_source_snapshots()
-        self._log(f"Created append A-MEM memory run: {run_dir}")
+        self._log(f"Created append {self._memory_method_label()} memory run: {run_dir}")
 
     def _start_memory_snapshot_manifest(self, *, resume_existing: bool = False) -> None:
         units = self._get_evaluation_units()
@@ -1671,23 +1722,23 @@ class MedMemoryBenchEvaluator:
             if getattr(self, "append", False):
                 if not self._memory_snapshot_manifest.get("append"):
                     raise ValueError(
-                        f"A-MEM resume target is not an append run: {run_dir}"
+                        f"{self._memory_method_label()} resume target is not an append run: {run_dir}"
                     )
                 if self._append_target_index is None:
                     self._prepare_append_plan()
                 if stored_unit_ids != expected_unit_ids[: self._append_target_index + 1]:
                     raise ValueError(
-                        f"A-MEM append run does not match current evaluation units: {run_dir}"
+                        f"{self._memory_method_label()} append run does not match current evaluation units: {run_dir}"
                     )
                 # Reconcile source snapshots after an interruption during the
                 # initial copy, before building any missing evaluation units.
                 self._copy_append_source_snapshots()
             elif stored_unit_ids != expected_unit_ids:
                 raise ValueError(
-                    f"A-MEM memory run does not match current evaluation units: {run_dir}"
+                    f"{self._memory_method_label()} memory run does not match current evaluation units: {run_dir}"
                 )
             run_label = run_dir.name if run_dir != self._memory_snapshot_root() else "legacy"
-            self._log(f"Resuming A-MEM memory run: {run_label}")
+            self._log(f"Resuming {self._memory_method_label()} memory run: {run_label}")
             return
 
         if getattr(self, "append", False):
@@ -1726,7 +1777,7 @@ class MedMemoryBenchEvaluator:
             "snapshots": [],
         }
         self._write_memory_snapshot_manifest()
-        self._log(f"Created A-MEM memory run: {run_dir}")
+        self._log(f"Created {self._memory_method_label()} memory run: {run_dir}")
 
     def _load_memory_snapshot_manifest(self) -> None:
         run_dir = self._select_memory_snapshot_run(require_complete=True)
@@ -1736,18 +1787,20 @@ class MedMemoryBenchEvaluator:
         if manifest.get("append"):
             if not set(stored_unit_ids).issubset(set(expected_unit_ids)):
                 raise ValueError(
-                    f"A-MEM append manifest contains unknown evaluation units: {run_dir}"
+                    f"{self._memory_method_label()} append manifest contains unknown evaluation units: {run_dir}"
                 )
         elif stored_unit_ids != expected_unit_ids:
             raise ValueError(
-                f"A-MEM memory manifest does not match current evaluation units: {run_dir}"
+                f"{self._memory_method_label()} memory manifest does not match current evaluation units: {run_dir}"
             )
         snapshot_unit_ids = sorted(item.get("unit_id") for item in manifest.get("snapshots", []))
         if snapshot_unit_ids != sorted(stored_unit_ids):
-            raise ValueError(f"A-MEM memory manifest snapshot list is incomplete: {run_dir}")
+            raise ValueError(
+                f"{self._memory_method_label()} memory manifest snapshot list is incomplete: {run_dir}"
+            )
         self._memory_unit_ids = set(stored_unit_ids)
         run_label = run_dir.name if run_dir != self._memory_snapshot_root() else "legacy"
-        self._log(f"Using A-MEM memory run: {run_label}")
+        self._log(f"Using {self._memory_method_label()} memory run: {run_label}")
 
     def _complete_memory_snapshot_manifest(self) -> None:
         if self._memory_snapshot_manifest is None:
@@ -1757,7 +1810,7 @@ class MedMemoryBenchEvaluator:
         expected = sorted(expected)
         if completed != expected:
             raise RuntimeError(
-                f"A-MEM snapshot build is incomplete: expected units {expected}, got {completed}"
+                f"{self._memory_method_label()} snapshot build is incomplete: expected units {expected}, got {completed}"
             )
         snapshot_logs = [
             {
@@ -1918,7 +1971,7 @@ class MedMemoryBenchEvaluator:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(
-                f"Cannot read A-MEM snapshot {path}: {truncate_error_message(exc)}"
+                f"Cannot read {self._memory_method_label()} snapshot {path}: {truncate_error_message(exc)}"
             ) from exc
         if (
             payload.get("format") != "medmemorybench.memory_snapshot"
@@ -1927,10 +1980,10 @@ class MedMemoryBenchEvaluator:
             or payload.get("unit_id") != unit.unit_id
             or payload.get("build_id") != manifest.get("build_id")
         ):
-            raise ValueError(f"A-MEM snapshot metadata does not match unit {unit.unit_id}: {path}")
+            raise ValueError(f"{self._memory_method_label()} snapshot metadata does not match unit {unit.unit_id}: {path}")
         expected_hash = self._snapshot_integrity_hash(payload)
         if payload.get("integrity_hash") != expected_hash:
-            raise ValueError(f"A-MEM snapshot integrity check failed: {path}")
+            raise ValueError(f"{self._memory_method_label()} snapshot integrity check failed: {path}")
         if require_current_config:
             manifest_path = path.parent / "manifest.json"
             if self.execution_stage == "query":
@@ -1950,7 +2003,7 @@ class MedMemoryBenchEvaluator:
                 mismatch_message = "build configuration"
             if not config_compatible:
                 raise ValueError(
-                    f"A-MEM snapshot {mismatch_message} does not match: {path}"
+                    f"{self._memory_method_label()} snapshot {mismatch_message} does not match: {path}"
                 )
         payload_build_hash = str(payload.get("build_config_hash") or "")
         if (
@@ -1960,7 +2013,7 @@ class MedMemoryBenchEvaluator:
             and payload_build_hash != self._batch_config_hash()
         ):
             raise ValueError(
-                f"A-MEM snapshot payload build configuration does not match: {path}"
+                f"{self._memory_method_label()} snapshot payload build configuration does not match: {path}"
             )
         payload_query_hash = str(payload.get("retrieval_compatibility_hash") or "")
         if (
@@ -1973,7 +2026,7 @@ class MedMemoryBenchEvaluator:
             )
         ):
             raise ValueError(
-                f"A-MEM snapshot payload query configuration does not match: {path}"
+                f"{self._memory_method_label()} snapshot payload query configuration does not match: {path}"
             )
         payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
         embedding_state = (
@@ -1984,19 +2037,25 @@ class MedMemoryBenchEvaluator:
         )
         if embedding_state is not None:
             if embedding_state.get("storage") != "npy":
-                raise ValueError(f"A-MEM embedding snapshot metadata is invalid: {path}")
+                raise ValueError(
+                    f"{self._memory_method_label()} embedding snapshot metadata is invalid: {path}"
+                )
             embedding_path = path.parent / embedding_state["path"]
             if (
                 not embedding_path.exists()
                 or self._file_sha256(embedding_path) != embedding_state.get("sha256")
             ):
-                raise ValueError(f"A-MEM embedding snapshot integrity check failed: {embedding_path}")
+                raise ValueError(
+                    f"{self._memory_method_label()} embedding snapshot integrity check failed: {embedding_path}"
+                )
             embedding_values = np.load(embedding_path, allow_pickle=False)
             if (
                 str(embedding_values.dtype) != embedding_state.get("dtype")
                 or list(embedding_values.shape) != embedding_state.get("shape")
             ):
-                raise ValueError(f"A-MEM embedding snapshot shape or dtype is invalid: {embedding_path}")
+                raise ValueError(
+                    f"{self._memory_method_label()} embedding snapshot shape or dtype is invalid: {embedding_path}"
+                )
             embedding_state["values"] = embedding_values
         return payload
 
@@ -2070,7 +2129,9 @@ class MedMemoryBenchEvaluator:
         if not path.exists():
             return None
         if self._memory_snapshot_manifest is None:
-            raise RuntimeError("A-MEM memory snapshot manifest has not been loaded")
+            raise RuntimeError(
+                f"{self._memory_method_label()} memory snapshot manifest has not been loaded"
+            )
         payload = self._read_snapshot_payload(
             path,
             self._memory_snapshot_manifest,
@@ -2083,7 +2144,9 @@ class MedMemoryBenchEvaluator:
         """Reload the just-written state before retrieval starts."""
         payload = self._read_memory_snapshot(unit)
         if payload is None:
-            raise RuntimeError(f"A-MEM snapshot is unavailable for unit {unit.unit_id}")
+            raise RuntimeError(
+                f"{self._memory_method_label()} snapshot is unavailable for unit {unit.unit_id}"
+            )
         self.agent_manager.import_memory_state(
             payload["memory_state"],
             context_id=unit.context_id,
@@ -2217,7 +2280,10 @@ class MedMemoryBenchEvaluator:
         self._deferred_judges = []
 
     def _is_deferred_judge_query(self, query_id: str) -> bool:
-        return any(item.get("query_id") == query_id for item in self._deferred_judges)
+        return any(
+            item.get("query_id") == query_id
+            for item in getattr(self, "_deferred_judges", [])
+        )
 
     def evaluate(self) -> EvaluationReport:
         start_time = datetime.now()
@@ -2292,10 +2358,11 @@ class MedMemoryBenchEvaluator:
         elif self.execution_stage == "query" and self._memory_unit_ids is not None:
             units = [unit for unit in units if unit.unit_id in self._memory_unit_ids]
 
-        self._start_query_progress(units)
+        self._configure_query_progress(units)
 
         if self.execution_stage == "query" and getattr(self, "workers", 1) > 1 and len(units) > 1:
             try:
+                self._start_query_progress()
                 self._run_query_stage_parallel(units)
             finally:
                 self._finish_query_progress()
@@ -2337,7 +2404,7 @@ class MedMemoryBenchEvaluator:
                 snapshot_payload = self._read_memory_snapshot(unit)
                 if snapshot_payload is None:
                     raise FileNotFoundError(
-                        f"No compatible A-MEM snapshot for evaluation unit {unit.unit_id}: "
+                        f"No compatible {self._memory_method_label()} snapshot for evaluation unit {unit.unit_id}: "
                         f"{self._memory_snapshot_path(unit)}"
                     )
                 if not self._supports_memory_snapshots():
@@ -2381,6 +2448,10 @@ class MedMemoryBenchEvaluator:
                     result.to_dict(),
                     persona_id=persona_id,
                 )
+
+        # Query-answer work is complete. Judge batches are a separate stage and
+        # should not leave a completed query bar mounted while they run.
+        self._finish_query_progress()
 
         for item in self._complete_deferred_judges():
             result = item["result"]
@@ -2427,7 +2498,7 @@ class MedMemoryBenchEvaluator:
             payload = self._read_memory_snapshot(unit)
             if payload is None:
                 raise FileNotFoundError(
-                    f"No compatible A-MEM snapshot for evaluation unit {unit.unit_id}: "
+                    f"No compatible {self._memory_method_label()} snapshot for evaluation unit {unit.unit_id}: "
                     f"{self._memory_snapshot_path(unit)}"
                 )
             self._record_source_build_metrics(unit, payload)
@@ -2631,6 +2702,8 @@ class MedMemoryBenchEvaluator:
                     persona_id=persona_id,
                 )
 
+        self._finish_query_progress()
+
         for item in self._complete_deferred_judges():
             result = item["result"]
             persona_id = item["persona_id"]
@@ -2677,14 +2750,14 @@ class MedMemoryBenchEvaluator:
 
     def _evaluate_unit_with_checkpoint(self, unit: EvaluationUnit) -> List[MetricResult]:
         """Evaluate unit with checkpoint support."""
-        self._log(f"\n  Evaluation Unit {unit.unit_id}:")
-        self._log(f"    Persona: {unit.context_id}")
-        self._log(f"    Sessions to inject: {len(unit.sessions_to_inject)}")
-        self._log(f"    Queries to evaluate: {len(unit.queries_to_evaluate)}")
+        self._log(
+            f"\nUnit {unit.unit_id} | persona={unit.context_id} | "
+            f"sessions={len(unit.sessions_to_inject)} | queries={len(unit.queries_to_evaluate)}"
+        )
 
         results = []
 
-        self._log(f"    --- Memory Build Start ---")
+        self._log(f"  Memory build started ({len(unit.sessions_to_inject)} sessions)")
 
         memory_build_failed = False
         total_memory_time = 0.0
@@ -2737,12 +2810,16 @@ class MedMemoryBenchEvaluator:
                 staged_start = time.perf_counter()
                 staged_usage_before = get_usage_tracker().get_stats()
                 try:
+                    # Each session has an independent preparation step and a
+                    # stateful ordered commit step.
+                    self._start_memory_progress(len(pending_sessions) * 2)
                     staged_text = "\n\n".join(session.to_memory_text() for session in pending_sessions)
                     prepared = self.agent_manager.prepare_memory_sessions(
                         message=staged_text,
                         context_id=unit.context_id,
                         memory_items=staged_items,
                         timestamp=None,
+                        progress_callback=self._advance_memory_progress,
                     )
                     total_memory_time += time.perf_counter() - staged_start
                     for prepared_session in prepared:
@@ -2764,6 +2841,7 @@ class MedMemoryBenchEvaluator:
                         total_memory_time += time.perf_counter() - session_start
                         if self._checkpoint_manager:
                             self._checkpoint_manager.mark_session_injected(session_id)
+                        self._advance_memory_progress()
                     if session_build_results:
                         session_build_results[0]["build_metrics"]["usage"] = diff_usage_stats(
                             get_usage_tracker().get_stats(), staged_usage_before
@@ -2786,6 +2864,8 @@ class MedMemoryBenchEvaluator:
                     if not isinstance(exc, LLMAPIError):
                         raise
                     sessions_to_process = []
+                finally:
+                    self._finish_memory_progress()
 
             for idx, session in enumerate(sessions_to_process):
                 session_ids.append(session.session_id)
@@ -2873,14 +2953,11 @@ class MedMemoryBenchEvaluator:
                                 session_index=idx,
                             )
 
-                        # Log brief progress info
                         passages_count = len(memory_result.all_passages) if memory_result.all_passages else memory_result.extra.get("inserted_count", 0)
-                        self._log(f"        → Stored {passages_count} passages, time={memory_result.time_cost:.2f}s")
-
-                        # Show extraction preview (first 100 chars)
-                        if memory_result.extraction_result:
-                            preview = memory_result.extraction_result[:150].replace('\n', ' ')
-                            self._log(f"        → Extraction: {preview}...")
+                        self._log(
+                            f"  Session {session.session_id} complete | "
+                            f"passages={passages_count} | time={memory_result.time_cost:.2f}s"
+                        )
 
                         session_build_record["build_result"] = memory_result.to_dict()
 
@@ -2972,7 +3049,10 @@ class MedMemoryBenchEvaluator:
                 ),
             })
 
-        self._log(f"    --- Memory Build Done, time={total_memory_time:.2f}s ---")
+        self._log(
+            f"  Memory build complete | passages={total_passages if not self.dry_run else 0} | "
+            f"time={total_memory_time:.2f}s"
+        )
 
         if memory_build_failed:
             self._log(
@@ -2996,7 +3076,7 @@ class MedMemoryBenchEvaluator:
             self._memory_build_logs[-1]["memory_snapshot"] = str(snapshot_path)
 
         if getattr(self, "execution_stage", "all") == "memory":
-            self._log("    --- Query Evaluation Skipped (memory stage only) ---")
+            self._log("  Query evaluation skipped (memory stage only)")
             return results
 
         return self._evaluate_unit_queries(unit, total_memory_time)
@@ -3010,7 +3090,7 @@ class MedMemoryBenchEvaluator:
         results: List[MetricResult] = []
 
         total_query_time = 0.0
-        self._log(f"    --- Query Evaluation Start ---")
+        self._log("  Query evaluation started")
 
         query_count = int(
             getattr(unit, "metadata", {}).get(
@@ -3033,8 +3113,10 @@ class MedMemoryBenchEvaluator:
             and not self._is_deferred_judge_query(query.query_id)
         )
         if not pending_query_count:
-            self._log(f"    --- Query Evaluation Done, time={total_query_time:.2f}s ---")
+            self._log("  Query evaluation complete | no pending questions")
             return results
+
+        self._start_query_progress()
 
         if pending_query_count and self._supports_batch_queries():
             batch_client = self._get_batch_client()
@@ -3055,8 +3137,12 @@ class MedMemoryBenchEvaluator:
             for result in query_results:
                 results.append(result)
                 total_query_time += result.query_time
-                status = "✓" if result.is_correct else "✗"
-                self._log(f"    [{status}] {result.query_id} ({result.query_type}): {result.score:.2f}")
+                if not result.is_correct:
+                    self._log(
+                        f"  Query failed | id={result.query_id} | "
+                        f"type={result.query_type} | score={result.score:.2f}",
+                        level="WARNING",
+                    )
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
                         result.query_id,
@@ -3099,8 +3185,12 @@ class MedMemoryBenchEvaluator:
                 results.append(result)
                 total_query_time += result.query_time
 
-                status = "✓" if result.is_correct else "✗"
-                self._log(f"    [{status}] {query.query_id} ({query.query_type}): {result.score:.2f}")
+                if not result.is_correct:
+                    self._log(
+                        f"  Query failed | id={query.query_id} | "
+                        f"type={query.query_type} | score={result.score:.2f}",
+                        level="WARNING",
+                    )
 
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
@@ -3109,7 +3199,7 @@ class MedMemoryBenchEvaluator:
                         persona_id=unit.context_id,
                     )
 
-        self._log(f"    --- Query Evaluation Done, time={total_query_time:.2f}s ---")
+        self._log(f"  Query evaluation complete | time={total_query_time:.2f}s")
 
         return results
 

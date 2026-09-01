@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -83,6 +84,39 @@ def safe_qualifiers(value: Any) -> Optional[Dict[str, Any]]:
     if isinstance(value, str) and value.strip():
         return {"text": value.strip()}
     return None
+
+
+def _normalized_semantic_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key).strip(): _normalized_semantic_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, list):
+        return [_normalized_semantic_value(item) for item in value]
+    return value.strip() if isinstance(value, str) else value
+
+
+def claim_semantic_fingerprint(raw: Dict[str, Any]) -> str:
+    """Return a stable identity for semantic claim fields, excluding provenance."""
+    persistence = enum(raw.get("persistence"), "persistence", "state")
+    payload = {
+        "subject": str(raw.get("subject") or "").strip(),
+        "subject_id": str(raw.get("subject_id") or "").strip(),
+        "predicate": str(raw.get("predicate") or "").strip(),
+        "value": str(raw.get("value") or "").strip(),
+        "qualifiers": _normalized_semantic_value(safe_qualifiers(raw.get("qualifiers")) or {}),
+        "polarity": enum(raw.get("polarity"), "polarity", "positive"),
+        "modality": enum(raw.get("modality"), "modality", "asserted"),
+        "persistence": persistence,
+        "state_slot": normalize_state_slot(raw.get("state_slot")) if persistence == "state" else None,
+        "valid_from": str(raw.get("valid_from")).strip() if isinstance(raw.get("valid_from"), str) else None,
+        "valid_to": str(raw.get("valid_to")).strip() if isinstance(raw.get("valid_to"), str) else None,
+        "valid_time_text": str(raw.get("valid_time_text")).strip() if isinstance(raw.get("valid_time_text"), str) else None,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+
+
+def claim_repair_identity(raw: Dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Identify a validated claim using semantic fields and canonical evidence IDs."""
+    return claim_semantic_fingerprint(raw), tuple(canonical_turn_id(item, "") for item in raw.get("source_turn_ids", []))
 
 
 def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: Set[Any]) -> Optional[Dict[str, Any]]:

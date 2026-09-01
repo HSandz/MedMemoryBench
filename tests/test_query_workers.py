@@ -80,6 +80,26 @@ def test_medmemorybench_query_progress_advances_for_serial_and_parallel_queries(
         assert progress.updates == [1, 1, 1]
 
 
+def test_medmemorybench_query_progress_is_created_only_at_query_start():
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator.verbose = False
+    evaluator._checkpoint_manager = None
+    units = [
+        SimpleNamespace(
+            context_id=1,
+            queries_to_evaluate=[SimpleNamespace(query_id="q1")],
+        )
+    ]
+
+    evaluator._configure_query_progress(units)
+    assert getattr(evaluator, "_query_progress", None) is None
+
+    evaluator._start_query_progress()
+    assert evaluator._query_progress is not None
+    evaluator._finish_query_progress()
+
+
 def test_locomo_workers_bound_real_time_query_concurrency_and_keep_order():
     evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
     evaluator.workers = 2

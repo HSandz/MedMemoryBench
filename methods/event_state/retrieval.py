@@ -28,8 +28,8 @@ class EventStateRetriever:
     def __init__(self, store: EventStateStore, embedder: Any, **config: Any) -> None:
         self.store, self.embedder, self.config = store, embedder, config
 
-    def retrieve(self, question: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        query_vector = self.embedder.embed_query(question)
+    def retrieve(self, question: str, query_vector: Sequence[float] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        query_vector = list(query_vector) if query_vector is not None else self.embedder.embed_query(question)
         claim_vectors, hidden_prior_state_count = self._visible_claim_vectors()
         claim_rank = dense_rank(query_vector, claim_vectors, self.config.get("claim_top_k", 30)) if self.config.get("retrieve_claims", True) else []
         episode_rank = dense_rank(query_vector, self.store.episode_embeddings, self.config.get("episode_top_k", 20)) if self.config.get("retrieve_episodes", True) else []

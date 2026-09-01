@@ -61,6 +61,7 @@ def setup_logger(
     """Configure and return logger."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
 
     # Clear existing handlers
     logger.handlers.clear()
@@ -97,7 +98,7 @@ def get_eval_logger(
     log_dir: Optional[Path] = None,
     log_filename: Optional[str] = None,
 ) -> logging.Logger:
-    """Get evaluation logger."""
+    """Get an evaluation logger that writes detailed records to its run file."""
     if log_dir is None:
         log_dir = PROJECT_ROOT / "logs"
 
@@ -107,7 +108,9 @@ def get_eval_logger(
     )
 
     logger_name = f"eval.{method_name}.{dataset_name}"
-    return setup_logger(logger_name, log_file=log_file)
+    # Evaluators render concise status directly in the terminal. A file-only
+    # handler prevents every evaluator message from being printed twice.
+    return setup_logger(logger_name, log_file=log_file, console=False)
 
 
 # Global logger

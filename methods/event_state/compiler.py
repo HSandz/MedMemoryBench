@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from datetime import date, datetime
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -89,6 +90,9 @@ class StateCompiler:
         self.state_candidate_semantic_slot_match_count = 0
         self.state_candidates_rejected_below_threshold = 0
         self.different_state_dimension_guard_count = 0
+        self.supersede_temporal_guard_count = 0
+        self.supersede_record_time_fallback_count = 0
+        self.retroactive_correction_applied_count = 0
         self.invalid_update_output_previews: List[str] = []
         # Singular alias retained for callers that expose one diagnostic field.
         self.invalid_update_output_preview = self.invalid_update_output_previews
@@ -273,6 +277,74 @@ class StateCompiler:
                     return turns
         return turns
 
+    @staticmethod
+    def _parse_date(value: Optional[str]) -> Optional[date]:
+        """Parse already-normalized ISO dates without guessing from prose."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        text = value.strip()
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+        except ValueError:
+            try:
+                return date.fromisoformat(text)
+            except ValueError:
+                return None
+
+    def _close_superseded_interval(self, old: Claim, claim: Claim, relation: str) -> None:
+        """Close a predecessor only at a safe ordinary or explicit correction boundary."""
+        guarded = False
+        old_start = self._parse_date(old.valid_from)
+        old_end = self._parse_date(old.valid_to)
+        if old_start is not None and old_end is not None and old_end < old_start:
+            old.valid_to = None
+            guarded = True
+        claim_start = self._parse_date(claim.valid_from)
+        claim_end = self._parse_date(claim.valid_to)
+        if claim_start is not None and claim_end is not None and claim_end < claim_start:
+            claim.valid_to = None
+        if not claim.valid_from:
+            if guarded:
+                self.supersede_temporal_guard_count += 1
+            return
+        transition = self._parse_date(claim.valid_from)
+        if transition is None:
+            guarded = True
+
+        old_recorded = self._parse_date(old.recorded_at)
+        if transition is not None and ((old.valid_from and old_start is None) or (old.recorded_at and old_recorded is None)):
+            guarded = True
+            transition = None
+        elif transition is not None and relation == "correction" and (old_start is None or transition >= old_start):
+            self.retroactive_correction_applied_count += 1
+        elif transition is not None and relation == "correction" and old_start is not None and transition < old_start:
+            guarded = True
+            transition = None
+        elif transition is not None:
+            floors = [item for item in (old_start, old_recorded) if item is not None]
+            if floors and transition < max(floors):
+                guarded = True
+                transition = None
+
+        if transition is None:
+            fallback = self._parse_date(claim.recorded_at)
+            if fallback is None:
+                if guarded:
+                    self.supersede_temporal_guard_count += 1
+                return
+            if old_start is not None and fallback < old_start:
+                guarded = True
+            else:
+                old.valid_to = claim.recorded_at
+                self.supersede_record_time_fallback_count += 1
+            if guarded:
+                self.supersede_temporal_guard_count += 1
+                return
+            return
+        if guarded:
+            self.supersede_temporal_guard_count += 1
+        old.valid_to = claim.valid_from
+
     def apply(self, claim: Claim, episode_id: str, embedding: Sequence[float], slot_embedding: Optional[Sequence[float]] = None) -> CompileResult:
         """Compile one observation and return the operation applied."""
         if claim.persistence == "history":
@@ -340,8 +412,7 @@ class StateCompiler:
             old = self.store.claims[matched_id]
             if operation == "SUPERSEDE":
                 old.status = "superseded"
-                if claim.valid_from:
-                    old.valid_to = claim.valid_from
+                self._close_superseded_interval(old, claim, decision.get("same_episode_relation", "none"))
                 self.store.add_relation_pair(claim.claim_id, old.claim_id, "SUPERSEDES")
             elif operation == "REFINE":
                 old.status = "refined"

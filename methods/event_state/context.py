@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from .embeddings import cosine
 from .schemas import Claim, Episode
 from .subjects import display_subject
 
@@ -64,27 +65,74 @@ def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str
     return "\n".join(lines)
 
 
-def render_episode(episode: Episode) -> str:
-    return "\n".join([
+def _turn_text(turn: Any, fallback_timestamp: str | None = None) -> str:
+    text = f"{turn.speaker} ({turn.timestamp or fallback_timestamp or 'unknown'}): {turn.text}"
+    if turn.image_caption:
+        text += f" [Shared image: {turn.image_caption}]"
+    return text
+
+
+def episode_turn_embedding_text(turn: Any) -> str:
+    """Build the small immutable representation used for query-time scoring."""
+    role = f" {turn.role}" if turn.role else ""
+    caption = f" {turn.image_caption}" if turn.image_caption else ""
+    return f"{turn.speaker}{role}: {turn.text}{caption}".strip()
+
+
+def select_episode_evidence(episode: Episode, query_vector: Sequence[float], embedder: Any, limit: int = 2) -> List[Any]:
+    """Select query-relevant turns, then restore their source conversation order."""
+    if limit <= 0 or not episode.turn_evidence:
+        return []
+    texts = [episode_turn_embedding_text(turn) for turn in episode.turn_evidence]
+    try:
+        vectors = embedder.embed_documents(texts)
+    except AttributeError:
+        vectors = [embedder.embed_query(text) for text in texts]
+    scored = sorted(
+        ((cosine(query_vector, vector), index) for index, vector in enumerate(vectors)),
+        key=lambda item: (-item[0], item[1]),
+    )[:limit]
+    return [episode.turn_evidence[index] for _, index in sorted(scored, key=lambda item: item[1])]
+
+
+def render_episode(episode: Episode, evidence_turns: Sequence[Any] = ()) -> str:
+    lines = [
         f"[Episode {episode.episode_id}]",
         f"Recorded: {episode.recorded_at or 'unknown'}",
         f"Participants: {', '.join(episode.participants) or 'unknown'}",
         f"Scope: {episode.conversation_scope or 'unknown'}",
         f"Summary: {episode.summary}",
-    ])
+    ]
+    if evidence_turns:
+        lines.extend(["", "Relevant source evidence:"])
+        lines.extend(f"  {_turn_text(turn, episode.recorded_at)}" for turn in evidence_turns)
+    return "\n".join(lines)
 
 
-def expand_claim_evidence(claim: Claim, episodes: Dict[str, Episode], already: set[str], limit: int) -> List[str]:
+def render_episode_evidence(episode: Episode, evidence_turns: Sequence[Any]) -> str:
+    """Render selected immutable turns as a separately budgetable source block."""
+    excerpt = "\n".join(f"  {_turn_text(turn, episode.recorded_at)}" for turn in evidence_turns)
+    return f"[Episode Evidence {episode.episode_id} / session {episode.source_session_id}]\n{excerpt}"
+
+
+def expand_claim_evidence(claim: Claim, episodes: Dict[str, Episode], already: set[Any], limit: int) -> List[str]:
     blocks = []
     for ref in claim.evidence[:max(0, limit)]:
         episode = episodes.get(ref.episode_id)
-        if not episode or episode.episode_id in already:
+        if not episode:
             continue
-        already.add(episode.episode_id)
         turns = [turn for turn in episode.turn_evidence if not ref.source_turn_ids or turn.turn_id in ref.source_turn_ids]
         if not turns:
             turns = episode.turn_evidence[:1]
-        excerpt = "\n".join(f"{turn.speaker} ({turn.timestamp or episode.recorded_at or 'unknown'}): {turn.text}{(' [Shared image: ' + turn.image_caption + ']') if turn.image_caption else ''}" for turn in turns[:3])
+        unseen = [
+            turn for turn in turns
+            if episode.episode_id not in already and (episode.episode_id, turn.turn_id) not in already
+        ]
+        if not unseen:
+            continue
+        excerpt_turns = unseen[:3]
+        already.update((episode.episode_id, turn.turn_id) for turn in excerpt_turns)
+        excerpt = "\n".join(f"  {_turn_text(turn, episode.recorded_at)}" for turn in excerpt_turns)
         blocks.append(f"[Supporting Evidence {episode.episode_id} / session {episode.source_session_id}]\n{excerpt}")
     return blocks
 
