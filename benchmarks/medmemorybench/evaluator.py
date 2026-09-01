@@ -176,11 +176,17 @@ class MedMemoryBenchEvaluator:
         if self._should_enable_checkpoint():
             self._init_checkpoint_manager()
 
-    def _log(self, message: str, level: str = "INFO") -> None:
+    def _log(
+        self,
+        message: str,
+        level: str = "INFO",
+        *,
+        terminal: bool = True,
+    ) -> None:
         level = level.upper()
         if level in {"ERROR", "WARNING"}:
             message = truncate_error_message(message)
-        if self.verbose:
+        if terminal and self.verbose:
             rendered = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}"
             if (
                 getattr(self, "_memory_progress", None) is not None
@@ -4224,11 +4230,17 @@ class MedMemoryBenchEvaluator:
         )
 
         if result_path is not None:
-            self._log(f"Results saved to: {result_path}")
+            self._log(f"Results saved to: {result_path}", terminal=False)
         if memory_build_path is not None:
-            self._log(f"Memory build details saved to: {memory_build_path}")
+            self._log(
+                f"Memory build details saved to: {memory_build_path}",
+                terminal=False,
+            )
         if query_answer_path is not None:
-            self._log(f"Query answer details saved to: {query_answer_path}")
+            self._log(
+                f"Query answer details saved to: {query_answer_path}",
+                terminal=False,
+            )
         if self.result_collector.last_api_failure_path is not None:
             self._log(
                 f"API failure details saved separately to: "
