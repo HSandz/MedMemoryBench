@@ -22,7 +22,7 @@ The combination identity comes from the effective build flags, not the YAML file
 | `memory/persona_*_unit_*.json` | `feature_configuration`, `memory_build_metrics`, and `memory_size` | Authoritative metrics and serialized footprint for one evaluation unit |
 | `memory_source.json` | `feature_configuration`, `build_metrics`, and `memory_size` copied from the selected manifest | Source-build report for query-only runs |
 
-`build_metrics` is the build-only view. For ordinary fresh runs, the memory-build report and completed manifest describe the same construction. For resumed or append workflows, use the completed manifest when reporting the full snapshot lifecycle because invocation reports intentionally do not recount restored work. The older `llm_usage` field remains useful for phase-level totals, but a full run can also include query and judge usage there.
+`build_metrics` is the build-only view. For ordinary fresh runs, the memory-build report and completed manifest describe the same construction. For resumed or append workflows, use the completed manifest when reporting the full snapshot lifecycle because invocation reports intentionally do not recount restored work. The `llm_usage` field reports `memorize_phase`, `query_phase`, and `judge_phase` separately; `total` is their sum.
 
 ## Feature Combination
 
@@ -99,6 +99,9 @@ Common metric fields:
 | `thinking_tokens` | Provider-reported hidden thinking/reasoning tokens; `0` when the provider does not expose a separate count |
 | `total_tokens` | Input plus output tokens |
 | `successful_calls` / `call_count` | Successful LLM calls |
+| `memorize_phase` | LLM calls used to construct memory |
+| `query_phase` | LLM calls used for retrieval preparation and final answers |
+| `judge_phase` | LLM calls used to score answers with an LLM judge |
 | `attempted_calls` | All LLM attempts, including failed attempts before retries |
 | `failed_attempts` | Attempts that raised an error or returned an unusable response |
 | `retry_count` | Failures followed by another attempt |

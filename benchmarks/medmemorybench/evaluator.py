@@ -767,10 +767,16 @@ class MedMemoryBenchEvaluator:
         )
         self.dataset.load()
         self._evaluation_units = list(self.dataset.get_evaluation_units())
+        self._evaluation_total_sessions = sum(
+            len(unit.sessions_to_inject) for unit in self._evaluation_units
+        )
+        self._evaluation_total_queries = sum(
+            len(unit.queries_to_evaluate) for unit in self._evaluation_units
+        )
 
         self._log(
-            f"Dataset ready | sessions={self.dataset.get_total_sessions()} | "
-            f"queries={self.dataset.get_total_queries()} | "
+            f"Dataset ready | sessions={self._evaluation_total_sessions} | "
+            f"queries={self._evaluation_total_queries} | "
             f"mode={self.dataset_config.evaluation_mode} | "
             f"interval={self.dataset_config.evaluation_interval}"
         )
@@ -984,7 +990,11 @@ class MedMemoryBenchEvaluator:
             return
 
         total_personas = len(self.dataset.get_persona_ids())
-        total_queries = self.dataset.get_total_queries()
+        total_queries = getattr(
+            self,
+            "_evaluation_total_queries",
+            self.dataset.get_total_queries(),
+        )
 
         self._checkpoint_manager.create(
             total_personas=total_personas,
@@ -1311,18 +1321,28 @@ class MedMemoryBenchEvaluator:
 
     def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
         """Publish stage attribution, batch lifecycle, and explicit cost status."""
-        query_operations = (llm_usage.get("operations") or {}).get("query", {})
+        operations = llm_usage.get("operations") or {}
+        query_operations = operations.get("query", {})
+        judge_operations = operations.get("judge", {})
         query_total = llm_usage.get("query_phase", {})
+        judge_total = llm_usage.get("judge_phase", {})
         answer_batch = query_operations.get("query.answer_batch", {})
         answer_realtime = query_operations.get("query.answer_realtime", {})
-        judge_batch = query_operations.get("query.judge_batch", {})
-        judge_realtime = query_operations.get("query.judge_realtime", {})
-        retrieval = query_operations.get("query.retrieval_preparation", {})
-        attributed = self._usage_total(
-            answer_batch, answer_realtime, judge_batch, judge_realtime, retrieval
+        # Read legacy operation names so older in-memory snapshots remain reportable.
+        judge_batch = judge_operations.get("judge.batch") or query_operations.get(
+            "query.judge_batch", {}
         )
-        unattributed = TokenUsage.from_dict(query_total).subtract(
-            TokenUsage.from_dict(attributed)
+        judge_realtime = judge_operations.get("judge.realtime") or query_operations.get(
+            "query.judge_realtime", {}
+        )
+        retrieval = query_operations.get("query.retrieval_preparation", {})
+        attributed_query = self._usage_total(answer_batch, answer_realtime, retrieval)
+        attributed_judge = self._usage_total(judge_batch, judge_realtime)
+        unattributed_query = TokenUsage.from_dict(query_total).subtract(
+            TokenUsage.from_dict(attributed_query)
+        ).to_dict()
+        unattributed_judge = TokenUsage.from_dict(judge_total).subtract(
+            TokenUsage.from_dict(attributed_judge)
         ).to_dict()
         api_config = get_api_config()
         answer_model = self._model_usage_identity(
@@ -1371,7 +1391,8 @@ class MedMemoryBenchEvaluator:
                 "models": [judge_model],
                 "cost": cost_unavailable,
             },
-            "unattributed_query_usage": unattributed,
+            "unattributed_query_usage": unattributed_query,
+            "unattributed_judge_usage": unattributed_judge,
             "batch_stages": batch_stages,
         }
 
@@ -3971,8 +3992,8 @@ class MedMemoryBenchEvaluator:
                 )
                 self._judge_batch_fallback_logged = True
             tracker = get_usage_tracker()
-            tracker.set_phase("query")
-            with tracker.scope("query.judge_realtime"):
+            tracker.set_phase("judge")
+            with tracker.scope("judge.realtime"):
                 result = self.metrics_calculator.compute(
                     query_id=query.query_id,
                     query_type=query.query_type,
@@ -4042,7 +4063,7 @@ class MedMemoryBenchEvaluator:
                     max_tokens=payload["max_tokens"],
                     reasoning_effort=payload.get("reasoning_effort"),
                     response_format={"type": "json_object"},
-                    phase="query",
+                    phase="judge",
                     metadata={"query_id": item["query_id"], "phase": "judge"},
                 )
             )
@@ -4053,8 +4074,8 @@ class MedMemoryBenchEvaluator:
         )
         judge_batch_client = self._get_judge_batch_client(judge_client)
         tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.judge_batch"):
+        tracker.set_phase("judge")
+        with tracker.scope("judge.batch"):
             responses = judge_batch_client.run_stage("judge-final", requests)
         finalized: List[Dict[str, Any]] = []
         for request_id, item in by_id.items():

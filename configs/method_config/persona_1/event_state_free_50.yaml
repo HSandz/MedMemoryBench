@@ -48,6 +48,8 @@ retrieval_config:
   rrf_k: 60.0
   claim_retrieval_weight: 1.0
   episode_retrieval_weight: 1.0
+  temporal_retrieval_enabled: true
+  temporal_retrieval_weight: 1.0
   ppr_enabled: false
   ppr_alpha: 0.85
   ppr_max_iterations: 20

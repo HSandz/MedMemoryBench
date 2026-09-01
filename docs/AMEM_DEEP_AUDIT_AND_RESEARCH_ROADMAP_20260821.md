@@ -313,7 +313,7 @@ Comparability:
 | G3 temporal policy | 0.547 ± 0.020 | 0.577 ± 0.012 | 23.00 | 751,320 | 781 s |
 | G4 provenance policy | 0.584 ± 0.028 | 0.604 ± 0.023 | 19.98 | 877,937 | 868 s |
 
-The run token totals include query rewriting, final answers, and judging. Each child has 137 successful calls, consistent with 49 keyword generations, 49 final answers, and 39 LLM judgments. The current usage schema groups all of them into `query_phase`; it does not preserve a separate judge phase in these artifacts. The elapsed time includes batch waiting, provider scheduling, retries, and fallbacks; it is not online retrieval or per-query serving latency.
+The run token totals include query rewriting, final answers, and judging. These historical child artifacts predate the separate `judge_phase` field, so their 137 successful calls remain grouped in `query_phase` (49 keyword generations, 49 final answers, and 39 LLM judgments). New result artifacts expose judge usage separately. The elapsed time includes batch waiting, provider scheduling, retries, and fallbacks; it is not online retrieval or per-query serving latency.
 
 Descriptive efficiency trade-offs:
 

@@ -199,6 +199,7 @@ class LLMUsageTracker:
     def _init(self):
         self._memorize_usage = TokenUsage()
         self._query_usage = TokenUsage()
+        self._judge_usage = TokenUsage()
         self._operation_usage: Dict[str, Dict[str, TokenUsage]] = {}
         self._current_phase: ContextVar[str] = ContextVar(
             "llm_usage_phase", default="unknown"
@@ -215,11 +216,12 @@ class LLMUsageTracker:
         self._current_phase.set(str(phase or "unknown"))
 
     def _phase_bucket(self) -> TokenUsage:
-        return (
-            self._memorize_usage
-            if self._current_phase.get() == "memorize"
-            else self._query_usage
-        )
+        phase = self._current_phase.get()
+        if phase == "memorize":
+            return self._memorize_usage
+        if phase == "judge":
+            return self._judge_usage
+        return self._query_usage
 
     def _operation_bucket(self) -> TokenUsage:
         phase = self._current_phase.get()
@@ -307,6 +309,7 @@ class LLMUsageTracker:
         with self._lock:
             self._memorize_usage = TokenUsage()
             self._query_usage = TokenUsage()
+            self._judge_usage = TokenUsage()
             self._operation_usage = {}
         self._current_phase.set("unknown")
         self._current_operation.set("unscoped")
@@ -317,9 +320,11 @@ class LLMUsageTracker:
             total = TokenUsage()
             total.merge(self._memorize_usage)
             total.merge(self._query_usage)
+            total.merge(self._judge_usage)
             return {
                 "memorize_phase": self._memorize_usage.to_dict(),
                 "query_phase": self._query_usage.to_dict(),
+                "judge_phase": self._judge_usage.to_dict(),
                 "total": total.to_dict(),
                 "operations": {
                     phase: {
@@ -346,6 +351,7 @@ def merge_usage_stats(*stats_values: Dict[str, Any]) -> Dict[str, Any]:
     phase_totals = {
         "memorize_phase": TokenUsage(),
         "query_phase": TokenUsage(),
+        "judge_phase": TokenUsage(),
     }
     operation_totals: Dict[str, Dict[str, TokenUsage]] = {}
     for stats in stats_values:
@@ -365,9 +371,11 @@ def merge_usage_stats(*stats_values: Dict[str, Any]) -> Dict[str, Any]:
     total = TokenUsage()
     total.merge(phase_totals["memorize_phase"])
     total.merge(phase_totals["query_phase"])
+    total.merge(phase_totals["judge_phase"])
     return {
         "memorize_phase": phase_totals["memorize_phase"].to_dict(),
         "query_phase": phase_totals["query_phase"].to_dict(),
+        "judge_phase": phase_totals["judge_phase"].to_dict(),
         "total": total.to_dict(),
         "operations": {
             phase: {
@@ -385,7 +393,7 @@ def diff_usage_stats(
 ) -> Dict[str, Any]:
     """Return the non-negative usage accumulated between two snapshots."""
     phase_deltas = {}
-    for phase_name in ("memorize_phase", "query_phase"):
+    for phase_name in ("memorize_phase", "query_phase", "judge_phase"):
         phase_deltas[phase_name] = TokenUsage.from_dict(after.get(phase_name)).subtract(
             TokenUsage.from_dict(before.get(phase_name))
         )
@@ -417,9 +425,11 @@ def diff_usage_stats(
     total = TokenUsage()
     total.merge(phase_deltas["memorize_phase"])
     total.merge(phase_deltas["query_phase"])
+    total.merge(phase_deltas["judge_phase"])
     return {
         "memorize_phase": phase_deltas["memorize_phase"].to_dict(),
         "query_phase": phase_deltas["query_phase"].to_dict(),
+        "judge_phase": phase_deltas["judge_phase"].to_dict(),
         "total": total.to_dict(),
         "operations": {
             phase: {

@@ -309,6 +309,12 @@ each supported non-empty stage uses its provider's Batch API regardless of
 request count. An unsupported stage logs the fallback and remains real-time
 without disabling batch execution for other supported stages.
 
+Result `llm_usage` keeps answer/query calls and evaluator judge calls in separate
+phase objects: `query_phase` contains retrieval preparation and final-answer
+generation, `judge_phase` contains LLM-based scoring, and `total` combines both
+with `memorize_phase`. The per-operation breakdown uses matching `query` and
+`judge` operation buckets.
+
 Vertex Gemini uses Cloud Storage JSONL staging and requires
 `GOOGLE_BATCH_GCS_URI` or `--batch-gcs-uri`. OpenRouter submits inline requests
 to its Batch API and ignores the GCS argument. It preserves
@@ -339,10 +345,14 @@ construction, result collection, and checkpoint writes remain coordinated by the
 main evaluator; completed reports retain dataset order. In Batch API mode,
 query rewriting and read-only retrieval preparation are also worker-bounded.
 
-The evaluator displays one run-wide `Query progress` bar for pending questions.
-It advances as each question reaches a result or terminal API failure, regardless
-of completion order, and therefore works for both serial and worker-parallel
-execution. Batch-judged questions advance after their judge result is finalized.
+The evaluator displays one run-wide `Query progress` bar only when query-answer
+work starts, and closes it before a separate LLM-judge batch begins. It advances
+as each question reaches an answer or terminal API failure, regardless of
+completion order, and therefore works for both serial and worker-parallel
+execution. Event-State memory preparation also displays a per-unit
+`Memory build` bar when `--workers` enables staged preparation. The bar counts
+both preparation and ordered stateful commit steps, so completion means the
+entire memory build is finished.
 
 When running `--stage query` against completed A-MEM snapshots, independent
 unit contexts can initialize without waiting for earlier units. Each unit uses

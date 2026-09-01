@@ -28,6 +28,7 @@ def _failure_counts_from_usage(llm_usage: Dict[str, Any]) -> Dict[str, Any]:
     phases = {
         "memorize": dict(llm_usage.get("memorize_phase") or {}),
         "query": dict(llm_usage.get("query_phase") or {}),
+        "judge": dict(llm_usage.get("judge_phase") or {}),
     }
     by_phase = {
         phase: {

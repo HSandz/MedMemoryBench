@@ -3,11 +3,64 @@ from types import SimpleNamespace
 from methods.event_state.retrieval import EventStateRetriever
 from methods.event_state.schemas import Claim, Episode, EvidenceRef
 from methods.event_state.store import EventStateStore
+from methods.event_state.temporal import parse_temporal_query
 
 
 class Embedder:
     def embed_query(self, text):
         return [1.0, 0.0]
+
+
+def _episode(identifier, recorded_at, vector):
+    return Episode(identifier, "ctx", identifier, 0, None, recorded_at, ["User"], "primary_user", "", identifier, []), vector
+
+
+def test_temporal_parser_is_conservative_and_supports_bounded_iso_forms():
+    assert parse_temporal_query("What did we discuss in the record dated 2025-03-15?").kind == "exact_record_time"
+    assert parse_temporal_query("Where was I living as of 2025/03/15?").kind == "as_of"
+    interval = parse_temporal_query("What happened between 2025-01-05 and 2025-01-15?")
+    assert interval.start_date.isoformat() == "2025-01-05"
+    assert parse_temporal_query("What happened around the 5th?") is None
+
+
+def test_temporal_episode_channel_adds_exact_record_date_candidate():
+    store = EventStateStore("ctx")
+    for episode, vector in (_episode("A", "2025-01-01", [0.0, 1.0]), _episode("B", "2025-03-15", [0.0, 1.0]), _episode("C", "2025-06-01", [1.0, 0.0])):
+        store.add_episode(episode, vector)
+    retriever = EventStateRetriever(store, Embedder(), retrieve_claims=False, episode_top_k=1, candidate_count=1, evidence_count=1)
+    selected, extra = retriever.retrieve("What did we discuss in the record dated 2025-03-15?")
+    assert extra["temporal_constraint_detected"] is True
+    assert extra["temporal_episode_candidate_count"] == 1
+    assert selected[0]["id"] == "B"
+    assert selected[0]["temporal_match_type"] == "exact_record_time"
+
+
+def test_as_of_retrieval_exposes_historical_state_but_hides_current_version():
+    store = EventStateStore("ctx")
+    store.add_episode(Episode("E1", "ctx", "s1", 0, None, "2025-01-01", ["User"], "primary_user", "", "", []), [1.0, 0.0])
+    store.add_episode(Episode("E2", "ctx", "s2", 1, None, "2025-03-15", ["User"], "primary_user", "", "", []), [1.0, 0.0])
+    old = Claim("A", "User", "primary_user", "lives_in", "Boston", state_slot="residence_location", recorded_at="2025-01-01", valid_from="2025-01-01", valid_to="2025-03-01", status="superseded", evidence=[EvidenceRef("E1", "s1", [])])
+    current = Claim("B", "User", "primary_user", "lives_in", "Tokyo", state_slot="residence_location", recorded_at="2025-03-15", valid_from="2025-03-01", status="active", evidence=[EvidenceRef("E2", "s2", [])])
+    store.add_claim(old, [1.0, 0.0])
+    store.add_claim(current, [1.0, 0.0])
+    retriever = EventStateRetriever(store, Embedder(), retrieve_episodes=False, claim_top_k=10, candidate_count=10, evidence_count=2)
+    selected, extra = retriever.retrieve("Where was the user living as of 2025-02-15?")
+    assert [item["id"] for item in selected] == ["A"]
+    assert extra["temporal_historical_state_candidate_count"] == 1
+    assert extra["temporal_future_state_filtered_count"] == 1
+    assert old.status == "superseded" and current.status == "active"
+
+
+def test_non_temporal_retrieval_does_not_activate_temporal_channel():
+    store = EventStateStore("ctx")
+    for episode, vector in (_episode("A", "2025-01-01", [1.0, 0.0]), _episode("B", "2025-03-15", [0.0, 1.0])):
+        store.add_episode(episode, vector)
+    config = dict(retrieve_claims=False, episode_top_k=2, candidate_count=2, evidence_count=2)
+    selected_a, extra_a = EventStateRetriever(store, Embedder(), **config, temporal_retrieval_enabled=False).retrieve("Where does the user live?")
+    selected_b, extra_b = EventStateRetriever(store, Embedder(), **config, temporal_retrieval_enabled=True).retrieve("Where does the user live?")
+    assert [item["id"] for item in selected_a] == [item["id"] for item in selected_b]
+    assert [(item["fusion_score"], item["final_score"]) for item in selected_a] == [(item["fusion_score"], item["final_score"]) for item in selected_b]
+    assert extra_b["temporal_constraint_detected"] is False
 
 
 def test_ppr_is_bounded_and_conserves_personalized_mass():

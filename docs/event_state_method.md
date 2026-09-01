@@ -130,6 +130,27 @@ local/HuggingFace and OpenAI configurations.
 The default `state_current_candidate_top_k` is `3`; lower it only when the
 classifier prompt budget requires fewer current-state candidates.
 
+Temporal retrieval is query-only and is enabled by `temporal_retrieval_enabled`
+(`true` by default), with a neutral `temporal_retrieval_weight` of `1.0`.
+The deterministic parser recognizes explicit `YYYY-MM-DD` and `YYYY/MM/DD`
+dates with `as of`/`by` (state as-of), `before`, `after`, `between ... and ...`
+or `from ... to ...` (record-time bounds), and record cues such as `record
+dated DATE` (exact record time). A date without a clear axis uses a hybrid
+record/valid-time candidate channel; incomplete expressions such as "around the
+5th" are ignored and use ordinary retrieval.
+
+Episode temporal candidates require a parseable `recorded_at` satisfying the
+bound (for as-of, recorded on or before the target). Claims use actual EvidenceRefs to matching episodes and, for as-of
+queries, their structured valid interval as a secondary check. As-of retrieval
+uses knowledge-as-of semantics: state evidence recorded after the target is
+excluded, and known valid intervals use `[valid_from, valid_to)` (inclusive
+start, exclusive end). Claims without valid bounds may use a lower-confidence
+record-time fallback but no interval is fabricated. Temporal candidates are
+added to the existing claim/episode RRF channels and still pass the unchanged
+candidate limit and state-aware MMR selector. Query diagnostics expose the
+constraint, candidate counts, future-state filtering, and temporal contribution
+on selected records; querying never mutates a snapshot.
+
 `max_episode_source_excerpts_total` is an optional query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of
 raw source turns across all selected episodes, rather than two turns per

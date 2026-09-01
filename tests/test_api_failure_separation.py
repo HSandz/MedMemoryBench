@@ -170,6 +170,7 @@ def test_failure_counts_are_saved_even_without_terminal_failure_events(tmp_path)
         "by_phase": {
             "memorize": {"failed_attempts": 4, "retry_count": 3},
             "query": {"failed_attempts": 2, "retry_count": 1},
+            "judge": {"failed_attempts": 0, "retry_count": 0},
         },
     }
 
@@ -285,9 +286,9 @@ def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path
     for operation, tokens in (
         ("query.retrieval_preparation", (11, 2)),
         ("query.answer_batch", (101, 12)),
-        ("query.judge_batch", (21, 3)),
+        ("judge.batch", (21, 3)),
     ):
-        tracker.set_phase("query")
+        tracker.set_phase("judge" if operation.startswith("judge.") else "query")
         with tracker.scope(operation):
             tracker.record(LLMResponse(
                 content="ok",

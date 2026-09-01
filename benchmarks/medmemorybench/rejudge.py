@@ -463,15 +463,18 @@ def rejudge_medmemorybench(
                     rejudged_count += 1
                     continue
             else:
-                result = calculator.compute(
-                    query_id=dataset_query.query_id,
-                    query_type=dataset_query.query_type,
-                    model_output=str(saved_query.get("model_output", "")),
-                    expected_answers=dataset_query.get_correct_answers(),
-                    question=dataset_query.question,
-                    answers_data=dataset_query.answers_data,
-                    metadata=dataset_query.metadata,
-                )
+                tracker = get_usage_tracker()
+                tracker.set_phase("judge")
+                with tracker.scope("judge.realtime"):
+                    result = calculator.compute(
+                        query_id=dataset_query.query_id,
+                        query_type=dataset_query.query_type,
+                        model_output=str(saved_query.get("model_output", "")),
+                        expected_answers=dataset_query.get_correct_answers(),
+                        question=dataset_query.question,
+                        answers_data=dataset_query.answers_data,
+                        metadata=dataset_query.metadata,
+                    )
             result.query_time = float(saved_query.get("query_time", 0.0))
             result.retrieved_memories = copy.deepcopy(
                 saved_query.get("retrieved_memories", [])
@@ -578,7 +581,7 @@ def rejudge_medmemorybench(
                 max_tokens=payload["max_tokens"],
                 reasoning_effort=payload.get("reasoning_effort", judge_reasoning_effort),
                 response_format={"type": "json_object"},
-                phase="query",
+                phase="judge",
                 metadata={
                     "query_id": prepared["query_id"],
                     "context_id": item["context_id"],
@@ -587,7 +590,10 @@ def rejudge_medmemorybench(
             ))
             by_request_id[request_id] = item
 
-        responses = batch_client.run_stage("rejudge-final", requests)
+        tracker = get_usage_tracker()
+        tracker.set_phase("judge")
+        with tracker.scope("judge.batch"):
+            responses = batch_client.run_stage("rejudge-final", requests)
         for request_id, item in by_request_id.items():
             response = responses.get(request_id)
             if response is None or response.status or not response.content:

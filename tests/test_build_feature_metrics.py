@@ -55,6 +55,24 @@ def test_scoped_usage_tracks_feature_calls_retries_and_wall_time():
     assert typed["wall_time"] >= 0
 
 
+def test_usage_separates_judge_phase_from_query_phase():
+    tracker = get_usage_tracker()
+    tracker.reset()
+
+    tracker.set_phase("query")
+    with tracker.scope("query.answer_realtime"):
+        _record_success(10, 2, 0.1)
+    tracker.set_phase("judge")
+    with tracker.scope("judge.realtime"):
+        _record_success(20, 3, 0.2)
+
+    usage = tracker.get_stats()
+    assert usage["query_phase"]["successful_calls"] == 1
+    assert usage["judge_phase"]["successful_calls"] == 1
+    assert usage["total"]["successful_calls"] == 2
+    assert "judge.realtime" in usage["operations"]["judge"]
+
+
 def _metrics_evaluator() -> MedMemoryBenchEvaluator:
     evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
     build_config = {

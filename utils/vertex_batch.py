@@ -755,7 +755,7 @@ class VertexBatchClient:
         attempts = 0
         self._progress(
             f"Stage '{job_entry['stage']}': {job_entry['job_name']} is {state or 'unknown'}; "
-            f"polling every {self.poll_interval}s. Vertex reports job state, not per-request progress while running."
+            f"polling every {self.poll_interval}s."
         )
         while state not in TERMINAL_STATES:
             time.sleep(self.poll_interval)

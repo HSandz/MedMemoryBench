@@ -757,17 +757,20 @@ class LoCoMoEvaluator:
             retrieved_memories = []
             retrieved_count = 0
 
-        result = self.metrics_calculator.compute(
-            query_id=query.query_id,
-            query_type=query.query_type,
-            model_output=model_output,
-            expected_answers=query.get_correct_answers(),
-            question=query.question,
-            category=query.category,
-            evidence=query.evidence,
-            adversarial_answer=query.adversarial_answer,
-            metadata=query.metadata,
-        )
+        tracker = get_usage_tracker()
+        tracker.set_phase("judge")
+        with tracker.scope("judge.realtime"):
+            result = self.metrics_calculator.compute(
+                query_id=query.query_id,
+                query_type=query.query_type,
+                model_output=model_output,
+                expected_answers=query.get_correct_answers(),
+                question=query.question,
+                category=query.category,
+                evidence=query.evidence,
+                adversarial_answer=query.adversarial_answer,
+                metadata=query.metadata,
+            )
 
         result.query_time = query_time
         result.retrieved_memories = retrieved_memories
