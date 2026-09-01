@@ -1,0 +1,21 @@
+method_name: "mem0_gemma"
+method_type: "agentic_memory"
+description: "Mem0 Agent with Gemma 26B API"
+
+model:
+  provider: "openai"
+  name: "gemma-4-26b"
+  temperature: 0.3
+  max_completion_tokens: 4096
+
+agent_params:
+  retrieve_num: 5
+  chunk_size_tokens: 8000
+  max_context_tokens: 32768
+
+embedding:
+  provider: "openai"
+  model: "gemini-embedding-1"
+
+dataset_overrides:
+  persona_ids: [1]

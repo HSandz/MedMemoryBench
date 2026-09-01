@@ -1,35 +1,21 @@
-method_name: amem
-method_type: agentic_memory
-description: A-Mem (Agentic Memory) adapter for MedMemoryBench
+# A-Mem Agent Configuration
+
+method_name: "amem"
+method_type: "agentic_memory"
+description: "A-Mem (Agentic Memory) adapter for MedMemoryBench"
+
 model:
-  provider: openai
-  name: Qwen3-235B-A22B-Instruct-2507
-  temperature: 0.0
-  max_completion_tokens: 20000
-memorize_model:
-  provider: openai
-  name: Qwen3-235B-A22B-Instruct-2507
-build_config:
-  amem_embedding_model: BAAI/bge-small-zh-v1.5
-  amem_evo_threshold: 100
-  amem_max_tokens: 10000
-  amem_chunk_size_tokens: 10240
-  amem_build_max_context_tokens: 200000
-  amem_original_evolution: true
-  amem_typed_relations: false
-  amem_relation_candidate_count: 5
-  amem_relation_temperature: 0.0
-  amem_temporal_state: false
-  amem_provenance: false
-  amem_temperature: 0.0
-  amem_retry_temperature: 0.0
-  amem_connectivity_temperature: 0.0
-retrieval_config:
+  provider: "openai"
+  name: "Qwen3-235B-A22B-Instruct-2507"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
+agent_params:
   retrieve_num: 5
-  amem_max_context_tokens: 40000
-  amem_typed_expansion_count: 5
-  amem_expand_related: false
-  amem_relation_min_confidence: 0.5
-  amem_temporal_expansion_count: 5
-  amem_provenance_max_evidence: 10
-  amem_provenance_inject_raw_text: false
+  amem_backend: "openai"          # openai / ollama / sglang / vllm
+  amem_model: "Qwen3-235B-A22B-Instruct-2507"        # model used by A-Mem metadata/evolution calls
+  amem_embedding_model: "BAAI/bge-small-zh-v1.5"
+  amem_evo_threshold: 100
+  amem_max_tokens: 10000          # max tokens for A-Mem internal LLM calls
+  amem_max_context_tokens: 40000 
+  amem_chunk_size_tokens: 10240   # chunk size for splitting large memory content

@@ -37,7 +37,7 @@ act_mem:
       backend: "huggingface_singleton"
       config:
         model_name_or_path: "Qwen/Qwen3-1.7B"
-        temperature: 0.0
+        temperature: 0.8
         max_tokens: 1024
         top_p: 0.9
         top_k: 50
@@ -51,7 +51,7 @@ para_mem:
       backend: "huggingface_singleton"
       config:
         model_name_or_path: "Qwen/Qwen3-1.7B"
-        temperature: 0.0
+        temperature: 0.8
         max_tokens: 1024
         top_p: 0.9
         top_k: 50

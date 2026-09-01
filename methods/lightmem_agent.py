@@ -89,8 +89,6 @@ class TrackedMemoryManager:
         usage_info = {
             "prompt_tokens": response.input_tokens,
             "completion_tokens": response.output_tokens,
-            "visible_output_tokens": response.visible_output_tokens,
-            "thinking_tokens": response.thinking_tokens,
             "total_tokens": response.input_tokens + response.output_tokens,
         }
 
@@ -365,7 +363,6 @@ class LightMemAgent(BaseAgent):
         lightmem_temperature: float = 0.1,
         lightmem_max_tokens: int = 2000,
         lightmem_top_p: float = 0.1,
-        lightmem_buffer_max_tokens: int = 4096,
         # Token limits
         max_context_tokens: int = 120000,
         **kwargs,
@@ -390,7 +387,6 @@ class LightMemAgent(BaseAgent):
         self.lightmem_temperature = lightmem_temperature
         self.lightmem_max_tokens = lightmem_max_tokens
         self.lightmem_top_p = lightmem_top_p
-        self.lightmem_buffer_max_tokens = lightmem_buffer_max_tokens
         self.max_context_tokens = max_context_tokens
 
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -404,7 +400,6 @@ class LightMemAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
-            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Initialize LLM client for LightMem internal operations (memory extraction)
@@ -415,7 +410,6 @@ class LightMemAgent(BaseAgent):
             max_tokens=lightmem_max_tokens,
             api_key=api_key,
             base_url=base_url,
-            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # LightMem instances per context_id
@@ -592,13 +586,11 @@ class LightMemAgent(BaseAgent):
 
         instance = self._LightMemory.from_config(config)
 
+        # Increase ShortMemBuffer threshold to reduce LLM API calls
+        # Default is 512, we increase to 4096 to batch more segments before extraction
         if hasattr(instance, 'shortmem_buffer_manager'):
-            buffer_max_tokens = getattr(self, "lightmem_buffer_max_tokens", 4096)
-            instance.shortmem_buffer_manager.max_tokens = buffer_max_tokens
-            print(
-                f"[LightMem] ShortMemBuffer max_tokens set to "
-                f"{buffer_max_tokens}"
-            )
+            instance.shortmem_buffer_manager.max_tokens = 4096
+            print(f"[LightMem] ShortMemBuffer max_tokens set to 4096")
 
         # Replace the manager with our tracked version
         instance.manager = TrackedMemoryManager(

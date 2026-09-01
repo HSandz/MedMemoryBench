@@ -4,17 +4,12 @@ from .logger import setup_logger, get_logger, get_eval_logger
 from .llm_client import (
     BaseLLMClient,
     OpenAIClient,
-    OpenRouterClient,
-    ModalClient,
     AzureOpenAIClient,
     AnthropicClient,
-    GeminiVertexClient,
-    GeminiAIStudioClient,
-    GeminiHybridClient,
+    GeminiEnterpriseClient,
     LLMResponse,
     create_llm_client,
     format_messages,
-    get_google_service_account_files,
 )
 from .templates import TemplateManager, get_template_manager
 
@@ -26,17 +21,12 @@ __all__ = [
     # LLM Client
     "BaseLLMClient",
     "OpenAIClient",
-    "OpenRouterClient",
-    "ModalClient",
     "AzureOpenAIClient",
     "AnthropicClient",
-    "GeminiVertexClient",
-    "GeminiAIStudioClient",
-    "GeminiHybridClient",
+    "GeminiEnterpriseClient",
     "LLMResponse",
     "create_llm_client",
     "format_messages",
-    "get_google_service_account_files",
     # Templates
     "TemplateManager",
     "get_template_manager",

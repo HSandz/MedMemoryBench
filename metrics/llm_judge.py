@@ -2,17 +2,11 @@
 
 import re
 import json
+import time
 import logging
 from typing import List, Dict, Any, Optional
 
 from .base import BaseMetric, MetricResult
-from .string_match import StringContainMetric
-from utils.llm_client import (
-    InvalidLLMResponseError,
-    OpenRouterClient,
-    is_gemini_provider,
-    with_retry,
-)
 from utils.templates import get_prompt_manager
 
 logger = logging.getLogger(__name__)
@@ -26,11 +20,6 @@ class LLMJudge:
     def __init__(self, dataset: str = "medmemorybench", client=None,
                  judge_model: str = None, judge_provider: str = None,
                  judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None,
-                 judge_reasoning_effort=None,
-                 judge_client_max_tokens: int = None,
-                 judge_max_tokens: int = None,
-                 judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._client = client
         self._initialized = False
@@ -40,44 +29,6 @@ class LLMJudge:
         self._active_judge_provider: Optional[str] = None
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
-        self._judge_temperature = judge_temperature
-        self._judge_reasoning_effort = judge_reasoning_effort
-        self._judge_client_max_tokens = judge_client_max_tokens
-        self._judge_max_tokens = judge_max_tokens
-        self._judge_mcd_max_tokens = judge_mcd_max_tokens
-
-    def _settings(self) -> Dict[str, Any]:
-        """Resolve judge generation settings from explicit values or `.env`."""
-        from src.config import get_api_config
-
-        api_config = get_api_config()
-        return {
-            "temperature": (
-                self._judge_temperature
-                if self._judge_temperature is not None
-                else api_config.get_judge_temperature()
-            ),
-            "client_max_tokens": (
-                self._judge_client_max_tokens
-                if self._judge_client_max_tokens is not None
-                else api_config.get_judge_client_max_tokens()
-            ),
-            "reasoning_effort": (
-                self._judge_reasoning_effort
-                if self._judge_reasoning_effort is not None
-                else getattr(api_config, "get_judge_reasoning_effort", lambda: None)()
-            ),
-            "max_tokens": (
-                self._judge_max_tokens
-                if self._judge_max_tokens is not None
-                else api_config.get_judge_max_tokens()
-            ),
-            "mcd_max_tokens": (
-                self._judge_mcd_max_tokens
-                if self._judge_mcd_max_tokens is not None
-                else api_config.get_judge_max_tokens("multi_hop_clinical_deduction")
-            ),
-        }
 
     def _ensure_client(self):
         if not self._initialized:
@@ -96,11 +47,10 @@ class LLMJudge:
                 self._client = create_llm_client(
                     provider=provider,
                     model=model,
-                    temperature=self._settings()["temperature"],
-                    max_tokens=self._settings()["client_max_tokens"],
+                    temperature=1.0,
+                    max_tokens=10000,
                     api_key=api_key,
                     base_url=base_url,
-                    reasoning_effort=self._settings()["reasoning_effort"],
                 )
             self._initialized = True
 
@@ -149,59 +99,61 @@ class LLMJudge:
 
         return None
 
-    @with_retry()
-    def _call_llm(self, prompt: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+    def _call_llm(self, prompt: str, max_tokens: int = 500, max_retries: int = 3) -> Optional[Dict[str, Any]]:
         self._ensure_client()
-        settings = self._settings()
 
-        request = {
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": settings["temperature"],
-            "max_tokens": max_tokens if max_tokens is not None else settings["max_tokens"],
-        }
-        if settings["reasoning_effort"] is not None:
-            request["reasoning_effort"] = settings["reasoning_effort"]
-        # Gemini guarantees a JSON MIME response for judge prompts.
-        if is_gemini_provider(self._active_judge_provider):
-            request["response_format"] = {"type": "json_object"}
-        response = self._client.chat(**request)
-        result_text = response.content.strip()
+        for attempt in range(1, max_retries + 1):
+            try:
+                request = {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                }
+                # Gemini guarantees a JSON MIME response for judge prompts.
+                if self._active_judge_provider in {"gemini", "vertex", "vertex_ai"}:
+                    request["response_format"] = {"type": "json_object"}
+                response = self._client.chat(**request)
+                result_text = response.content.strip()
 
-        try:
-            return json.loads(result_text)
-        except json.JSONDecodeError:
-            pass
+                # First try direct JSON parsing
+                try:
+                    return json.loads(result_text)
+                except json.JSONDecodeError:
+                    pass
 
-        result = self._extract_json_from_text(result_text)
-        if result is not None:
-            return result
+                # Use bracket-matching extraction for nested JSON structures
+                result = self._extract_json_from_text(result_text)
+                if result is not None:
+                    return result
 
-        raise InvalidLLMResponseError(
-            "LLM judge returned a response that could not be parsed as JSON."
-        )
+                logger.warning(f"[LLMJudge] Failed to extract JSON from response: {result_text[:200]}...")
+                # JSON parse failure — no point retrying the same response, return None
+                return None
+
+            except Exception as e:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                if attempt < max_retries:
+                    logger.warning(f"[LLMJudge] API call failed (attempt {attempt}/{max_retries}), retrying in {wait}s: {e}")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"[LLMJudge] API call failed after {max_retries} attempts: {e}")
+        return None
 
     def _is_empty_output(self, model_output: str) -> bool:
         return not model_output or not model_output.strip()
 
     def get_batch_client(self):
-        """Return a managed client supported by an offline batch transport."""
+        """Return the managed Gemini client after lazy initialization."""
         self._ensure_client()
-        from utils.llm_client import GeminiHybridClient, GeminiVertexClient
+        from utils.llm_client import GeminiEnterpriseClient
 
-        return (
-            self._client
-            if isinstance(
-                self._client,
-                (GeminiVertexClient, GeminiHybridClient, OpenRouterClient),
-            )
-            else None
-        )
+        return self._client if isinstance(self._client, GeminiEnterpriseClient) else None
 
     def prepare_batch_prompt(
         self,
         query_type: str,
         question: str,
         model_output: str,
+
         expected_answer: str,
         explanation: str = "",
         metadata: Optional[Dict[str, Any]] = None,
@@ -233,13 +185,7 @@ class LLMJudge:
                 explanation=explanation,
                 metadata_info=metadata_info,
             )
-            return {
-                "prompt": prompt,
-                "temperature": self._settings()["temperature"],
-                "max_tokens": self._settings()["max_tokens"],
-                "reasoning_effort": self._settings()["reasoning_effort"],
-                "query_type": query_type,
-            }
+            return {"prompt": prompt, "max_tokens": 500, "query_type": query_type}
 
         if query_type == "multi_hop_clinical_deduction":
             reasoning_chain = (metadata or {}).get("reasoning_chain", [])
@@ -271,20 +217,11 @@ class LLMJudge:
                 hop_count=hop_count,
                 reasoning_pattern=reasoning_pattern,
             )
-            return {
-                "prompt": prompt,
-                "temperature": self._settings()["temperature"],
-                "max_tokens": self._settings()["mcd_max_tokens"],
-                "reasoning_effort": self._settings()["reasoning_effort"],
-                "query_type": query_type,
-            }
+            return {"prompt": prompt, "max_tokens": 8192, "query_type": query_type}
 
-        if query_type in {"entity_exact_match", "entity_exact_match_judge"}:
-            effective_type = "entity_exact_match"
-        elif query_type in {"temporal_localization", "state_update", "locomo_open_domain"}:
-            effective_type = query_type
-        else:
-            effective_type = "state_update"
+        effective_type = query_type if query_type in {
+            "temporal_localization", "state_update", "locomo_open_domain"
+        } else "state_update"
         prompt = self._prompt_manager.format_judge(
             query_type=effective_type,
             question=question,
@@ -292,13 +229,7 @@ class LLMJudge:
             expected_answer=expected_answer,
             explanation=explanation,
         )
-        return {
-            "prompt": prompt,
-            "temperature": self._settings()["temperature"],
-            "max_tokens": self._settings()["max_tokens"],
-            "reasoning_effort": self._settings()["reasoning_effort"],
-            "query_type": query_type,
-        }
+        return {"prompt": prompt, "max_tokens": 500, "query_type": query_type}
 
     @staticmethod
     def _empty_batch_result(query_type: str) -> Dict[str, Any]:
@@ -316,9 +247,7 @@ class LLMJudge:
         except json.JSONDecodeError:
             parsed = self._extract_json_from_text(result_text)
         if not parsed:
-            raise InvalidLLMResponseError(
-                "Batch LLM judge returned a response that could not be parsed as JSON."
-            )
+            return self._empty_batch_result(payload["query_type"]) | {"reason": "Judge failed"}
 
         if payload["query_type"] != "multi_hop_clinical_deduction":
             is_correct = bool(parsed.get("is_correct", False))
@@ -351,16 +280,37 @@ class LLMJudge:
             "reason": parsed.get("reason", ""),
         }
 
+    @staticmethod
+    def _normalize_date(s: str) -> str:
+        """Normalize a date string to YYYY-MM-DD for comparison."""
+        if not s:
+            return ""
+        s = s.strip()
+        # Extract the date portion with regex (handles 2024-01-05 and 2024-01-05 00:00:00)
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+        return m.group(1) if m else s.lower()
+
     def judge_temporal_localization(
         self,
         question: str,
         model_output: str,
+
         expected_answer: str,
         explanation: str = "",
     ) -> Dict[str, Any]:
         if self._is_empty_output(model_output):
             logger.warning(f"[LLMJudge] Empty model output for temporal_localization")
             return {"is_correct": False, "score": 0.0, "reason": EMPTY_OUTPUT_REASON}
+
+        # Fast path: if date portion matches exactly, no need to call LLM
+        norm_output = self._normalize_date(model_output)
+        norm_expected = self._normalize_date(expected_answer)
+        if norm_output and norm_expected and norm_output == norm_expected:
+            return {
+                "is_correct": True,
+                "score": 1.0,
+                "reason": f"Date match (normalized): {norm_output} == {norm_expected}",
+            }
 
         prompt = self._prompt_manager.format_judge(
             query_type="temporal_localization",
@@ -378,12 +328,21 @@ class LLMJudge:
                 "score": 1.0 if is_correct else 0.0,
                 "reason": result.get("reason", ""),
             }
+        # Judge API failed — fall back to date-normalization heuristic
+        if norm_output and norm_expected:
+            is_correct = norm_output == norm_expected
+            return {
+                "is_correct": is_correct,
+                "score": 1.0 if is_correct else 0.0,
+                "reason": f"Judge failed; fallback date comparison: {norm_output} vs {norm_expected}",
+            }
         return {"is_correct": False, "score": 0.0, "reason": "Judge failed"}
 
     def judge_state_update(
         self,
         question: str,
         model_output: str,
+
         expected_answer: str,
         explanation: str = "",
     ) -> Dict[str, Any]:
@@ -407,41 +366,14 @@ class LLMJudge:
                 "score": 1.0 if is_correct else 0.0,
                 "reason": result.get("reason", ""),
             }
-        return {"is_correct": False, "score": 0.0, "reason": "Judge failed"}
 
-    def judge_entity_exact_match(
-        self,
-        question: str,
-        model_output: str,
-        expected_answer: str,
-        explanation: str = "",
-    ) -> Dict[str, Any]:
-        if self._is_empty_output(model_output):
-            logger.warning("[LLMJudge] Empty model output for entity_exact_match")
-            return {"is_correct": False, "score": 0.0, "reason": EMPTY_OUTPUT_REASON}
-
-        prompt = self._prompt_manager.format_judge(
-            query_type="entity_exact_match",
-            question=question,
-            model_output=model_output,
-            expected_answer=expected_answer,
-            explanation=explanation,
-        )
-
-        result = self._call_llm(prompt)
-        if result:
-            is_correct = result.get("is_correct", False)
-            return {
-                "is_correct": is_correct,
-                "score": 1.0 if is_correct else 0.0,
-                "reason": result.get("reason", ""),
-            }
-        return {"is_correct": False, "score": 0.0, "reason": "Judge failed"}
+        return {"is_correct": False, "score": 0.0, "reason": "Judge failed after retries"}
 
     def judge_inference_generation(
         self,
         question: str,
         model_output: str,
+
         expected_answer: str,
         explanation: str = "",
         metadata: Optional[Dict[str, Any]] = None,
@@ -488,6 +420,7 @@ class LLMJudge:
         self,
         question: str,
         model_output: str,
+
         expected_answer: str,
         explanation: str = "",
         metadata: Optional[Dict[str, Any]] = None,
@@ -550,7 +483,7 @@ Node {node_id}:
             reasoning_pattern=reasoning_pattern,
         )
 
-        result = self._call_llm(prompt, max_tokens=self._settings()["mcd_max_tokens"])
+        result = self._call_llm(prompt, max_tokens=8192)
         if result:
             is_correct = result.get("is_correct", False)
             ncr_score = result.get("ncr_score", 0.0)
@@ -603,6 +536,7 @@ Node {node_id}:
         self,
         question: str,
         model_output: str,
+
         expected_answer: str,
     ) -> Dict[str, Any]:
         if self._is_empty_output(model_output):
@@ -636,19 +570,11 @@ class LLMJudgeMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_reasoning_effort=None,
-                 judge_client_max_tokens: int = None,
-                 judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
-        self._judge_temperature = judge_temperature
-        self._judge_reasoning_effort = judge_reasoning_effort
-        self._judge_client_max_tokens = judge_client_max_tokens
-        self._judge_max_tokens = judge_max_tokens
-        self._judge_mcd_max_tokens = judge_mcd_max_tokens
         self._language = language
         self._judge: Optional[LLMJudge] = None
 
@@ -660,11 +586,6 @@ class LLMJudgeMetric(BaseMetric):
                 judge_model=self._judge_model,
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
-                judge_temperature=self._judge_temperature,
-                judge_reasoning_effort=self._judge_reasoning_effort,
-                judge_client_max_tokens=self._judge_client_max_tokens,
-                judge_max_tokens=self._judge_max_tokens,
-                judge_mcd_max_tokens=self._judge_mcd_max_tokens,
                 language=self._language,
             )
         return self._judge
@@ -674,6 +595,7 @@ class LLMJudgeMetric(BaseMetric):
         query_id: str,
         query_type: str,
         model_output: str,
+
         expected_answers: List[str],
         question: str = "",
         answers_data: List[dict] = None,
@@ -691,10 +613,6 @@ class LLMJudgeMetric(BaseMetric):
 
         if query_type == "temporal_localization":
             result = self.judge.judge_temporal_localization(
-                question, model_output, expected_answer, explanation
-            )
-        elif query_type in {"entity_exact_match", "entity_exact_match_judge"}:
-            result = self.judge.judge_entity_exact_match(
                 question, model_output, expected_answer, explanation
             )
         elif query_type == "state_update":
@@ -738,6 +656,7 @@ class LLMJudgeMetric(BaseMetric):
         query_id: str,
         query_type: str,
         model_output: str,
+
         expected_answers: List[str],
         question: str = "",
         answers_data: List[dict] = None,
@@ -756,7 +675,6 @@ class LLMJudgeMetric(BaseMetric):
             "query_type": query_type,
             "model_output": model_output,
             "expected_answer": expected_answer,
-            "expected_answers": expected_answers,
             "question": question,
             "explanation": explanation,
             "judge_payload": self.judge.prepare_batch_prompt(
@@ -782,74 +700,6 @@ class LLMJudgeMetric(BaseMetric):
         )
 
 
-class EEMJudgeMetric(LLMJudgeMetric):
-    """Run the original EEM metric and the LLM judge for the same query."""
-
-    NAME = "eem_judge"
-
-    @staticmethod
-    def _with_original_eem(
-        result: MetricResult,
-        original_result: MetricResult,
-    ) -> MetricResult:
-        result.details["metrics"] = {
-            "EEM": {
-                "metric": "string_contain",
-                "score": original_result.score,
-                "is_correct": original_result.is_correct,
-                "details": original_result.details,
-            },
-            "EEM_judge": {
-                "metric": EEMJudgeMetric.NAME,
-                "score": result.score,
-                "is_correct": result.is_correct,
-                "details": {
-                    "judge_reason": result.details.get("judge_reason", ""),
-                },
-            },
-        }
-        return result
-
-    def compute(
-        self,
-        query_id: str,
-        query_type: str,
-        model_output: str,
-        expected_answers: List[str],
-        question: str = "",
-        **kwargs,
-    ) -> MetricResult:
-        result = super().compute(
-            query_id=query_id,
-            query_type=query_type,
-            model_output=model_output,
-            expected_answers=expected_answers,
-            question=question,
-            **kwargs,
-        )
-        original_result = StringContainMetric().compute(
-            query_id=query_id,
-            query_type=query_type,
-            model_output=model_output,
-            expected_answers=expected_answers,
-            question=question,
-        )
-        return self._with_original_eem(result, original_result)
-
-    def finalize_batch(self, prepared: Dict[str, Any], result_text: str) -> MetricResult:
-        result = super().finalize_batch(prepared, result_text)
-        original_result = StringContainMetric().compute(
-            query_id=prepared["query_id"],
-            query_type=prepared["query_type"],
-            model_output=prepared["model_output"],
-            expected_answers=prepared.get(
-                "expected_answers", [prepared["expected_answer"]]
-            ),
-            question=prepared["question"],
-        )
-        return self._with_original_eem(result, original_result)
-
-
 class LLMJudgeMCDMetric(BaseMetric):
     """LLM Judge metric for multi-hop clinical deduction (MCD) with NCR/CRC/CC scoring."""
 
@@ -857,19 +707,11 @@ class LLMJudgeMCDMetric(BaseMetric):
 
     def __init__(self, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_reasoning_effort=None,
-                 judge_client_max_tokens: int = None,
-                 judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
-        self._judge_temperature = judge_temperature
-        self._judge_reasoning_effort = judge_reasoning_effort
-        self._judge_client_max_tokens = judge_client_max_tokens
-        self._judge_max_tokens = judge_max_tokens
-        self._judge_mcd_max_tokens = judge_mcd_max_tokens
         self._language = language
         self._judge: Optional[LLMJudge] = None
 
@@ -881,11 +723,6 @@ class LLMJudgeMCDMetric(BaseMetric):
                 judge_model=self._judge_model,
                 judge_api_key=self._judge_api_key,
                 judge_base_url=self._judge_base_url,
-                judge_temperature=self._judge_temperature,
-                judge_reasoning_effort=self._judge_reasoning_effort,
-                judge_client_max_tokens=self._judge_client_max_tokens,
-                judge_max_tokens=self._judge_max_tokens,
-                judge_mcd_max_tokens=self._judge_mcd_max_tokens,
                 language=self._language,
             )
         return self._judge
@@ -895,6 +732,7 @@ class LLMJudgeMCDMetric(BaseMetric):
         query_id: str,
         query_type: str,
         model_output: str,
+
         expected_answers: List[str],
         question: str = "",
         answers_data: List[dict] = None,
@@ -944,6 +782,7 @@ class LLMJudgeMCDMetric(BaseMetric):
         query_id: str,
         query_type: str,
         model_output: str,
+
         expected_answers: List[str],
         question: str = "",
         answers_data: List[dict] = None,

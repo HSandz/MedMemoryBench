@@ -3,7 +3,7 @@ import os
 import platform
 import sys
 
-import mem0
+import methods.mem0 as mem0
 from methods.mem0.memory.setup import get_user_id, setup_config
 
 MEM0_TELEMETRY = os.environ.get("MEM0_TELEMETRY", "True")

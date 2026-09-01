@@ -89,7 +89,7 @@ Answer:""",
 
 Question: {question}
 
-[ANSWER REQUIREMENTS] If the question asks about a time, answer in YYYY-MM-DD format (e.g., 2024-01-15). If the question asks about an event at a specific time, clearly describe the specific content and details of the event.
+[ANSWER REQUIREMENTS] If the question asks about a time, answer in YYYY-MM-DD format (e.g., 2024-01-15). If the exact start date is not explicitly mentioned but a symptom is first recorded on a specific document date, use that document's date as the exact time. Do not guess an earlier date based on relative phrases like 'past few days'. If the question asks about an event at a specific time, clearly describe the specific content and details of the event.
 
 Answer:""",
 

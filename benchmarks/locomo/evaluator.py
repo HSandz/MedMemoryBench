@@ -3,7 +3,6 @@
 import hashlib
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -13,13 +12,16 @@ from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
 from src.agent import AgentManager
 from src.result import EvaluationReport, ResultCollector
+from src.memory_snapshot import (
+    MemorySnapshotKey,
+    MemorySnapshotStore,
+    compute_memory_config_hash,
+)
 from benchmarks.locomo.dataset import LoCoMoDataset, LoCoMoQuery, LoCoMoSession
 from benchmarks.base import EvaluationUnit
 from methods.base import MemoryBuildResult
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from utils.templates import get_prompt_manager
-from utils.logger import truncate_error_message
-from utils.batch_client import create_batch_client
 from utils.llm_client import get_usage_tracker
 from utils.vertex_batch import (
     BatchChatRequest,
@@ -30,6 +32,7 @@ from utils.vertex_batch import (
     restore_prepared_query,
     scoped_manifest_path,
     snapshot_prepared_query,
+    should_use_batch,
 )
 
 
@@ -49,11 +52,10 @@ class LoCoMoEvaluator:
         verbose: bool = True,
         logger: Optional[logging.Logger] = None,
         resume: bool = False,
-        run_scoped_output: bool = False,
+        rebuild_memory: bool = False,
         batch_api: bool = False,
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
-        workers: int = 1,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -62,13 +64,10 @@ class LoCoMoEvaluator:
         self.verbose = verbose
         self.logger = logger
         self.resume = resume
-        self.run_scoped_output = run_scoped_output
+        self.rebuild_memory = rebuild_memory
         self.batch_api = batch_api
         self.batch_gcs_uri = batch_gcs_uri
         self.batch_wait = batch_wait
-        if workers < 1:
-            raise ValueError("workers must be at least 1")
-        self.workers = workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -84,11 +83,6 @@ class LoCoMoEvaluator:
             judge_model=api_config.judge_model or None,
             judge_api_key=api_config.judge_api_key or None,
             judge_base_url=api_config.judge_base_url or None,
-            judge_temperature=getattr(api_config, "judge_temperature", 1.0),
-            judge_reasoning_effort=getattr(api_config, "judge_reasoning_effort", None),
-            judge_client_max_tokens=getattr(api_config, "judge_client_max_tokens", 10000),
-            judge_max_tokens=getattr(api_config, "judge_max_tokens", 500),
-            judge_mcd_max_tokens=getattr(api_config, "judge_mcd_max_tokens", 2000),
         )
         self.aggregator = MetricsAggregator()
         self.result_collector = ResultCollector()
@@ -96,12 +90,18 @@ class LoCoMoEvaluator:
         self._memory_build_logs: List[Dict[str, Any]] = []
         self._batch_client: Optional[VertexBatchClient] = None
         self._batch_fallback_logged = False
-        self._pending_batch_queries: List[Dict[str, Any]] = []
 
         # Memory chunk configuration
         # Get from dataset config or use default
         eval_config = dataset_config.raw_config.get("evaluation", {})
         self.memory_chunk_size = eval_config.get("memory_chunk_size", DEFAULT_MEMORY_CHUNK_SIZE)
+        self._memory_snapshot_store = MemorySnapshotStore(
+            self.output_dir / "memory_snapshots",
+            dataset=dataset_config.dataset_name,
+            method=method_config.method_name,
+            model=method_config.model.name,
+            config_hash=compute_memory_config_hash(method_config, dataset_config),
+        )
 
     def _batch_config_hash(self) -> str:
         """Bind a resumable batch manifest to the evaluated configuration."""
@@ -113,12 +113,49 @@ class LoCoMoEvaluator:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
     def _log(self, message: str, level: str = "INFO") -> None:
-        if level.upper() in {"ERROR", "WARNING"}:
-            message = truncate_error_message(message)
         if self.verbose:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
             self.logger.info(message)
+
+    def _memory_snapshot_key(self, unit: EvaluationUnit) -> MemorySnapshotKey:
+        return self._memory_snapshot_store.make_key(unit)
+
+    def _try_load_memory_snapshot(self, key: MemorySnapshotKey) -> bool:
+        if (
+            self.rebuild_memory
+            or self.agent_manager is None
+            or not self.agent_manager.supports_memory_snapshots()
+        ):
+            return False
+        state = self._memory_snapshot_store.load(key)
+        if state is None:
+            return False
+        try:
+            self.agent_manager.import_memory_state(state)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._log(f"  [Memory Cache] Invalid snapshot ignored: {exc}", level="WARNING")
+            return False
+        self._log(
+            f"  [Memory Cache] Loaded exact unit snapshot: "
+            f"{self._memory_snapshot_store.path_for(key)}"
+        )
+        return True
+
+    def _save_memory_snapshot(
+        self,
+        key: MemorySnapshotKey,
+        session_ids: List[str],
+    ) -> Optional[Path]:
+        if self.agent_manager is None or not self.agent_manager.supports_memory_snapshots():
+            return None
+        path = self._memory_snapshot_store.save(
+            key,
+            self.agent_manager.export_memory_state(),
+            session_ids=session_ids,
+        )
+        self._log(f"  [Memory Cache] Saved unit snapshot: {path}")
+        return path
 
     def _init_dataset(self) -> None:
         self._log(f"Loading dataset: {self.dataset_config.dataset_name}")
@@ -149,10 +186,7 @@ class LoCoMoEvaluator:
                 try:
                     self.agent_manager.reset()
                 except Exception as e:
-                    self._log(
-                        f"Warning: Failed to reset old agent: {truncate_error_message(e)}",
-                        level="WARNING",
-                    )
+                    self._log(f"Warning: Failed to reset old agent: {e}", level="WARNING")
 
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
@@ -160,7 +194,6 @@ class LoCoMoEvaluator:
                 batch_api=self.batch_api,
                 batch_gcs_uri=self.batch_gcs_uri,
                 batch_wait=self.batch_wait,
-                workers=self.workers,
                 batch_manifest_dir=self.output_dir / "batch",
                 batch_config_hash=self._batch_config_hash(),
                 batch_progress_callback=self._log,
@@ -201,12 +234,6 @@ class LoCoMoEvaluator:
             for result in unit_results:
                 self.aggregator.add_result(result)
                 self.result_collector.add_result(result, sample_id)
-
-        for item in self._complete_combined_batch_queries():
-            result = item["result"]
-            sample_id = item["sample_id"]
-            self.aggregator.add_result(result)
-            self.result_collector.add_result(result, sample_id)
 
     def _split_sessions_into_chunks(
         self,
@@ -251,6 +278,9 @@ class LoCoMoEvaluator:
 
     def _evaluate_unit(self, unit: EvaluationUnit) -> List[MetricResult]:
         results = []
+        snapshot_key = self._memory_snapshot_key(unit)
+        snapshot_loaded = False
+        memory_build_failed = False
 
         self._log(f"  --- Memory Build Phase ---")
 
@@ -259,9 +289,18 @@ class LoCoMoEvaluator:
             total_memory_time = 0.0
             chunk_build_results = []
         else:
-            # Split sessions into chunks
-            chunks = self._split_sessions_into_chunks(unit.sessions_to_inject)
+            # SmartMem0 needs one episode boundary per call because each LoCoMo
+            # session has its own DATE header. Combining sessions would assign
+            # one document_time to facts from several different sessions.
+            if self.method_config.method_name.lower().startswith("smart_mem0"):
+                chunks = [(
+                    [session],
+                    session.to_memory_text(),
+                ) for session in unit.sessions_to_inject]
+            else:
+                chunks = self._split_sessions_into_chunks(unit.sessions_to_inject)
             total_chunks = len(chunks)
+            snapshot_loaded = self._try_load_memory_snapshot(snapshot_key)
 
             self._log(f"  Split into {total_chunks} chunks (chunk_size={self.memory_chunk_size:,} chars)")
 
@@ -274,6 +313,9 @@ class LoCoMoEvaluator:
             for chunk_idx, (chunk_sessions, chunk_text) in enumerate(chunks):
                 chunk_session_ids = [s.session_id for s in chunk_sessions]
                 all_session_ids.extend(chunk_session_ids)
+
+                if snapshot_loaded:
+                    continue
 
                 chunk_chars = len(chunk_text)
                 chunk_tokens_est = chunk_chars // 4
@@ -291,28 +333,10 @@ class LoCoMoEvaluator:
                 chunk_start_time = time.time()
 
                 try:
-                    memory_items = []
-                    for session_index, session in enumerate(chunk_sessions):
-                        for turn in session.dialogues:
-                            memory_item = {
-                                "speaker": turn.get("speaker", "Unknown"),
-                                "content": turn.get("text", ""),
-                                "blip_caption": turn.get("blip_caption", ""),
-                                "timestamp": session.date_time,
-                            }
-                            if self.method_config.method_name in {"amem_test", "event_state"}:
-                                memory_item.update({
-                                    "source_session_id": session.session_id,
-                                    "source_session_index": session_index if self.method_config.method_name == "event_state" else session.session_id,
-                                    "source_turn_id": turn.get("dia_id"),
-                                    "source_event_id": session.metadata.get("session_key"),
-                                })
-                            memory_items.append(memory_item)
                     memory_result = self.agent_manager.send_message(
                         message=formatted_text,
                         memorizing=True,
                         context_id=unit.context_id,
-                        memory_items=memory_items,
                     )
 
                     chunk_time = time.time() - chunk_start_time
@@ -350,10 +374,8 @@ class LoCoMoEvaluator:
 
                 except Exception as e:
                     chunk_time = time.time() - chunk_start_time
-                    self._log(
-                        f"      [ERROR] Chunk {chunk_idx + 1} failed: {truncate_error_message(e)}",
-                        level="ERROR",
-                    )
+                    self._log(f"      [ERROR] Chunk {chunk_idx + 1} failed: {e}", level="ERROR")
+                    memory_build_failed = True
 
                     chunk_build_results.append({
                         "chunk_index": chunk_idx,
@@ -362,8 +384,15 @@ class LoCoMoEvaluator:
                         "input_chars": chunk_chars,
                         "input_tokens_est": chunk_tokens_est,
                         "time_cost": chunk_time,
-                        "error": truncate_error_message(e),
+                        "error": str(e),
                     })
+
+            snapshot_path = None
+            if not snapshot_loaded and not memory_build_failed:
+                snapshot_path = self._save_memory_snapshot(
+                    snapshot_key,
+                    [str(value) for value in all_session_ids],
+                )
 
             # Calculate summary stats
             total_entries = sum(
@@ -390,46 +419,42 @@ class LoCoMoEvaluator:
                 "total_time": total_memory_time,
                 "total_entries": total_entries,
                 "total_stored_chunks": total_stored_chunks,
+                "memory_snapshot_hit": snapshot_loaded,
+                "memory_snapshot_path": str(
+                    snapshot_path or self._memory_snapshot_store.path_for(snapshot_key)
+                ),
                 "chunk_builds": chunk_build_results,
             })
 
         self._log(f"  Memory Build Done, total_time={total_memory_time:.2f}s")
+
+        if not self.dry_run and memory_build_failed:
+            raise RuntimeError(
+                f"Memory build failed for context {unit.context_id}, unit {unit.unit_id}; "
+                "queries were not run against an incomplete memory state."
+            )
 
         self._log(f"  --- Query Evaluation Phase ---")
 
         query_count = len(unit.queries_to_evaluate)
         memory_time_per_query = total_memory_time / query_count if query_count > 0 else 0.0
 
-        if unit.queries_to_evaluate and self._supports_batch_queries():
-            batch_client = self._get_batch_client()
-            combined_stage = "query-final"
-            legacy_stage = f"query-unit-{unit.unit_id}"
-            if not batch_client.has_stage(combined_stage) and batch_client.has_stage(legacy_stage):
-                query_results = self._evaluate_batch_queries(unit)
-            else:
-                prepared_count = self._prepare_combined_batch_queries(
-                    unit,
-                    memory_time_per_query,
-                )
-                query_results = []
-                self._log(
-                    f"  [Batch] Prepared {prepared_count:,} request(s) for "
-                    f"combined stage '{combined_stage}'."
-                )
+        if self._can_batch_queries(len(unit.queries_to_evaluate)):
+            query_results = self._evaluate_batch_queries(unit)
         else:
             if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
                 self._log(
-                    "Batch API is unavailable for this adapter; "
-                    "using real-time final-answer generation.",
+                    "Vertex batch API is unavailable or this stage is too small; "
+                    "using real-time generation for dependent requests.",
                     level="WARNING",
                 )
                 self._batch_fallback_logged = True
-            query_results = self._evaluate_realtime_queries(
-                unit.queries_to_evaluate,
-                unit.context_id,
-            )
+            query_results = [
+                self._evaluate_query(query, unit.context_id)
+                for query in unit.queries_to_evaluate
+            ]
 
-        for result in query_results:
+        for query, result in zip(unit.queries_to_evaluate, query_results):
             result.memory_construction_time = memory_time_per_query
             results.append(result)
 
@@ -438,30 +463,13 @@ class LoCoMoEvaluator:
 
         return results
 
-    def _supports_batch_queries(self) -> bool:
+    def _can_batch_queries(self, request_count: int) -> bool:
         return bool(
-            self.batch_api
+            should_use_batch(request_count)
+            and self.batch_api
             and self.agent_manager
             and self.agent_manager.supports_batch_queries()
         )
-
-    def _evaluate_realtime_queries(
-        self,
-        queries: List[LoCoMoQuery],
-        context_id: Any,
-    ) -> List[MetricResult]:
-        """Run independent real-time query evaluations with bounded concurrency."""
-        if len(queries) < 2 or self.workers == 1:
-            return [self._evaluate_query(query, context_id) for query in queries]
-
-        worker_count = min(self.workers, len(queries))
-        self._log(f"  [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            # executor.map preserves dataset order for deterministic reports.
-            return list(executor.map(
-                lambda query: self._evaluate_query(query, context_id),
-                queries,
-            ))
 
     def _get_batch_client(self) -> VertexBatchClient:
         if self._batch_client is None:
@@ -469,8 +477,8 @@ class LoCoMoEvaluator:
                 raise VertexBatchError("Agent manager is not initialized for batch execution.")
             llm_client = self.agent_manager.get_batch_llm_client()
             if llm_client is None:
-                raise VertexBatchError("This method does not expose a managed batch client.")
-            self._batch_client = create_batch_client(
+                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
+            self._batch_client = VertexBatchClient.from_gemini_client(
                 llm_client,
                 gcs_uri=self.batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
@@ -482,7 +490,6 @@ class LoCoMoEvaluator:
                 wait=self.batch_wait,
                 config_hash=self._batch_config_hash(),
                 progress_callback=self._log,
-                vertex_batch_class=VertexBatchClient,
             )
         return self._batch_client
 
@@ -497,13 +504,13 @@ class LoCoMoEvaluator:
                 f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
             )
             saved_request = batch_client.get_saved_request(stage, request_id)
-            batch_request_time = (
-                saved_request.metadata.get("batch_request_time")
-                if saved_request is not None
-                else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
             prepared = restore_prepared_query(saved_request) if saved_request else None
             if prepared is None:
+                batch_request_time = (
+                    saved_request.metadata.get("batch_request_time")
+                    if saved_request is not None
+                    else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
                 formatted_question = self.prompt_manager.format_query(
                     question=query.question,
                     query_type=query.query_type,
@@ -511,10 +518,9 @@ class LoCoMoEvaluator:
                 prepared = self.agent_manager.prepare_batch_query(
                     formatted_question,
                     query_id=query.query_id,
+                    query_type=query.query_type,
                     context_id=unit.context_id,
                     batch_request_time=batch_request_time,
-                    raw_question=query.question,
-                    query_type=query.query_type,
                 )
 
             if saved_request is not None:
@@ -540,20 +546,13 @@ class LoCoMoEvaluator:
                 )
             prepared_by_id[request_id] = (query, prepared)
 
-        get_saved_requests = getattr(batch_client, "get_saved_requests", None)
-        saved_requests = get_saved_requests(stage) if callable(get_saved_requests) else []
-        submitted_requests = saved_requests or requests
-        responses = batch_client.run_stage(stage, submitted_requests)
+        responses = batch_client.run_stage(stage, requests)
         results: List[MetricResult] = []
         for request_id, (query, prepared) in prepared_by_id.items():
             batch_response = responses.get(request_id)
             if batch_response is None or batch_response.status:
                 error = batch_response.status if batch_response else "No output row returned"
-                results.append(
-                    self._api_error_result(
-                        query, f"Batch request failed: {truncate_error_message(error)}"
-                    )
-                )
+                results.append(self._api_error_result(query, f"Vertex batch request failed: {error}"))
                 continue
             response = self.agent_manager.finalize_batch_query(
                 prepared,
@@ -563,139 +562,6 @@ class LoCoMoEvaluator:
             )
             results.append(self._score_agent_response(query, response))
         return results
-
-    def _prepare_combined_batch_queries(
-        self,
-        unit: EvaluationUnit,
-        memory_time_per_query: float,
-    ) -> int:
-        """Freeze a sample's prompts before its agent is reset for the next sample."""
-        stage = "query-final"
-        batch_client = self._get_batch_client()
-        prepared_count = 0
-
-        query_items = []
-        for query in unit.queries_to_evaluate:
-            request_id = make_request_id(
-                "query",
-                f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
-            )
-            saved_request = batch_client.get_saved_request(stage, request_id)
-            batch_request_time = (
-                saved_request.metadata.get("batch_request_time")
-                if saved_request is not None
-                else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            prepared = restore_prepared_query(saved_request) if saved_request else None
-            query_items.append((query, request_id, saved_request, batch_request_time, prepared))
-
-        def prepare_item(item):
-            query, _, _, batch_request_time, prepared = item
-            if prepared is not None:
-                return prepared
-            formatted_question = self.prompt_manager.format_query(
-                question=query.question, query_type=query.query_type
-            )
-            return self.agent_manager.prepare_batch_query(
-                formatted_question,
-                query_id=query.query_id,
-                context_id=unit.context_id,
-                batch_request_time=batch_request_time,
-                raw_question=query.question,
-                query_type=query.query_type,
-            )
-
-        worker_count = getattr(self, "workers", 1)
-        if worker_count > 1 and len(query_items) > 1:
-            with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
-                prepared_items = list(executor.map(prepare_item, query_items))
-        else:
-            prepared_items = [prepare_item(item) for item in query_items]
-
-        for item, prepared in zip(query_items, prepared_items):
-            query, request_id, saved_request, batch_request_time, _ = item
-
-            request = saved_request or BatchChatRequest(
-                request_id=request_id,
-                messages=prepared["messages"],
-                temperature=self.method_config.model.temperature,
-                max_tokens=(
-                    self.method_config.model.max_completion_tokens
-                    or self.method_config.model.max_tokens
-                ),
-                phase="query",
-                metadata={
-                    "query_id": query.query_id,
-                    "unit_id": unit.unit_id,
-                    "context_id": unit.context_id,
-                    "memory_time_per_query": memory_time_per_query,
-                    "batch_request_time": batch_request_time,
-                    PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared),
-                },
-            )
-            self._pending_batch_queries.append({
-                "request": request,
-                "query": query,
-                "prepared": prepared,
-                "sample_id": unit.context_id,
-                "memory_time_per_query": request.metadata.get(
-                    "memory_time_per_query",
-                    memory_time_per_query,
-                ),
-            })
-            prepared_count += 1
-
-        return prepared_count
-
-    def _complete_combined_batch_queries(self) -> List[Dict[str, Any]]:
-        """Submit all LoCoMo final-answer prompts as one Vertex stage."""
-        if not self._pending_batch_queries:
-            return []
-
-        stage = "query-final"
-        batch_client = self._get_batch_client()
-        saved_requests = batch_client.get_saved_requests(stage)
-        requests = saved_requests or [
-            item["request"] for item in self._pending_batch_queries
-        ]
-        self._log(
-            f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined "
-            "final-answer request(s) from all prepared samples."
-        )
-        responses = batch_client.run_stage(stage, requests)
-        finalized: List[Dict[str, Any]] = []
-
-        for item in self._pending_batch_queries:
-            request = item["request"]
-            query = item["query"]
-            batch_response = responses.get(request.request_id)
-            if batch_response is None or batch_response.status:
-                error = batch_response.status if batch_response else "No output row returned"
-                result = self._api_error_result(
-                    query,
-                    f"Batch request failed: {truncate_error_message(error)}",
-                )
-            else:
-                response = self.agent_manager.finalize_batch_query(
-                    item["prepared"],
-                    batch_response.content,
-                    input_tokens=batch_response.input_tokens,
-                    output_tokens=batch_response.output_tokens,
-                )
-                result = self._score_agent_response(query, response)
-
-            result.memory_construction_time = item["memory_time_per_query"]
-            status = "✓" if result.is_correct else "✗"
-            self._log(
-                f"  [{status}] {result.query_id} ({result.query_type}): {result.score:.2f}"
-            )
-            finalized.append({
-                "sample_id": item["sample_id"],
-                "result": result,
-            })
-
-        self._pending_batch_queries = []
-        return finalized
 
     def _evaluate_query(self, query: LoCoMoQuery, context_id: Any) -> MetricResult:
         if self.dry_run:
@@ -718,9 +584,8 @@ class LoCoMoEvaluator:
         response = self.agent_manager.send_message(
             message=formatted_question,
             memorizing=False,
-            context_id=context_id,
-            raw_question=query.question,
             query_type=query.query_type,
+            context_id=context_id,
         )
 
         return self._score_agent_response(query, response)
@@ -731,13 +596,10 @@ class LoCoMoEvaluator:
             query_type=query.query_type,
             score=0.0,
             is_correct=False,
-            model_output="[API_ERROR] Batch request failed",
+            model_output="[API_ERROR] Vertex batch request failed",
             expected_answer=", ".join(query.get_correct_answers()),
             question=query.question,
-            details={
-                "api_error": True,
-                "error_message": truncate_error_message(error_message),
-            },
+            details={"api_error": True, "error_message": error_message},
         )
 
     def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
@@ -746,16 +608,19 @@ class LoCoMoEvaluator:
             query_time = response.get("query_time", 0.0)
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
+            agent_extra = response.get("extra", {})
         elif hasattr(response, "output"):
             model_output = response.output
             query_time = getattr(response, "query_time", 0.0)
             retrieved_memories = getattr(response, "retrieved_memories", [])
             retrieved_count = getattr(response, "retrieved_count", 0)
+            agent_extra = getattr(response, "extra", {})
         else:
             model_output = str(response)
             query_time = 0.0
             retrieved_memories = []
             retrieved_count = 0
+            agent_extra = {}
 
         result = self.metrics_calculator.compute(
             query_id=query.query_id,
@@ -777,6 +642,8 @@ class LoCoMoEvaluator:
             result.details["category"] = query.category
         if "evidence" not in result.details:
             result.details["evidence"] = query.evidence
+        if agent_extra:
+            result.details["agent_telemetry"] = agent_extra
 
         return result
 
@@ -804,21 +671,6 @@ class LoCoMoEvaluator:
             config={
                 "method_config": self.method_config.raw_config,
                 "dataset_config": self.dataset_config.raw_config,
-                "judge_config": {
-                    "provider": get_api_config().get_judge_provider(),
-                    "model": get_api_config().get_judge_model(),
-                    "temperature": getattr(get_api_config(), "judge_temperature", 1.0),
-                    "reasoning_effort": getattr(
-                        get_api_config(), "judge_reasoning_effort", None
-                    ),
-                    "client_max_tokens": getattr(
-                        get_api_config(), "judge_client_max_tokens", 10000
-                    ),
-                    "max_tokens": getattr(get_api_config(), "judge_max_tokens", 500),
-                    "mcd_max_tokens": getattr(
-                        get_api_config(), "judge_mcd_max_tokens", 2000
-                    ),
-                },
                 "dry_run": self.dry_run,
             },
             metadata={
@@ -834,7 +686,6 @@ class LoCoMoEvaluator:
             report=report,
             output_dir=self.output_dir,
             memory_build_logs=self._memory_build_logs,
-            use_method_subdir=not self.run_scoped_output,
         )
 
         self._log(f"Results saved to: {result_path}")
@@ -896,16 +747,12 @@ def evaluate_locomo(
     verbose: bool = True,
     logger: Optional[logging.Logger] = None,
     resume: bool = False,
-    execution_stage: str = "all",
-    run_scoped_output: bool = False,
+    rebuild_memory: bool = False,
     batch_api: bool = False,
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
-    workers: int = 1,
     **kwargs
 ) -> EvaluationReport:
-    if execution_stage != "all":
-        raise ValueError("Separated memory/query execution is currently implemented for AMem on MedMemoryBench only")
     evaluator = LoCoMoEvaluator(
         method_config=method_config,
         dataset_config=dataset_config,
@@ -914,10 +761,9 @@ def evaluate_locomo(
         verbose=verbose,
         logger=logger,
         resume=resume,
-        run_scoped_output=run_scoped_output,
+        rebuild_memory=rebuild_memory,
         batch_api=batch_api,
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
-        workers=workers,
     )
     return evaluator.evaluate()

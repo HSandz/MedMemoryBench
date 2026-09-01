@@ -11,8 +11,7 @@ import pytest
 from metrics.llm_judge import LLMJudgeMCDMetric, LLMJudgeMetric
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
 from src.evaluator import Evaluator
-from utils.llm_client import LLMResponse, OpenRouterClient, get_usage_tracker
-from utils.openrouter_batch import OpenRouterBatchClient, OpenRouterBatchPending
+from utils.llm_client import get_usage_tracker
 from utils.vertex_batch import (
     BatchChatRequest,
     PREPARED_QUERY_METADATA_KEY,
@@ -75,24 +74,6 @@ def _success_row(request: dict, content: str = "answer") -> dict:
     }
 
 
-def test_vertex_batch_usage_separates_thought_tokens_from_visible_output():
-    response = VertexBatchClient._parse_row(
-        {
-            "response": {
-                "usageMetadata": {
-                    "promptTokenCount": 7,
-                    "candidatesTokenCount": 10,
-                    "thoughtsTokenCount": 6,
-                },
-                "candidates": [{"content": {"parts": [{"text": "answer"}]}}],
-            }
-        },
-        "request-1",
-    )
-
-    assert (response.output_tokens, response.visible_output_tokens, response.thinking_tokens) == (10, 4, 6)
-
-
 class _Batches:
     def __init__(self, storage: _Storage, partial_first_job: bool = False):
         self.storage = storage
@@ -124,22 +105,6 @@ class _GenAI:
         self.batches = batches
 
 
-class _DirectClient:
-    def __init__(self):
-        self.calls = []
-
-    def chat(self, messages, **kwargs):
-        self.calls.append((messages, kwargs))
-        text = messages[-1]["content"]
-        return LLMResponse(
-            content=f"direct-{text}",
-            input_tokens=5,
-            output_tokens=2,
-            model="gemini-2.5-flash",
-            raw_response={"transport": "direct"},
-        )
-
-
 def _client(
     tmp_path: Path,
     batches: _Batches,
@@ -147,7 +112,6 @@ def _client(
     *,
     wait: bool = True,
     progress_callback=None,
-    direct_client=None,
 ):
     return VertexBatchClient(
         model="gemini-2.5-flash",
@@ -159,7 +123,6 @@ def _client(
         wait=wait,
         config_hash="config-hash",
         genai_client=_GenAI(batches),
-        direct_client=direct_client,
         storage_client=storage,
         progress_callback=progress_callback,
     )
@@ -174,50 +137,6 @@ def _request(request_id: str, text: str = None) -> BatchChatRequest:
         response_format={"type": "json_object"},
         phase="query",
     )
-
-
-def test_batch_control_operations_use_vertex_credential_pool(tmp_path):
-    attempts = []
-
-    class CredentialPool:
-        def _run_with_service_account_rotation(self, operation, operation_name):
-            for project in ("project-one", "project-two"):
-                try:
-                    return operation(None, object(), project)
-                except PermissionError:
-                    continue
-            raise AssertionError("credential pool was exhausted")
-
-    class Batches:
-        def __init__(self, project):
-            self.project = project
-
-        def get(self, *, name):
-            attempts.append((self.project, name))
-            if self.project == "project-one":
-                raise PermissionError("permission denied")
-            return SimpleNamespace(name=name, state="JOB_STATE_SUCCEEDED")
-
-    client = VertexBatchClient(
-        model="gemini-2.5-flash",
-        project="project-one",
-        location="global",
-        credentials=object(),
-        gcs_uri="gs://private-bucket/evaluation-batch",
-        manifest_path=tmp_path / "batch_manifest.json",
-        wait=True,
-        credential_client=CredentialPool(),
-    )
-    client._new_batch_genai_client = lambda credentials, project: _GenAI(Batches(project))
-
-    job = client._get_job("projects/test/locations/global/batchPredictionJobs/1")
-
-    assert job.state == "JOB_STATE_SUCCEEDED"
-    assert attempts == [
-        ("project-one", "projects/test/locations/global/batchPredictionJobs/1"),
-        ("project-two", "projects/test/locations/global/batchPredictionJobs/1"),
-    ]
-    assert client.project == "project-two"
 
 
 def test_jsonl_mapping_and_output_parsing(tmp_path):
@@ -267,8 +186,6 @@ def test_json_schema_mapping_and_saved_request_restore(tmp_path):
     assert restored is not None
     assert restored.messages == request.messages
     assert restored.metadata == request.metadata
-    assert client.has_stage("concepts") is True
-    assert [item.request_id for item in client.get_saved_requests("concepts")] == ["structured"]
 
 
 def test_progress_callback_reports_submission_and_collection(tmp_path):
@@ -287,7 +204,7 @@ def test_progress_callback_reports_submission_and_collection(tmp_path):
     assert "finalized 1/1 request(s)" in joined
 
 
-def test_progress_callback_reports_only_poll_state_changes(tmp_path):
+def test_progress_callback_reports_each_wait_poll(tmp_path):
     class PollingBatches(_Batches):
         def __init__(self, storage):
             super().__init__(storage)
@@ -300,9 +217,7 @@ def test_progress_callback_reports_only_poll_state_changes(tmp_path):
 
         def get(self, *, name: str):
             self.get_calls += 1
-            if self.get_calls in {4, 5}:
-                self.states[name] = "JOB_STATE_QUEUED"
-            elif self.get_calls >= 6:
+            if self.get_calls >= 3:
                 self.states[name] = "JOB_STATE_SUCCEEDED"
             return super().get(name=name)
 
@@ -315,12 +230,8 @@ def test_progress_callback_reports_only_poll_state_changes(tmp_path):
     client.run_stage("query-unit-1", [_request("opaque-1")])
 
     joined = "\n".join(progress)
-    poll_messages = [message for message in progress if ": poll " in message]
     assert "polling every 0s" in joined
-    assert poll_messages == [
-        "[Vertex Batch] Stage 'query-unit-1': poll 2; jobs/1 is JOB_STATE_QUEUED.",
-        "[Vertex Batch] Stage 'query-unit-1': poll 4; jobs/1 is JOB_STATE_SUCCEEDED.",
-    ]
+    assert "poll 1; jobs/1 is JOB_STATE_SUCCEEDED" in joined
 
 
 def test_empty_stage_is_cloud_free(tmp_path):
@@ -331,63 +242,6 @@ def test_empty_stage_is_cloud_free(tmp_path):
     assert client.run_stage("unused", []) == {}
     assert batches.created == []
     assert storage.uploads == {}
-
-
-def test_small_stage_uses_vertex_batch_when_explicit(tmp_path, monkeypatch):
-    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
-    storage = _Storage()
-    batches = _Batches(storage)
-    direct_client = _DirectClient()
-    client = _client(
-        tmp_path,
-        batches,
-        storage,
-        direct_client=direct_client,
-    )
-    requests = [_request("request-0")]
-
-    responses = client.run_stage("small-stage", requests)
-
-    assert len(batches.created) == 1
-    assert storage.uploads
-    assert (tmp_path / "batch_manifest.json").exists()
-    assert direct_client.calls == []
-    assert responses["request-0"].content == "answer-request-0"
-
-
-def test_six_requests_create_a_batch_job(tmp_path, monkeypatch):
-    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
-    storage = _Storage()
-    batches = _Batches(storage)
-    direct_client = _DirectClient()
-    client = _client(tmp_path, batches, storage, direct_client=direct_client)
-
-    responses = client.run_stage(
-        "batch-stage",
-        [_request(f"request-{index}") for index in range(6)],
-    )
-
-    assert len(batches.created) == 1
-    assert direct_client.calls == []
-    assert len(responses) == 6
-
-
-def test_small_batch_retry_uses_another_batch_job(tmp_path, monkeypatch):
-    monkeypatch.delenv("VERTEX_BATCH_MIN_REQUESTS", raising=False)
-    storage = _Storage()
-    batches = _Batches(storage, partial_first_job=True)
-    direct_client = _DirectClient()
-    client = _client(tmp_path, batches, storage, direct_client=direct_client)
-
-    responses = client.run_stage(
-        "partial-stage",
-        [_request(f"request-{index}") for index in range(6)],
-    )
-
-    assert len(batches.created) == 2
-    assert direct_client.calls == []
-    assert len(responses) == 6
-    assert responses["request-5"].content == "answer-request-5"
 
 
 @pytest.mark.parametrize("method_name", ["amem", "mem0", "memos", "memrl", "mirix"])
@@ -416,20 +270,6 @@ def test_native_mirix_is_not_an_eligible_final_answer_batch_stage():
 
     with pytest.raises(ValueError, match="at least one eligible Gemini stage"):
         evaluator._validate_batch_eligibility()
-
-
-def test_openrouter_batch_eligibility_does_not_require_gcs(monkeypatch):
-    evaluator = Evaluator.__new__(Evaluator)
-    evaluator.method_config = SimpleNamespace(
-        method_name="long_context",
-        model=SimpleNamespace(provider="openrouter"),
-        raw_config={},
-    )
-    evaluator.dataset_config = SimpleNamespace(dataset_name="locomo")
-    evaluator.batch_gcs_uri = None
-    monkeypatch.delenv("GOOGLE_BATCH_GCS_URI", raising=False)
-
-    evaluator._validate_batch_eligibility()
 
 
 def test_submit_only_resume_does_not_resubmit(tmp_path):
@@ -521,31 +361,6 @@ def test_prepared_query_snapshot_is_json_safe_and_bound_to_staged_messages():
     assert restore_prepared_query(request) == snapshot
     request.messages = [{"role": "user", "content": "different prompt"}]
     assert restore_prepared_query(request) is None
-
-
-def test_batch_request_serializes_gemini_thinking_settings():
-    request = BatchChatRequest(
-        request_id="thinking",
-        messages=[{"role": "user", "content": "hello"}],
-        temperature=0.2,
-        max_tokens=100,
-        reasoning_effort="high",
-    )
-    record = request.to_vertex_record(model="gemini-3-pro-preview")
-    assert record["request"]["generationConfig"]["thinkingConfig"] == {
-        "thinkingLevel": "HIGH"
-    }
-
-    budget_request = BatchChatRequest(
-        request_id="budget",
-        messages=[{"role": "user", "content": "hello"}],
-        temperature=0.2,
-        max_tokens=100,
-        reasoning_effort=1024,
-    )
-    assert budget_request.to_vertex_request(model="gemini-2.5-flash")["generationConfig"][
-        "thinkingConfig"
-    ] == {"thinkingBudget": 1024}
 
 
 def test_medmemorybench_resume_reuses_saved_prepared_query_without_retrieval():
@@ -645,51 +460,6 @@ def test_deferred_judge_work_is_persisted_for_resume(tmp_path):
     assert not list((tmp_path / "batch").glob("medmemorybench_deferred_judges-*.json"))
 
 
-def test_single_deferred_judge_uses_batch_stage():
-    class BatchStageCalled(RuntimeError):
-        pass
-
-    captured = {}
-
-    def run_stage(stage, requests):
-        captured["stage"] = stage
-        captured["requests"] = requests
-        raise BatchStageCalled
-
-    judge_client = SimpleNamespace(model="gemini-2.5-flash-lite")
-    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
-    evaluator._deferred_judges = [{
-        "query_id": "q1",
-        "persona_id": 1,
-        "prepared_metric": {"prepared": {
-            "query_id": "q1",
-            "query_type": "state_update",
-            "model_output": "answer",
-            "question": "What changed?",
-            "judge_payload": {
-                "prompt": "judge this answer",
-                "temperature": 0.2,
-                "max_tokens": 100,
-            },
-        }},
-    }]
-    evaluator.method_config = SimpleNamespace(method_name="long_context")
-    evaluator.metrics_calculator = SimpleNamespace(
-        get_batch_judge_client=lambda query_type: judge_client,
-    )
-    evaluator._save_deferred_judges = lambda client: None
-    evaluator._get_judge_batch_client = lambda client: SimpleNamespace(
-        run_stage=run_stage,
-    )
-    evaluator._log = lambda message: None
-
-    with pytest.raises(BatchStageCalled):
-        evaluator._complete_deferred_judges()
-
-    assert captured["stage"] == "judge-final"
-    assert len(captured["requests"]) == 1
-
-
 def test_judge_prepare_finalize_preserves_metric_schema():
     judge = LLMJudgeMetric(language="en")
     prepared = judge.prepare_batch(
@@ -725,205 +495,3 @@ def test_judge_prepare_finalize_preserves_metric_schema():
     )
     assert result_mcd.score == 1.0
     assert result_mcd.details["metric"] == "llm_judge_mcd"
-
-
-class _OpenRouterResponse:
-    def __init__(self, payload, status_code=200):
-        self._payload = payload
-        self.status_code = status_code
-        self.text = json.dumps(payload)
-
-    def json(self):
-        return self._payload
-
-
-class _OpenRouterHTTPClient:
-    def __init__(self, handler):
-        self.handler = handler
-        self.calls = []
-
-    def request(self, method, url, **kwargs):
-        self.calls.append((method, url, kwargs))
-        return self.handler(method, url, kwargs)
-
-
-def _openrouter_client(*, routing=None, service_tier=None, direct_calls=None):
-    client = object.__new__(OpenRouterClient)
-    client.model = "openai/gpt-4o"
-    client.temperature = 0.2
-    client.max_tokens = 100
-    client.provider_routing = routing
-    client.service_tier = service_tier
-    client.client = SimpleNamespace(
-        base_url="https://openrouter.ai/api/v1/",
-        api_key="test-key",
-    )
-    direct_calls = direct_calls if direct_calls is not None else []
-
-    def chat(messages, **kwargs):
-        direct_calls.append((messages, kwargs))
-        return LLMResponse(
-            content=f"direct-{messages[-1]['content']}",
-            input_tokens=3,
-            output_tokens=2,
-            model=client.model,
-        )
-
-    client.chat = chat
-    return client
-
-
-def _openrouter_request(request_id, text):
-    return BatchChatRequest(
-        request_id=request_id,
-        messages=[{"role": "user", "content": text}],
-        temperature=0.1,
-        max_tokens=50,
-        phase="query",
-    )
-
-
-def test_openrouter_batch_submits_and_correlates_inline_results(tmp_path, monkeypatch):
-    monkeypatch.setenv("VERTEX_BATCH_MIN_REQUESTS", "2")
-
-    def handler(method, url, kwargs):
-        if url.endswith("/models/openai/gpt-4o%3Abatch/endpoints"):
-            return _OpenRouterResponse({
-                "data": {"endpoints": [{"tag": "openai"}]}
-            })
-        if method == "POST":
-            return _OpenRouterResponse(
-                {"id": "batch_1", "status": "validating"}, 202
-            )
-        return _OpenRouterResponse({
-            "id": "batch_1",
-            "status": "completed",
-            "results": [
-                {
-                    "custom_id": "req-2",
-                    "response": {
-                        "status_code": 200,
-                        "body": {
-                            "choices": [{"message": {"content": "answer-2"}}],
-                            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
-                        },
-                    },
-                    "error": None,
-                },
-                {
-                    "custom_id": "req-1",
-                    "response": {
-                        "status_code": 200,
-                        "body": {
-                            "choices": [{"message": {"content": "answer-1"}}],
-                            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
-                        },
-                    },
-                    "error": None,
-                },
-            ],
-        })
-
-    http_client = _OpenRouterHTTPClient(handler)
-    client = OpenRouterBatchClient(
-        direct_client=_openrouter_client(
-            routing={"order": ["openai", "azure"], "allow_fallbacks": False}
-        ),
-        manifest_path=tmp_path / "batch.json",
-        wait=True,
-        config_hash="hash",
-        http_client=http_client,
-    )
-
-    responses = client.run_stage(
-        "query-final",
-        [
-            _openrouter_request("req-1", "one"),
-            _openrouter_request("req-2", "two"),
-        ],
-    )
-
-    assert responses["req-1"].content == "answer-1"
-    assert responses["req-2"].input_tokens == 7
-    post = next(call for call in http_client.calls if call[0] == "POST")
-    payload = json.loads(post[2]["content"])
-    assert list(payload) == ["endpoint", "model", "requests"]
-    assert payload["requests"][0]["body"]["provider"] == {
-        "order": ["openai", "azure"],
-        "allow_fallbacks": False,
-    }
-
-
-@pytest.mark.parametrize(
-    ("routing", "service_tier"),
-    [
-        ({"only": ["azure"]}, None),
-        (None, "priority"),
-    ],
-)
-def test_openrouter_unsupported_route_uses_realtime_client(
-    tmp_path, routing, service_tier
-):
-    direct_calls = []
-    progress = []
-    http_client = _OpenRouterHTTPClient(
-        lambda method, url, kwargs: _OpenRouterResponse({
-            "data": {"endpoints": [{"tag": "openai"}]}
-        })
-    )
-    client = OpenRouterBatchClient(
-        direct_client=_openrouter_client(
-            routing=routing,
-            service_tier=service_tier,
-            direct_calls=direct_calls,
-        ),
-        manifest_path=tmp_path / "batch.json",
-        wait=False,
-        http_client=http_client,
-        progress_callback=progress.append,
-    )
-
-    responses = client.run_stage(
-        "query-final", [_openrouter_request("req-1", "one")]
-    )
-
-    assert responses["req-1"].content == "direct-one"
-    assert len(direct_calls) == 1
-    assert all(method != "POST" for method, _, _ in http_client.calls)
-    assert any("ignoring --batch-api" in message for message in progress)
-
-
-def test_openrouter_submit_only_raises_shared_pending_type(tmp_path, monkeypatch):
-    monkeypatch.setenv("VERTEX_BATCH_MIN_REQUESTS", "2")
-
-    def handler(method, url, kwargs):
-        if url.endswith("/endpoints"):
-            return _OpenRouterResponse({
-                "data": {"endpoints": [{"tag": "openai"}]}
-            })
-        if method == "POST":
-            return _OpenRouterResponse(
-                {"id": "batch_pending", "status": "validating"}, 202
-            )
-        return _OpenRouterResponse({
-            "id": "batch_pending", "status": "in_progress"
-        })
-
-    client = OpenRouterBatchClient(
-        direct_client=_openrouter_client(),
-        manifest_path=tmp_path / "batch.json",
-        wait=False,
-        http_client=_OpenRouterHTTPClient(handler),
-    )
-
-    with pytest.raises(OpenRouterBatchPending) as exc_info:
-        client.run_stage(
-            "query-final",
-            [
-                _openrouter_request("req-1", "one"),
-                _openrouter_request("req-2", "two"),
-            ],
-        )
-
-    assert isinstance(exc_info.value, VertexBatchPending)
-    assert exc_info.value.job_name == "batch_pending"

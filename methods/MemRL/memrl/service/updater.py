@@ -261,11 +261,7 @@ Provide a brief reflection:
 """
         messages = [{"role": "user", "content": prompt}]
         try:
-            return self.llm.generate(
-                messages,
-                temperature=getattr(self.llm, "reflection_temperature", 0.3),
-                max_tokens=getattr(self.llm, "reflection_max_tokens", None),
-            )
+            return self.llm.generate(messages, temperature=0.3)
         except Exception as e:
             logger.warning(f"LLM reflection generation failed: {e}")
             return "Reflection not available due to LLM error."
@@ -425,3 +421,4 @@ def get_updater(
     if strategy == UpdateStrategy.VALIDATION:
         return ValidationUpdater(mos, num_workers, user_id, strategies, llm, default_cube_id=default_cube_id, memory_confidence=memory_confidence, adjustment_config=cfg)
     return AdjustmentUpdater(mos, num_workers, user_id, strategies, llm, default_cube_id=default_cube_id, memory_confidence=memory_confidence, adjustment_config=cfg)
+

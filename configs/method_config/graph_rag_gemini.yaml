@@ -1,17 +1,21 @@
-method_name: graph_rag
-method_type: rag
-description: Graph RAG Agent with Gemini model configuration
+# Graph RAG Agent Configuration with Gemini selected as the model.
+
+method_name: "graph_rag"
+method_type: "rag"
+description: "Graph RAG Agent with Gemini model configuration"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
   max_tokens: 10000
-embedding:
-  provider: local
-  model: BAAI/bge-small-zh-v1.5
-build_config:
+
+agent_params:
   top_k: 5
   chunk_size: 10240
   chunk_overlap: 200
   edges_threshold: 0.8
-retrieval_config: {}
+
+embedding:
+  provider: "local"
+  model: "BAAI/bge-small-zh-v1.5"

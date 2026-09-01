@@ -661,7 +661,7 @@ class MemFeedback(BaseMemFeedback):
         messages = [{"role": "user", "content": prompt}]
         response_text = ""
         try:
-            response_text = self.llm.generate(messages, timeout=60)
+            response_text = self.llm.generate(messages, temperature=0.3, timeout=60)
             if not dsl:
                 return response_text
             try:

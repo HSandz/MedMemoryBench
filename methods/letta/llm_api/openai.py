@@ -137,7 +137,6 @@ def build_openai_chat_completions_request(
             max_completion_tokens=llm_config.max_tokens,
             temperature=1.0 if llm_config.enable_reasoner else llm_config.temperature,
             reasoning_effort=llm_config.reasoning_effort,
-            extra_body=llm_config.extra_body,
         )
     else:
         data = ChatCompletionRequest(
@@ -149,7 +148,6 @@ def build_openai_chat_completions_request(
             max_completion_tokens=llm_config.max_tokens,
             temperature=1.0 if llm_config.enable_reasoner else llm_config.temperature,
             reasoning_effort=llm_config.reasoning_effort,
-            extra_body=llm_config.extra_body,
         )
         # https://platform.openai.com/docs/guides/text-generation/json-mode
         # only supported by gpt-4o, gpt-4-turbo, or gpt-3.5-turbo

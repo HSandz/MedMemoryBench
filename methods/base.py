@@ -1,6 +1,7 @@
 """Base agent class and data structures."""
 
 from abc import ABC, abstractmethod
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
@@ -24,7 +25,9 @@ class MemoryBuildResult:
     all_passages: List[Dict[str, Any]] = field(default_factory=list)  # All stored passages
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        # Results are persisted after later sessions mutate the agent store.
+        # Deep-copy mutable fields so each report entry is a real snapshot.
+        return copy.deepcopy({
             "success": self.success,
             "method": self.method,
             "action": self.action,
@@ -36,7 +39,7 @@ class MemoryBuildResult:
             "extraction_result": self.extraction_result,
             "all_passages": self.all_passages,
             **self.extra
-        }
+        })
 
 
 @dataclass
@@ -49,13 +52,13 @@ class AgentResponse:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        return copy.deepcopy({
             "output": self.output,
             "query_time": self.query_time,
             "retrieved_count": self.retrieved_count,
             "retrieved_memories": self.retrieved_memories,
             **self.extra
-        }
+        })
 
 
 class BaseAgent(ABC):

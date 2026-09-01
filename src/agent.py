@@ -5,11 +5,7 @@ from typing import Callable, Dict, Any, Optional, List
 
 from src.config import MethodConfig, DatasetConfig, get_api_config
 from methods.base import MemoryBuildResult, AgentResponse
-from utils.llm_client import (
-    get_usage_tracker,
-    is_batch_provider,
-    is_gemini_provider,
-)
+from utils.llm_client import get_usage_tracker
 
 
 class AgentManager:
@@ -18,14 +14,12 @@ class AgentManager:
         "long_context": ("methods.long_context", "LongContextAgent"),
         "embedding_rag": ("methods.embedding_rag", "EmbeddingRAGAgent"),
         "bm25_rag": ("methods.bm25_rag", "BM25RAGAgent"),
-        "amem_fix": ("methods.amem_fix_agent", "AMemFixAgent"),
-        "amem_test": ("methods.amem_test_agent", "AMemTestAgent"),
-        "event_state": ("methods.event_state_agent", "EventStateAgent"),
         "amem": ("methods.amem_agent", "AMemAgent"),
         "letta": ("methods.letta_agent", "LettaAgent"),
         "memos": ("methods.memos_agent", "MemOSAgent"),
         "mirix": ("methods.mirix_agent", "MIRIXAgent"),
         "mem0": ("methods.mem0_agent", "Mem0Agent"),
+        "smart_mem0": ("methods.smart_mem0_agent", "SmartMem0Agent"),
         "mem1": ("methods.mem1_agent", "Mem1Agent"),
         "memrl": ("methods.memrl_agent", "MemRLAgent"),
         "zep": ("methods.zep_agent", "ZepAgent"),
@@ -47,8 +41,6 @@ class AgentManager:
         batch_manifest_dir: Optional[Path] = None,
         batch_config_hash: str = "",
         batch_progress_callback: Optional[Callable[[str], None]] = None,
-        workers: int = 1,
-        query_only: bool = False,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -59,8 +51,6 @@ class AgentManager:
         self._batch_manifest_dir = batch_manifest_dir
         self._batch_config_hash = batch_config_hash
         self._batch_progress_callback = batch_progress_callback
-        self._workers = max(1, int(workers))
-        self._query_only = bool(query_only)
 
         self._api_config = get_api_config()
 
@@ -71,50 +61,20 @@ class AgentManager:
         self._initialize_agent()
 
     def _initialize_agent(self) -> None:
-        matched_method = self._matched_method_key(self.method_name)
+        matched_method = None
+        if self.method_name in self.SUPPORTED_METHODS:
+            matched_method = self.method_name
+        else:
+            for method_key in self.SUPPORTED_METHODS:
+                if method_key in self.method_name:
+                    matched_method = method_key
+                    break
+
+        if matched_method is None:
+            matched_method = "long_context"
 
         module_path, class_name = self.SUPPORTED_METHODS[matched_method]
         self._agent = self._create_agent_instance(module_path, class_name, matched_method)
-
-    @classmethod
-    def _matched_method_key(cls, method_name: str) -> str:
-        """Return the adapter key selected for a configured method name."""
-        normalized_name = method_name.lower()
-        for method_key in cls.SUPPORTED_METHODS:
-            if method_key in normalized_name:
-                return method_key
-        return "long_context"
-
-    @classmethod
-    def resolve_effective_init_params(
-        cls,
-        method_config: MethodConfig,
-        dataset_config: DatasetConfig,
-        *,
-        batch_api: bool = False,
-        batch_gcs_uri: Optional[str] = None,
-        batch_wait: bool = False,
-        batch_manifest_dir: Optional[Path] = None,
-        batch_config_hash: str = "",
-        query_only: bool = False,
-        workers: int = 1,
-    ) -> tuple[str, Dict[str, Any]]:
-        """Resolve adapter kwargs without constructing an agent or making provider calls."""
-        manager = cls.__new__(cls)
-        manager.method_config = method_config
-        manager.dataset_config = dataset_config
-        manager.method_name = method_config.method_name.lower()
-        manager._batch_api = batch_api
-        manager._batch_gcs_uri = batch_gcs_uri
-        manager._batch_wait = batch_wait
-        manager._batch_manifest_dir = batch_manifest_dir
-        manager._batch_config_hash = batch_config_hash
-        manager._batch_progress_callback = None
-        manager._workers = max(1, int(workers))
-        manager._query_only = bool(query_only)
-        manager._api_config = get_api_config()
-        method_key = cls._matched_method_key(manager.method_name)
-        return method_key, manager._build_agent_params(method_key)
 
     def _create_agent_instance(self, module_path: str, class_name: str, method_key: str):
         import importlib
@@ -124,59 +84,9 @@ class AgentManager:
         init_params = self._build_agent_params(method_key)
         return agent_class(**init_params)
 
-    def _resolve_model_runtime(
-        self,
-        model_config,
-    ) -> tuple[Optional[str], str, Dict[str, Any]]:
-        """Resolve credentials, endpoint, and provider options for one model block."""
-        api_key = model_config.api_key
-        provider = model_config.provider.lower()
-        if not is_gemini_provider(provider):
-            if provider == "modal":
-                api_key = api_key or getattr(self._api_config, "modal_api_key", "")
-            elif provider == "openrouter":
-                api_key = api_key or getattr(
-                    self._api_config, "openrouter_api_key", ""
-                )
-            else:
-                api_key = api_key or getattr(self._api_config, "openai_api_key", "")
-
-        configured_base_url = getattr(self._api_config, "openai_base_url", "")
-        if provider == "modal":
-            configured_base_url = getattr(self._api_config, "modal_base_url", "")
-        elif provider == "openrouter":
-            configured_base_url = getattr(self._api_config, "openrouter_base_url", "")
-
-        client_kwargs: Dict[str, Any] = {}
-        reasoning_effort = getattr(model_config, "reasoning_effort", None)
-        if reasoning_effort is not None:
-            client_kwargs["reasoning_effort"] = reasoning_effort
-        nim_thinking_enabled = getattr(model_config, "nim_thinking_enabled", None)
-        if nim_thinking_enabled is not None:
-            client_kwargs["nim_thinking_enabled"] = nim_thinking_enabled
-        nim_reasoning_budget = getattr(model_config, "nim_reasoning_budget", None)
-        if nim_reasoning_budget is not None:
-            client_kwargs["nim_reasoning_budget"] = nim_reasoning_budget
-        if provider == "openrouter":
-            if model_config.openrouter_provider is not None:
-                client_kwargs["provider_routing"] = dict(
-                    model_config.openrouter_provider
-                )
-            if model_config.openrouter_service_tier is not None:
-                client_kwargs["service_tier"] = model_config.openrouter_service_tier
-
-        return api_key, model_config.base_url or configured_base_url, client_kwargs
-
     def _build_agent_params(self, method_key: str) -> Dict[str, Any]:
         model_config = self.method_config.model
-        # Merge sections only at the adapter boundary; snapshot identity keeps
-        # build and retrieval ownership separate.
-        agent_params = {
-            **(self.method_config.build_config or {}),
-            **(self.method_config.retrieval_config or {}),
-        }
-        if not agent_params:
-            agent_params = self.method_config.agent_params or {}
+        agent_params = self.method_config.agent_params or {}
         env_embedding_model = os.environ.get("DEFAULT_EMBEDDING_MODEL")
         env_embedding_provider = os.environ.get("EMBEDDING_PROVIDER", "").lower()
         use_env_embedding = bool(
@@ -191,36 +101,25 @@ class AgentManager:
         )
 
         effective_max_tokens = model_config.max_completion_tokens or model_config.max_tokens
-        api_key, base_url, llm_client_kwargs = self._resolve_model_runtime(model_config)
 
         params = {
             "model": model_config.name,
             "temperature": model_config.temperature,
             "max_tokens": effective_max_tokens,
             "provider": model_config.provider,
-            "api_key": api_key,
-            "base_url": base_url,
+            "api_key": (
+                model_config.api_key
+                or self._api_config.openai_api_key
+            ),
+            "base_url": (
+                model_config.base_url
+                or self._api_config.openai_base_url
+            ),
         }
-        if llm_client_kwargs:
-            params["llm_client_kwargs"] = llm_client_kwargs
-
-        build_model_config = self.method_config.memorize_model
-        if build_model_config is not None:
-            build_api_key, build_base_url, build_client_kwargs = (
-                self._resolve_model_runtime(build_model_config)
-            )
-            build_max_tokens = (
-                build_model_config.max_completion_tokens
-                or build_model_config.max_tokens
-            )
-        else:
-            build_api_key = build_base_url = None
-            build_client_kwargs = {}
-            build_max_tokens = None
 
         if (
             self._batch_api
-            and is_batch_provider(model_config.provider)
+            and model_config.provider.lower() in {"gemini", "vertex", "vertex_ai"}
             and method_key in {"lightmem", "remem", "graph_rag", "memrl"}
         ):
             params.update({
@@ -267,6 +166,8 @@ class AgentManager:
                 "retrieve_num": agent_params.get("retrieve_num", 5),
                 "chunk_size_tokens": agent_params.get("chunk_size_tokens"),
                 "max_context_tokens": agent_params.get("max_context_tokens"),
+                "turn_by_turn": agent_params.get("turn_by_turn", False),
+                "max_recent_turns": agent_params.get("max_recent_turns", 10),
             })
             if self.method_config.embedding:
                 params["embedding_model"] = self.method_config.embedding.model
@@ -274,255 +175,55 @@ class AgentManager:
                 if self.method_config.embedding.model_path:
                     params["embedding_model_path"] = self.method_config.embedding.model_path
 
-        elif method_key == "amem_fix":
+        elif method_key == "smart_mem0":
             params.update({
-                "retrieve_num": agent_params.get("retrieve_num", 10),
-                "amem_backend": agent_params.get(
-                    "amem_backend",
-                    build_model_config.provider if build_model_config else "openai",
+                "retrieve_num": agent_params.get("retrieve_num", 8),
+                "max_context_tokens": agent_params.get("max_context_tokens", 32768),
+                "max_question_tokens": agent_params.get("max_question_tokens", 1200),
+                "enable_memory_write": agent_params.get("enable_memory_write", True),
+                "enable_planner": agent_params.get("enable_planner", True),
+                "enable_unified_controller": agent_params.get(
+                    "enable_unified_controller", True
                 ),
-                "amem_model": agent_params.get(
-                    "amem_model",
-                    build_model_config.name if build_model_config else model_config.name,
+                "enable_slot_support_validation": agent_params.get(
+                    "enable_slot_support_validation", False
                 ),
-                "amem_embedding_model": agent_params.get(
-                    "amem_embedding_model", "all-MiniLM-L6-v2"
+                "enable_replan": agent_params.get("enable_replan", False),
+                "enable_zero_result_recovery": agent_params.get(
+                    "enable_zero_result_recovery", True
                 ),
-                "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get(
-                    "amem_max_tokens", build_max_tokens or 1000
+                "enable_planner_repair": agent_params.get(
+                    "enable_planner_repair", False
                 ),
-                "amem_temperature": agent_params.get(
-                    "amem_temperature",
-                    build_model_config.temperature if build_model_config else 0.7,
+                "frozen_memory_path": agent_params.get("frozen_memory_path"),
+                "write_window_max_turns": agent_params.get("write_window_max_turns", 64),
+                "write_window_max_tokens": agent_params.get("write_window_max_tokens", 3000),
+                "write_context_mode": agent_params.get("write_context_mode", "full"),
+                "write_prior_belief_limit": agent_params.get(
+                    "write_prior_belief_limit", 8
                 ),
-                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
-                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
-                "amem_build_max_context_tokens": agent_params.get(
-                    "amem_build_max_context_tokens", 200000
+                "write_provisional_limit": agent_params.get(
+                    "write_provisional_limit", 4
                 ),
-                "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
-                "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
-                "amem_query_keywords": agent_params.get("amem_query_keywords", True),
-                "amem_expand_links": agent_params.get("amem_expand_links", True),
-            })
-
-        elif method_key == "amem_test":
-            params.update({
-                "retrieve_num": agent_params.get("retrieve_num", 10),
-                "amem_backend": agent_params.get(
-                    "amem_backend",
-                    build_model_config.provider if build_model_config else "openai",
-                ),
-                "amem_model": agent_params.get(
-                    "amem_model",
-                    build_model_config.name if build_model_config else model_config.name,
-                ),
-                "amem_embedding_model": agent_params.get(
-                    "amem_embedding_model", "all-MiniLM-L6-v2"
-                ),
-                "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get(
-                    "amem_max_tokens", build_max_tokens or 1000
-                ),
-                "amem_temperature": agent_params.get(
-                    "amem_temperature",
-                    build_model_config.temperature if build_model_config else 0.7,
-                ),
-                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
-                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
-                "amem_build_max_context_tokens": agent_params.get(
-                    "amem_build_max_context_tokens", 200000
-                ),
-                "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
-                "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
-                "amem_query_keywords": agent_params.get("amem_query_keywords", True),
-                "amem_regex_intent_conditioning": agent_params.get(
-                    "amem_regex_intent_conditioning", True
-                ),
-                "amem_expand_links": agent_params.get("amem_expand_links", True),
-                "amem_note_level": agent_params.get("amem_note_level", "turn"),
-                "amem_original_evolution": agent_params.get(
-                    "amem_original_evolution", True
-                ),
-                "amem_typed_relations": agent_params.get("amem_typed_relations", True),
-                "amem_workers": getattr(self, "_workers", 1),
-                "amem_query_only": getattr(self, "_query_only", False),
-                "amem_typed_retrieval": agent_params.get(
-                    "amem_typed_retrieval",
-                    bool(agent_params.get("amem_typed_relations", True)),
-                ),
-                "amem_relation_candidate_count": agent_params.get(
-                    "amem_relation_candidate_count", 5
-                ),
-                "amem_typed_expansion_count": agent_params.get(
-                    "amem_typed_expansion_count", 5
-                ),
-                "amem_expand_related": agent_params.get("amem_expand_related", False),
-                "amem_relation_min_confidence": agent_params.get(
-                    "amem_relation_min_confidence", 0.5
-                ),
-                "amem_relation_temperature": agent_params.get("amem_relation_temperature", 0.2),
-                "amem_temporal_transition_min_confidence": agent_params.get(
-                    "amem_temporal_transition_min_confidence", 0.5
-                ),
-                "amem_temporal_state": agent_params.get("amem_temporal_state", False),
-                "amem_temporal_retrieval": agent_params.get(
-                    "amem_temporal_retrieval",
-                    bool(agent_params.get("amem_temporal_state", False)),
-                ),
-                "amem_temporal_ordering": agent_params.get(
-                    "amem_temporal_ordering", True
-                ),
-                "amem_temporal_expansion_count": agent_params.get(
-                    "amem_temporal_expansion_count", 5
-                ),
-                "amem_provenance": agent_params.get("amem_provenance", False),
-                "amem_provenance_retrieval": agent_params.get(
-                    "amem_provenance_retrieval",
-                    bool(agent_params.get("amem_provenance", False)),
-                ),
-                "amem_provenance_max_evidence": agent_params.get(
-                    "amem_provenance_max_evidence", 10
-                ),
-                "amem_provenance_inject_raw_text": agent_params.get(
-                    "amem_provenance_inject_raw_text", False
-                ),
-                "amem_hybrid_retrieval": agent_params.get(
-                    "amem_hybrid_retrieval", False
-                ),
-                "amem_hybrid_candidate_count": agent_params.get(
-                    "amem_hybrid_candidate_count", 50
-                ),
-                "amem_hybrid_rrf_k": agent_params.get("amem_hybrid_rrf_k", 60.0),
-                "amem_hybrid_dense_weight": agent_params.get(
-                    "amem_hybrid_dense_weight", 1.0
-                ),
-                "amem_hybrid_bm25_weight": agent_params.get(
-                    "amem_hybrid_bm25_weight", 1.0
-                ),
-                "amem_hybrid_entity_weight": agent_params.get(
-                    "amem_hybrid_entity_weight", 1.0
-                ),
-                "amem_hybrid_timestamp_weight": agent_params.get(
-                    "amem_hybrid_timestamp_weight", 1.0
-                ),
-                "amem_hybrid_state_weight": agent_params.get(
-                    "amem_hybrid_state_weight", 1.0
-                ),
-                "amem_hybrid_graph_weight": agent_params.get(
-                    "amem_hybrid_graph_weight", 1.0
-                ),
-                "amem_graph_ranking_mode": agent_params.get(
-                    "amem_graph_ranking_mode", "fixed_bfs"
-                ),
-                "amem_graph_alpha": agent_params.get("amem_graph_alpha", 0.85),
-                "amem_graph_iterations": agent_params.get(
-                    "amem_graph_iterations", 20
-                ),
-                "amem_graph_tolerance": agent_params.get(
-                    "amem_graph_tolerance", 1e-6
-                ),
-                "amem_graph_supersede_weight": agent_params.get(
-                    "amem_graph_supersede_weight", 1.25
-                ),
-                "amem_graph_conflict_weight": agent_params.get(
-                    "amem_graph_conflict_weight", 0.75
-                ),
-                "amem_graph_refine_weight": agent_params.get(
-                    "amem_graph_refine_weight", 1.15
-                ),
-                "amem_graph_support_weight": agent_params.get(
-                    "amem_graph_support_weight", 1.0
-                ),
-                "amem_graph_related_weight": agent_params.get(
-                    "amem_graph_related_weight", 0.5
-                ),
-                "amem_chain_selection": agent_params.get(
-                    "amem_chain_selection", False
-                ),
-                "amem_chain_candidate_count": agent_params.get(
-                    "amem_chain_candidate_count", 50
-                ),
-                "amem_chain_evidence_count": agent_params.get(
-                    "amem_chain_evidence_count", 30
-                ),
-                "amem_chain_max_hops": agent_params.get(
-                    "amem_chain_max_hops", 2
-                ),
-                "amem_chain_max_groups": agent_params.get(
-                    "amem_chain_max_groups", 3
-                ),
-                "amem_chain_relevance_weight": agent_params.get(
-                    "amem_chain_relevance_weight", 1.0
-                ),
-                "amem_chain_coverage_weight": agent_params.get(
-                    "amem_chain_coverage_weight", 1.0
-                ),
-                "amem_chain_connectivity_weight": agent_params.get(
-                    "amem_chain_connectivity_weight", 0.35
-                ),
-                "amem_chain_path_weight": agent_params.get(
-                    "amem_chain_path_weight", 0.75
-                ),
-                "amem_chain_temporal_weight": agent_params.get(
-                    "amem_chain_temporal_weight", 0.5
-                ),
-                "amem_chain_redundancy_weight": agent_params.get(
-                    "amem_chain_redundancy_weight", 0.25
-                ),
-            })
-
-        elif method_key == "event_state":
-            params.update(agent_params)
-            params.update({
-                "event_state_workers": getattr(self, "_workers", 1),
-                "memory_model": build_model_config.name if build_model_config else model_config.name,
-                "memory_provider": build_model_config.provider if build_model_config else model_config.provider,
-                "memory_temperature": build_model_config.temperature if build_model_config else model_config.temperature,
-                "memory_max_tokens": build_max_tokens or effective_max_tokens,
-                "memory_api_key": build_api_key if build_model_config else api_key,
-                "memory_base_url": build_base_url if build_model_config else base_url,
-                "memory_llm_client_kwargs": build_client_kwargs if build_model_config else llm_client_kwargs,
             })
             if self.method_config.embedding:
-                params.update({
-                    "embedding_model": self.method_config.embedding.model,
-                    "embedding_provider": self.method_config.embedding.provider,
-                    "embedding_model_path": self.method_config.embedding.model_path,
-                    "embedding_api_key": self.method_config.embedding.api_key,
-                    "embedding_base_url": self.method_config.embedding.base_url,
-                })
+                params["embedding_model"] = self.method_config.embedding.model
+                params["embedding_provider"] = self.method_config.embedding.provider
+                if self.method_config.embedding.model_path:
+                    params["embedding_model_path"] = self.method_config.embedding.model_path
 
         elif method_key == "amem":
             params.update({
                 "retrieve_num": agent_params.get("retrieve_num", 5),
-                "amem_backend": agent_params.get(
-                    "amem_backend",
-                    build_model_config.provider if build_model_config else "openai",
-                ),
-                "amem_model": agent_params.get(
-                    "amem_model",
-                    build_model_config.name if build_model_config else model_config.name,
-                ),
+                "amem_backend": agent_params.get("amem_backend", "openai"),
+                "amem_model": agent_params.get("amem_model", model_config.name),
                 "amem_embedding_model": (
                     env_embedding_model
                     if use_env_amem_embedding
                     else amem_embedding_model
                 ),
                 "amem_evo_threshold": agent_params.get("amem_evo_threshold", 100),
-                "amem_max_tokens": agent_params.get(
-                    "amem_max_tokens", build_max_tokens
-                ),
-                "amem_temperature": agent_params.get(
-                    "amem_temperature",
-                    build_model_config.temperature if build_model_config else 0.7,
-                ),
-                "amem_retry_temperature": agent_params.get("amem_retry_temperature", 0.3),
-                "amem_connectivity_temperature": agent_params.get("amem_connectivity_temperature", 0.0),
-                "amem_build_max_context_tokens": agent_params.get(
-                    "amem_build_max_context_tokens", 200000
-                ),
+                "amem_max_tokens": agent_params.get("amem_max_tokens"),
                 "amem_max_context_tokens": agent_params.get("amem_max_context_tokens", 200000),
                 "amem_chunk_size_tokens": agent_params.get("amem_chunk_size_tokens"),
             })
@@ -564,8 +265,6 @@ class AgentManager:
                 "retrieve_num": agent_params.get("retrieve_num", 5),
                 "memos_backend": agent_params.get("memos_backend", "openai"),
                 "memos_model": agent_params.get("memos_model", model_config.name),
-                "memos_temperature": agent_params.get("memos_temperature", 0.0),
-                "memos_max_tokens": agent_params.get("memos_max_tokens", 4096),
                 "text_mem_type": agent_params.get("text_mem_type", "general_text"),
                 "embedding_dim": agent_params.get("embedding_dim"),
                 "observability_search": agent_params.get("observability_search", True),
@@ -628,14 +327,6 @@ class AgentManager:
                 "query_memory_item_tokens": agent_params.get("query_memory_item_tokens", 300),
                 "query_memory_context_tokens": agent_params.get("query_memory_context_tokens", 1800),
                 "max_concurrent_api_calls": agent_params.get("max_concurrent_api_calls", 4),
-                "memrl_keyword_temperature": agent_params.get("memrl_keyword_temperature", 0.0),
-                "memrl_keyword_max_tokens": agent_params.get("memrl_keyword_max_tokens", 100),
-                "memrl_script_temperature": agent_params.get("memrl_script_temperature", 0.7),
-                "memrl_script_max_tokens": agent_params.get("memrl_script_max_tokens", 500),
-                "memrl_reflection_temperature": agent_params.get("memrl_reflection_temperature", 0.3),
-                "memrl_reflection_max_tokens": agent_params.get("memrl_reflection_max_tokens"),
-                "memrl_extractor_temperature": agent_params.get("memrl_extractor_temperature", 0.0),
-                "memrl_extractor_max_tokens": agent_params.get("memrl_extractor_max_tokens", 4096),
                 # Strategy configuration
                 "build_strategy": agent_params.get("build_strategy", "proceduralization"),
                 "retrieve_strategy": agent_params.get("retrieve_strategy", "query"),
@@ -715,7 +406,6 @@ class AgentManager:
                 "lightmem_temperature": agent_params.get("lightmem_temperature", 0.1),
                 "lightmem_max_tokens": agent_params.get("lightmem_max_tokens", 2000),
                 "lightmem_top_p": agent_params.get("lightmem_top_p", 0.1),
-                "lightmem_buffer_max_tokens": agent_params.get("lightmem_buffer_max_tokens", 4096),
                 # Token limits
                 "max_context_tokens": agent_params.get("max_context_tokens", 120000),
             })
@@ -855,15 +545,6 @@ class AgentManager:
                 if self.method_config.embedding.model_path:
                     params["embedding_model_path"] = self.method_config.embedding.model_path
 
-        if build_model_config is not None and method_key in {
-            "amem", "amem_fix", "amem_test"
-        }:
-            params.update({
-                "amem_api_key": build_api_key,
-                "amem_base_url": build_base_url,
-                "amem_llm_client_kwargs": build_client_kwargs,
-            })
-
         return params
 
     def send_message(
@@ -879,11 +560,7 @@ class AgentManager:
             self._agent.set_context_id(context_id)
 
         if memorizing:
-            return self._handle_memorize(
-                message,
-                is_last_session=is_last_session,
-                **kwargs,
-            )
+            return self._handle_memorize(message, is_last_session=is_last_session)
         else:
             return self._handle_query(message, **kwargs)
 
@@ -893,36 +570,10 @@ class AgentManager:
         if callable(adapter_support) and not adapter_support():
             return False
         return bool(
-            is_batch_provider(self.method_config.model.provider)
+            self.method_config.model.provider.lower() in {"gemini", "vertex", "vertex_ai"}
             and hasattr(self._agent, "prepare_batch_query")
             and hasattr(self._agent, "finalize_batch_query")
         )
-
-    def supports_memory_snapshots(self) -> bool:
-        """Return whether the adapter can persist exact retrieval state."""
-        support = getattr(self._agent, "supports_memory_snapshots", None)
-        return bool(callable(support) and support())
-
-    def export_memory_state(self, context_id: Optional[int] = None) -> Dict[str, Any]:
-        """Export the active adapter's retrieval state."""
-        if not self.supports_memory_snapshots():
-            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
-        if context_id is not None:
-            self.set_context_id(context_id)
-        return self._agent.export_memory_state(context_id=context_id)
-
-    def import_memory_state(
-        self,
-        state: Dict[str, Any],
-        context_id: Optional[int] = None,
-    ) -> None:
-        """Restore the active adapter's retrieval state."""
-        if not self.supports_memory_snapshots():
-            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
-        self._agent.import_memory_state(state, context_id=context_id)
-        resolved_context_id = state.get("context_id") if context_id is None else context_id
-        if resolved_context_id is not None:
-            self._context_id = int(resolved_context_id)
 
     def get_batch_llm_client(self):
         """Expose the managed client only for the evaluator's batch transport."""
@@ -933,70 +584,13 @@ class AgentManager:
     def prepare_batch_query(self, message: str, **kwargs) -> Dict[str, Any]:
         """Prepare local retrieval and an immutable final-answer request."""
         if not self.supports_batch_queries():
-            raise RuntimeError(f"{self.method_name} does not support batch queries")
+            raise RuntimeError(f"{self.method_name} does not support Vertex batch queries")
         context_id = kwargs.pop("context_id", None)
         if context_id is not None and context_id != self._context_id:
             self._context_id = context_id
             self._agent.set_context_id(context_id)
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.retrieval_preparation"):
-            return self._agent.prepare_batch_query(message, **kwargs)
-
-    def supports_staged_queries(self) -> bool:
-        """Return whether retrieval and final generation can run separately."""
-        return bool(
-            hasattr(self._agent, "prepare_batch_query")
-            and hasattr(self._agent, "finalize_batch_query")
-            and getattr(self._agent, "_llm_client", None) is not None
-        )
-
-    def prepare_query(self, message: str, **kwargs) -> Dict[str, Any]:
-        """Run retrieval and freeze the exact final-answer request."""
-        if not self.supports_staged_queries():
-            raise RuntimeError(f"{self.method_name} does not support staged queries")
-        context_id = kwargs.pop("context_id", None)
-        if context_id is not None and context_id != self._context_id:
-            self.set_context_id(context_id)
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        from utils.templates import get_template_manager
-        template_manager = get_template_manager(self.dataset_config.dataset_name)
-        system_message = template_manager.get_system_message()
-        started_at = time.time()
-        with tracker.scope("query.retrieval_preparation"):
-            prepared = self._agent.prepare_batch_query(
-                message,
-                system_message=system_message,
-                **kwargs,
-            )
-        return {"prepared": prepared, "started_at": started_at}
-
-    def answer_prepared_query(self, staged_query: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate from a frozen retrieval request and preserve legacy timing."""
-        if not self.supports_staged_queries():
-            raise RuntimeError(f"{self.method_name} does not support staged queries")
-        prepared = staged_query["prepared"]
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.answer_realtime"):
-            response = self._agent._llm_client.chat(prepared["messages"])
-        finalized = self._agent.finalize_batch_query(prepared, response.content)
-        return {
-            "output": finalized.output,
-            "query_time": time.time() - staged_query["started_at"],
-            "retrieved_count": finalized.retrieved_count,
-            "retrieved_memories": finalized.retrieved_memories,
-            "answer_usage": {
-                "transport": "realtime",
-                "input_tokens": getattr(response, "input_tokens", 0),
-                "output_tokens": getattr(response, "output_tokens", 0),
-                "visible_output_tokens": getattr(response, "visible_output_tokens", 0),
-                "thinking_tokens": getattr(response, "thinking_tokens", 0),
-                "finish_reason": getattr(response, "finish_reason", None),
-                "duration_seconds": getattr(response, "latency", None),
-            },
-        }
+        get_usage_tracker().set_phase("query")
+        return self._agent.prepare_batch_query(message, **kwargs)
 
     def finalize_batch_query(
         self,
@@ -1012,20 +606,31 @@ class AgentManager:
             record_usage(response, input_tokens, output_tokens)
         return response
 
-    def _handle_memorize(
-        self,
-        message: str,
-        is_last_session: bool = False,
-        **kwargs,
-    ) -> MemoryBuildResult:
+    def supports_memory_snapshots(self) -> bool:
+        """Return whether this agent exposes a complete durable memory state."""
+        return bool(
+            self._agent
+            and callable(getattr(self._agent, "export_memory_state", None))
+            and callable(getattr(self._agent, "import_memory_state", None))
+        )
+
+    def export_memory_state(self) -> Dict[str, Any]:
+        if not self.supports_memory_snapshots():
+            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
+        return self._agent.export_memory_state()
+
+    def import_memory_state(self, state: Dict[str, Any]) -> None:
+        if not self.supports_memory_snapshots():
+            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
+        self._agent.import_memory_state(state)
+        if self._context_id is not None:
+            self._agent.set_context_id(self._context_id)
+
+    def _handle_memorize(self, message: str, is_last_session: bool = False) -> MemoryBuildResult:
         get_usage_tracker().set_phase("memorize")
         start_time = time.time()
 
-        result = self._agent.memorize(
-            message,
-            is_last_session=is_last_session,
-            **kwargs,
-        )
+        result = self._agent.memorize(message, is_last_session=is_last_session)
 
         memory_time = time.time() - start_time
 
@@ -1057,29 +662,6 @@ class AgentManager:
             time_cost=memory_time,
         )
 
-    def supports_staged_memory(self) -> bool:
-        """Return whether memory construction exposes preparation and commit stages."""
-        return bool(
-            hasattr(self._agent, "prepare_memory_sessions")
-            and hasattr(self._agent, "commit_prepared_memory")
-        )
-
-    def prepare_memory_sessions(self, message: str, **kwargs):
-        if not self.supports_staged_memory():
-            raise RuntimeError(f"{self.method_name} does not support staged memory")
-        context_id = kwargs.get("context_id")
-        if context_id is not None and context_id != self._context_id:
-            self._context_id = context_id
-            self._agent.set_context_id(context_id)
-        get_usage_tracker().set_phase("memorize")
-        return self._agent.prepare_memory_sessions(message, **kwargs)
-
-    def commit_prepared_memory(self, prepared_sessions, **kwargs):
-        if not self.supports_staged_memory():
-            raise RuntimeError(f"{self.method_name} does not support staged memory")
-        get_usage_tracker().set_phase("memorize")
-        return self._agent.commit_prepared_memory(prepared_sessions, **kwargs)
-
     def _handle_query(self, message: str, **kwargs) -> Dict[str, Any]:
         get_usage_tracker().set_phase("query")
         from utils.templates import get_template_manager
@@ -1088,12 +670,7 @@ class AgentManager:
 
         start_time = time.time()
 
-        with get_usage_tracker().scope("query.answer_realtime"):
-            response = self._agent.query(
-                message,
-                system_message=system_message,
-                **kwargs,
-            )
+        response = self._agent.query(message, system_message=system_message, **kwargs)
 
         query_time = time.time() - start_time
 

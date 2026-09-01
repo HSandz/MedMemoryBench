@@ -1,26 +1,31 @@
-method_name: memos
-method_type: agentic_memory
-description: MemOS with hybrid Gemini provider final-answer generation
+# MemOS Agent Configuration with Gemini selected as the model.
+
+method_name: "memos"
+method_type: "agentic_memory"
+description: "MemOS with Gemini Enterprise Agent Platform final-answer generation"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
 embedding:
-  provider: local
-  model: BAAI/bge-small-zh-v1.5
-  model_path: BAAI/bge-small-zh-v1.5
-build_config:
+  provider: "local"
+  model: "BAAI/bge-small-zh-v1.5"
+  model_path: "BAAI/bge-small-zh-v1.5"
+
+agent_params:
   retrieve_num: 5
-  memos_backend: gemini
-  memos_model: gemini-2.5-flash
-  text_mem_type: general_text
-  embedding_model: BAAI/bge-small-zh-v1.5
-  embedding_model_path: BAAI/bge-small-zh-v1.5
+  # Use the managed Gemini backend for MemOS extraction; final answers use it too.
+  memos_backend: "gemini"
+  memos_model: "gemini-2.5-flash"
+  text_mem_type: "general_text"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+  embedding_model_path: "BAAI/bge-small-zh-v1.5"
   embedding_dim: 512
-  embedding_provider: local
+  embedding_provider: "local"
   max_input_tokens: 40960
   max_question_tokens: 10000
   max_context_tokens: 128000
   max_memory_tokens: 80000
-retrieval_config: {}

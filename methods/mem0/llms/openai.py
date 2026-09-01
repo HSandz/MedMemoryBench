@@ -31,22 +31,17 @@ class OpenAILLM(LLMBase):
         # Timeout for LLM API calls (large models like Qwen3-235B need longer read time)
         timeout = httpx.Timeout(timeout=300.0, connect=30.0, read=300.0, write=30.0)
 
-        # Minimal connection pooling - proxy connections are unreliable for keepalive
+        # Minimal connection pooling
         limits = httpx.Limits(
-            max_keepalive_connections=1,  # Minimal keepalive
-            max_connections=5,
-            keepalive_expiry=10.0,  # Very short expiry - proxy connections die fast
+            max_keepalive_connections=5,
+            max_connections=10,
+            keepalive_expiry=10.0,
         )
 
-        # Create transport with socket-level options for better dead connection detection
+        # Create transport without custom socket options to avoid MacOS/endpoint issues
         transport = httpx.HTTPTransport(
             retries=0,  # We handle retries ourselves
             limits=limits,
-            socket_options=[
-                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),  # Enable TCP keepalive
-                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),  # Keepalive interval: 10s
-                (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),  # Max keepalive probes
-            ]
         )
 
         return httpx.Client(timeout=timeout, transport=transport)
@@ -128,20 +123,9 @@ class OpenAILLM(LLMBase):
         params = {
             "model": self.config.model,
             "messages": messages,
-            "temperature": self.config.temperature,
+            "temperature": 1,
             "max_completion_tokens": self.config.max_tokens,
         }
-        if self.config.reasoning_effort is not None:
-            if os.getenv("OPENROUTER_API_KEY"):
-                extra_body = dict(params.get("extra_body") or {})
-                reasoning = dict(extra_body.get("reasoning") or {})
-                reasoning.setdefault("effort", self.config.reasoning_effort)
-                extra_body["reasoning"] = reasoning
-                params["extra_body"] = extra_body
-            else:
-                params["reasoning_effort"] = self.config.reasoning_effort
-        if self.config.extra_body:
-            params["extra_body"] = self.config.extra_body
 
         if os.getenv("OPENROUTER_API_KEY"):
             openrouter_params = {}
@@ -166,7 +150,7 @@ class OpenAILLM(LLMBase):
             params["tool_choice"] = tool_choice
 
         # Retry logic for rate limiting and connection errors
-        max_retries = 5
+        max_retries = 25
         last_exception = None
         for attempt in range(max_retries):
             try:
@@ -187,7 +171,7 @@ class OpenAILLM(LLMBase):
                 error_msg = str(e).lower()
 
                 # Check for retryable errors
-                is_rate_limit = "rate limit" in error_msg or "429" in error_msg
+                is_rate_limit = "rate limit" in error_msg or "429" in error_msg or "quota" in error_msg
                 is_connection_error = any(keyword in error_msg for keyword in [
                     "connection", "ssl", "eof", "timeout", "reset",
                     "connect", "network", "socket", "refused", "closed",
@@ -196,23 +180,23 @@ class OpenAILLM(LLMBase):
 
                 if is_rate_limit or is_connection_error:
                     if attempt < max_retries - 1:
-                        # Exponential backoff: 5s, 10s, 20s, 40s
-                        wait_time = 5 * (2 ** attempt)
-                        error_type = "Rate limit" if is_rate_limit else "Connection error"
-                        logger.warning(f"[Mem0 LLM] {error_type} hit, waiting {wait_time}s before retry (attempt {attempt + 1}/{max_retries})...")
-                        print(f"⚠️  [Mem0 LLM] {error_type}: {e}")
-                        print(f"   Waiting {wait_time}s before retry (attempt {attempt + 1}/{max_retries})...")
-
-                        # On connection errors, recreate the HTTP client to get fresh connections
-                        if is_connection_error and attempt >= 2:
-                            try:
-                                logger.warning("[Mem0 LLM] Recreating HTTP client after repeated connection errors...")
-                                print("   Recreating HTTP client...")
-                                self._recreate_client()
-                            except Exception as recreate_error:
-                                logger.warning(f"[Mem0 LLM] Failed to recreate client: {recreate_error}")
-
-                        time.sleep(wait_time)
+                        # KEY ROTATION LOGIC
+                        api_key_str = os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+                        keys = [k.strip() for k in api_key_str.split(",") if k.strip()] if api_key_str else []
+                        if keys:
+                            if not hasattr(self, "_key_idx"):
+                                self._key_idx = 0
+                            self._key_idx = (self._key_idx + 1) % len(keys)
+                            self.client.api_key = keys[self._key_idx]
+                            
+                            if (attempt + 1) % len(keys) == 0:
+                                logger.warning(f"[Mem0 LLM] ALL keys exhausted, waiting 10s...")
+                                time.sleep(10.0)
+                            else:
+                                logger.warning(f"[Mem0 LLM] Error ({error_msg[:30]}), rotating key...")
+                                time.sleep(1.0)
+                        else:
+                            time.sleep(5.0)
                     else:
                         error_type = "Rate limit" if is_rate_limit else "Connection errors"
                         logger.error(f"[Mem0 LLM] {error_type} after {max_retries} retries")

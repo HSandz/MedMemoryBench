@@ -1,39 +1,27 @@
-method_name: amem
-method_type: agentic_memory
-description: A-Mem with hybrid Gemini provider final-answer generation
+# A-Mem configuration with Gemini selected for final answer generation.
+
+method_name: "amem"
+method_type: "agentic_memory"
+description: "A-Mem with Gemini Enterprise Agent Platform final-answer generation"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
-memorize_model:
-  provider: gemini
-  name: gemini-2.5-flash
-build_config:
-  amem_embedding_model: BAAI/bge-small-zh-v1.5
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
+agent_params:
+  retrieve_num: 5
+  # A-Mem's vendored metadata/evolution backend is OpenAI-compatible only.
+  amem_backend: "gemini"
+  amem_model: "gemini-2.5-flash"
+  amem_embedding_model: "BAAI/bge-small-zh-v1.5"
   amem_evo_threshold: 100
   amem_max_tokens: 10000
-  amem_chunk_size_tokens: 5120
-  amem_build_max_context_tokens: 200000
-  amem_original_evolution: true
-  amem_typed_relations: false
-  amem_relation_candidate_count: 5
-  amem_relation_temperature: 0.0
-  amem_temporal_state: false
-  amem_provenance: false
-  amem_temperature: 0.0
-  amem_retry_temperature: 0.0
-  amem_connectivity_temperature: 0.0
-retrieval_config:
-  retrieve_num: 5
   amem_max_context_tokens: 200000
-  amem_typed_expansion_count: 5
-  amem_expand_related: false
-  amem_relation_min_confidence: 0.5
-  amem_temporal_expansion_count: 5
-  amem_provenance_max_evidence: 10
-  amem_provenance_inject_raw_text: false
+  amem_chunk_size_tokens: 5120
+
+# Run this method against persona 1 only; all sessions remain available.
 dataset_overrides:
-  persona_ids:
-  - 1
+  persona_ids: [1]
   max_sessions_per_persona: null

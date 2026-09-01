@@ -1,16 +1,19 @@
-method_name: mem1
-method_type: agentic_memory
-description: Mem1-style compact memory consolidation with Gemini model configuration
+# Mem1-style Agent Configuration with Gemini selected as the model.
+
+method_name: "mem1"
+method_type: "agentic_memory"
+description: "Mem1-style compact memory consolidation with Gemini model configuration"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
-build_config:
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
+agent_params:
   retrieve_num: 5
   max_state_tokens: 10240
   max_note_tokens: 4096
   note_keep: 500
   max_input_tokens: 40960
   max_context_tokens: 128000
-retrieval_config: {}

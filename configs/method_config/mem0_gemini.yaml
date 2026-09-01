@@ -1,16 +1,24 @@
-method_name: mem0
-method_type: agentic_memory
-description: Mem0 Agent with Gemini model configuration
+method_name: "mem0_gemini"
+method_type: "agentic_memory"
+description: "Mem0 Agent with Gemini Flash Lite API (turn-by-turn mode - paper faithful)"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
-embedding:
-  provider: local
-  model: BAAI/bge-small-zh-v1.5
-build_config:
+  provider: "openai"
+  name: "gemini-3.5-flash-lite"
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  temperature: 0.3
+  max_completion_tokens: 4096
+
+agent_params:
   retrieve_num: 5
-  chunk_size_tokens: 40960
-  max_context_tokens: 128000
-retrieval_config: {}
+  chunk_size_tokens: 8000  # fallback only; turn_by_turn=True bypasses this
+  max_context_tokens: 32768
+  turn_by_turn: true        # Feed each Patient/Doctor turn individually (Mem0 paper design)
+  max_recent_turns: 10      # Keep for future rolling-window extension
+
+embedding:
+  provider: "local"
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+
+dataset_overrides:
+  persona_ids: [1]

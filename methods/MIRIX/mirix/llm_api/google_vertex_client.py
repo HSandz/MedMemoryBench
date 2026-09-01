@@ -15,7 +15,7 @@ class GoogleVertexClient(GoogleAIClient):
         from utils.llm_client import create_llm_client
 
         self._vertex_client = create_llm_client(
-            provider="vertex",
+            provider="gemini",
             model=llm_config.model,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens or 4096,

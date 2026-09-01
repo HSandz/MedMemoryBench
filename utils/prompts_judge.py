@@ -4,9 +4,6 @@ from typing import Dict
 
 JUDGE_TEMPLATES: Dict[str, str] = {
 
-    # MedMemoryBench - Exact Entity Match
-    "medmemorybench_entity_exact_match_judge": 'You are a strict judge for an exact-entity medical question. Determine whether the model answer identifies the same entity as the reference answer.\n\nQuestion:\n{question}\n\nReference answer:\n{expected_answer}\n\nAnswer explanation:\n{explanation}\n\nModel answer:\n{model_output}\n\nJudgment criteria:\n- Judge the meaning of the requested entity, not exact formatting.\n- Accept harmless differences such as capitalization, punctuation, spacing, articles, abbreviations, or equivalent date/number formatting when they identify the same entity.\n- Extra explanation is acceptable if the requested entity is correct.\n- Mark incorrect when the entity is missing, ambiguous, contradictory, or materially different.\n- Do not accept a merely related entity or an answer that changes the requested value.\n\nOutput JSON only: {{"is_correct": true/false, "reason": "brief justification"}}',
-
     # MedMemoryBench - Temporal Localization
     "medmemorybench_temporal_localization_judge": 'You are a strict medical conversation review judge. Please determine whether the model\'s answer correctly answers the time-related question.\n\n【Question】\n{question}\n\n【Standard answer】\n{expected_answer}\n\n[Answer explanation]\n{explanation}\n\n[Model answer]\n{model_output}\n\n【Judgment Criteria】\nThis is a time positioning problem, which may be one of the following two forms:\n1. Ask when an event occurred → the model needs to answer the time point correctly\n2. Ask what events occurred at a certain time → the model needs to answer the event content correctly\n\nPlease judge strictly:\n- If the model answer contains the correct time point or the correct event content, it is judged as [correct]\n- If the time/event answered by the model does not match the standard answer or fails to answer, it will be judged as [error]\n- The time format does not need to be completely consistent, but must point to the same point in time (for example, "January 1, 2024" and "2024-01-01" are considered the same)\n\nPlease output in the following JSON format:\n{{"is_correct": true/false, "reason": "Brief reason for judgment"}}\n\nOutput only JSON and nothing else.',
 
@@ -146,30 +143,6 @@ Be LENIENT - the core answer matters, not the format:
    - "by biking" = "biking" = "bike"
 
 Output JSON only: {{"is_correct": true/false, "reason": "brief explanation"}}""",
-
-    # MedMemoryBench - English: Temporal Localization
-    "medmemorybench_en_entity_exact_match_judge": """You are a strict judge for an exact-entity medical question. Determine whether the model answer identifies the same entity as the reference answer.
-
-Question:
-{question}
-
-Reference answer:
-{expected_answer}
-
-Answer explanation:
-{explanation}
-
-Model answer:
-{model_output}
-
-Judgment criteria:
-- Judge the meaning of the requested entity, not exact formatting.
-- Accept harmless differences such as capitalization, punctuation, spacing, articles, abbreviations, or equivalent date/number formatting when they identify the same entity.
-- Extra explanation is acceptable if the requested entity is correct.
-- Mark incorrect when the entity is missing, ambiguous, contradictory, or materially different.
-- Do not accept a merely related entity or an answer that changes the requested value.
-
-Output JSON only: {{"is_correct": true/false, "reason": "brief justification"}}""",
 
     # MedMemoryBench - English: Temporal Localization
     "medmemorybench_en_temporal_localization_judge": """You are a strict medical dialogue evaluation judge. Determine whether the model's answer correctly addresses the time-related question.

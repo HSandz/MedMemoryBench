@@ -96,7 +96,6 @@ class ZepAgent(BaseAgent):
         self._api_key = api_key
         self._base_url = base_url
         self._provider = provider
-        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
 
         # Azure config
         self._use_azure = use_azure or bool(os.environ.get("AZURE_OPENAI_ENDPOINT"))
@@ -146,7 +145,6 @@ class ZepAgent(BaseAgent):
                 max_tokens=self.max_tokens,
                 api_key=self._api_key,
                 base_url=self._base_url,
-                **self._llm_client_kwargs,
             )
 
     def _get_ids(self, sub_dataset: str = "default") -> tuple:
@@ -443,7 +441,6 @@ Answer:"""
         messages = self._build_llm_messages(retrieved_context, question)
         return {
             "messages": messages,
-            "context_id": self._context_id,
             "retrieved_context": retrieved_context,
             "query_id": query_id,
             "sub_dataset": sub_dataset,
@@ -463,7 +460,7 @@ Answer:"""
         if prepared["query_id"] is not None:
             self._save_retrieval_context(
                 query_id=prepared["query_id"],
-                context_id=prepared.get("context_id", self._context_id),
+                context_id=self._context_id,
                 sub_dataset=prepared["sub_dataset"],
                 retrieved_context=prepared["retrieved_context"],
                 response=content,

@@ -136,7 +136,6 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None  # unique ID of the end-user (for monitoring)
     parallel_tool_calls: Optional[bool] = None
     reasoning_effort: Optional[str] = None  # For reasoning models (o1, o3, etc.)
-    extra_body: Optional[Dict[str, Any]] = None
 
     # function-calling related
     tools: Optional[List[Tool]] = None

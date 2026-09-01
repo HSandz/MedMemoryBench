@@ -104,7 +104,6 @@ class OpenAIClient(LLMClientBase):
             user=str(),
             max_completion_tokens=llm_config.max_tokens,
             temperature=llm_config.temperature,
-            extra_body=llm_config.extra_body,
         )
 
         if "inference.memgpt.ai" in llm_config.model_endpoint:

@@ -31,6 +31,7 @@ class LLMFactory(BaseLLM):
         "openai_new": OpenAIResponsesLLM,
         "gemini": GeminiLLM,
         "vertex": GeminiLLM,
+        "vertex_ai": GeminiLLM,
     }
 
     @classmethod

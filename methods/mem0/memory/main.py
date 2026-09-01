@@ -198,6 +198,7 @@ class Memory(MemoryBase):
         return {"results": vector_store_result}
 
     def _add_to_vector_store(self, messages, metadata, filters, infer):
+        print(f"[_add_to_vector_store] infer is {infer}, type is {type(infer)}")
         if not infer:
             returned_memories = []
             for message in messages:

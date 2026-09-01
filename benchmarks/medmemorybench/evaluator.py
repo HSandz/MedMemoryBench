@@ -1,46 +1,27 @@
 """MedMemoryBench evaluation module."""
 
-import hashlib
-import copy
 import json
-import os
-import sys
-import threading
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import logging
 
-import numpy as np
-from tqdm.auto import tqdm
-
 from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
 from src.agent import AgentManager, AgentResponse, MemoryBuildResult
-from methods.event_state.subjects import normalize_scope
 from src.result import EvaluationReport, ResultCollector
+from src.memory_snapshot import (
+    MemorySnapshotKey,
+    MemorySnapshotStore,
+    compute_memory_config_hash,
+)
 from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery, MedSession
 from benchmarks.base import EvaluationUnit
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.base import MetricResult as BaseMetricResult
-from metrics.retrieval_quality import (
-    RETRIEVAL_QUALITY_GROUP,
-    compute_session_retrieval_quality,
-)
 from utils.templates import get_prompt_manager
-from utils.logger import truncate_error_message
-from utils.batch_client import create_batch_client
-from utils.llm_client import (
-    LLMAPIError,
-    LLMRetryExhaustedError,
-    TokenUsage,
-    diff_usage_stats,
-    get_usage_tracker,
-    merge_usage_stats,
-)
+from utils.llm_client import get_usage_tracker, LLMRetryExhaustedError
 from utils.vertex_batch import (
     BatchChatRequest,
     VertexBatchClient,
@@ -50,16 +31,12 @@ from utils.vertex_batch import (
     restore_prepared_query,
     scoped_manifest_path,
     snapshot_prepared_query,
+    should_use_batch,
 )
 
 from benchmarks.medmemorybench.checkpoint import (
     MedMemoryBenchCheckpointManager,
     compute_config_hash,
-    compute_memory_query_compatibility_hash,
-    compute_query_config_hash,
-    derive_legacy_build_config_hash,
-    is_manifest_build_compatible,
-    is_manifest_query_compatible,
 )
 
 
@@ -75,19 +52,10 @@ class MedMemoryBenchEvaluator:
         verbose: bool = True,
         logger: Optional[logging.Logger] = None,
         resume: bool = False,
-        force_resume: bool = False,
-        execution_stage: str = "all",
-        memory_run: Optional[str] = None,
-        append: bool = False,
-        append_persona: Optional[int] = None,
-        append_unit: Optional[int] = None,
-        memory_source_run_dir: Optional[Path] = None,
-        memory_run_explicit: bool = False,
-        run_scoped_output: bool = False,
+        rebuild_memory: bool = False,
         batch_api: bool = False,
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
-        workers: int = 1,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -96,27 +64,10 @@ class MedMemoryBenchEvaluator:
         self.verbose = verbose
         self.logger = logger
         self.resume = resume
-        self.force_resume = force_resume
-        if execution_stage not in {"all", "memory", "query"}:
-            raise ValueError(f"Unsupported execution stage: {execution_stage}")
-        self.execution_stage = execution_stage
-        self.memory_run = memory_run
-        self.append = bool(append)
-        self.append_persona = append_persona
-        self.append_unit = append_unit
-        self.memory_source_run_dir = (
-            Path(memory_source_run_dir).resolve()
-            if memory_source_run_dir is not None
-            else None
-        )
-        self.memory_run_explicit = memory_run_explicit
-        self.run_scoped_output = run_scoped_output
+        self.rebuild_memory = rebuild_memory
         self.batch_api = batch_api
         self.batch_gcs_uri = batch_gcs_uri
         self.batch_wait = batch_wait
-        if workers < 1:
-            raise ValueError("workers must be at least 1")
-        self.workers = workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -128,626 +79,41 @@ class MedMemoryBenchEvaluator:
         self.dataset: Optional[MedMemoryBenchDataset] = None
 
         api_config = get_api_config()
-        metric_mapping = {
-            query_type.name: query_type.metric
-            for query_type in dataset_config.query_types
-            if query_type.name and query_type.metric
-        }
         self.metrics_calculator = MetricsCalculator(
-            custom_mapping=metric_mapping,
             judge_model=api_config.judge_model or None,
             judge_api_key=api_config.judge_api_key or None,
             judge_base_url=api_config.judge_base_url or None,
-            judge_temperature=getattr(api_config, "judge_temperature", 1.0),
-            judge_client_max_tokens=getattr(api_config, "judge_client_max_tokens", 10000),
-            judge_max_tokens=getattr(api_config, "judge_max_tokens", 500),
-            judge_mcd_max_tokens=getattr(api_config, "judge_mcd_max_tokens", 2000),
             language=dataset_config.language,
         )
         self.aggregator = MetricsAggregator()
         self.result_collector = ResultCollector()
 
         self._memory_build_logs: List[Dict[str, Any]] = []
-        self._source_memory_build_logs: List[Dict[str, Any]] = []
         self._batch_client: Optional[VertexBatchClient] = None
         self._judge_batch_client: Optional[VertexBatchClient] = None
         self._batch_fallback_logged = False
         self._judge_batch_fallback_logged = False
         self._deferred_judges: List[Dict[str, Any]] = []
-        self._pending_batch_queries: List[Dict[str, Any]] = []
-        self._api_failures: List[Dict[str, Any]] = []
-        self._api_failure_duration_seconds = 0.0
-        self._api_failure_lock = threading.Lock()
 
         self._checkpoint_manager: Optional[MedMemoryBenchCheckpointManager] = None
         self._checkpoint_enabled = False
-        self._force_resume_persona_id: Optional[int] = None
-        self._memory_snapshot_manifest: Optional[Dict[str, Any]] = None
-        self._memory_snapshot_run_dir: Optional[Path] = None
-        self._evaluation_units: List[EvaluationUnit] = []
-        self._memory_unit_ids: Optional[set[int]] = None
-        self._append_target_index: Optional[int] = None
-        self._append_target_unit_id: Optional[int] = None
-        self._append_target_reached = False
-        self._append_source_snapshot_keys: set[tuple[int, int]] = set()
-        self._append_source_snapshot_records: Dict[tuple[int, int], Dict[str, Any]] = {}
-        self._append_source_manifest: Optional[Dict[str, Any]] = None
+        self._memory_snapshot_store = MemorySnapshotStore(
+            self.output_dir / "memory_snapshots",
+            dataset=dataset_config.dataset_name,
+            method=method_config.method_name,
+            model=method_config.model.name,
+            config_hash=compute_memory_config_hash(method_config, dataset_config),
+        )
+        self._memory_snapshot_lineage: Dict[str, str] = {}
 
         if self._should_enable_checkpoint():
             self._init_checkpoint_manager()
 
-    def _log(
-        self,
-        message: str,
-        level: str = "INFO",
-        *,
-        terminal: bool = True,
-    ) -> None:
-        level = level.upper()
-        if level in {"ERROR", "WARNING"}:
-            message = truncate_error_message(message)
-        if terminal and self.verbose:
-            rendered = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}"
-            if (
-                getattr(self, "_memory_progress", None) is not None
-                or getattr(self, "_query_progress", None) is not None
-            ):
-                tqdm.write(rendered, file=sys.stdout)
-            else:
-                print(rendered)
+    def _log(self, message: str, level: str = "INFO") -> None:
+        if self.verbose:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
-            self.logger.log(getattr(logging, level, logging.INFO), message)
-
-    def _configure_query_progress(self, units: List[EvaluationUnit]) -> None:
-        """Count pending questions without rendering a bar before query work begins."""
-        self._query_progress_total = 0
-        if getattr(self, "execution_stage", "all") == "memory":
-            return
-        total = 0
-        checkpoint = getattr(self, "_checkpoint_manager", None)
-        for unit in units:
-            for query in unit.queries_to_evaluate:
-                if not (
-                    checkpoint
-                    and checkpoint.is_query_completed(
-                        query.query_id,
-                        persona_id=unit.context_id,
-                    )
-                ) and not self._is_deferred_judge_query(query.query_id):
-                    total += 1
-        if not total:
-            return
-        self._query_progress_lock = threading.Lock()
-        self._query_progress_completed = set()
-        self._query_progress_total = total
-
-    def _start_query_progress(self) -> None:
-        """Render the run-wide counter only when query work starts."""
-        if getattr(self, "_query_progress", None) is not None:
-            return
-        total = getattr(self, "_query_progress_total", 0)
-        if not total:
-            return
-        self._query_progress = tqdm(
-            total=total,
-            desc="Query progress",
-            unit="question",
-            dynamic_ncols=True,
-            file=sys.stdout,
-            disable=not getattr(self, "verbose", True),
-        )
-
-    def _start_memory_progress(self, total: int) -> None:
-        """Render one per-unit counter while Event-State prepares sessions."""
-        if total <= 0 or getattr(self, "_memory_progress", None) is not None:
-            return
-        self._memory_progress_lock = threading.Lock()
-        self._memory_progress = tqdm(
-            total=total,
-            desc="Memory build",
-            unit="session",
-            dynamic_ncols=True,
-            file=sys.stdout,
-            disable=not getattr(self, "verbose", True),
-        )
-
-    def _advance_memory_progress(self) -> None:
-        progress = getattr(self, "_memory_progress", None)
-        if progress is None:
-            return
-        with self._memory_progress_lock:
-            progress.update(1)
-
-    def _finish_memory_progress(self) -> None:
-        progress = getattr(self, "_memory_progress", None)
-        if progress is not None:
-            progress.close()
-            self._memory_progress = None
-
-    def _advance_query_progress(
-        self,
-        query_id: str,
-        *,
-        context_id: Optional[int] = None,
-    ) -> None:
-        """Advance once after a question reaches a terminal run outcome."""
-        progress = getattr(self, "_query_progress", None)
-        if progress is None:
-            return
-        key = (context_id, query_id)
-        with self._query_progress_lock:
-            if key in self._query_progress_completed:
-                return
-            self._query_progress_completed.add(key)
-            progress.update(1)
-
-    def _finish_query_progress(self) -> None:
-        progress = getattr(self, "_query_progress", None)
-        if progress is not None:
-            progress.close()
-            self._query_progress = None
-
-    def _amem_feature_configuration(self) -> Dict[str, Any]:
-        """Describe the build feature combination represented by this run."""
-        method_config = getattr(self, "method_config", None)
-        method_name = str(getattr(method_config, "method_name", ""))
-        build_config = getattr(method_config, "build_config", None)
-        if not isinstance(build_config, dict):
-            build_config = (
-                method_config.snapshot_build_config()
-                if hasattr(method_config, "snapshot_build_config")
-                else {}
-            )
-        if method_name.lower() == "event_state":
-            features = {
-                "episode_archive": bool(build_config.get("enable_episodes", True)),
-                "claim_extraction": bool(build_config.get("enable_state_claims", True)),
-                "state_compilation": bool(build_config.get("enable_state_compilation", True)),
-                "bitemporal_state": bool(build_config.get("enable_bitemporal_time", True)),
-                "provenance": bool(build_config.get("preserve_turn_evidence", True)),
-            }
-            enabled = [name for name, enabled_flag in features.items() if enabled_flag]
-            return {
-                "schema_version": 3,
-                "method_name": method_name,
-                "combination_id": "+".join(enabled) if enabled else "none",
-                "enabled_features": enabled,
-                "features": features,
-                "dependencies": [],
-                "build_config_hash": self._batch_config_hash() if hasattr(self, "dataset_config") else "",
-                "build_config": copy.deepcopy(build_config),
-            }
-        is_experimental = method_name.lower().startswith("amem_test")
-        features = {
-            "base_memory": True,
-            "original_evolution": bool(
-                build_config.get("amem_original_evolution", not is_experimental)
-            ),
-            "typed_relations": bool(build_config.get("amem_typed_relations", False)),
-            "temporal_state": bool(build_config.get("amem_temporal_state", False)),
-            "provenance": bool(build_config.get("amem_provenance", False)),
-        }
-        enabled = [name for name, enabled_flag in features.items() if enabled_flag]
-        combination = "+".join(enabled) if enabled else "none"
-        dependencies = []
-        if features["temporal_state"] and not features["typed_relations"]:
-            dependencies.append(
-                "temporal_state records timestamps, but inferred transitions require typed_relations"
-            )
-        return {
-            "schema_version": 1,
-            "method_name": method_name,
-            "combination_id": combination,
-            "enabled_features": enabled,
-            "features": features,
-            "dependencies": dependencies,
-            "build_config_hash": (
-                self._batch_config_hash()
-                if method_config is not None and hasattr(self, "dataset_config")
-                else ""
-            ),
-            "build_config": copy.deepcopy(build_config),
-        }
-
-    def _session_retrieval_quality_enabled(self) -> bool:
-        """Return whether this run builds session-level experimental A-MEM notes."""
-        method_config = getattr(self, "method_config", None)
-        if str(getattr(method_config, "method_name", "")).lower() not in {"amem_test", "event_state"}:
-            return False
-        build_config = getattr(method_config, "build_config", {})
-        if not isinstance(build_config, dict):
-            build_config = {}
-        note_level = str(build_config.get("amem_note_level", "turn"))
-        if str(getattr(method_config, "method_name", "")).lower() == "event_state":
-            return True
-        return note_level.strip().lower() == "session"
-
-    def _session_retrieval_quality(
-        self,
-        query: Any,
-        retrieved_memories: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        if not self._session_retrieval_quality_enabled():
-            return None
-        quality = compute_session_retrieval_quality(
-            retrieved_memories=retrieved_memories,
-            source_key_points=getattr(query, "source_key_points", []),
-            metadata=getattr(query, "metadata", {}),
-        )
-        if str(getattr(self.method_config, "method_name", "")).lower() != "event_state":
-            return quality
-        visible_records = []
-        for record in retrieved_memories:
-            copied = copy.deepcopy(record)
-            if copied.get("type") == "state_claim":
-                included_in_context = bool(copied.get("included_in_context", False))
-                included_provenance = copied.get("included_provenance_evidence", [])
-                if not isinstance(included_provenance, list):
-                    included_provenance = []
-                if not included_in_context and not included_provenance:
-                    continue
-                if not included_in_context:
-                    copied["source_session_id"] = None
-                # Answer visibility is limited to prompt-visible state or excerpts.
-                copied.pop("provenance", None)
-                copied.pop("raw_evidence_added", None)
-                copied.pop("retrieval_audit", None)
-                copied["provenance_evidence"] = included_provenance
-            elif not copied.get("included_in_context", False):
-                continue
-            visible_records.append(copied)
-        lineage_records = []
-        for record in retrieved_memories:
-            copied = copy.deepcopy(record)
-            if copied.get("type") == "state_claim":
-                copied["provenance_evidence"] = copied.get("all_provenance_evidence", [])
-            lineage_records.append(copied)
-        quality["claim_lineage"] = compute_session_retrieval_quality(
-            retrieved_memories=lineage_records,
-            source_key_points=getattr(query, "source_key_points", []),
-            metadata=getattr(query, "metadata", {}),
-        )
-        quality["answer_visible"] = compute_session_retrieval_quality(
-            retrieved_memories=visible_records,
-            source_key_points=getattr(query, "source_key_points", []),
-            metadata=getattr(query, "metadata", {}),
-        )
-        quality["retrieval_quality_claim_lineage"] = quality["claim_lineage"]
-        quality["retrieval_quality_answer_visible"] = quality["answer_visible"]
-        quality["provenance_semantics"] = "selected claim origin plus selected episodes; answer_visible uses included evidence only"
-        return quality
-
-    @staticmethod
-    def _attach_session_retrieval_quality(
-        result: MetricResult,
-        retrieval_quality: Optional[Dict[str, Any]],
-    ) -> None:
-        if retrieval_quality is None:
-            return
-        metric_groups = result.details.get("metric_groups")
-        if not isinstance(metric_groups, dict):
-            metric_groups = {}
-            result.details["metric_groups"] = metric_groups
-        metric_groups[RETRIEVAL_QUALITY_GROUP] = retrieval_quality
-
-    @staticmethod
-    def _feature_for_operation(operation: str) -> str:
-        parts = str(operation).split(".")
-        if len(parts) >= 2 and parts[0] == "amem":
-            return parts[1]
-        if len(parts) >= 2 and parts[0] == "event_state":
-            return {"extract": "claim_extraction", "extract_repair": "claim_extraction", "update_classify": "state_compilation", "embedding": "embedding"}.get(parts[1], parts[1])
-        return "unscoped"
-
-    def _build_metrics_report(
-        self,
-        logs: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Aggregate per-unit telemetry into a report-ready feature breakdown."""
-        selected_logs = list(
-            logs
-            if logs is not None
-            else self._combined_memory_build_logs()
-        )
-        usage_values = []
-        units = []
-        total_wall_time = 0.0
-        total_sessions = 0
-        complete_telemetry = True
-        measured_memory_units = 0
-        memory_snapshot_bytes = 0
-        previous_memory_bytes: Dict[Any, int] = {}
-        latest_memory_by_context: Dict[Any, Dict[str, Any]] = {}
-        for log in selected_logs:
-            metrics = log.get("build_metrics") or {}
-            usage = metrics.get("usage") or {}
-            if usage:
-                usage_values.append(usage)
-            wall_time = float(
-                metrics.get("wall_time_seconds", log.get("total_time", 0.0)) or 0.0
-            )
-            total_wall_time += wall_time
-            total_sessions += int(log.get("session_count", 0) or 0)
-            legacy_metrics_unavailable = bool(
-                metrics.get("legacy_metrics_unavailable", False)
-            )
-            complete_telemetry = complete_telemetry and not legacy_metrics_unavailable
-            context_id = log.get("context_id")
-            memory_size = log.get("memory_size") or metrics.get("memory_size")
-            unit_memory_size: Optional[Dict[str, Any]] = None
-            if isinstance(memory_size, dict) and memory_size.get("bytes") is not None:
-                unit_memory_size = copy.deepcopy(memory_size)
-                memory_bytes = int(unit_memory_size["bytes"])
-                prior_bytes = previous_memory_bytes.get(context_id, 0)
-                delta_bytes = memory_bytes - prior_bytes
-                unit_memory_size.update({
-                    "delta_from_previous_unit_bytes": delta_bytes,
-                    "delta_from_previous_unit_mib": round(
-                        delta_bytes / (1024 ** 2), 6
-                    ),
-                })
-                previous_memory_bytes[context_id] = memory_bytes
-                measured_memory_units += 1
-                memory_snapshot_bytes += memory_bytes
-                latest_memory_by_context[context_id] = {
-                    "unit_id": log.get("unit_id"),
-                    "bytes": memory_bytes,
-                    "mib": round(memory_bytes / (1024 ** 2), 6),
-                }
-            units.append({
-                "unit_id": log.get("unit_id"),
-                "context_id": context_id,
-                "session_count": log.get("session_count", 0),
-                "wall_time_seconds": round(wall_time, 6),
-                "restored_from_snapshot": bool(log.get("restored_from_snapshot", False)),
-                "legacy_metrics_unavailable": legacy_metrics_unavailable,
-                "memory_size": unit_memory_size,
-                "usage": usage,
-            })
-
-        merged_usage = merge_usage_stats(*usage_values)
-        operations = (
-            merged_usage.get("operations", {}).get("memorize", {})
-        )
-        feature_configuration = self._amem_feature_configuration()
-        feature_totals: Dict[str, TokenUsage] = {
-            "base": TokenUsage(),
-            "embedding": TokenUsage(),
-        }
-        for feature, enabled in feature_configuration["features"].items():
-            if enabled and feature != "base_memory":
-                feature_totals.setdefault(feature, TokenUsage())
-        for operation, usage in operations.items():
-            feature = self._feature_for_operation(operation)
-            feature_totals.setdefault(feature, TokenUsage()).merge(
-                TokenUsage.from_dict(usage)
-            )
-        scoped_wall_time = sum(
-            float(usage.get("wall_time", 0.0) or 0.0)
-            for usage in operations.values()
-        )
-        memorize_totals = dict(merged_usage.get("memorize_phase", {}))
-        memorize_totals.pop("wall_time", None)
-        memorize_totals.update({
-            "wall_time_seconds": round(total_wall_time, 6),
-            "scoped_operation_wall_time_seconds": round(scoped_wall_time, 6),
-            "unattributed_wall_time_seconds": round(
-                max(total_wall_time - scoped_wall_time, 0.0), 6
-            ),
-        })
-        overall_memory_bytes = sum(
-            item["bytes"] for item in latest_memory_by_context.values()
-        )
-        memory_size_report = {
-            "schema_version": 1,
-            "measurement": "serialized_memory_state",
-            "unit": "bytes",
-            "available": measured_memory_units > 0,
-            "complete": bool(units) and measured_memory_units == len(units),
-            "overall_bytes": overall_memory_bytes,
-            "overall_mib": round(overall_memory_bytes / (1024 ** 2), 6),
-            "unit_snapshot_bytes": memory_snapshot_bytes,
-            "unit_snapshot_mib": round(memory_snapshot_bytes / (1024 ** 2), 6),
-            "context_count": len({unit.get("context_id") for unit in units}),
-            "measured_unit_count": measured_memory_units,
-            "by_context": {
-                str(context_id): value
-                for context_id, value in sorted(
-                    latest_memory_by_context.items(),
-                    key=lambda item: str(item[0]),
-                )
-            },
-        }
-        memorize_totals.update({
-            "memory_size_bytes": overall_memory_bytes,
-            "memory_size_mib": memory_size_report["overall_mib"],
-        })
-        return {
-            "schema_version": 2,
-            "feature_configuration": feature_configuration,
-            "unit_count": len(units),
-            "session_count": total_sessions,
-            "complete_telemetry": complete_telemetry,
-            "totals": memorize_totals,
-            "memory_size": memory_size_report,
-            "by_feature": {
-                feature: usage.to_dict()
-                for feature, usage in sorted(feature_totals.items())
-            },
-            "by_operation": operations,
-            "units": units,
-            "usage": merged_usage,
-        }
-
-    def _combined_memory_build_logs(self) -> List[Dict[str, Any]]:
-        """Return one cumulative build record per evaluation unit."""
-        combined: Dict[tuple[Any, Any], Dict[str, Any]] = {}
-        for log in getattr(self, "_source_memory_build_logs", []):
-            combined[(log.get("context_id"), log.get("unit_id"))] = log
-        for log in getattr(self, "_memory_build_logs", []):
-            combined[(log.get("context_id"), log.get("unit_id"))] = log
-        unit_order = {
-            (unit.context_id, unit.unit_id): index
-            for index, unit in enumerate(self._get_evaluation_units())
-        }
-        return sorted(
-            combined.values(),
-            key=lambda log: unit_order.get(
-                (log.get("context_id"), log.get("unit_id")),
-                len(unit_order),
-            ),
-        )
-
-    def _record_source_build_metrics(
-        self,
-        unit: EvaluationUnit,
-        payload: Dict[str, Any],
-    ) -> None:
-        metrics = payload.get("memory_build_metrics")
-        if not isinstance(metrics, dict):
-            metrics = {
-                "wall_time_seconds": float(
-                    payload.get("memory_build_time", 0.0) or 0.0
-                ),
-                "usage": {},
-                "legacy_metrics_unavailable": True,
-            }
-        logs = getattr(self, "_source_memory_build_logs", None)
-        if logs is None:
-            self._source_memory_build_logs = []
-            logs = self._source_memory_build_logs
-        logs[:] = [item for item in logs if item.get("unit_id") != unit.unit_id]
-        logs.append({
-            "unit_id": unit.unit_id,
-            "context_id": unit.context_id,
-            "session_count": len(unit.sessions_to_inject),
-            "total_time": payload.get("memory_build_time", 0.0),
-            "build_metrics": copy.deepcopy(metrics),
-            "memory_size": copy.deepcopy(
-                payload.get("memory_size") or metrics.get("memory_size")
-            ),
-            "restored_from_snapshot": True,
-        })
-
-    def _record_api_failure(
-        self,
-        phase: str,
-        error: Any,
-        failure_duration_seconds: Optional[float] = None,
-        **context: Any,
-    ) -> None:
-        """Record provider failures without constructing a metric result."""
-        if failure_duration_seconds is None:
-            failure_duration_seconds = getattr(
-                error,
-                "_medmemorybench_api_duration_seconds",
-                0.0,
-            )
-        try:
-            failure_duration_seconds = max(float(failure_duration_seconds), 0.0)
-        except (TypeError, ValueError):
-            failure_duration_seconds = 0.0
-
-        structured = error if isinstance(error, dict) else None
-        root_error = (
-            error.last_exception
-            if isinstance(error, LLMRetryExhaustedError)
-            else error
-        )
-        if structured is not None:
-            root_error = None
-        failure = {
-            "timestamp": datetime.now().isoformat(),
-            "phase": phase,
-            "error_type": (
-                structured.get("error_type", "UnknownError")
-                if structured is not None
-                else type(error).__name__
-            ),
-            "error_message": (
-                truncate_error_message(structured.get("error_message", ""))
-                if structured is not None
-                else truncate_error_message(error)
-            ),
-            **{key: value for key, value in context.items() if value is not None},
-        }
-        if structured is not None:
-            for key in (
-                "operation",
-                "memory_id",
-                "root_error_type",
-                "root_error_message",
-                "attempts",
-                "failure_type",
-                "retry_counts",
-                "duration_seconds",
-            ):
-                if structured.get(key) is not None:
-                    failure[key] = structured[key]
-            for key in ("error_message", "root_error_message"):
-                if key in failure:
-                    failure[key] = truncate_error_message(failure[key])
-        else:
-            failure["root_error_type"] = type(root_error).__name__
-            failure["root_error_message"] = truncate_error_message(root_error)
-        if isinstance(error, LLMRetryExhaustedError):
-            failure["attempts"] = error.attempts
-            if error.failure_type:
-                failure["failure_type"] = error.failure_type
-            if error.retry_counts:
-                failure["retry_counts"] = error.retry_counts
-
-        def store_failure() -> None:
-            if failure_duration_seconds:
-                failure["duration_seconds"] = failure_duration_seconds
-                self._api_failure_duration_seconds = (
-                    getattr(self, "_api_failure_duration_seconds", 0.0)
-                    + failure_duration_seconds
-                )
-            self._api_failures.append(failure)
-
-        lock = getattr(self, "_api_failure_lock", None)
-        if lock is None:
-            store_failure()
-        else:
-            with lock:
-                store_failure()
-
-    @staticmethod
-    def _run_api_call(operation, *args, **kwargs):
-        """Attach elapsed time to an API exception without changing its type."""
-        tracker = get_usage_tracker()
-        failure_duration_before = tracker.current_failure_duration()
-        started_at = time.perf_counter()
-        try:
-            return operation(*args, **kwargs)
-        except LLMAPIError as error:
-            elapsed = time.perf_counter() - started_at
-            tracked_failure_duration = max(
-                tracker.current_failure_duration() - failure_duration_before,
-                0.0,
-            )
-            previous_duration = getattr(
-                error,
-                "_medmemorybench_api_duration_seconds",
-                0.0,
-            )
-            error._medmemorybench_api_duration_seconds = (
-                max(float(previous_duration), 0.0)
-                + max(elapsed - tracked_failure_duration, 0.0)
-            )
-            raise
-
-    def _drain_memory_api_failures(self, context_id: Any) -> List[Dict[str, Any]]:
-        """Collect retry-exhausted A-MEM build calls even when a build aborts."""
-        manager = getattr(self, "agent_manager", None)
-        agent = getattr(manager, "_agent", None)
-        getter = getattr(agent, "_get_memory_system", None)
-        if not callable(getter):
-            return []
-        system = getter(context_id)
-        drain = getattr(system, "drain_api_failure_events", None)
-        return list(drain()) if callable(drain) else []
+            self.logger.info(message)
 
     def _init_dataset(self) -> None:
         self._log(f"Loading dataset: {self.dataset_config.dataset_name}")
@@ -766,110 +132,14 @@ class MedMemoryBenchEvaluator:
             }
         )
         self.dataset.load()
-        self._evaluation_units = list(self.dataset.get_evaluation_units())
 
-        self._log(
-            f"Dataset ready | sessions={self.dataset.get_total_sessions()} | "
-            f"queries={self.dataset.get_total_queries()} | "
-            f"mode={self.dataset_config.evaluation_mode} | "
-            f"interval={self.dataset_config.evaluation_interval}"
-        )
+        self._log(f"  Total Sessions: {self.dataset.get_total_sessions()}")
+        self._log(f"  Total Queries: {self.dataset.get_total_queries()}")
+        self._log(f"  Evaluation Mode: {self.dataset_config.evaluation_mode}")
+        self._log(f"  Evaluation Interval: {self.dataset_config.evaluation_interval}")
 
     def _should_enable_checkpoint(self) -> bool:
         return self.dataset_config.evaluation_mode == "independent"
-
-    def _session_level_force_resume(self) -> bool:
-        """Use forced session skipping only for backends without A-MEM snapshots."""
-        method_name = str(
-            getattr(getattr(self, "method_config", None), "method_name", "")
-        ).lower()
-        return bool(getattr(self, "force_resume", False) and not (method_name.startswith("amem") or method_name == "event_state"))
-
-    def _get_evaluation_units(self) -> List[EvaluationUnit]:
-        """Return the loaded units without consuming the dataset iterator twice."""
-        cached = getattr(self, "_evaluation_units", None)
-        if cached:
-            return list(cached)
-        if self.dataset is None:
-            return []
-        return list(self.dataset.get_evaluation_units())
-
-    def _prepare_append_plan(self) -> None:
-        """Resolve the append target and validate the source snapshot prefix."""
-        if not getattr(self, "append", False):
-            return
-        if self.dataset_config.evaluation_mode != "independent":
-            raise ValueError("--append currently requires independent evaluation mode")
-        if self.memory_source_run_dir is None:
-            raise ValueError("--append requires a memory source run")
-        if getattr(self, "append_persona", None) is None or getattr(self, "append_unit", None) is None:
-            raise ValueError("--append requires both --persona and --unit")
-
-        units = self._get_evaluation_units()
-        target_matches = [
-            (index, unit)
-            for index, unit in enumerate(units)
-            if unit.context_id == getattr(self, "append_persona", None)
-            and unit.unit_id == getattr(self, "append_unit", None)
-        ]
-        if len(target_matches) != 1:
-            raise ValueError(
-                f"Append target persona={getattr(self, 'append_persona', None)}, "
-                f"unit={getattr(self, 'append_unit', None)} "
-                "does not identify exactly one evaluation unit in the stored dataset"
-            )
-        target_index, target_unit = target_matches[0]
-        self._append_target_index = target_index
-        self._append_target_unit_id = target_unit.unit_id
-        target_key = (target_unit.context_id, target_unit.unit_id)
-
-        manifest_path = self.memory_source_run_dir / "memory" / "manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"Cannot read append source manifest {manifest_path}: {truncate_error_message(exc)}"
-            ) from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("format") != "medmemorybench.memory_manifest"
-            or manifest.get("version") != 1
-            or manifest.get("status") not in {"building", "complete"}
-        ):
-            raise ValueError(f"Append source manifest is unavailable or invalid: {manifest_path}")
-
-        unit_lookup = {(unit.context_id, unit.unit_id): index for index, unit in enumerate(units)}
-        records: Dict[tuple[int, int], Dict[str, Any]] = {}
-        processed_indices: List[int] = []
-        for record in manifest.get("snapshots", []):
-            if not isinstance(record, dict):
-                raise ValueError(f"Append source manifest contains an invalid snapshot record: {manifest_path}")
-            try:
-                key = (int(record["context_id"]), int(record["unit_id"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"Append source snapshot record is missing its unit identity: {manifest_path}") from exc
-            if key not in unit_lookup:
-                raise ValueError(
-                    f"Append source snapshot {key} does not belong to the stored dataset configuration"
-                )
-            if key in records:
-                raise ValueError(f"Append source contains duplicate snapshot record {key}")
-            records[key] = record
-            processed_indices.append(unit_lookup[key])
-
-        processed_indices.sort()
-        if processed_indices:
-            expected_prefix = list(range(processed_indices[-1] + 1))
-            if processed_indices != expected_prefix:
-                raise ValueError(
-                    "Append source snapshots are not a contiguous evaluation prefix; "
-                    "repair or rebuild the source run before appending"
-                )
-        self._append_target_reached = target_key in records
-
-        self._append_source_manifest = manifest
-        self._append_source_snapshot_records = records
-        self._append_source_snapshot_keys = set(records)
 
     def _init_checkpoint_manager(self) -> None:
         config_hash = compute_config_hash(self.method_config, self.dataset_config)
@@ -889,92 +159,30 @@ class MedMemoryBenchEvaluator:
 
         checkpoint = self._checkpoint_manager.load()
         if checkpoint is None:
-            self._log(
-                "Checkpoint and previous-good backup are unavailable or corrupted; "
-                "starting from scratch",
-                level="WARNING",
-            )
+            self._log("Checkpoint file corrupted, starting from scratch")
             self._checkpoint_manager.delete()
             return False
 
-        if self._checkpoint_manager.recovered_from_backup:
-            self._log(
-                "Primary checkpoint was corrupted; restored the previous-good backup.",
-                level="WARNING",
-            )
-
-        config_matches = self._checkpoint_manager.validate_config()
-        force_requested = bool(getattr(self, "force_resume", False))
-        force_resume = self._session_level_force_resume()
-        method_name = str(
-            getattr(getattr(self, "method_config", None), "method_name", "")
-        ).lower()
-        if (
-            not config_matches
-            and force_requested
-            and (method_name.startswith("amem") or method_name == "event_state")
-        ):
-            raise ValueError(
-                f"Cannot force-resume a {self._memory_method_label()} run after "
-                "memory-build configuration changes. Resume with the stored "
-                "configuration or start a new run."
-            )
-        if not config_matches and not force_requested:
+        if not self._checkpoint_manager.validate_config():
             self._log("Config changed, checkpoint invalid, starting from scratch")
             self._checkpoint_manager.delete()
             return False
-
-        if not config_matches:
-            self._log(
-                "Config changed; --force is keeping the existing checkpoint and "
-                "continuing with the new configuration.",
-                level="WARNING",
-            )
-            self._checkpoint_manager.adopt_config_hash()
 
         if not self._checkpoint_manager.is_independent_mode():
             self._log("Checkpoint not in independent mode, cannot resume")
             return False
 
-        resume_info = self._checkpoint_manager.get_resume_info()
-        if force_resume and resume_info.get("active_session_id") is not None:
-            raise RuntimeError(
-                "Cannot safely force-resume because the last session may already have "
-                "committed to the persistent memory backend. Resolve or rebuild that "
-                "backend before resuming."
-            )
-
-        rollback = self._checkpoint_manager.rollback_incomplete_session()
-        if rollback is not None:
-            self._log(
-                f"Rolled back unfinished session {rollback['session_id']} "
-                f"from evaluation unit {rollback['unit_id']}; it will be retried.",
-                level="WARNING",
-            )
-
         self._load_checkpoint_results()
 
         info = self._checkpoint_manager.get_resume_info()
-        if force_resume:
-            self._force_resume_persona_id = info["current_persona"]
-            self._log(
-                "Forced session-level resume trusts the memory backend to retain all "
-                "sessions recorded by the checkpoint.",
-                level="WARNING",
-            )
         self._log("=" * 50)
         self._log("Resuming from checkpoint")
         self._log(f"  Checkpoint ID: {info['checkpoint_id'][:8]}...")
         self._log(f"  Completed Personas: {info['completed_personas']}/{info['total_personas']}")
         self._log(f"  Completed Queries: {info['completed_queries']}/{info['total_queries']}")
         if info['current_persona'] is not None:
-            resume_action = "continuing stored memory" if force_resume else "rebuilding memory"
-            self._log(
-                f"  Current Persona: {info['current_persona']} "
-                f"({info['current_persona_completed_queries']} queries done, "
-                f"{info['current_persona_injected_sessions']} sessions injected, "
-                f"{resume_action})"
-            )
+            self._log(f"  Current Persona: {info['current_persona']} "
+                     f"({info['current_persona_completed_queries']} queries done, rebuilding memory)")
         self._log("=" * 50)
 
         return True
@@ -1022,8 +230,10 @@ class MedMemoryBenchEvaluator:
             # Clean up old agent's resources before creating new one
             if self.agent_manager is not None:
                 try:
+                    self._log(f"[DEBUG] Starting reset of old agent...")
                     # Reset releases resources (closes Qdrant client, etc.)
                     self.agent_manager.reset()
+                    self._log(f"[DEBUG] Reset completed")
 
                     # Explicitly delete old agent manager to release all references
                     old_manager = self.agent_manager
@@ -1034,1175 +244,32 @@ class MedMemoryBenchEvaluator:
                     import gc
                     gc.collect()
 
+                    self._log(f"[DEBUG] Old agent deleted, sleeping 1s for resource cleanup...")
                     # Give time for resources to be fully released
                     import time
                     time.sleep(1.0)
+                    self._log(f"[DEBUG] Sleep done, creating new agent...")
                 except Exception as e:
-                    self._log(
-                        f"Failed to reset previous agent: {truncate_error_message(e)}",
-                        level="WARNING",
-                    )
+                    self._log(f"Warning: Failed to reset old agent: {e}")
 
+            self._log(f"[DEBUG] Creating AgentManager for context {context_id}...")
             self.agent_manager = AgentManager(
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
                 batch_api=self.batch_api,
-                batch_gcs_uri=getattr(self, "batch_gcs_uri", None),
-                batch_wait=getattr(self, "batch_wait", False),
-                workers=self.workers,
+                batch_gcs_uri=self.batch_gcs_uri,
+                batch_wait=self.batch_wait,
                 batch_manifest_dir=self.output_dir / "batch",
                 batch_config_hash=self._batch_manifest_config_hash(),
                 batch_progress_callback=self._log,
-                query_only=self.execution_stage == "query",
             )
+            self._log(f"[DEBUG] AgentManager created successfully")
 
         self.agent_manager.set_context_id(context_id)
+        self._log(f"[DEBUG] Context ID set to {context_id}")
 
     def _batch_config_hash(self) -> str:
-        if getattr(self, "execution_stage", "all") == "query":
-            return compute_query_config_hash(self.method_config, self.dataset_config)
         return compute_config_hash(self.method_config, self.dataset_config)
-
-    def _judge_batch_config_hash(self) -> str:
-        """Include `.env` judge settings in judge submit/resume identity."""
-        api_config = get_api_config()
-        payload = {
-            "method_config_hash": self._batch_manifest_config_hash(),
-            "provider": api_config.get_judge_provider(),
-            "model": api_config.get_judge_model(),
-            "temperature": getattr(api_config, "judge_temperature", 1.0),
-            "reasoning_effort": getattr(api_config, "judge_reasoning_effort", None),
-            "client_max_tokens": getattr(api_config, "judge_client_max_tokens", 10000),
-            "max_tokens": getattr(api_config, "judge_max_tokens", 500),
-            "mcd_max_tokens": getattr(api_config, "judge_mcd_max_tokens", 2000),
-        }
-        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()[:48]
-
-    def _supports_memory_snapshots(self) -> bool:
-        support = getattr(self.agent_manager, "supports_memory_snapshots", None)
-        return bool(callable(support) and support())
-
-    def _memory_snapshot_root(self) -> Path:
-        if getattr(self, "run_scoped_output", False):
-            return self.output_dir / "memory"
-        safe_method = self.method_config.method_name.replace("/", "-").replace("\\", "-")
-        safe_model = self.method_config.model.name.replace("/", "-").replace("\\", "-")
-        return self.output_dir / f"{safe_method}_{safe_model}" / "memory"
-
-    def _run_scoped_experiment_dir(self) -> Path:
-        memory_source_run_dir = getattr(self, "memory_source_run_dir", None)
-        if memory_source_run_dir is not None:
-            return memory_source_run_dir.parent
-        if self.output_dir.parent.name == "query_runs":
-            return self.output_dir.parent.parent.parent
-        return self.output_dir.parent
-
-    def _legacy_memory_snapshot_root(self) -> Path:
-        """Return the pre-run-directory memory root for compatibility."""
-        if getattr(self, "run_scoped_output", False):
-            return self._run_scoped_experiment_dir() / "memory"
-        return self._memory_snapshot_root()
-
-    def _memory_snapshot_dir(self) -> Path:
-        if self._memory_snapshot_run_dir is None:
-            raise RuntimeError(
-                f"{self._memory_method_label()} memory snapshot run has not been selected"
-            )
-        return self._memory_snapshot_run_dir
-
-    def _memory_method_label(self) -> str:
-        """Return the user-facing name for the active snapshot-backed method."""
-        method_name = str(getattr(self.method_config, "method_name", "")).lower()
-        return "Event-State" if method_name == "event_state" else "A-MEM"
-
-    def _memory_snapshot_path(self, unit: EvaluationUnit) -> Path:
-        return self._memory_snapshot_dir() / (
-            f"persona_{unit.context_id}_unit_{unit.unit_id}.json"
-        )
-
-    def _memory_snapshot_manifest_path(self) -> Path:
-        return self._memory_snapshot_dir() / "manifest.json"
-
-    def _memory_snapshot_embeddings_path(self, unit: EvaluationUnit) -> Path:
-        return self._memory_snapshot_path(unit).with_suffix(".embeddings.npy")
-
-    def _artifact_relative_path(self, path: Optional[Path]) -> Optional[str]:
-        """Return an artifact path relative to this run when possible."""
-        if path is None or not hasattr(self, "output_dir"):
-            return None
-        return os.path.relpath(Path(path), self.output_dir)
-
-    def _query_artifact_references(
-        self,
-        *,
-        context_id: Optional[int],
-        unit_id: Optional[int],
-        answer_request_id: Optional[str] = None,
-        answer_batch_client: Optional[Any] = None,
-        answer_messages: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Build compact, joinable provenance for one scored query."""
-        references: Dict[str, Any] = {}
-        manifest = getattr(self, "_memory_snapshot_manifest", None) or {}
-        if context_id is not None and unit_id is not None and manifest:
-            snapshot = next(
-                (
-                    item for item in manifest.get("snapshots", [])
-                    if item.get("context_id") == context_id
-                    and item.get("unit_id") == unit_id
-                ),
-                {},
-            )
-            if snapshot:
-                snapshot_path = self._memory_snapshot_dir() / snapshot.get("path", "")
-                references["memory_snapshot"] = {
-                    "build_id": manifest.get("build_id", ""),
-                    "build_config_hash": manifest.get("build_config_hash", ""),
-                    "retrieval_config_hash": manifest.get("retrieval_config_hash", ""),
-                    "manifest_path": self._artifact_relative_path(
-                        self._memory_snapshot_manifest_path()
-                    ),
-                    "snapshot_path": self._artifact_relative_path(snapshot_path),
-                    "integrity_hash": snapshot.get("integrity_hash", ""),
-                    "embedding_sha256": snapshot.get("embedding_sha256", ""),
-                }
-        if answer_request_id:
-            answer_reference: Dict[str, Any] = {
-                "transport": "batch" if answer_batch_client is not None else "realtime",
-            }
-            answer_reference[
-                "request_id" if answer_batch_client is not None else "correlation_id"
-            ] = answer_request_id
-            relative_path = self._artifact_relative_path(
-                getattr(answer_batch_client, "manifest_path", None)
-            )
-            if relative_path is not None:
-                answer_reference["manifest_path"] = relative_path
-            if answer_messages is not None:
-                answer_reference["prompt_sha256"] = self._artifact_content_hash(
-                    answer_messages
-                )
-            references["answer"] = answer_reference
-        return references
-
-    def _batch_artifact_reference(
-        self,
-        batch_client: Any,
-        request_id: str,
-    ) -> Dict[str, Any]:
-        """Describe a persisted batch request without copying its raw payload."""
-        reference: Dict[str, Any] = {
-            "transport": "batch",
-            "request_id": request_id,
-        }
-        relative_path = self._artifact_relative_path(
-            getattr(batch_client, "manifest_path", None)
-        )
-        if relative_path is not None:
-            reference["manifest_path"] = relative_path
-        return reference
-
-    @staticmethod
-    def _artifact_content_hash(value: Any) -> str:
-        """Return a stable digest for a JSON artifact fragment."""
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _batch_response_usage(response: Any, *, transport: str) -> Dict[str, Any]:
-        """Normalize provider usage without treating unavailable timing as zero."""
-        return {
-            "transport": transport,
-            "input_tokens": int(getattr(response, "input_tokens", 0) or 0),
-            "output_tokens": int(getattr(response, "output_tokens", 0) or 0),
-            "visible_output_tokens": int(
-                getattr(response, "visible_output_tokens", 0) or 0
-            ),
-            "thinking_tokens": int(getattr(response, "thinking_tokens", 0) or 0),
-            "duration_seconds": getattr(response, "duration_seconds", None),
-        }
-
-    @staticmethod
-    def _usage_total(*usage_values: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge tracker usage objects while preserving derived averages."""
-        total = TokenUsage()
-        for usage in usage_values:
-            total.merge(TokenUsage.from_dict(usage))
-        return total.to_dict()
-
-    @staticmethod
-    def _model_usage_identity(model_config: Any, *, transport: str) -> Dict[str, Any]:
-        """Describe the configured model used by a stage, never a guessed route."""
-        return {
-            "provider": str(getattr(model_config, "provider", "") or ""),
-            "model": str(getattr(model_config, "name", "") or ""),
-            "transport": transport,
-            "service_tier": getattr(model_config, "openrouter_service_tier", None),
-        }
-
-    def _batch_manifest_stage_summaries(self, batch_client: Any) -> List[Dict[str, Any]]:
-        """Expose compact batch lifecycle and provider usage from a raw manifest."""
-        manifest_path = getattr(batch_client, "manifest_path", None)
-        if manifest_path is None:
-            return []
-        try:
-            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        summaries = []
-        for stage_name, stage in (manifest.get("jobs") or {}).items():
-            if not isinstance(stage, dict):
-                continue
-            responses = stage.get("responses") or {}
-            response_values = list(responses.values()) if isinstance(responses, dict) else []
-            submitted_at = stage.get("submitted_at")
-            completed_at = stage.get("completed_at")
-            duration_seconds = None
-            if isinstance(submitted_at, str) and isinstance(completed_at, str):
-                try:
-                    duration_seconds = (
-                        datetime.fromisoformat(completed_at)
-                        - datetime.fromisoformat(submitted_at)
-                    ).total_seconds()
-                except ValueError:
-                    pass
-            fallback_reason = stage.get("fallback_reason")
-            summaries.append({
-                "stage": stage_name,
-                "manifest_path": self._artifact_relative_path(Path(manifest_path)),
-                "transport": "realtime_fallback" if fallback_reason else "batch",
-                "provider": manifest.get("provider") or (
-                    "openrouter" if manifest.get("project") == "openrouter" else "vertex"
-                ),
-                "model": manifest.get("model", ""),
-                "state": stage.get("state", ""),
-                "request_count": len(stage.get("requests") or []),
-                "response_count": len(response_values),
-                "successful_response_count": sum(
-                    not item.get("status") for item in response_values if isinstance(item, dict)
-                ),
-                "failed_response_count": sum(
-                    bool(item.get("status")) for item in response_values if isinstance(item, dict)
-                ),
-                "retry_count": len(stage.get("retries") or []),
-                "submitted_at": submitted_at,
-                "completed_at": completed_at,
-                "remote_elapsed_seconds": duration_seconds,
-                "token_usage": {
-                    field: sum(
-                        int(item.get(field, 0) or 0)
-                        for item in response_values if isinstance(item, dict)
-                    )
-                    for field in (
-                        "input_tokens", "output_tokens", "visible_output_tokens",
-                        "thinking_tokens",
-                    )
-                },
-                "fallback_reason": fallback_reason,
-            })
-        return summaries
-
-    def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
-        """Publish stage attribution, batch lifecycle, and explicit cost status."""
-        query_operations = (llm_usage.get("operations") or {}).get("query", {})
-        query_total = llm_usage.get("query_phase", {})
-        answer_batch = query_operations.get("query.answer_batch", {})
-        answer_realtime = query_operations.get("query.answer_realtime", {})
-        judge_batch = query_operations.get("query.judge_batch", {})
-        judge_realtime = query_operations.get("query.judge_realtime", {})
-        retrieval = query_operations.get("query.retrieval_preparation", {})
-        attributed = self._usage_total(
-            answer_batch, answer_realtime, judge_batch, judge_realtime, retrieval
-        )
-        unattributed = TokenUsage.from_dict(query_total).subtract(
-            TokenUsage.from_dict(attributed)
-        ).to_dict()
-        api_config = get_api_config()
-        answer_model = self._model_usage_identity(
-            self.method_config.model,
-            transport="batch_or_realtime",
-        )
-        judge_model = {
-            "provider": api_config.get_judge_provider(),
-            "model": api_config.get_judge_model(),
-            "transport": "batch_or_realtime",
-            "service_tier": None,
-        }
-        cost_unavailable = {
-            "available": False,
-            "currency": "USD",
-            "reason": (
-                "No versioned provider price schedule is configured; token totals "
-                "are recorded without an estimated monetary cost."
-            ),
-        }
-        batch_stages = (
-            self._batch_manifest_stage_summaries(getattr(self, "_batch_client", None))
-            + self._batch_manifest_stage_summaries(
-                getattr(self, "_judge_batch_client", None)
-            )
-        )
-        return {
-            "schema_version": 1,
-            "memory_build": {
-                "usage": llm_usage.get("memorize_phase", {}),
-                "models": [],
-                "cost": cost_unavailable,
-            },
-            "retrieval_preparation": {
-                "usage": retrieval,
-                "models": [answer_model],
-                "cost": cost_unavailable,
-            },
-            "answer": {
-                "usage": self._usage_total(answer_batch, answer_realtime),
-                "models": [answer_model],
-                "cost": cost_unavailable,
-            },
-            "judge": {
-                "usage": self._usage_total(judge_batch, judge_realtime),
-                "models": [judge_model],
-                "cost": cost_unavailable,
-            },
-            "unattributed_query_usage": unattributed,
-            "batch_stages": batch_stages,
-        }
-
-    @staticmethod
-    def _file_sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def _write_memory_snapshot_manifest(self) -> None:
-        if self._memory_snapshot_manifest is None:
-            return
-        path = self._memory_snapshot_manifest_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_name(f"{path.name}.tmp")
-        with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(
-                self._memory_snapshot_manifest,
-                handle,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        self._fsync_directory(path.parent)
-
-    @staticmethod
-    def _fsync_directory(path: Path) -> None:
-        """Make a completed atomic replacement durable on supported filesystems."""
-        try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            pass
-        finally:
-            os.close(descriptor)
-
-    @staticmethod
-    def _new_memory_run_name() -> str:
-        return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-    def _memory_run_candidates(self) -> List[Path]:
-        if getattr(self, "run_scoped_output", False):
-            candidates = []
-            experiment_dir = self._run_scoped_experiment_dir()
-            for run_dir in sorted(
-                [path for path in experiment_dir.iterdir() if path.is_dir()],
-                key=lambda path: path.name,
-                reverse=True,
-            ):
-                memory_dir = run_dir / "memory"
-                if memory_dir != self._memory_snapshot_root():
-                    candidates.append(memory_dir)
-
-            legacy_root = self._legacy_memory_snapshot_root()
-            if legacy_root.exists():
-                candidates.extend(sorted(
-                    [path for path in legacy_root.iterdir() if path.is_dir()],
-                    key=lambda path: path.name,
-                    reverse=True,
-                ))
-                if (legacy_root / "manifest.json").exists():
-                    candidates.append(legacy_root)
-            return candidates
-
-        root = self._memory_snapshot_root()
-        if not root.exists():
-            return []
-        candidates = sorted(
-            [path for path in root.iterdir() if path.is_dir()],
-            key=lambda path: path.name,
-            reverse=True,
-        )
-        # Runs produced before timestamped directories stored their manifest
-        # and unit snapshots directly in the memory root.
-        if (root / "manifest.json").exists():
-            candidates.append(root)
-        return candidates
-
-    def _saved_memory_source_candidate(self) -> Optional[Path]:
-        if not getattr(self, "run_scoped_output", False):
-            return None
-        source_path = self.output_dir / "memory_source.json"
-        if not source_path.exists():
-            return None
-        try:
-            payload = json.loads(source_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"Cannot read saved memory source {source_path}: {truncate_error_message(exc)}"
-            ) from exc
-        manifest_value = payload.get("manifest_path")
-        if not isinstance(manifest_value, str) or not manifest_value:
-            raise ValueError(f"Saved memory source is invalid: {source_path}")
-        manifest_path = Path(manifest_value)
-        if not manifest_path.is_absolute():
-            manifest_path = self.output_dir / manifest_path
-        return manifest_path.resolve().parent
-
-    def _explicit_memory_run_candidates(self, requested_run: str) -> List[Path]:
-        if requested_run == "legacy":
-            return [self._legacy_memory_snapshot_root()]
-        if Path(requested_run).name != requested_run:
-            raise ValueError("--memory-run must be a run timestamp directory name")
-        if getattr(self, "run_scoped_output", False):
-            candidates = []
-            memory_source_run_dir = getattr(self, "memory_source_run_dir", None)
-            if memory_source_run_dir is not None:
-                candidates.append(memory_source_run_dir / "memory")
-            candidates.extend([
-                self._run_scoped_experiment_dir() / requested_run / "memory",
-                self._legacy_memory_snapshot_root() / requested_run,
-            ])
-            return list(dict.fromkeys(candidates))
-        return [self._memory_snapshot_root() / requested_run]
-
-    def _write_memory_source(self, run_dir: Path, manifest: Dict[str, Any]) -> None:
-        if not getattr(self, "run_scoped_output", False):
-            return
-        manifest_path = run_dir / "manifest.json"
-        relative_manifest = os.path.relpath(manifest_path, self.output_dir)
-        source_run_id = (
-            run_dir.parent.name
-            if (
-                run_dir.name == "memory"
-                and run_dir.parent.parent == self._run_scoped_experiment_dir()
-            )
-            else f"legacy:{run_dir.name}"
-        )
-        payload = {
-            "format": "medmemorybench.memory_source",
-            "version": 1,
-            "selected_at": datetime.now().isoformat(),
-            "selection": (
-                "explicit"
-                if getattr(
-                    self,
-                    "memory_run_explicit",
-                    bool(getattr(self, "memory_run", None)),
-                )
-                else "newest_compatible"
-            ),
-            "source_run_id": source_run_id,
-            "manifest_path": relative_manifest,
-            "build_id": manifest.get("build_id"),
-            "config_hash": manifest.get("config_hash"),
-            "build_config_hash": derive_legacy_build_config_hash(
-                manifest, manifest_path
-            ),
-            "feature_configuration": manifest.get("feature_configuration", {}),
-            "build_metrics": manifest.get("build_metrics", {}),
-            "memory_size": manifest.get("memory_size", {}),
-            "status": manifest.get("status"),
-        }
-        path = self.output_dir / "memory_source.json"
-        temporary_path = path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary_path.replace(path)
-
-    def _select_memory_snapshot_run(
-        self,
-        *,
-        require_complete: bool,
-        resume_current: bool = False,
-    ) -> Path:
-        requested_run = getattr(self, "memory_run", None)
-        saved_source = (
-            self._saved_memory_source_candidate()
-            if require_complete and not requested_run
-            else None
-        )
-        if resume_current and getattr(self, "run_scoped_output", False):
-            candidates = [self._memory_snapshot_root()]
-        elif saved_source is not None:
-            candidates = [saved_source]
-        elif requested_run:
-            candidates = self._explicit_memory_run_candidates(requested_run)
-        else:
-            candidates = self._memory_run_candidates()
-
-        for run_dir in candidates:
-            manifest_path = run_dir / "manifest.json"
-            if not manifest_path.exists():
-                continue
-            try:
-                with manifest_path.open("r", encoding="utf-8") as handle:
-                    manifest = json.load(handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (
-                manifest.get("format") != "medmemorybench.memory_manifest"
-                or manifest.get("version") != 1
-                or not (
-                    is_manifest_query_compatible(
-                        manifest,
-                        self.method_config,
-                        self.dataset_config,
-                        manifest_path,
-                    )
-                    if self.execution_stage == "query"
-                    else is_manifest_build_compatible(
-                        manifest, self._batch_config_hash(), manifest_path
-                    )
-                )
-                or manifest.get("method_name") != self.method_config.method_name
-                or (require_complete and manifest.get("status") != "complete")
-                or (not require_complete and manifest.get("status") != "building")
-            ):
-                continue
-            self._memory_snapshot_run_dir = run_dir
-            self._memory_snapshot_manifest = manifest
-            if require_complete:
-                self._write_memory_source(run_dir, manifest)
-            return run_dir
-
-        selection = f" '{requested_run}'" if requested_run else ""
-        status = "complete" if require_complete else "in-progress"
-        raise FileNotFoundError(
-            f"No compatible {status} {self._memory_method_label()} memory run{selection} for experiment "
-            f"{self._run_scoped_experiment_dir() if getattr(self, 'run_scoped_output', False) else self._memory_snapshot_root()}"
-        )
-
-    def _copy_append_source_snapshots(self) -> None:
-        """Materialize source snapshots into the derived append run."""
-        if self._append_source_manifest is None or self.memory_source_run_dir is None:
-            return
-        units = self._get_evaluation_units()
-        unit_lookup = {(unit.context_id, unit.unit_id): unit for unit in units}
-        source_memory_dir = self.memory_source_run_dir / "memory"
-        snapshots = self._memory_snapshot_manifest["snapshots"]
-        for key, record in sorted(
-            self._append_source_snapshot_records.items(),
-            key=lambda item: unit_lookup[item[0]].unit_id,
-        ):
-            unit = unit_lookup[key]
-            source_name = record.get("path")
-            if not isinstance(source_name, str) or Path(source_name).name != source_name:
-                raise ValueError(f"Append source snapshot path is invalid for unit {key}")
-            source_path = source_memory_dir / source_name
-            source_payload = self._read_snapshot_payload(
-                source_path,
-                self._append_source_manifest,
-                unit,
-                require_current_config=True,
-            )
-            child_payload = copy.deepcopy(source_payload)
-            child_payload["build_id"] = self._memory_snapshot_manifest["build_id"]
-            child_payload["append_source"] = {
-                "run_id": self.memory_source_run_dir.name,
-                "build_id": self._append_source_manifest.get("build_id"),
-            }
-            target_path = self._memory_snapshot_path(unit)
-            child_payload = self._write_snapshot_payload(child_payload, target_path)
-            snapshots[:] = [
-                item
-                for item in snapshots
-                if not (
-                    item.get("context_id") == unit.context_id
-                    and item.get("unit_id") == unit.unit_id
-                )
-            ]
-            snapshots.append({
-                "unit_id": unit.unit_id,
-                "context_id": unit.context_id,
-                "path": target_path.name,
-                "integrity_hash": child_payload.get("integrity_hash", ""),
-                "embedding_sha256": self._snapshot_embedding_sha256(child_payload),
-                "source": self.memory_source_run_dir.name,
-                "session_count": len(child_payload.get("session_ids", [])),
-                "memory_build_time": child_payload.get("memory_build_time", 0.0),
-                "memory_build_metrics": copy.deepcopy(
-                    child_payload.get("memory_build_metrics") or {}
-                ),
-                "memory_size": copy.deepcopy(child_payload.get("memory_size")),
-            })
-        snapshots.sort(key=lambda item: item["unit_id"])
-        self._write_memory_snapshot_manifest()
-
-    def _start_append_memory_snapshot_manifest(self) -> None:
-        """Create a derived memory run seeded with the source prefix."""
-        self._prepare_append_plan()
-        units = self._get_evaluation_units()
-        if self._append_target_index is None:
-            raise RuntimeError("Append target was not resolved")
-        selected_units = units[: self._append_target_index + 1]
-        run_name = self.output_dir.name if self.run_scoped_output else self._new_memory_run_name()
-        run_dir = self._memory_snapshot_root()
-        run_dir.mkdir(parents=True, exist_ok=False)
-        self._memory_snapshot_run_dir = run_dir
-        source_manifest = self._append_source_manifest or {}
-        self._memory_snapshot_manifest = {
-            "format": "medmemorybench.memory_manifest",
-            "version": 1,
-            "build_id": str(uuid.uuid4()),
-            "run_name": run_name,
-            "status": "building",
-            "method_name": self.method_config.method_name,
-            "model_name": self.method_config.model.name,
-            "config_hash": self._batch_config_hash(),
-            "build_config_hash": self._batch_config_hash(),
-            "retrieval_config_hash": compute_query_config_hash(
-                self.method_config, self.dataset_config
-            ),
-            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
-                self.method_config, self.dataset_config
-            ),
-            "feature_configuration": self._amem_feature_configuration(),
-            "created_at": datetime.now().isoformat(),
-            "completed_at": None,
-            "unit_ids": [unit.unit_id for unit in selected_units],
-            "dataset_unit_ids": [unit.unit_id for unit in units],
-            "append": {
-                "source_run_id": self.memory_source_run_dir.name,
-                "source_build_id": source_manifest.get("build_id"),
-                "target_persona": getattr(self, "append_persona", None),
-                "target_unit": getattr(self, "append_unit", None),
-                "target_index": self._append_target_index,
-                "source_snapshot_count": len(self._append_source_snapshot_records),
-            },
-            "snapshots": [],
-        }
-        self._write_memory_snapshot_manifest()
-        self._copy_append_source_snapshots()
-        self._log(f"Created append {self._memory_method_label()} memory run: {run_dir}")
-
-    def _start_memory_snapshot_manifest(self, *, resume_existing: bool = False) -> None:
-        units = self._get_evaluation_units()
-        # A process can stop after publishing the memory manifest but before the
-        # checkpoint is created. Reuse that current run on the next --resume.
-        if (
-            not resume_existing
-            and getattr(self, "resume", False)
-            and getattr(self, "run_scoped_output", False)
-            and (self._memory_snapshot_root() / "manifest.json").exists()
-        ):
-            resume_existing = True
-        if resume_existing:
-            run_dir = self._select_memory_snapshot_run(
-                require_complete=False,
-                resume_current=True,
-            )
-            expected_unit_ids = [unit.unit_id for unit in units]
-            stored_unit_ids = self._memory_snapshot_manifest.get("unit_ids", [])
-            if getattr(self, "append", False):
-                if not self._memory_snapshot_manifest.get("append"):
-                    raise ValueError(
-                        f"{self._memory_method_label()} resume target is not an append run: {run_dir}"
-                    )
-                if self._append_target_index is None:
-                    self._prepare_append_plan()
-                if stored_unit_ids != expected_unit_ids[: self._append_target_index + 1]:
-                    raise ValueError(
-                        f"{self._memory_method_label()} append run does not match current evaluation units: {run_dir}"
-                    )
-                # Reconcile source snapshots after an interruption during the
-                # initial copy, before building any missing evaluation units.
-                self._copy_append_source_snapshots()
-            elif stored_unit_ids != expected_unit_ids:
-                raise ValueError(
-                    f"{self._memory_method_label()} memory run does not match current evaluation units: {run_dir}"
-                )
-            run_label = run_dir.name if run_dir != self._memory_snapshot_root() else "legacy"
-            self._log(f"Resuming {self._memory_method_label()} memory run: {run_label}")
-            return
-
-        if getattr(self, "append", False):
-            self._start_append_memory_snapshot_manifest()
-            return
-
-        if getattr(self, "run_scoped_output", False):
-            run_name = self.output_dir.name
-            run_dir = self._memory_snapshot_root()
-        else:
-            run_name = self._new_memory_run_name()
-            run_dir = self._memory_snapshot_root() / run_name
-        run_dir.mkdir(parents=True, exist_ok=False)
-        self._memory_snapshot_run_dir = run_dir
-        self._memory_snapshot_manifest = {
-            "format": "medmemorybench.memory_manifest",
-            "version": 1,
-            "build_id": str(uuid.uuid4()),
-            "run_name": run_name,
-            "status": "building",
-            "method_name": self.method_config.method_name,
-            "model_name": self.method_config.model.name,
-            "config_hash": self._batch_config_hash(),
-            "build_config_hash": self._batch_config_hash(),
-            "retrieval_config_hash": compute_query_config_hash(
-                self.method_config, self.dataset_config
-            ),
-            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
-                self.method_config, self.dataset_config
-            ),
-            "feature_configuration": self._amem_feature_configuration(),
-            "created_at": datetime.now().isoformat(),
-            "completed_at": None,
-            "unit_ids": [unit.unit_id for unit in units],
-            "dataset_unit_ids": [unit.unit_id for unit in units],
-            "snapshots": [],
-        }
-        self._write_memory_snapshot_manifest()
-        self._log(f"Created {self._memory_method_label()} memory run: {run_dir}")
-
-    def _load_memory_snapshot_manifest(self) -> None:
-        run_dir = self._select_memory_snapshot_run(require_complete=True)
-        manifest = self._memory_snapshot_manifest
-        expected_unit_ids = [unit.unit_id for unit in self._get_evaluation_units()]
-        stored_unit_ids = manifest.get("unit_ids", [])
-        if manifest.get("append"):
-            if not set(stored_unit_ids).issubset(set(expected_unit_ids)):
-                raise ValueError(
-                    f"{self._memory_method_label()} append manifest contains unknown evaluation units: {run_dir}"
-                )
-        elif stored_unit_ids != expected_unit_ids:
-            raise ValueError(
-                f"{self._memory_method_label()} memory manifest does not match current evaluation units: {run_dir}"
-            )
-        snapshot_unit_ids = sorted(item.get("unit_id") for item in manifest.get("snapshots", []))
-        if snapshot_unit_ids != sorted(stored_unit_ids):
-            raise ValueError(
-                f"{self._memory_method_label()} memory manifest snapshot list is incomplete: {run_dir}"
-            )
-        self._memory_unit_ids = set(stored_unit_ids)
-        run_label = run_dir.name if run_dir != self._memory_snapshot_root() else "legacy"
-        self._log(f"Using {self._memory_method_label()} memory run: {run_label}")
-
-    def _complete_memory_snapshot_manifest(self) -> None:
-        if self._memory_snapshot_manifest is None:
-            return
-        expected = self._memory_snapshot_manifest.get("unit_ids", [])
-        completed = sorted(item["unit_id"] for item in self._memory_snapshot_manifest["snapshots"])
-        expected = sorted(expected)
-        if completed != expected:
-            raise RuntimeError(
-                f"{self._memory_method_label()} snapshot build is incomplete: expected units {expected}, got {completed}"
-            )
-        snapshot_logs = [
-            {
-                "unit_id": item.get("unit_id"),
-                "context_id": item.get("context_id"),
-                "session_count": item.get("session_count", 0),
-                "total_time": item.get("memory_build_time", 0.0),
-                "build_metrics": item.get("memory_build_metrics") or {},
-                "memory_size": item.get("memory_size"),
-                "restored_from_snapshot": bool(item.get("source")),
-            }
-            for item in self._memory_snapshot_manifest.get("snapshots", [])
-        ]
-        self._memory_snapshot_manifest["build_metrics"] = self._build_metrics_report(
-            snapshot_logs
-        )
-        self._memory_snapshot_manifest["memory_size"] = copy.deepcopy(
-            self._memory_snapshot_manifest["build_metrics"]["memory_size"]
-        )
-        self._memory_snapshot_manifest["status"] = "complete"
-        self._memory_snapshot_manifest["completed_at"] = datetime.now().isoformat()
-        self._write_memory_snapshot_manifest()
-
-    @staticmethod
-    def _snapshot_integrity_hash(payload: Dict[str, Any]) -> str:
-        hash_payload = dict(payload)
-        hash_payload.pop("integrity_hash", None)
-        content = json.dumps(
-            hash_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _snapshot_embedding_sha256(payload: Dict[str, Any]) -> str:
-        """Return the published embedding sidecar digest, when present."""
-        embeddings = (
-            payload.get("memory_state", {})
-            .get("system_state", {})
-            .get("retriever", {})
-            .get("embeddings")
-        )
-        return str(embeddings.get("sha256", "")) if isinstance(embeddings, dict) else ""
-
-    @staticmethod
-    def _measure_snapshot_memory_size(
-        payload: Dict[str, Any],
-        snapshot_path: Path,
-    ) -> Dict[str, Any]:
-        """Measure the serialized retrieval state without snapshot metadata."""
-        memory_state = payload.get("memory_state") or {}
-        json_bytes = len(json.dumps(
-            memory_state,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8"))
-        system_state = memory_state.get("system_state") or {}
-        embedding_state = (system_state.get("retriever") or {}).get("embeddings")
-        embedding_bytes = 0
-        if isinstance(embedding_state, dict):
-            embedding_name = embedding_state.get("path")
-            if (
-                isinstance(embedding_name, str)
-                and Path(embedding_name).name == embedding_name
-            ):
-                embedding_path = snapshot_path.parent / embedding_name
-                if embedding_path.is_file():
-                    embedding_bytes = embedding_path.stat().st_size
-        memory_entries = system_state.get("memories") or []
-        memory_chunks = (memory_state.get("agent_state") or {}).get(
-            "memory_chunks"
-        ) or []
-        total_bytes = json_bytes + embedding_bytes
-        return {
-            "measurement": "serialized_memory_state",
-            "bytes": total_bytes,
-            "mib": round(total_bytes / (1024 ** 2), 6),
-            "json_bytes": json_bytes,
-            "embedding_bytes": embedding_bytes,
-            "memory_entry_count": len(memory_entries),
-            "memory_chunk_count": len(memory_chunks),
-        }
-
-    def _write_snapshot_payload(
-        self,
-        payload: Dict[str, Any],
-        path: Path,
-    ) -> Dict[str, Any]:
-        """Publish a snapshot without invalidating the previous generation."""
-        payload = copy.deepcopy(payload)
-        embedding_state = (
-            payload.get("memory_state", {})
-            .get("system_state", {})
-            .get("retriever", {})
-            .get("embeddings")
-        )
-        published_embedding_path: Optional[Path] = None
-        if embedding_state is not None:
-            embedding_values = np.asarray(embedding_state.pop("values"))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_embedding_path = path.parent / (
-                f".{path.stem}.embeddings.{uuid.uuid4().hex}.tmp"
-            )
-            with temporary_embedding_path.open("wb") as handle:
-                np.save(handle, embedding_values, allow_pickle=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            embedding_sha256 = self._file_sha256(temporary_embedding_path)
-            published_embedding_path = path.parent / (
-                f"{path.stem}.embeddings.{embedding_sha256}.npy"
-            )
-            os.replace(temporary_embedding_path, published_embedding_path)
-            self._fsync_directory(path.parent)
-            embedding_state.update({
-                "storage": "npy",
-                "path": published_embedding_path.name,
-                "sha256": embedding_sha256,
-            })
-
-        payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
-        payload["integrity_hash"] = self._snapshot_integrity_hash(payload)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_name(f"{path.name}.tmp")
-        with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        self._fsync_directory(path.parent)
-
-        referenced_embedding = (
-            published_embedding_path.name
-            if published_embedding_path is not None
-            else None
-        )
-        embedding_candidates = list(
-            path.parent.glob(f"{path.stem}.embeddings.*.npy")
-        )
-        embedding_candidates.append(path.with_suffix(".embeddings.npy"))
-        for candidate in embedding_candidates:
-            if candidate.name != referenced_embedding:
-                candidate.unlink(missing_ok=True)
-        return payload
-
-    def _read_snapshot_payload(
-        self,
-        path: Path,
-        manifest: Dict[str, Any],
-        unit: EvaluationUnit,
-        *,
-        require_current_config: bool = True,
-    ) -> Dict[str, Any]:
-        """Read and validate a snapshot from any memory-run directory."""
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"Cannot read {self._memory_method_label()} snapshot {path}: {truncate_error_message(exc)}"
-            ) from exc
-        if (
-            payload.get("format") != "medmemorybench.memory_snapshot"
-            or payload.get("version") != 1
-            or payload.get("context_id") != unit.context_id
-            or payload.get("unit_id") != unit.unit_id
-            or payload.get("build_id") != manifest.get("build_id")
-        ):
-            raise ValueError(f"{self._memory_method_label()} snapshot metadata does not match unit {unit.unit_id}: {path}")
-        expected_hash = self._snapshot_integrity_hash(payload)
-        if payload.get("integrity_hash") != expected_hash:
-            raise ValueError(f"{self._memory_method_label()} snapshot integrity check failed: {path}")
-        if require_current_config:
-            manifest_path = path.parent / "manifest.json"
-            if self.execution_stage == "query":
-                config_compatible = is_manifest_query_compatible(
-                    manifest,
-                    self.method_config,
-                    self.dataset_config,
-                    manifest_path,
-                )
-                mismatch_message = "query configuration"
-            else:
-                config_compatible = is_manifest_build_compatible(
-                    manifest,
-                    self._batch_config_hash(),
-                    manifest_path,
-                )
-                mismatch_message = "build configuration"
-            if not config_compatible:
-                raise ValueError(
-                    f"{self._memory_method_label()} snapshot {mismatch_message} does not match: {path}"
-                )
-        payload_build_hash = str(payload.get("build_config_hash") or "")
-        if (
-            require_current_config
-            and self.execution_stage != "query"
-            and payload_build_hash
-            and payload_build_hash != self._batch_config_hash()
-        ):
-            raise ValueError(
-                f"{self._memory_method_label()} snapshot payload build configuration does not match: {path}"
-            )
-        payload_query_hash = str(payload.get("retrieval_compatibility_hash") or "")
-        if (
-            require_current_config
-            and self.execution_stage == "query"
-            and payload_query_hash
-            and payload_query_hash
-            != compute_memory_query_compatibility_hash(
-                self.method_config, self.dataset_config
-            )
-        ):
-            raise ValueError(
-                f"{self._memory_method_label()} snapshot payload query configuration does not match: {path}"
-            )
-        payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
-        embedding_state = (
-            payload.get("memory_state", {})
-            .get("system_state", {})
-            .get("retriever", {})
-            .get("embeddings")
-        )
-        if embedding_state is not None:
-            if embedding_state.get("storage") != "npy":
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot metadata is invalid: {path}"
-                )
-            embedding_path = path.parent / embedding_state["path"]
-            if (
-                not embedding_path.exists()
-                or self._file_sha256(embedding_path) != embedding_state.get("sha256")
-            ):
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot integrity check failed: {embedding_path}"
-                )
-            embedding_values = np.load(embedding_path, allow_pickle=False)
-            if (
-                str(embedding_values.dtype) != embedding_state.get("dtype")
-                or list(embedding_values.shape) != embedding_state.get("shape")
-            ):
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot shape or dtype is invalid: {embedding_path}"
-                )
-            embedding_state["values"] = embedding_values
-        return payload
-
-    def _write_memory_snapshot(
-        self,
-        unit: EvaluationUnit,
-        memory_build_time: float = 0.0,
-        memory_build_metrics: Optional[Dict[str, Any]] = None,
-    ) -> Path:
-        """Persist the exact post-build state, then atomically publish it."""
-        path = self._memory_snapshot_path(unit)
-        state = self.agent_manager.export_memory_state(context_id=unit.context_id)
-        payload = {
-            "format": "medmemorybench.memory_snapshot",
-            "version": 1,
-            "method_name": self.method_config.method_name,
-            "model_name": self.method_config.model.name,
-            "config_hash": self._batch_config_hash(),
-            "build_config_hash": self._batch_config_hash(),
-            "retrieval_config_hash": compute_query_config_hash(
-                self.method_config, self.dataset_config
-            ),
-            "retrieval_compatibility_hash": compute_memory_query_compatibility_hash(
-                self.method_config, self.dataset_config
-            ),
-            "build_id": self._memory_snapshot_manifest["build_id"],
-            "context_id": unit.context_id,
-            "unit_id": unit.unit_id,
-            "evaluation_session_id": unit.metadata.get("eval_session_id"),
-            "session_ids": [session.session_id for session in unit.sessions_to_inject],
-            "memory_build_time": memory_build_time,
-            "memory_build_metrics": copy.deepcopy(memory_build_metrics or {}),
-            "feature_configuration": self._amem_feature_configuration(),
-            "created_at": datetime.now().isoformat(),
-            "memory_state": state,
-        }
-        payload = self._write_snapshot_payload(payload, path)
-        memory_size = copy.deepcopy(payload.get("memory_size"))
-        snapshot_record = {
-            "unit_id": unit.unit_id,
-            "context_id": unit.context_id,
-            "path": path.name,
-            "integrity_hash": payload["integrity_hash"],
-            "embedding_sha256": self._snapshot_embedding_sha256(payload),
-            "session_count": len(unit.sessions_to_inject),
-            "memory_build_time": memory_build_time,
-            "memory_build_metrics": copy.deepcopy(memory_build_metrics or {}),
-            "memory_size": memory_size,
-        }
-        snapshots = self._memory_snapshot_manifest["snapshots"]
-        snapshots[:] = [item for item in snapshots if item["unit_id"] != unit.unit_id]
-        snapshots.append(snapshot_record)
-        snapshots.sort(key=lambda item: item["unit_id"])
-        for log in reversed(getattr(self, "_memory_build_logs", [])):
-            if (
-                log.get("unit_id") == unit.unit_id
-                and log.get("context_id") == unit.context_id
-            ):
-                log["memory_size"] = copy.deepcopy(memory_size)
-                break
-        self._write_memory_snapshot_manifest()
-        return path
-
-    def _read_memory_snapshot(
-        self,
-        unit: EvaluationUnit,
-        *,
-        require_current_config: bool = True,
-    ) -> Optional[Dict[str, Any]]:
-        path = self._memory_snapshot_path(unit)
-        if not path.exists():
-            return None
-        if self._memory_snapshot_manifest is None:
-            raise RuntimeError(
-                f"{self._memory_method_label()} memory snapshot manifest has not been loaded"
-            )
-        payload = self._read_snapshot_payload(
-            path,
-            self._memory_snapshot_manifest,
-            unit,
-            require_current_config=require_current_config,
-        )
-        return payload
-
-    def _restore_memory_snapshot(self, unit: EvaluationUnit) -> Path:
-        """Reload the just-written state before retrieval starts."""
-        payload = self._read_memory_snapshot(unit)
-        if payload is None:
-            raise RuntimeError(
-                f"{self._memory_method_label()} snapshot is unavailable for unit {unit.unit_id}"
-            )
-        self.agent_manager.import_memory_state(
-            payload["memory_state"],
-            context_id=unit.context_id,
-        )
-        return self._memory_snapshot_path(unit)
-
-    def _save_and_restore_unit_memory(
-        self,
-        unit: EvaluationUnit,
-        memory_build_time: float = 0.0,
-        memory_build_metrics: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Path]:
-        if self.dry_run or not self._supports_memory_snapshots():
-            return None
-        self._log("    --- Memory Snapshot Start ---")
-        path = self._write_memory_snapshot(
-            unit,
-            memory_build_time=memory_build_time,
-            memory_build_metrics=memory_build_metrics,
-        )
-        self._restore_memory_snapshot(unit)
-        self._log(f"      Saved and restored retrieval state: {path}")
-        self._log("    --- Memory Snapshot Done ---")
-        return path
-
-    def _restore_completed_unit_for_resume(
-        self,
-        unit: EvaluationUnit,
-    ) -> Optional[Dict[str, Any]]:
-        if (
-            not (
-                getattr(self, "resume", False)
-                or getattr(self, "force_resume", False)
-            )
-            or self.dry_run
-            or not self._supports_memory_snapshots()
-        ):
-            return None
-        payload = self._read_memory_snapshot(unit)
-        if payload is None:
-            return None
-        self.agent_manager.import_memory_state(
-            payload["memory_state"],
-            context_id=unit.context_id,
-        )
-        self._log(
-            f"      [Resume] Restored completed unit state from "
-            f"{self._memory_snapshot_path(unit)}"
-        )
-        return payload
 
     def _batch_manifest_config_hash(self) -> str:
         """Namespace manifests by checkpoint so only --resume reuses a run."""
@@ -2225,24 +292,68 @@ class MedMemoryBenchEvaluator:
             config_hash=self._batch_manifest_config_hash(),
         )
 
+    def _memory_snapshot_key(self, unit: EvaluationUnit) -> MemorySnapshotKey:
+        context_key = str(unit.context_id)
+        key = self._memory_snapshot_store.make_key(
+            unit,
+            parent_fingerprint=self._memory_snapshot_lineage.get(context_key, ""),
+        )
+        self._memory_snapshot_lineage[context_key] = key.unit_fingerprint
+        return key
+
+    def _try_load_memory_snapshot(
+        self,
+        key: MemorySnapshotKey,
+    ) -> bool:
+        if (
+            self.rebuild_memory
+            or self.agent_manager is None
+            or not self.agent_manager.supports_memory_snapshots()
+        ):
+            return False
+        state = self._memory_snapshot_store.load(key)
+        if state is None:
+            return False
+        try:
+            self.agent_manager.import_memory_state(state)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._log(f"      [Memory Cache] Invalid snapshot ignored: {exc}", level="WARNING")
+            return False
+        self._log(
+            f"      [Memory Cache] Loaded exact unit snapshot: "
+            f"{self._memory_snapshot_store.path_for(key)}"
+        )
+        return True
+
+    def _save_memory_snapshot(
+        self,
+        key: MemorySnapshotKey,
+        session_ids: List[str],
+    ) -> Optional[Path]:
+        if self.agent_manager is None or not self.agent_manager.supports_memory_snapshots():
+            return None
+        state = self.agent_manager.export_memory_state()
+        path = self._memory_snapshot_store.save(
+            key,
+            state,
+            session_ids=session_ids,
+        )
+        self._log(f"      [Memory Cache] Saved unit snapshot: {path}")
+        return path
+
     def _deferred_judge_state_paths(self) -> List[Path]:
         batch_dir = self.output_dir / "batch"
         return sorted(batch_dir.glob(
-            f"medmemorybench_deferred_judges-*-{self._judge_batch_config_hash()}.json"
+            f"medmemorybench_deferred_judges-*-{self._batch_manifest_config_hash()}.json"
         ))
 
     def _save_deferred_judges(self, judge_client) -> None:
         """Persist judge inputs before submitting so resume never regenerates them."""
-        path = scoped_manifest_path(
-            self.output_dir / "batch",
-            "medmemorybench_deferred_judges",
-            model=judge_client.model,
-            config_hash=self._judge_batch_config_hash(),
-        )
+        path = self._batch_manifest_path("medmemorybench_deferred_judges", judge_client.model)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
-            "config_hash": self._judge_batch_config_hash(),
+            "config_hash": self._batch_manifest_config_hash(),
             "judge_model": judge_client.model,
             "items": self._deferred_judges,
         }
@@ -2266,19 +377,17 @@ class MedMemoryBenchEvaluator:
             with path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            raise VertexBatchError(
-                f"Cannot read deferred judge state {path}: {truncate_error_message(exc)}"
-            ) from exc
+            raise VertexBatchError(f"Cannot read deferred judge state {path}: {exc}") from exc
         if (
             payload.get("version") != 1
-            or payload.get("config_hash") != self._judge_batch_config_hash()
+            or payload.get("config_hash") != self._batch_manifest_config_hash()
         ):
             raise VertexBatchError(f"Deferred judge state does not match this evaluator: {path}")
         items = payload.get("items")
         if not isinstance(items, list):
             raise VertexBatchError(f"Deferred judge state is invalid: {path}")
         self._deferred_judges = items
-        self._log(f"[Batch] Restored {len(items):,} deferred LLM-judge request(s) from {path}.")
+        self._log(f"[Vertex Batch] Restored {len(items):,} deferred LLM-judge request(s) from {path}.")
 
     def _clear_deferred_judges(self) -> None:
         for path in self._deferred_judge_state_paths():
@@ -2286,10 +395,7 @@ class MedMemoryBenchEvaluator:
         self._deferred_judges = []
 
     def _is_deferred_judge_query(self, query_id: str) -> bool:
-        return any(
-            item.get("query_id") == query_id
-            for item in getattr(self, "_deferred_judges", [])
-        )
+        return any(item.get("query_id") == query_id for item in self._deferred_judges)
 
     def evaluate(self) -> EvaluationReport:
         start_time = datetime.now()
@@ -2298,23 +404,9 @@ class MedMemoryBenchEvaluator:
 
         self._init_dataset()
 
-        if self.execution_stage != "all" and not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
-            raise ValueError(
-                "Separated memory/query execution is currently implemented for AMem methods only"
-            )
-        if getattr(self, "append", False):
-            if not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
-                raise ValueError("--append is currently implemented for AMem methods only")
-            self._prepare_append_plan()
-
         resumed = False
         if self.resume and self._checkpoint_enabled:
             resumed = self._try_resume_from_checkpoint()
-
-        if self.execution_stage == "query":
-            self._load_memory_snapshot_manifest()
-        elif not self.dry_run and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
-            self._start_memory_snapshot_manifest(resume_existing=resumed)
 
         # Deferred judge inputs belong to the loaded checkpoint namespace.
         # Do not attach a fresh run to an older namespace when no checkpoint
@@ -2322,31 +414,15 @@ class MedMemoryBenchEvaluator:
         if resumed and self.batch_api and not self.dry_run:
             self._load_deferred_judges()
 
-        # Query-only runs still submit batch work, so they need the same unique
-        # checkpoint-backed manifest scope as full runs. Without this, a fresh
-        # query invocation falls back to the config-only legacy manifest name.
         if not resumed and self._checkpoint_enabled:
             self._create_new_checkpoint()
 
-        try:
-            self._run_evaluation_loop()
-        finally:
-            self._finish_query_progress()
+        self._run_evaluation_loop()
 
-        if (
-            self.execution_stage in {"all", "memory"}
-            and not self.dry_run
-            and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state")
-        ):
-            self._complete_memory_snapshot_manifest()
-
-        if self._checkpoint_manager and self.execution_stage in {"all", "query"}:
+        if self._checkpoint_manager:
             self._checkpoint_manager.mark_completed()
             self._checkpoint_manager.delete()
             self._log("Evaluation completed, checkpoint deleted")
-        elif self._checkpoint_manager and self.execution_stage == "memory":
-            self._checkpoint_manager.delete()
-            self._log("Memory build completed, checkpoint deleted")
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -2358,23 +434,7 @@ class MedMemoryBenchEvaluator:
     def _run_evaluation_loop(self) -> None:
         current_context_id = None
 
-        units = self._get_evaluation_units()
-        if getattr(self, "append", False) and self._append_target_index is not None:
-            units = units[: self._append_target_index + 1]
-        elif self.execution_stage == "query" and self._memory_unit_ids is not None:
-            units = [unit for unit in units if unit.unit_id in self._memory_unit_ids]
-
-        self._configure_query_progress(units)
-
-        if self.execution_stage == "query" and getattr(self, "workers", 1) > 1 and len(units) > 1:
-            try:
-                self._start_query_progress()
-                self._run_query_stage_parallel(units)
-            finally:
-                self._finish_query_progress()
-            return
-
-        for unit in units:
+        for unit in self.dataset.get_evaluation_units():
             persona_id = unit.context_id
 
             if self._checkpoint_manager and self._checkpoint_manager.is_persona_completed(persona_id):
@@ -2397,67 +457,15 @@ class MedMemoryBenchEvaluator:
                 current_context_id = persona_id
 
                 if self._checkpoint_manager:
-                    preserve_progress = (
-                        self._session_level_force_resume()
-                        and persona_id == getattr(self, "_force_resume_persona_id", None)
-                    )
-                    self._checkpoint_manager.start_persona(
-                        persona_id,
-                        preserve_progress=preserve_progress,
-                    )
+                    # Do not wipe progress if we are resuming the same persona that was interrupted
+                    if self._checkpoint_manager.get_current_persona_id() != persona_id:
+                        self._checkpoint_manager.start_persona(persona_id)
 
-            if getattr(self, "execution_stage", "all") == "query":
-                snapshot_payload = self._read_memory_snapshot(unit)
-                if snapshot_payload is None:
-                    raise FileNotFoundError(
-                        f"No compatible {self._memory_method_label()} snapshot for evaluation unit {unit.unit_id}: "
-                        f"{self._memory_snapshot_path(unit)}"
-                    )
-                if not self._supports_memory_snapshots():
-                    raise RuntimeError(
-                        f"Method {self.method_config.method_name} does not support query-only snapshots"
-                    )
-                self.agent_manager.import_memory_state(
-                    snapshot_payload["memory_state"],
-                    context_id=unit.context_id,
-                )
-                self._record_source_build_metrics(unit, snapshot_payload)
-                self._log(
-                    f"\n  Evaluation Unit {unit.unit_id}: restored query-stage memory "
-                    f"from {self._memory_snapshot_path(unit)}"
-                )
-                unit_results = self._evaluate_unit_queries(
-                    unit,
-                    total_memory_time=float(snapshot_payload.get("memory_build_time", 0.0)),
-                )
-            elif getattr(self, "append", False):
-                unit_results = self._evaluate_append_unit(unit)
-            else:
-                unit_results = self._evaluate_unit_with_checkpoint(unit)
+            unit_results = self._evaluate_unit_with_checkpoint(unit)
 
             for result in unit_results:
                 self.aggregator.add_result(result)
                 self.result_collector.add_result(result, persona_id)
-
-        if getattr(self, "execution_stage", "all") == "memory":
-            self._finish_query_progress()
-            return
-
-        for item in self._complete_combined_batch_queries():
-            result = item["result"]
-            persona_id = item["persona_id"]
-            self.aggregator.add_result(result)
-            self.result_collector.add_result(result, persona_id)
-            if self._checkpoint_manager:
-                self._checkpoint_manager.mark_query_completed(
-                    result.query_id,
-                    result.to_dict(),
-                    persona_id=persona_id,
-                )
-
-        # Query-answer work is complete. Judge batches are a separate stage and
-        # should not leave a completed query bar mounted while they run.
-        self._finish_query_progress()
 
         for item in self._complete_deferred_judges():
             result = item["result"]
@@ -2476,424 +484,36 @@ class MedMemoryBenchEvaluator:
                 self._checkpoint_manager.complete_persona(persona_id)
         elif current_context_id is not None and self._checkpoint_manager:
             self._checkpoint_manager.complete_persona(current_context_id)
-        self._finish_query_progress()
-
-    def _run_query_stage_parallel(self, units: List[EvaluationUnit]) -> None:
-        """Evaluate snapshot-backed units concurrently with isolated agents.
-
-        Query-stage snapshots are immutable and independent, but ``AgentManager``
-        keeps mutable active-memory state. Each task therefore owns a manager;
-        shared report/checkpoint state is merged by this coordinator in dataset
-        order after the workers finish.
-        """
-        if not hasattr(self, "_pending_batch_queries"):
-            self._pending_batch_queries = []
-        if not hasattr(self, "_api_failures"):
-            self._api_failures = []
-        pending_units: List[tuple[EvaluationUnit, Dict[str, Any]]] = []
-        deferred_query_ids = {
-            item.get("query_id") for item in self._deferred_judges
-        }
-        for unit in units:
-            if (
-                self._checkpoint_manager
-                and self._checkpoint_manager.is_persona_completed(unit.context_id)
-            ):
-                self._log(f"Skipping completed Persona: {unit.context_id}")
-                continue
-            payload = self._read_memory_snapshot(unit)
-            if payload is None:
-                raise FileNotFoundError(
-                    f"No compatible {self._memory_method_label()} snapshot for evaluation unit {unit.unit_id}: "
-                    f"{self._memory_snapshot_path(unit)}"
-                )
-            self._record_source_build_metrics(unit, payload)
-            queries = [
-                query
-                for query in unit.queries_to_evaluate
-                if not (
-                    self._checkpoint_manager
-                    and self._checkpoint_manager.is_query_completed(
-                        query.query_id,
-                        persona_id=unit.context_id,
-                    )
-                )
-                and query.query_id not in deferred_query_ids
-            ]
-            pending_units.append((
-                EvaluationUnit(
-                    unit_id=unit.unit_id,
-                    sessions_to_inject=unit.sessions_to_inject,
-                    queries_to_evaluate=queries,
-                    context_id=unit.context_id,
-                    metadata={
-                        **unit.metadata,
-                        # Resume may omit completed queries from this worker,
-                        # but memory-build time must retain the serial run's
-                        # original per-query attribution.
-                        "_query_stage_original_query_count": len(
-                            unit.queries_to_evaluate
-                        ),
-                    },
-                ),
-                payload,
-            ))
-
-        if not pending_units:
-            return
-
-        # Batch completion/finalization uses the coordinator's manager. Worker
-        # managers are independent and never mutate this active manager state.
-        if self.batch_api:
-            self._init_agent_for_context(
-                context_id=pending_units[0][0].context_id,
-                force_new=True,
-            )
-            if self._supports_batch_queries():
-                self._get_batch_client()
-
-        def create_worker(item: tuple[EvaluationUnit, Dict[str, Any]]) -> Dict[str, Any]:
-            unit, payload = item
-            worker = copy.copy(self)
-            # The outer executor owns the complete worker budget. Never let an
-            # isolated unit create a nested per-query executor.
-            worker.workers = 1
-            worker.agent_manager = AgentManager(
-                method_config=self.method_config,
-                dataset_config=self.dataset_config,
-                batch_api=self.batch_api,
-                batch_gcs_uri=getattr(self, "batch_gcs_uri", None),
-                batch_wait=getattr(self, "batch_wait", False),
-                workers=1,
-                batch_manifest_dir=self.output_dir / "batch",
-                batch_config_hash=self._batch_manifest_config_hash(),
-                batch_progress_callback=self._log,
-                query_only=self.execution_stage == "query",
-            )
-            worker._checkpoint_manager = None
-            worker._memory_build_logs = []
-            worker._source_memory_build_logs = []
-            worker._pending_batch_queries = []
-            worker._deferred_judges = []
-            worker._api_failures = []
-            worker._api_failure_duration_seconds = 0.0
-            worker._api_failure_lock = threading.Lock()
-            worker._batch_fallback_logged = True
-            worker._judge_batch_fallback_logged = True
-            worker._batch_client = getattr(self, "_batch_client", None)
-            worker._judge_batch_client = getattr(self, "_judge_batch_client", None)
-            worker.agent_manager.import_memory_state(
-                payload["memory_state"],
-                context_id=unit.context_id,
-            )
-            return {
-                "unit": unit,
-                "payload": payload,
-                "worker": worker,
-                "results": [],
-            }
-
-        context_worker_count = min(self.workers, len(pending_units))
-        self._log(
-            f"[Workers] Initializing {len(pending_units):,} isolated query-unit "
-            f"contexts with up to {context_worker_count} workers."
-        )
-        with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
-            worker_results = list(executor.map(create_worker, pending_units))
-
-        try:
-            if self._supports_batch_queries():
-                # Batch final-answer transport has one combined dispatch below.
-                # Unit preparation is bounded by the same global worker budget.
-                with ThreadPoolExecutor(max_workers=context_worker_count) as executor:
-                    for item, results in zip(
-                        worker_results,
-                        executor.map(
-                            lambda item: item["worker"]._evaluate_unit_queries(
-                                item["unit"],
-                                total_memory_time=float(
-                                    item["payload"].get("memory_build_time", 0.0)
-                                ),
-                            ),
-                            worker_results,
-                        ),
-                    ):
-                        item["results"] = results
-            else:
-                query_jobs = [
-                    (item, query)
-                    for item in worker_results
-                    for query in item["unit"].queries_to_evaluate
-                ]
-                query_worker_count = min(self.workers, len(query_jobs))
-                self._log(
-                    f"[Workers] Running {len(query_jobs):,} real-time queries across "
-                    f"{len(worker_results):,} query units with {query_worker_count} "
-                    "workers total."
-                )
-
-                def evaluate_query_job(job):
-                    item, query = job
-                    unit = item["unit"]
-                    worker = item["worker"]
-                    try:
-                        memory_time = float(
-                            item["payload"].get("memory_build_time", 0.0)
-                        ) / int(
-                            unit.metadata.get(
-                                "_query_stage_original_query_count",
-                                len(unit.queries_to_evaluate),
-                            )
-                        )
-                        if worker._supports_memory_snapshots():
-                            result = worker._evaluate_query_staged(
-                                query,
-                                unit.context_id,
-                                memory_time_per_query=memory_time,
-                                unit_id=unit.unit_id,
-                            )
-                        else:
-                            result = worker._evaluate_query(
-                                query,
-                                unit.context_id,
-                                memory_time_per_query=memory_time,
-                                unit_id=unit.unit_id,
-                            )
-                        return item, result
-                    finally:
-                        self._advance_query_progress(
-                            query.query_id,
-                            context_id=unit.context_id,
-                        )
-
-                if query_jobs:
-                    with ThreadPoolExecutor(max_workers=query_worker_count) as executor:
-                        # map preserves unit/query ordering for report aggregation.
-                        evaluated_queries = list(executor.map(evaluate_query_job, query_jobs))
-                    for item, result in evaluated_queries:
-                        if result is not None:
-                            item["results"].append(result)
-        finally:
-            for item in worker_results:
-                item["worker"].agent_manager.reset()
-
-        for item in worker_results:
-            worker = item["worker"]
-            self._api_failures.extend(worker._api_failures)
-            self._api_failure_duration_seconds = (
-                getattr(self, "_api_failure_duration_seconds", 0.0)
-                + worker._api_failure_duration_seconds
-            )
-            self._pending_batch_queries.extend(worker._pending_batch_queries)
-            self._deferred_judges.extend(worker._deferred_judges)
-            for result in item["results"]:
-                self.aggregator.add_result(result)
-                self.result_collector.add_result(result, item["unit"].context_id)
-                if self._checkpoint_manager:
-                    self._checkpoint_manager.mark_query_completed(
-                        result.query_id,
-                        result.to_dict(),
-                        persona_id=item["unit"].context_id,
-                    )
-
-        for item in self._complete_combined_batch_queries():
-            result = item["result"]
-            persona_id = item["persona_id"]
-            self.aggregator.add_result(result)
-            self.result_collector.add_result(result, persona_id)
-            if self._checkpoint_manager:
-                self._checkpoint_manager.mark_query_completed(
-                    result.query_id,
-                    result.to_dict(),
-                    persona_id=persona_id,
-                )
-
-        self._finish_query_progress()
-
-        for item in self._complete_deferred_judges():
-            result = item["result"]
-            persona_id = item["persona_id"]
-            self.aggregator.add_result(result)
-            self.result_collector.add_result(result, persona_id)
-            if self._checkpoint_manager:
-                self._checkpoint_manager.mark_query_completed(
-                    result.query_id,
-                    result.to_dict(),
-                    persona_id=persona_id,
-                )
-
-        if self._checkpoint_manager and self.batch_api:
-            for persona_id in self.dataset.get_persona_ids():
-                self._checkpoint_manager.complete_persona(persona_id)
-        elif self._checkpoint_manager:
-            for unit, _ in pending_units:
-                self._checkpoint_manager.complete_persona(unit.context_id)
-
-    def _evaluate_append_unit(self, unit: EvaluationUnit) -> List[MetricResult]:
-        """Reuse a carried-forward snapshot or build the next missing unit."""
-        snapshot_payload = self._read_memory_snapshot(unit)
-        if snapshot_payload is not None:
-            if not self._supports_memory_snapshots():
-                raise RuntimeError(
-                    f"Method {self.method_config.method_name} does not support append snapshots"
-                )
-            self.agent_manager.import_memory_state(
-                snapshot_payload["memory_state"],
-                context_id=unit.context_id,
-            )
-            self._record_source_build_metrics(unit, snapshot_payload)
-            self._log(
-                f"\n  Evaluation Unit {unit.unit_id}: restored append memory from "
-                f"{self._memory_snapshot_path(unit)}"
-            )
-            if self.execution_stage == "memory":
-                return []
-            return self._evaluate_unit_queries(
-                unit,
-                total_memory_time=float(snapshot_payload.get("memory_build_time", 0.0)),
-            )
-        return self._evaluate_unit_with_checkpoint(unit)
 
     def _evaluate_unit_with_checkpoint(self, unit: EvaluationUnit) -> List[MetricResult]:
         """Evaluate unit with checkpoint support."""
-        self._log(
-            f"\nUnit {unit.unit_id} | persona={unit.context_id} | "
-            f"sessions={len(unit.sessions_to_inject)} | queries={len(unit.queries_to_evaluate)}"
-        )
+        self._log(f"\n  Evaluation Unit {unit.unit_id}:")
+        self._log(f"    Persona: {unit.context_id}")
+        self._log(f"    Sessions to inject: {len(unit.sessions_to_inject)}")
+        self._log(f"    Queries to evaluate: {len(unit.queries_to_evaluate)}")
 
         results = []
 
-        self._log(f"  Memory build started ({len(unit.sessions_to_inject)} sessions)")
+        self._log(f"    --- Memory Build Start ---")
 
         memory_build_failed = False
         total_memory_time = 0.0
-        staged_build_wall_time = None
         session_build_results = []  # Store per-session build results
-        restored_payload = self._restore_completed_unit_for_resume(unit)
-        restored_completed_unit = restored_payload is not None
-        if restored_payload is not None:
-            total_memory_time = float(restored_payload.get("memory_build_time", 0.0))
+        snapshot_key = self._memory_snapshot_key(unit)
+        snapshot_loaded = False
 
         if self.dry_run:
             self._log(f"    [Dry Run] Skipping memory build")
         else:
             total_sessions = len(unit.sessions_to_inject)
-            session_ids = []
+            session_ids = [str(session.session_id) for session in unit.sessions_to_inject]
+            snapshot_loaded = self._try_load_memory_snapshot(snapshot_key)
 
-            method_name = str(getattr(getattr(self, "method_config", None), "method_name", "")).lower()
-            pending_sessions = list(unit.sessions_to_inject)
-            if self._session_level_force_resume() and not self._supports_memory_snapshots() and self._checkpoint_manager:
-                pending_sessions = [
-                    session for session in pending_sessions
-                    if not self._checkpoint_manager.is_session_injected(session.session_id, persona_id=unit.context_id)
-                ]
-            supports_staged_memory = getattr(self.agent_manager, "supports_staged_memory", None)
-            staged_event_state = "event_state" in method_name and len(pending_sessions) > 1 and callable(supports_staged_memory) and supports_staged_memory()
-            sessions_to_process = unit.sessions_to_inject
-            if staged_event_state and not restored_completed_unit:
-                # Extraction and embedding are independent per source session;
-                # the returned preparations are committed below in source order.
-                staged_items = []
-                pending_ids = {session.session_id for session in pending_sessions}
-                for idx, session in enumerate(unit.sessions_to_inject):
-                    if session.session_id not in pending_ids:
-                        continue
-                    session_ids.append(session.session_id)
-                    session_scope = normalize_scope(session.to_memory_text())
-                    source_messages = session.metadata.get("messages", []) or [{"speaker": "Unknown", "content": session.content, "source_turn_id": None}]
-                    for turn_index, item in enumerate(source_messages):
-                        staged_item = dict(item)
-                        staged_item.setdefault("source_session_id", session.session_id)
-                        staged_item.setdefault("source_session_index", idx)
-                        staged_item.setdefault("source_turn_id", item.get("turn_id", item.get("dia_id", turn_index)))
-                        staged_item.setdefault("source_event_id", session.metadata.get("event_id"))
-                        staged_item.setdefault("timestamp", session.timestamp)
-                        staged_item.setdefault("conversation_scope", session_scope)
-                        staged_items.append(staged_item)
-                    marker = getattr(self._checkpoint_manager, "mark_session_started", None)
-                    if callable(marker):
-                        marker(session.session_id, unit.unit_id)
-                staged_start = time.perf_counter()
-                staged_usage_before = get_usage_tracker().get_stats()
-                try:
-                    # Each session has an independent preparation step and a
-                    # stateful ordered commit step.
-                    self._start_memory_progress(len(pending_sessions) * 2)
-                    staged_text = "\n\n".join(session.to_memory_text() for session in pending_sessions)
-                    prepared = self.agent_manager.prepare_memory_sessions(
-                        message=staged_text,
-                        context_id=unit.context_id,
-                        memory_items=staged_items,
-                        timestamp=None,
-                        progress_callback=self._advance_memory_progress,
-                    )
-                    total_memory_time += time.perf_counter() - staged_start
-                    for prepared_session in prepared:
-                        session_start = time.perf_counter()
-                        memory_result = self.agent_manager.commit_prepared_memory(
-                            [prepared_session],
-                            text=prepared_session.session.get("text", ""),
-                            context_id=unit.context_id,
-                        )
-                        session_id = prepared_session.session.get("source_session_id")
-                        session_index = prepared_session.session.get("source_session_index")
-                        session_build_results.append({
-                            "session_id": session_id,
-                            "session_index": session_index,
-                            "build_result": memory_result.to_dict(),
-                            "wall_time_seconds": time.perf_counter() - session_start,
-                            "build_metrics": {"wall_time_seconds": time.perf_counter() - session_start, "usage": {}},
-                        })
-                        total_memory_time += time.perf_counter() - session_start
-                        if self._checkpoint_manager:
-                            self._checkpoint_manager.mark_session_injected(session_id)
-                        self._advance_memory_progress()
-                    if session_build_results:
-                        session_build_results[0]["build_metrics"]["usage"] = diff_usage_stats(
-                            get_usage_tracker().get_stats(), staged_usage_before
-                        )
-                    staged_build_wall_time = time.perf_counter() - staged_start
-                    sessions_to_process = []
-                except Exception as exc:
-                    memory_build_failed = True
-                    self._log(
-                        f"        [ERROR] Event-State staged preparation failed: {truncate_error_message(exc)}",
-                        level="ERROR",
-                    )
-                    rollback_incomplete = getattr(
-                        self._checkpoint_manager,
-                        "rollback_incomplete_session",
-                        None,
-                    )
-                    if callable(rollback_incomplete):
-                        rollback_incomplete()
-                    if not isinstance(exc, LLMAPIError):
-                        raise
-                    sessions_to_process = []
-                finally:
-                    self._finish_memory_progress()
-
-            for idx, session in enumerate(sessions_to_process):
-                session_ids.append(session.session_id)
-                if restored_completed_unit:
-                    self._log(
-                        f"      [Resume] Session {session.session_id} restored from snapshot; skipping"
-                    )
+            for idx, session in enumerate(unit.sessions_to_inject):
+                if snapshot_loaded:
+                    if self._checkpoint_manager:
+                        self._checkpoint_manager.mark_session_injected(session.session_id)
                     continue
-                if (
-                    self._session_level_force_resume()
-                    and not self._supports_memory_snapshots()
-                    and self._checkpoint_manager
-                    and self._checkpoint_manager.is_session_injected(
-                        session.session_id,
-                        persona_id=unit.context_id,
-                    )
-                ):
-                    self._log(
-                        f"      [Resume] Session {session.session_id} already injected; skipping"
-                    )
-                    continue
-                session_succeeded = False
                 memory_text = session.to_memory_text()
 
                 # Show progress
@@ -2906,138 +526,58 @@ class MedMemoryBenchEvaluator:
 
                 is_last_session = (idx == total_sessions - 1)
 
-                mark_session_started = getattr(
-                    self._checkpoint_manager,
-                    "mark_session_started",
-                    None,
-                )
-                if callable(mark_session_started):
-                    mark_session_started(session.session_id, unit.unit_id)
-
-                usage_tracker = get_usage_tracker()
-                usage_before = usage_tracker.get_stats()
-                session_started_at = time.perf_counter()
-                session_build_record: Dict[str, Any] = {
-                    "session_id": session.session_id,
-                    "session_index": idx,
-                }
                 try:
-                    experimental_source = {}
-                    method_name = getattr(
-                        getattr(self, "method_config", None),
-                        "method_name",
-                        "",
-                    )
-                    if method_name in {"amem_test", "event_state"}:
-                        experimental_source = {
-                            "source_session_id": session.session_id,
-                            "source_session_index": idx,
-                            "source_event_id": session.metadata.get("event_id"),
-                        }
-                    memory_result = self._run_api_call(
-                        self.agent_manager.send_message,
+                    memory_result = self.agent_manager.send_message(
                         message=formatted_text,
                         memorizing=True,
                         context_id=unit.context_id,
                         is_last_session=is_last_session,
-                        timestamp=session.timestamp,
-                        memory_items=session.metadata.get("messages", []),
-                        **experimental_source,
                     )
 
                     if memory_result is not None and isinstance(memory_result, MemoryBuildResult):
-                        session_succeeded = True
                         total_memory_time += memory_result.time_cost
 
-                        for failure in memory_result.extra.get("api_failures", []):
-                            self._record_api_failure(
-                                "memory_build",
-                                failure,
-                                unit_id=unit.unit_id,
-                                context_id=unit.context_id,
-                                session_id=session.session_id,
-                                session_index=idx,
-                            )
+                        # Log brief progress info
+                        passages_count = len(memory_result.all_passages) if memory_result.all_passages else memory_result.extra.get("inserted_count", len(memory_result.memory_entries))
+                        self._log(f"        → Stored {passages_count} passages, time={memory_result.time_cost:.2f}s")
 
-                        passages_count = len(memory_result.all_passages) if memory_result.all_passages else memory_result.extra.get("inserted_count", 0)
-                        self._log(
-                            f"  Session {session.session_id} complete | "
-                            f"passages={passages_count} | time={memory_result.time_cost:.2f}s"
-                        )
+                        # Show extraction preview (first 100 chars)
+                        if memory_result.extraction_result:
+                            preview = memory_result.extraction_result[:150].replace('\n', ' ')
+                            self._log(f"        → Extraction: {preview}...")
 
-                        session_build_record["build_result"] = memory_result.to_dict()
+                        # Store detailed result for this session
+                        session_build_results.append({
+                            "session_id": session.session_id,
+                            "session_index": idx,
+                            "build_result": memory_result.to_dict(),
+                        })
 
-                except LLMAPIError as e:
-                    session_build_record["error"] = truncate_error_message(e)
+                    if self._checkpoint_manager:
+                        self._checkpoint_manager.mark_session_injected(session.session_id)
+
+                except LLMRetryExhaustedError as e:
                     self._log(
-                        f"        [API ERROR] Session {session.session_id} failed: {truncate_error_message(e)}",
+                        f"        [API ERROR] Session {session.session_id} failed: {e}",
                         level="ERROR"
                     )
                     memory_build_failed = True
-                    memory_failures = self._drain_memory_api_failures(unit.context_id)
-                    if not memory_failures:
-                        memory_failures = [{}]
-                    for failure in memory_failures:
-                        self._record_api_failure(
-                            "memory_build",
-                            failure if failure else e,
-                            unit_id=unit.unit_id,
-                            context_id=unit.context_id,
-                            session_id=session.session_id,
-                            session_index=idx,
-                            affected_query_ids=[
-                                query.query_id for query in unit.queries_to_evaluate
-                            ],
-                        )
-                    rollback_incomplete = getattr(
-                        self._checkpoint_manager,
-                        "rollback_incomplete_session",
-                        None,
-                    )
-                    if callable(rollback_incomplete):
-                        rollback_incomplete()
-                finally:
-                    session_wall_time = time.perf_counter() - session_started_at
-                    session_build_record["wall_time_seconds"] = session_wall_time
-                    session_build_record["build_metrics"] = {
-                        "wall_time_seconds": session_wall_time,
-                        "usage": diff_usage_stats(
-                            usage_tracker.get_stats(), usage_before
-                        ),
-                    }
-                    session_build_results.append(session_build_record)
+                    session_build_results.append({
+                        "session_id": session.session_id,
+                        "session_index": idx,
+                        "error": str(e),
+                    })
 
-                if self._checkpoint_manager and session_succeeded:
-                    self._checkpoint_manager.mark_session_injected(session.session_id)
-                if memory_build_failed:
-                    break
+            snapshot_path = None
+            if not snapshot_loaded and not memory_build_failed:
+                snapshot_path = self._save_memory_snapshot(snapshot_key, session_ids)
 
             # Log summary
             total_passages = sum(
-                len(r.get("build_result", {}).get("all_passages", []))
+                len(r.get("build_result", {}).get("all_passages", []) or r.get("build_result", {}).get("memory_entries", []))
                 for r in session_build_results if "build_result" in r
             )
             self._log(f"      [Summary] Total passages stored: {total_passages}")
-
-            if restored_payload is not None and not session_build_results:
-                unit_build_metrics = copy.deepcopy(
-                    restored_payload.get("memory_build_metrics") or {
-                        "wall_time_seconds": total_memory_time,
-                        "usage": {},
-                    }
-                )
-            else:
-                unit_usage = merge_usage_stats(*[
-                    record.get("build_metrics", {}).get("usage", {})
-                    for record in session_build_results
-                ])
-                unit_build_metrics = {
-                    "wall_time_seconds": staged_build_wall_time if staged_build_wall_time is not None else sum(
-                        float(record.get("wall_time_seconds", 0.0) or 0.0)
-                        for record in session_build_results
-                    ),
-                    "usage": unit_usage,
-                }
 
             # Store all session build results
             self._memory_build_logs.append({
@@ -3047,63 +587,25 @@ class MedMemoryBenchEvaluator:
                 "session_count": total_sessions,
                 "total_time": total_memory_time,
                 "total_passages": total_passages,
-                "session_builds": session_build_results,
-                "build_metrics": unit_build_metrics,
-                "feature_configuration": self._amem_feature_configuration(),
-                "restored_from_snapshot": bool(
-                    restored_payload is not None and not session_build_results
+                "memory_snapshot_hit": snapshot_loaded,
+                "memory_snapshot_path": str(
+                    snapshot_path or self._memory_snapshot_store.path_for(snapshot_key)
                 ),
+                "session_builds": session_build_results,
             })
 
-        self._log(
-            f"  Memory build complete | passages={total_passages if not self.dry_run else 0} | "
-            f"time={total_memory_time:.2f}s"
-        )
+        self._log(f"    --- Memory Build Done, time={total_memory_time:.2f}s ---")
 
         if memory_build_failed:
-            self._log(
-                "    [API ERROR] Skipping this unit's queries because memory construction "
-                "did not complete; no metric results will be recorded.",
-                level="ERROR",
+            raise RuntimeError(
+                f"Memory build failed for context {unit.context_id}, unit {unit.unit_id}; "
+                "queries were not run against an incomplete memory state."
             )
-            return results
-
-        # Snapshot boundaries are part of the staged AMem execution, but their
-        # disk I/O is intentionally excluded from method construction/query time.
-        snapshot_path = self._save_and_restore_unit_memory(
-            unit,
-            memory_build_time=total_memory_time,
-            memory_build_metrics=(
-                self._memory_build_logs[-1].get("build_metrics", {})
-                if self._memory_build_logs else {}
-            ),
-        )
-        if snapshot_path is not None and self._memory_build_logs:
-            self._memory_build_logs[-1]["memory_snapshot"] = str(snapshot_path)
-
-        if getattr(self, "execution_stage", "all") == "memory":
-            self._log("  Query evaluation skipped (memory stage only)")
-            return results
-
-        return self._evaluate_unit_queries(unit, total_memory_time)
-
-    def _evaluate_unit_queries(
-        self,
-        unit: EvaluationUnit,
-        total_memory_time: float,
-    ) -> List[MetricResult]:
-        """Retrieve, answer, and score one unit from its active memory state."""
-        results: List[MetricResult] = []
 
         total_query_time = 0.0
-        self._log("  Query evaluation started")
+        self._log(f"    --- Query Evaluation Start ---")
 
-        query_count = int(
-            getattr(unit, "metadata", {}).get(
-                "_query_stage_original_query_count",
-                len(unit.queries_to_evaluate),
-            )
-        )
+        query_count = len(unit.queries_to_evaluate)
         memory_time_per_query = total_memory_time / query_count if query_count > 0 else 0.0
 
         pending_query_count = sum(
@@ -3111,148 +613,68 @@ class MedMemoryBenchEvaluator:
             for query in unit.queries_to_evaluate
             if not (
                 self._checkpoint_manager
-                and self._checkpoint_manager.is_query_completed(
-                    query.query_id,
-                    persona_id=unit.context_id,
-                )
+                and self._checkpoint_manager.is_query_completed(query.query_id)
             )
             and not self._is_deferred_judge_query(query.query_id)
         )
-        if not pending_query_count:
-            self._log("  Query evaluation complete | no pending questions")
-            return results
-
-        self._start_query_progress()
-
-        if pending_query_count and self._supports_batch_queries():
-            batch_client = self._get_batch_client()
-            combined_stage = "query-final"
-            legacy_stage = f"query-unit-{unit.unit_id}"
-            if not batch_client.has_stage(combined_stage) and batch_client.has_stage(legacy_stage):
-                query_results = self._evaluate_batch_queries(unit, memory_time_per_query)
-            else:
-                prepared_count = self._prepare_combined_batch_queries(
-                    unit,
-                    memory_time_per_query,
-                )
-                query_results = []
-                self._log(
-                    f"    [Batch] Prepared {prepared_count:,} request(s) for "
-                    f"combined stage '{combined_stage}'."
-                )
+        if self._can_batch_queries(pending_query_count):
+            query_results = self._evaluate_batch_queries(unit, memory_time_per_query)
             for result in query_results:
                 results.append(result)
                 total_query_time += result.query_time
-                if not result.is_correct:
-                    self._log(
-                        f"  Query failed | id={result.query_id} | "
-                        f"type={result.query_type} | score={result.score:.2f}",
-                        level="WARNING",
-                    )
+                status = "✓" if result.is_correct else "✗"
+                self._log(f"    [{status}] {result.query_id} ({result.query_type}): {result.score:.2f}")
+                self._log_query_timing(result)
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
                         result.query_id,
                         result.to_dict(),
-                        persona_id=unit.context_id,
                     )
         else:
             if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
                 self._log(
-                    "Batch API is unavailable for this adapter; "
-                    "using real-time final-answer generation.",
+                    "Vertex batch API is unavailable or this stage is too small; "
+                    "using real-time generation for dependent requests.",
                     level="WARNING",
                 )
                 self._batch_fallback_logged = True
 
-            pending_queries = []
             for query in unit.queries_to_evaluate:
-                if (
-                    self._checkpoint_manager
-                    and self._checkpoint_manager.is_query_completed(
-                        query.query_id,
-                        persona_id=unit.context_id,
-                    )
-                ):
+                if self._checkpoint_manager and self._checkpoint_manager.is_query_completed(query.query_id):
                     self._log(f"    [Skip] {query.query_id} (completed)")
                     continue
                 if self._is_deferred_judge_query(query.query_id):
                     self._log(f"    [Skip] {query.query_id} (awaiting saved Vertex judge result)")
                     continue
-                pending_queries.append(query)
 
-            for query, result in self._evaluate_realtime_queries(
-                pending_queries,
-                context_id=unit.context_id,
-                memory_time_per_query=memory_time_per_query,
-                unit_id=unit.unit_id,
-            ):
+                result = self._evaluate_query(
+                    query,
+                    unit.context_id,
+                    memory_time_per_query=memory_time_per_query,
+                )
                 if result is None:
                     continue
                 results.append(result)
                 total_query_time += result.query_time
 
-                if not result.is_correct:
-                    self._log(
-                        f"  Query failed | id={query.query_id} | "
-                        f"type={query.query_type} | score={result.score:.2f}",
-                        level="WARNING",
-                    )
+                status = "✓" if result.is_correct else "✗"
+                self._log(f"    [{status}] {query.query_id} ({query.query_type}): {result.score:.2f}")
+                self._log_query_timing(result)
 
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
                         query.query_id,
                         result.to_dict(),
-                        persona_id=unit.context_id,
                     )
 
-        self._log(f"  Query evaluation complete | time={total_query_time:.2f}s")
+        self._log(f"    --- Query Evaluation Done, time={total_query_time:.2f}s ---")
 
         return results
 
-    def _evaluate_realtime_queries(
-        self,
-        queries: List[MedQuery],
-        *,
-        context_id: int,
-        memory_time_per_query: float,
-        unit_id: int,
-    ) -> List[tuple[MedQuery, Optional[MetricResult]]]:
-        """Run independent answer-and-score pairs with bounded concurrency."""
-        def evaluate_one(query: MedQuery) -> tuple[MedQuery, Optional[MetricResult]]:
-            try:
-                if self._supports_memory_snapshots():
-                    result = self._evaluate_query_staged(
-                        query,
-                        context_id,
-                        memory_time_per_query=memory_time_per_query,
-                        unit_id=unit_id,
-                    )
-                else:
-                    result = self._evaluate_query(
-                        query,
-                        context_id,
-                        memory_time_per_query=memory_time_per_query,
-                        unit_id=unit_id,
-                    )
-                return query, result
-            finally:
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=context_id,
-                )
-
-        if len(queries) < 2 or self.workers == 1:
-            return [evaluate_one(query) for query in queries]
-
-        worker_count = min(self.workers, len(queries))
-        self._log(f"    [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            # executor.map preserves dataset order for deterministic reports/checkpoints.
-            return list(executor.map(evaluate_one, queries))
-
-    def _supports_batch_queries(self) -> bool:
+    def _can_batch_queries(self, request_count: int) -> bool:
         return bool(
-            self.batch_api
+            should_use_batch(request_count)
+            and self.batch_api
             and self.agent_manager
             and self.agent_manager.supports_batch_queries()
         )
@@ -3263,34 +685,29 @@ class MedMemoryBenchEvaluator:
                 raise VertexBatchError("Agent manager is not initialized for batch execution.")
             llm_client = self.agent_manager.get_batch_llm_client()
             if llm_client is None:
-                raise VertexBatchError("This method does not expose a managed batch client.")
-            self._batch_client = create_batch_client(
+                raise VertexBatchError("This method does not expose a managed Gemini batch client.")
+            self._batch_client = VertexBatchClient.from_gemini_client(
                 llm_client,
                 gcs_uri=self.batch_gcs_uri,
                 manifest_path=self._batch_manifest_path("medmemorybench_batch_manifest", llm_client.model),
                 wait=self.batch_wait,
                 config_hash=self._batch_manifest_config_hash(),
                 progress_callback=self._log,
-                vertex_batch_class=VertexBatchClient,
             )
         return self._batch_client
 
     def _get_judge_batch_client(self, judge_client) -> VertexBatchClient:
         """Create an independent manifest because judge and agent models may differ."""
         if self._judge_batch_client is None:
-            self._judge_batch_client = create_batch_client(
+            self._judge_batch_client = VertexBatchClient.from_gemini_client(
                 judge_client,
                 gcs_uri=self.batch_gcs_uri,
-                manifest_path=scoped_manifest_path(
-                    self.output_dir / "batch",
-                    "medmemorybench_judge_batch_manifest",
-                    model=judge_client.model,
-                    config_hash=self._judge_batch_config_hash(),
+                manifest_path=self._batch_manifest_path(
+                    "medmemorybench_judge_batch_manifest", judge_client.model
                 ),
                 wait=self.batch_wait,
-                config_hash=self._judge_batch_config_hash(),
+                config_hash=self._batch_manifest_config_hash(),
                 progress_callback=self._log,
-                vertex_batch_class=VertexBatchClient,
             )
         return self._judge_batch_client
 
@@ -3306,13 +723,7 @@ class MedMemoryBenchEvaluator:
         batch_client = self._get_batch_client()
 
         for query in unit.queries_to_evaluate:
-            if (
-                self._checkpoint_manager
-                and self._checkpoint_manager.is_query_completed(
-                    query.query_id,
-                    persona_id=unit.context_id,
-                )
-            ):
+            if self._checkpoint_manager and self._checkpoint_manager.is_query_completed(query.query_id):
                 self._log(f"    [Skip] {query.query_id} (completed)")
                 continue
             if self._is_deferred_judge_query(query.query_id):
@@ -3337,35 +748,13 @@ class MedMemoryBenchEvaluator:
                     question=query.question,
                     query_type=query.query_type,
                 )
-                try:
-                    prepared = self._run_api_call(
-                        self.agent_manager.prepare_batch_query,
-                        formatted_question,
-                        query_id=query.query_id,
-                        context_id=unit.context_id,
-                        batch_request_time=batch_request_time,
-                        raw_question=query.question,
-                        query_type=query.query_type,
-                    )
-                except LLMAPIError as e:
-                    self._log(
-                        f"    [API ERROR] {query.query_id}: query preparation failed; "
-                        f"skipping this query. Error: {truncate_error_message(e)}",
-                        level="ERROR",
-                    )
-                    self._record_api_failure(
-                        "query_preparation",
-                        e,
-                        query_id=query.query_id,
-                        query_type=query.query_type,
-                        context_id=unit.context_id,
-                        unit_id=unit.unit_id,
-                    )
-                    self._advance_query_progress(
-                        query.query_id,
-                        context_id=unit.context_id,
-                    )
-                    continue
+                prepared = self.agent_manager.prepare_batch_query(
+                    formatted_question,
+                    query_id=query.query_id,
+                    query_type=query.query_type,
+                    context_id=unit.context_id,
+                    batch_request_time=batch_request_time,
+                )
 
             if saved_request is not None:
                 # Reuse the exact staged request. This protects a resume from
@@ -3392,336 +781,39 @@ class MedMemoryBenchEvaluator:
                 )
             prepared_by_id[request_id] = (query, prepared)
 
-        if not requests:
-            return []
-
         self._log(
-            f"    [Batch] Stage '{stage}': local preparation complete; "
+            f"    [Vertex Batch] Stage '{stage}': local preparation complete; "
             f"submitting {len(requests):,} final-answer request(s)."
         )
-        get_saved_requests = getattr(batch_client, "get_saved_requests", None)
-        saved_requests = get_saved_requests(stage) if callable(get_saved_requests) else []
-        submitted_requests = saved_requests or requests
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.answer_batch"):
-            responses = batch_client.run_stage(stage, submitted_requests)
+        responses = batch_client.run_stage(stage, requests)
         results: List[MetricResult] = []
         for request_id, (query, prepared) in prepared_by_id.items():
             batch_response = responses.get(request_id)
             if batch_response is None or batch_response.status:
                 error = batch_response.status if batch_response else "No output row returned"
-                self._record_batch_api_failure(
-                    query,
-                    f"Batch request failed: {truncate_error_message(error)}",
-                    failure_duration_seconds=(
-                        getattr(batch_response, "duration_seconds", 0.0)
-                        if batch_response is not None else 0.0
-                    ),
-                    context_id=unit.context_id,
-                    unit_id=unit.unit_id,
-                )
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
+                results.append(self._api_error_result(query, f"Vertex batch request failed: {error}"))
                 continue
-            try:
-                response = self._run_api_call(
-                    self.agent_manager.finalize_batch_query,
-                    prepared,
-                    batch_response.content,
-                    input_tokens=batch_response.input_tokens,
-                    output_tokens=batch_response.output_tokens,
-                )
-                result = self._run_api_call(
-                    self._score_agent_response,
-                    query,
-                    response,
-                    context_id=unit.context_id,
-                    memory_construction_time=memory_time_per_query,
-                    artifact_references=self._query_artifact_references(
-                        context_id=unit.context_id,
-                        unit_id=unit.unit_id,
-                        answer_request_id=request_id,
-                        answer_batch_client=batch_client,
-                        answer_messages=prepared.get("messages"),
-                    ),
-                    execution_usage={
-                        "answer": self._batch_response_usage(
-                            batch_response, transport="batch"
-                        ),
-                    },
-                )
-            except LLMAPIError as e:
-                self._log(
-                    f"    [API ERROR] {query.query_id}: judge API call failed; "
-                    f"skipping this query. Error: {truncate_error_message(e)}",
-                    level="ERROR",
-                )
-                self._record_api_failure(
-                    "judge",
-                    e,
-                    query_id=query.query_id,
-                    query_type=query.query_type,
-                    context_id=unit.context_id,
-                    unit_id=unit.unit_id,
-                )
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
-                continue
+            response = self.agent_manager.finalize_batch_query(
+                prepared,
+                batch_response.content,
+                input_tokens=batch_response.input_tokens,
+                output_tokens=batch_response.output_tokens,
+            )
+            result = self._score_agent_response(
+                query,
+                response,
+                context_id=unit.context_id,
+                memory_construction_time=memory_time_per_query,
+            )
             if result is not None:
                 results.append(result)
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
-            elif not self._is_deferred_judge_query(query.query_id):
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
         return results
-
-    def _prepare_combined_batch_queries(
-        self,
-        unit: EvaluationUnit,
-        memory_time_per_query: float,
-    ) -> int:
-        """Freeze this unit's prompts while its current memory snapshot is active."""
-        stage = "query-final"
-        batch_client = self._get_batch_client()
-        prepared_count = 0
-
-        query_items = []
-        for query in unit.queries_to_evaluate:
-            if (
-                self._checkpoint_manager
-                and self._checkpoint_manager.is_query_completed(
-                    query.query_id, persona_id=unit.context_id
-                )
-            ):
-                self._log(f"    [Skip] {query.query_id} (completed)")
-                continue
-            if self._is_deferred_judge_query(query.query_id):
-                self._log(
-                    f"    [Skip] {query.query_id} "
-                    "(awaiting saved Vertex judge result)"
-                )
-                continue
-            request_id = make_request_id(
-                "query",
-                f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}",
-            )
-            saved_request = batch_client.get_saved_request(stage, request_id)
-            batch_request_time = (
-                saved_request.metadata.get("batch_request_time")
-                if saved_request is not None
-                else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            prepared = restore_prepared_query(saved_request) if saved_request else None
-            query_items.append((query, request_id, saved_request, batch_request_time, prepared))
-
-        def prepare_item(item):
-            query, _, _, batch_request_time, prepared = item
-            if prepared is not None:
-                return prepared, None
-            formatted_question = self.prompt_manager.format_query(
-                question=query.question, query_type=query.query_type
-            )
-            try:
-                return self._run_api_call(
-                    self.agent_manager.prepare_batch_query,
-                    formatted_question,
-                    query_id=query.query_id,
-                    context_id=unit.context_id,
-                    batch_request_time=batch_request_time,
-                    raw_question=query.question,
-                    query_type=query.query_type,
-                ), None
-            except LLMAPIError as exc:
-                return None, exc
-
-        worker_count = getattr(self, "workers", 1)
-        if worker_count > 1 and len(query_items) > 1:
-            with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
-                prepared_items = list(executor.map(prepare_item, query_items))
-        else:
-            prepared_items = [prepare_item(item) for item in query_items]
-
-        for item, (prepared, preparation_error) in zip(query_items, prepared_items):
-            query, request_id, saved_request, batch_request_time, _ = item
-            if preparation_error is not None:
-                self._log(
-                    f"    [API ERROR] {query.query_id}: query preparation failed; "
-                    f"skipping this query. Error: {preparation_error}",
-                    level="ERROR",
-                )
-                self._record_api_failure(
-                    "query_preparation",
-                    preparation_error,
-                    query_id=query.query_id,
-                    query_type=query.query_type,
-                    context_id=unit.context_id,
-                    unit_id=unit.unit_id,
-                )
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
-                continue
-
-            request = saved_request or BatchChatRequest(
-                request_id=request_id,
-                messages=prepared["messages"],
-                temperature=self.method_config.model.temperature,
-                max_tokens=(
-                    self.method_config.model.max_completion_tokens
-                    or self.method_config.model.max_tokens
-                ),
-                phase="query",
-                metadata={
-                    "query_id": query.query_id,
-                    "unit_id": unit.unit_id,
-                    "context_id": unit.context_id,
-                    "memory_time_per_query": memory_time_per_query,
-                    "batch_request_time": batch_request_time,
-                    PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared),
-                },
-            )
-            self._pending_batch_queries.append({
-                "request": request,
-                "query": query,
-                "prepared": prepared,
-                "persona_id": unit.context_id,
-                "unit_id": unit.unit_id,
-                "memory_time_per_query": request.metadata.get(
-                    "memory_time_per_query",
-                    memory_time_per_query,
-                ),
-            })
-            prepared_count += 1
-
-        return prepared_count
-
-    def _complete_combined_batch_queries(self) -> List[Dict[str, Any]]:
-        """Submit all frozen final-answer prompts in one provider batch job."""
-        if not self._pending_batch_queries:
-            return []
-
-        stage = "query-final"
-        batch_client = self._get_batch_client()
-        saved_requests = batch_client.get_saved_requests(stage)
-        requests = saved_requests or [
-            item["request"] for item in self._pending_batch_queries
-        ]
-        self._log(
-            f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined "
-            "final-answer request(s) from all prepared units."
-        )
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.answer_batch"):
-            responses = batch_client.run_stage(stage, requests)
-        finalized: List[Dict[str, Any]] = []
-
-        for item in self._pending_batch_queries:
-            request = item["request"]
-            query = item["query"]
-            batch_response = responses.get(request.request_id)
-            if batch_response is None or batch_response.status:
-                error = batch_response.status if batch_response else "No output row returned"
-                self._record_batch_api_failure(
-                    query,
-                    f"Batch request failed: {truncate_error_message(error)}",
-                    failure_duration_seconds=(
-                        getattr(batch_response, "duration_seconds", 0.0)
-                        if batch_response is not None else 0.0
-                    ),
-                    context_id=item["persona_id"],
-                    unit_id=item["unit_id"],
-                )
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
-                continue
-            try:
-                response = self._run_api_call(
-                    self.agent_manager.finalize_batch_query,
-                    item["prepared"],
-                    batch_response.content,
-                    input_tokens=batch_response.input_tokens,
-                    output_tokens=batch_response.output_tokens,
-                )
-                result = self._run_api_call(
-                    self._score_agent_response,
-                    query,
-                    response,
-                    context_id=item["persona_id"],
-                    memory_construction_time=item["memory_time_per_query"],
-                    artifact_references=self._query_artifact_references(
-                        context_id=item["persona_id"],
-                        unit_id=item["unit_id"],
-                        answer_request_id=request.request_id,
-                        answer_batch_client=batch_client,
-                        answer_messages=item["prepared"].get("messages"),
-                    ),
-                    execution_usage={
-                        "answer": self._batch_response_usage(
-                            batch_response, transport="batch"
-                        ),
-                    },
-                )
-            except LLMAPIError as e:
-                self._log(
-                    f"[API ERROR] {query.query_id}: judge API call failed; "
-                    f"skipping this query. Error: {truncate_error_message(e)}",
-                    level="ERROR",
-                )
-                self._record_api_failure(
-                    "judge",
-                    e,
-                    query_id=query.query_id,
-                    query_type=query.query_type,
-                    context_id=item["persona_id"],
-                    unit_id=item["unit_id"],
-                )
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
-                continue
-            if result is not None:
-                status = "✓" if result.is_correct else "✗"
-                self._log(
-                    f"[{status}] {result.query_id} ({result.query_type}): {result.score:.2f}"
-                )
-                finalized.append({
-                    "persona_id": item["persona_id"],
-                    "result": result,
-                })
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
-            elif not self._is_deferred_judge_query(query.query_id):
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
-
-        self._pending_batch_queries = []
-        return finalized
 
     def _evaluate_query(
         self,
         query,
         context_id: int,
         memory_time_per_query: float = 0.0,
-        unit_id: Optional[int] = None,
     ) -> Optional[MetricResult]:
         if self.dry_run:
             return MetricResult(
@@ -3735,157 +827,66 @@ class MedMemoryBenchEvaluator:
                 details={"dry_run": True},
             )
 
+        answers_data = None
+        if isinstance(query, MedQuery):
+            answers_data = query.answers_data
+
         formatted_question = self.prompt_manager.format_query(
             question=query.question,
             query_type=query.query_type,
         )
 
         try:
-            response = self._run_api_call(
-                self.agent_manager.send_message,
+            response = self.agent_manager.send_message(
                 message=formatted_question,
                 memorizing=False,
                 query_id=query.query_id,
-                context_id=context_id,
-                raw_question=query.question,
                 query_type=query.query_type,
+                context_id=context_id,
             )
-        except LLMAPIError as e:
+        except LLMRetryExhaustedError as e:
+            # Log the error and return a failed result instead of crashing
             self._log(
-                f"    [API ERROR] {query.query_id}: answer API call failed, "
-                f"skipping this query. Error: {truncate_error_message(e)}",
+                f"    [API ERROR] {query.query_id}: API call failed after retries, "
+                f"skipping this query. Error: {e}",
                 level="ERROR"
             )
-            self._record_api_failure(
-                "query",
-                e,
+            return MetricResult(
                 query_id=query.query_id,
                 query_type=query.query_type,
-                context_id=context_id,
+                score=0.0,
+                is_correct=False,
+                model_output="[API_ERROR] Connection failed after retries",
+                expected_answer=", ".join(query.get_correct_answers()),
+                question=query.question,
+                details={
+                    "api_error": True,
+                    "error_type": "LLMRetryExhaustedError",
+                    "error_message": str(e),
+                },
             )
-            return None
 
-        try:
-            return self._run_api_call(
-                self._score_agent_response,
-                query,
-                response,
-                context_id=context_id,
-                memory_construction_time=memory_time_per_query,
-                artifact_references=self._query_artifact_references(
-                    context_id=context_id,
-                    unit_id=unit_id,
-                    answer_request_id=make_request_id(
-                        "query", f"{self.method_config.method_name}:{unit_id}:{query.query_id}"
-                    ) if unit_id is not None else None,
-                    answer_messages=[{"role": "user", "content": formatted_question}],
-                ),
-            )
-        except LLMAPIError as e:
-            self._log(
-                f"    [API ERROR] {query.query_id}: judge API call failed, "
-                f"skipping this query. Error: {truncate_error_message(e)}",
-                level="ERROR"
-            )
-            self._record_api_failure(
-                "judge",
-                e,
-                query_id=query.query_id,
-                query_type=query.query_type,
-                context_id=context_id,
-            )
-            return None
-
-    def _evaluate_query_staged(
-        self,
-        query,
-        context_id: int,
-        memory_time_per_query: float = 0.0,
-        unit_id: Optional[int] = None,
-    ) -> Optional[MetricResult]:
-        """Run retrieval, final answering, and scoring as explicit stages."""
-        formatted_question = self.prompt_manager.format_query(
-            question=query.question,
-            query_type=query.query_type,
+        return self._score_agent_response(
+            query,
+            response,
+            context_id=context_id,
+            memory_construction_time=memory_time_per_query,
         )
-        try:
-            staged_query = self._run_api_call(
-                self.agent_manager.prepare_query,
-                message=formatted_question,
-                query_id=query.query_id,
-                context_id=context_id,
-                raw_question=query.question,
-                query_type=query.query_type,
-            )
-            response = self._run_api_call(
-                self.agent_manager.answer_prepared_query,
-                staged_query,
-            )
-        except LLMAPIError as e:
-            self._log(
-                f"    [API ERROR] {query.query_id}: answer API call failed, "
-                f"skipping this query. Error: {truncate_error_message(e)}",
-                level="ERROR",
-            )
-            self._record_api_failure(
-                "query",
-                e,
-                query_id=query.query_id,
-                query_type=query.query_type,
-                context_id=context_id,
-            )
-            return None
 
-        try:
-            return self._run_api_call(
-                self._score_agent_response,
-                query,
-                response,
-                context_id=context_id,
-                memory_construction_time=memory_time_per_query,
-                artifact_references=self._query_artifact_references(
-                    context_id=context_id,
-                    unit_id=unit_id,
-                    answer_request_id=make_request_id(
-                        "query", f"{self.method_config.method_name}:{unit_id}:{query.query_id}"
-                    ) if unit_id is not None else None,
-                    answer_messages=staged_query.get("messages") if isinstance(staged_query, dict) else None,
-                ),
-            )
-        except LLMAPIError as e:
-            self._log(
-                f"    [API ERROR] {query.query_id}: judge API call failed, "
-                f"skipping this query. Error: {truncate_error_message(e)}",
-                level="ERROR",
-            )
-            self._record_api_failure(
-                "judge",
-                e,
-                query_id=query.query_id,
-                query_type=query.query_type,
-                context_id=context_id,
-            )
-            return None
-
-    def _record_batch_api_failure(
-        self,
-        query,
-        error_message: str,
-        **context: Any,
-    ) -> None:
-        failure_duration_seconds = context.pop("failure_duration_seconds", None)
-        self._log(
-            f"    [API ERROR] {query.query_id}: {error_message}; "
-            "skipping this query.",
-            level="ERROR",
-        )
-        self._record_api_failure(
-            "batch_query",
-            VertexBatchError(error_message),
+    def _api_error_result(self, query, error_message: str) -> MetricResult:
+        return MetricResult(
             query_id=query.query_id,
             query_type=query.query_type,
-            failure_duration_seconds=failure_duration_seconds,
-            **context,
+            score=0.0,
+            is_correct=False,
+            model_output="[API_ERROR] Connection failed after retries",
+            expected_answer=", ".join(query.get_correct_answers()),
+            question=query.question,
+            details={
+                "api_error": True,
+                "error_type": "LLMRetryExhaustedError",
+                "error_message": error_message,
+            },
         )
 
     def _score_agent_response(
@@ -3894,8 +895,6 @@ class MedMemoryBenchEvaluator:
         response: Any,
         context_id: Optional[int] = None,
         memory_construction_time: float = 0.0,
-        artifact_references: Optional[Dict[str, Any]] = None,
-        execution_usage: Optional[Dict[str, Any]] = None,
     ) -> Optional[MetricResult]:
         """Score a normal or batch-finalized agent response with unchanged metrics."""
         answers_data = query.answers_data if isinstance(query, MedQuery) else None
@@ -3905,23 +904,19 @@ class MedMemoryBenchEvaluator:
             query_time = response.get("query_time", 0.0)
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
-            response_usage = response.get("answer_usage")
+            agent_extra = response.get("extra", {})
         elif hasattr(response, "output"):
             model_output = response.output
             query_time = getattr(response, "query_time", 0.0)
             retrieved_memories = getattr(response, "retrieved_memories", [])
             retrieved_count = getattr(response, "retrieved_count", 0)
-            response_usage = None
+            agent_extra = getattr(response, "extra", {})
         else:
             model_output = str(response)
             query_time = 0.0
             retrieved_memories = []
             retrieved_count = 0
-            response_usage = None
-
-        resolved_execution_usage = copy.deepcopy(execution_usage or {})
-        if isinstance(response_usage, dict) and "answer" not in resolved_execution_usage:
-            resolved_execution_usage["answer"] = copy.deepcopy(response_usage)
+            agent_extra = {}
 
         metric_kwargs = {
             "answers_data": answers_data,
@@ -3954,66 +949,87 @@ class MedMemoryBenchEvaluator:
                     "memory_construction_time": memory_construction_time,
                     "retrieved_memories": retrieved_memories,
                     "retrieved_count": retrieved_count,
-                    "retrieval_quality": self._session_retrieval_quality(
-                        query, retrieved_memories
-                    ),
-                    "artifact_references": copy.deepcopy(artifact_references or {}),
-                    "execution_usage": resolved_execution_usage,
+                    "agent_extra": agent_extra,
                 })
                 return None
             result = self.metrics_calculator.finalize_batch(prepared_metric, "")
         else:
             if prepared_metric is not None and not self._judge_batch_fallback_logged:
                 self._log(
-                    "Batch API cannot batch the configured LLM judge; "
+                    "Vertex batch API cannot batch the configured LLM judge; "
                     "using its existing real-time client.",
                     level="WARNING",
                 )
                 self._judge_batch_fallback_logged = True
-            tracker = get_usage_tracker()
-            tracker.set_phase("query")
-            with tracker.scope("query.judge_realtime"):
-                result = self.metrics_calculator.compute(
-                    query_id=query.query_id,
-                    query_type=query.query_type,
-                    model_output=model_output,
-                    expected_answers=query.get_correct_answers(),
-                    question=query.question,
-                    **metric_kwargs,
-                )
+            result = self.metrics_calculator.compute(
+                query_id=query.query_id,
+                query_type=query.query_type,
+                model_output=model_output,
+                expected_answers=query.get_correct_answers(),
+                question=query.question,
+                **metric_kwargs,
+            )
 
         result.query_time = query_time
         result.memory_construction_time = memory_construction_time
         result.retrieved_memories = retrieved_memories
         result.retrieved_count = retrieved_count
-        references = copy.deepcopy(artifact_references or {})
-        references["retrieval"] = {
-            "payload_sha256": self._artifact_content_hash(retrieved_memories),
-            "memory_ids_sha256": self._artifact_content_hash([
-                memory.get("memory_id", memory.get("id"))
-                for memory in retrieved_memories
-                if isinstance(memory, dict)
-            ]),
-        }
-        answer_reference = references.get("answer")
-        if isinstance(answer_reference, dict):
-            answer_reference["response_sha256"] = self._artifact_content_hash(
-                model_output
-            )
-        references.setdefault("judge", {"transport": "realtime"})
-        self._attach_session_retrieval_quality(
-            result,
-            self._session_retrieval_quality(query, retrieved_memories),
-        )
-        result.details["artifact_references"] = references
-        result.details["execution_usage"] = resolved_execution_usage
+        if agent_extra:
+            result.details["agent_telemetry"] = agent_extra
 
         return result
+
+    def _log_query_timing(self, result: MetricResult) -> None:
+        """Expose per-stage query latency without changing evaluation semantics."""
+        telemetry = result.details.get("agent_telemetry", {})
+        timing = telemetry.get("query_latency")
+        if not isinstance(timing, dict):
+            return
+        stages = []
+        for name in ("fast_gate", "planner", "slot_validation", "replan", "answer"):
+            value = timing.get(name)
+            if value is not None and float(value or 0.0) > 0:
+                stages.append(f"{name}={float(value):.2f}s")
+        if stages:
+            self._log(
+                f"      [Timing] total={result.query_time:.2f}s "
+                + " ".join(stages)
+            )
 
     def _complete_deferred_judges(self) -> List[Dict[str, Any]]:
         """Submit all independent MedMemoryBench judge prompts as one final stage."""
         if not self._deferred_judges:
             return []
+
+        can_fallback_to_realtime = all(
+            "expected_answers" in item and "metric_kwargs" in item
+            for item in self._deferred_judges
+        )
+        if not should_use_batch(len(self._deferred_judges)) and can_fallback_to_realtime:
+            self._log(
+                f"[Vertex Batch] Only {len(self._deferred_judges):,} judge request(s); "
+                "using real-time judging."
+            )
+            finalized: List[Dict[str, Any]] = []
+            for item in self._deferred_judges:
+                prepared = item["prepared_metric"]["prepared"]
+                result = self.metrics_calculator.compute(
+                    query_id=prepared["query_id"],
+                    query_type=prepared["query_type"],
+                    model_output=prepared["model_output"],
+                    expected_answers=item["expected_answers"],
+                    question=prepared["question"],
+                    **item["metric_kwargs"],
+                )
+                result.query_time = item["query_time"]
+                result.memory_construction_time = item["memory_construction_time"]
+                result.retrieved_memories = item["retrieved_memories"]
+                result.retrieved_count = item["retrieved_count"]
+                if item.get("agent_extra"):
+                    result.details["agent_telemetry"] = item["agent_extra"]
+                finalized.append({"persona_id": item["persona_id"], "result": result})
+            self._clear_deferred_judges()
+            return finalized
 
         first_prepared = self._deferred_judges[0]["prepared_metric"]["prepared"]
         judge_client = self.metrics_calculator.get_batch_judge_client(first_prepared["query_type"])
@@ -4036,11 +1052,8 @@ class MedMemoryBenchEvaluator:
                 BatchChatRequest(
                     request_id=request_id,
                     messages=[{"role": "user", "content": payload["prompt"]}],
-                    temperature=payload.get(
-                        "temperature", getattr(get_api_config(), "judge_temperature", 1.0)
-                    ),
+                    temperature=1.0,
                     max_tokens=payload["max_tokens"],
-                    reasoning_effort=payload.get("reasoning_effort"),
                     response_format={"type": "json_object"},
                     phase="query",
                     metadata={"query_id": item["query_id"], "phase": "judge"},
@@ -4049,93 +1062,21 @@ class MedMemoryBenchEvaluator:
             by_id[request_id] = item
 
         self._log(
-            f"[Batch] Stage 'judge-final': prepared {len(requests):,} LLM-judge request(s)."
+            f"[Vertex Batch] Stage 'judge-final': prepared {len(requests):,} LLM-judge request(s)."
         )
-        judge_batch_client = self._get_judge_batch_client(judge_client)
-        tracker = get_usage_tracker()
-        tracker.set_phase("query")
-        with tracker.scope("query.judge_batch"):
-            responses = judge_batch_client.run_stage("judge-final", requests)
+        responses = self._get_judge_batch_client(judge_client).run_stage("judge-final", requests)
         finalized: List[Dict[str, Any]] = []
         for request_id, item in by_id.items():
             response = responses.get(request_id)
-            prepared = item["prepared_metric"]["prepared"]
-            if response is None or response.status:
-                error = response.status if response else "No output row returned"
-                self._log(
-                    f"[API ERROR] Batch judge failed for {item['query_id']}; "
-                    f"no metric result recorded. Error: {truncate_error_message(error)}",
-                    level="ERROR",
-                )
-                self._record_api_failure(
-                    "batch_judge",
-                    VertexBatchError(truncate_error_message(error)),
-                    failure_duration_seconds=(
-                        getattr(response, "duration_seconds", 0.0)
-                        if response is not None else 0.0
-                    ),
-                    query_id=item["query_id"],
-                    query_type=prepared["query_type"],
-                    context_id=item["persona_id"],
-                )
-                self._advance_query_progress(
-                    item["query_id"],
-                    context_id=item["persona_id"],
-                )
-                continue
-            try:
-                result = self._run_api_call(
-                    self.metrics_calculator.finalize_batch,
-                    item["prepared_metric"],
-                    response.content,
-                )
-            except LLMAPIError as e:
-                self._log(
-                    f"[API ERROR] Batch judge returned an unusable response for "
-                    f"{item['query_id']}; no metric result recorded. Error: {truncate_error_message(e)}",
-                    level="ERROR",
-                )
-                self._record_api_failure(
-                    "batch_judge",
-                    e,
-                    query_id=item["query_id"],
-                    query_type=prepared["query_type"],
-                    context_id=item["persona_id"],
-                )
-                self._advance_query_progress(
-                    item["query_id"],
-                    context_id=item["persona_id"],
-                )
-                continue
+            result_text = response.content if response is not None and not response.status else ""
+            result = self.metrics_calculator.finalize_batch(item["prepared_metric"], result_text)
             result.query_time = item["query_time"]
             result.memory_construction_time = item["memory_construction_time"]
             result.retrieved_memories = item["retrieved_memories"]
             result.retrieved_count = item["retrieved_count"]
-            self._attach_session_retrieval_quality(
-                result,
-                item.get("retrieval_quality"),
-            )
-            references = copy.deepcopy(item.get("artifact_references") or {})
-            references["judge"] = self._batch_artifact_reference(
-                judge_batch_client, request_id
-            )
-            references["judge"]["prompt_sha256"] = self._artifact_content_hash(
-                payload["prompt"]
-            )
-            references["judge"]["response_sha256"] = self._artifact_content_hash(
-                response.content
-            )
-            result.details["artifact_references"] = references
-            execution_usage = copy.deepcopy(item.get("execution_usage") or {})
-            execution_usage["judge"] = self._batch_response_usage(
-                response, transport="batch"
-            )
-            result.details["execution_usage"] = execution_usage
+            if item.get("agent_extra"):
+                result.details["agent_telemetry"] = item["agent_extra"]
             finalized.append({"persona_id": item["persona_id"], "result": result})
-            self._advance_query_progress(
-                item["query_id"],
-                context_id=item["persona_id"],
-            )
         self._clear_deferred_judges()
         return finalized
 
@@ -4148,29 +1089,8 @@ class MedMemoryBenchEvaluator:
         summary = self.aggregator.get_summary()
 
         memory_build_summary = self._summarize_memory_builds()
-        build_metrics = self._build_metrics_report()
 
         llm_usage = get_usage_tracker().get_stats()
-        stage_usage = self._stage_usage_report(llm_usage)
-        retry_failure_duration = self._retry_failure_duration(llm_usage)
-        failed_query_ids = set()
-        for failure in self._api_failures:
-            if failure.get("query_id"):
-                failed_query_ids.add(failure["query_id"])
-            failed_query_ids.update(failure.get("affected_query_ids", []))
-        expected_queries = self._expected_query_count()
-        scored_queries = len(self.aggregator.results)
-        evaluation_coverage = {
-            "expected_queries": expected_queries,
-            "scored_queries": scored_queries,
-            "omitted_queries": max(expected_queries - scored_queries, 0),
-            "api_failed_queries": len(failed_query_ids),
-            "api_failure_events": len(self._api_failures),
-            "coverage": (
-                scored_queries / expected_queries if expected_queries > 0 else 1.0
-            ),
-            "complete": scored_queries == expected_queries,
-        }
 
         report = EvaluationReport(
             method_name=self.method_config.method_name,
@@ -4184,21 +1104,6 @@ class MedMemoryBenchEvaluator:
             config={
                 "method_config": self.method_config.raw_config,
                 "dataset_config": self.dataset_config.raw_config,
-                "judge_config": {
-                    "provider": get_api_config().get_judge_provider(),
-                    "model": get_api_config().get_judge_model(),
-                    "temperature": getattr(get_api_config(), "judge_temperature", 1.0),
-                    "reasoning_effort": getattr(
-                        get_api_config(), "judge_reasoning_effort", None
-                    ),
-                    "client_max_tokens": getattr(
-                        get_api_config(), "judge_client_max_tokens", 10000
-                    ),
-                    "max_tokens": getattr(get_api_config(), "judge_max_tokens", 500),
-                    "mcd_max_tokens": getattr(
-                        get_api_config(), "judge_mcd_max_tokens", 2000
-                    ),
-                },
                 "dry_run": self.dry_run,
             },
             metadata={
@@ -4206,95 +1111,50 @@ class MedMemoryBenchEvaluator:
                 "evaluation_interval": self.dataset_config.evaluation_interval,
                 "total_personas": len(self.result_collector.get_context_ids()),
                 "memory_build_summary": memory_build_summary,
-                "build_metrics": build_metrics,
-                "memory_size": build_metrics["memory_size"],
-                "feature_configuration": build_metrics["feature_configuration"],
                 "llm_usage": llm_usage,
-                "stage_usage": stage_usage,
-                "evaluation_coverage": evaluation_coverage,
-                "api_failures": self._api_failures,
-                "api_failure_duration_seconds": retry_failure_duration,
             }
         )
 
-        execution_stage = getattr(self, "execution_stage", "all")
         result_path, memory_build_path, query_answer_path = self.result_collector.save_reports(
             report=report,
             output_dir=self.output_dir,
-            memory_build_logs=self._combined_memory_build_logs(),
-            include_result=execution_stage in {"all", "query"},
-            include_memory_build=execution_stage in {"all", "memory"},
-            include_query_answer=execution_stage in {"all", "query"},
-            include_api_failures=True,
-            use_method_subdir=not getattr(self, "run_scoped_output", False),
+            memory_build_logs=self._memory_build_logs,
         )
 
-        if result_path is not None:
-            self._log(f"Results saved to: {result_path}", terminal=False)
-        if memory_build_path is not None:
-            self._log(
-                f"Memory build details saved to: {memory_build_path}",
-                terminal=False,
-            )
-        if query_answer_path is not None:
-            self._log(
-                f"Query answer details saved to: {query_answer_path}",
-                terminal=False,
-            )
-        if self.result_collector.last_api_failure_path is not None:
-            self._log(
-                f"API failure details saved separately to: "
-                f"{self.result_collector.last_api_failure_path}"
-            )
+        self._log(f"Results saved to: {result_path}")
+        self._log(f"Memory build details saved to: {memory_build_path}")
+        self._log(f"Query answer details saved to: {query_answer_path}")
 
         return report
 
-    def _retry_failure_duration(self, llm_usage: Dict[str, Any]) -> float:
-        """Return recovered retry time plus terminal API failure time."""
-        recovered_retry_duration = float(
-            llm_usage.get("total", {}).get("failure_duration_seconds", 0.0) or 0.0
-        )
-        return recovered_retry_duration + self._api_failure_duration_seconds
-
-    def _expected_query_count(self) -> int:
-        """Return coverage denominator for the units selected by this run."""
-        units = self._get_evaluation_units()
-        if getattr(self, "append", False) and self._append_target_index is not None:
-            units = units[: self._append_target_index + 1]
-            return sum(len(unit.queries_to_evaluate) for unit in units)
-        if self.execution_stage == "query" and self._memory_unit_ids is not None:
-            units = [unit for unit in units if unit.unit_id in self._memory_unit_ids]
-        return sum(len(unit.queries_to_evaluate) for unit in units)
-
     def _summarize_memory_builds(self) -> Dict[str, Any]:
-        build_logs = self._combined_memory_build_logs()
-        if not build_logs:
+        if not self._memory_build_logs:
             return {"total_builds": 0}
 
-        total_units = len(build_logs)
+        total_units = len(self._memory_build_logs)
 
         total_sessions = sum(
             log.get("session_count", 0)
-            for log in build_logs
+            for log in self._memory_build_logs
         )
 
         # New structure: sum time from each unit's total_time
         total_time = sum(
             log.get("total_time", 0)
-            for log in build_logs
+            for log in self._memory_build_logs
         )
 
         # Count total passages from session_builds
         total_passages = sum(
             log.get("total_passages", 0)
-            for log in build_logs
+            for log in self._memory_build_logs
         )
 
         # Count memory entries from session builds
         total_memory_entries = 0
         methods = {}
 
-        for log in build_logs:
+        for log in self._memory_build_logs:
             session_builds = log.get("session_builds", [])
             for sb in session_builds:
                 build_result = sb.get("build_result", {})
@@ -4305,7 +1165,7 @@ class MedMemoryBenchEvaluator:
                     methods[method] = {"count": 0, "time_cost": 0, "passages": 0}
                 methods[method]["count"] += 1
                 methods[method]["time_cost"] += build_result.get("time_cost", 0)
-                methods[method]["passages"] += len(build_result.get("all_passages", []))
+                methods[method]["passages"] += len(build_result.get("all_passages", []) or build_result.get("memory_entries", []))
 
         return {
             "total_units": total_units,
@@ -4327,19 +1187,10 @@ def evaluate_medmemorybench(
     verbose: bool = True,
     logger: Optional[logging.Logger] = None,
     resume: bool = False,
-    force_resume: bool = False,
-    execution_stage: str = "all",
-    memory_run: Optional[str] = None,
-    append: bool = False,
-    append_persona: Optional[int] = None,
-    append_unit: Optional[int] = None,
-    memory_source_run_dir: Optional[Path] = None,
-    memory_run_explicit: bool = False,
-    run_scoped_output: bool = False,
+    rebuild_memory: bool = False,
     batch_api: bool = False,
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
-    workers: int = 1,
     **kwargs
 ) -> EvaluationReport:
     """MedMemoryBench evaluation entry point."""
@@ -4351,18 +1202,9 @@ def evaluate_medmemorybench(
         verbose=verbose,
         logger=logger,
         resume=resume,
-        force_resume=force_resume,
-        execution_stage=execution_stage,
-        memory_run=memory_run,
-        append=append,
-        append_persona=append_persona,
-        append_unit=append_unit,
-        memory_source_run_dir=memory_source_run_dir,
-        memory_run_explicit=memory_run_explicit,
-        run_scoped_output=run_scoped_output,
+        rebuild_memory=rebuild_memory,
         batch_api=batch_api,
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
-        workers=workers,
     )
     return evaluator.evaluate()

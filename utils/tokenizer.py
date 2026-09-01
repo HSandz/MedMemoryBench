@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from typing import Optional, Union, Protocol, List
 import logging
-from utils.logger import truncate_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +111,7 @@ def get_tokenizer(
                 logger.info(f"Using local Tokenizer: {local_path}")
                 return tokenizer
             except Exception as e:
-                logger.warning(
-                    f"Failed to load local Tokenizer: {truncate_error_message(e)}"
-                )
+                logger.warning(f"Failed to load local Tokenizer: {e}")
 
     # Try tiktoken
     try:
@@ -122,7 +119,7 @@ def get_tokenizer(
         logger.info(f"Using tiktoken encoding: {tiktoken_encoding}")
         return tokenizer
     except Exception as e:
-        logger.warning(f"Failed to load tiktoken: {truncate_error_message(e)}")
+        logger.warning(f"Failed to load tiktoken: {e}")
 
     # Fallback: char estimation
     logger.warning("Using char estimation Tokenizer (lower accuracy)")

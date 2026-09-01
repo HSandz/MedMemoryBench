@@ -15,10 +15,6 @@ from utils.llm_client import (
     create_llm_client,
     format_messages,
     BaseLLMClient,
-    is_google_ai_studio_provider,
-    is_gemini_provider,
-    is_hybrid_gemini_provider,
-    is_vertex_gemini_provider,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,8 +46,6 @@ class MemOSAgent(BaseAgent):
         retrieve_num: int = 5,
         memos_backend: str = "openai",
         memos_model: Optional[str] = None,
-        memos_temperature: float = DEFAULT_EXTRACTOR_TEMPERATURE,
-        memos_max_tokens: int = DEFAULT_EXTRACTOR_MAX_TOKENS,
         text_mem_type: str = "naive_text",
         embedding_model: Optional[str] = None,
         embedding_model_path: Optional[str] = None,
@@ -63,11 +57,8 @@ class MemOSAgent(BaseAgent):
 
         self.retrieve_num = retrieve_num
         self._provider = provider.lower()
-        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
         self.memos_backend = memos_backend
         self.memos_model = memos_model or model
-        self.memos_temperature = memos_temperature
-        self.memos_max_tokens = memos_max_tokens
         self.text_mem_type = text_mem_type
 
         # Token limits configuration
@@ -87,13 +78,7 @@ class MemOSAgent(BaseAgent):
         self.embedding_provider = embedding_provider
 
         # API configuration
-        self._memos_api_key = api_key
-        if not is_gemini_provider(provider):
-            self._memos_api_key = (
-                self._memos_api_key
-                or os.getenv("BIGMODEL_API_KEY")
-                or os.getenv("OPENAI_API_KEY", "")
-            )
+        self._memos_api_key = api_key or os.getenv("BIGMODEL_API_KEY") or os.getenv("OPENAI_API_KEY", "")
         self._memos_api_base = (
             base_url
             or os.getenv("BIGMODEL_BASE_URL")
@@ -109,7 +94,6 @@ class MemOSAgent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
-            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Memory system instances per context
@@ -164,34 +148,13 @@ class MemOSAgent(BaseAgent):
         Returns:
             MemoryConfigFactory instance with configured backend.
         """
-        use_vertex_gemini = is_vertex_gemini_provider(self._provider)
-        use_ai_studio = is_google_ai_studio_provider(self._provider)
-        use_hybrid_gemini = is_hybrid_gemini_provider(self._provider)
-        use_gemini = use_vertex_gemini or use_ai_studio or use_hybrid_gemini
+        use_vertex_gemini = self._provider in {"gemini", "vertex", "vertex_ai"}
         extractor_config: Dict[str, Any] = {
-            "model_name_or_path": self.model if use_gemini else self.memos_model,
-            "temperature": getattr(
-                self, "memos_temperature", self.DEFAULT_EXTRACTOR_TEMPERATURE
-            ),
-            "max_tokens": getattr(
-                self, "memos_max_tokens", self.DEFAULT_EXTRACTOR_MAX_TOKENS
-            ),
+            "model_name_or_path": self.model if use_vertex_gemini else self.memos_model,
+            "temperature": self.DEFAULT_EXTRACTOR_TEMPERATURE,
+            "max_tokens": self.DEFAULT_EXTRACTOR_MAX_TOKENS,
         }
-        if self._provider == "openrouter":
-            extractor_config["extra_body"] = {
-                key: value
-                for key, value in (
-                    ("provider", self._llm_client_kwargs.get("provider_routing")),
-                    ("service_tier", self._llm_client_kwargs.get("service_tier")),
-                )
-                if value is not None
-            } or None
-        if use_ai_studio or use_hybrid_gemini:
-            extractor_config.update({
-                "gemini_provider": self._provider,
-                "api_key": self._memos_api_key,
-            })
-        elif not use_vertex_gemini:
+        if not use_vertex_gemini:
             extractor_config.update({
                 "api_key": self._memos_api_key,
                 "api_base": self._memos_api_base,
@@ -199,11 +162,7 @@ class MemOSAgent(BaseAgent):
 
         base_config: Dict[str, Any] = {
             "extractor_llm": {
-                "backend": (
-                    self._provider
-                    if use_vertex_gemini
-                    else "gemini" if use_ai_studio or use_hybrid_gemini else self.memos_backend
-                ),
+                "backend": self._provider if use_vertex_gemini else self.memos_backend,
                 "config": extractor_config,
             }
         }

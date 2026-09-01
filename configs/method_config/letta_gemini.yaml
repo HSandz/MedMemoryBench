@@ -1,26 +1,29 @@
-method_name: letta
-method_type: agentic_memory
-description: Letta (MemGPT) with Gemini model configuration
+# Letta (MemGPT) Agent Configuration with Gemini selected as the model.
+
+method_name: "letta"
+method_type: "agentic_memory"
+description: "Letta (MemGPT) with Gemini model configuration"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
 embedding:
-  provider: local
-  model: bge-small-zh-v1.5
-  model_path: BAAI/bge-small-zh-v1.5
+  provider: "local"
+  model: "bge-small-zh-v1.5"
+  model_path: "BAAI/bge-small-zh-v1.5"
   dim: 512
-build_config:
+
+agent_params:
   retrieve_num: 5
   embedding_chunk_size: 300
   context_window: 120480
-  memory_persona: I am an assistant helping with medical QA while preserving long-term
-    memory.
-  memory_human: The user is a patient in a longitudinal medical dialogue setting.
+  memory_persona: "I am an assistant helping with medical QA while preserving long-term memory."
+  memory_human: "The user is a patient in a longitudinal medical dialogue setting."
   memorize_chunk_tokens: 6000
   memorize_chunk_overlap_tokens: 200
   max_input_tokens: 120480
   max_question_tokens: 120480
   max_context_tokens: 120480
-retrieval_config: {}

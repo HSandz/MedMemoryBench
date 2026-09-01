@@ -1,22 +1,27 @@
-method_name: embedding_rag
-method_type: rag
-description: Embedding RAG Agent using hybrid Gemini provider
+# Embedding RAG Agent Configuration using Gemini Enterprise Agent Platform.
+
+method_name: "embedding_rag"
+method_type: "rag"
+description: "Embedding RAG Agent using Gemini Enterprise Agent Platform"
+
 model:
-  provider: gemini
-  name: gemini-2.5-flash
-  temperature: 0.0
-  max_completion_tokens: 20000
-embedding:
-  provider: local
-  model: BAAI/bge-small-zh-v1.5
-  model_path: BAAI/bge-small-zh-v1.5
-build_config:
+  provider: "gemini"
+  name: "gemini-2.5-flash"
+  temperature: 0.3
+  max_completion_tokens: 10000
+
+agent_params:
   top_k: 5
   chunk_size: 4096
   chunk_overlap: 50
   max_context_tokens: 10000
-retrieval_config: {}
+
+embedding:
+  provider: "local"
+  model: "BAAI/bge-small-zh-v1.5"
+  model_path: "BAAI/bge-small-zh-v1.5"
+
+# Run this method against persona 1 only; all sessions remain available.
 dataset_overrides:
-  persona_ids:
-  - 1
+  persona_ids: [1]
   max_sessions_per_persona: null

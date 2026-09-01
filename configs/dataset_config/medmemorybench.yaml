@@ -21,8 +21,8 @@ evaluation:
 query_types:
   - name: "entity_exact_match"
     abbr: "EEM"
-    metric: "eem_judge"
-    description: "Entity exact match judged by an LLM"
+    metric: "string_contain"
+    description: "Entity exact match"
 
   - name: "temporal_localization"
     abbr: "TLA"
@@ -36,8 +36,8 @@ query_types:
 
   - name: "multiple_choice"
     abbr: "MQ"
-    metric: "mq_fix"
-    description: "Multiple choice with partial credit"
+    metric: "option_match"
+    description: "Multiple choice"
 
   - name: "inference_generation"
     abbr: "IG"

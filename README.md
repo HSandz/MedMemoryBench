@@ -264,9 +264,6 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 AZURE_OPENAI_API_KEY=your_azure_key
 AZURE_OPENAI_ENDPOINT=https://your-endpoint.openai.azure.com/
 
-# Google AI Studio (optional; one API key per line, path relative to this repository)
-GOOGLE_AI_STUDIO_API_KEYS_FILE=secrets/google_ai_studio_api_keys.txt
-
 # Zep Cloud (optional, only needed for the Zep agent)
 ZEP_API_KEY=your_zep_api_key
 
@@ -282,7 +279,6 @@ LETTA_DIR=.tmp/letta_runtime
 > **Tips:**
 > - For BigModel, set `BIGMODEL_API_KEY` / `BIGMODEL_BASE_URL` first; the framework maps them to OpenAI-compatible settings internally.
 > - `LETTA_DIR` is recommended to avoid stale SQLite metadata from previous Letta runs.
-> - Gemini has exactly three provider names: `vertex`, `ai_studio`, and `gemini`. Vertex can rotate through multiple service-account JSON files; hybrid `gemini` rotates through those Vertex accounts and then AI Studio keys when one failure type reaches five attempts on a transport. AI Studio ignores Vertex-only batch options; hybrid batch calls always use the rotating Vertex account pool.
 
 ### 4. Run Evaluation
 
@@ -303,28 +299,7 @@ python main.py -m embedding_rag_gpt-5.1 -d medmemorybench --dry-run
 
 # Resume from checkpoint
 python main.py -m embedding_rag_gpt-5.1 -d medmemorybench --resume
-
-# Re-run only the LLM judge from saved method answers
-JUDGE_MODEL=gpt-5.1 python main.py \
-  --rejudge outputs/METHOD_MODEL/RUN_query_answer.json
 ```
-
-`--rejudge` does not rebuild memory or call the evaluated method again. It
-reloads the MedMemoryBench ground-truth metadata, reuses every saved
-`model_output`, reruns only the LLM-judge query types, and preserves the
-existing local-metric results. Each pass is written beside the source file as
-`<source_stem>_rejudge_1.json`, then `_rejudge_2.json`, and so on. Configure the
-judge with `JUDGE_PROVIDER`, `JUDGE_MODEL`, `JUDGE_API_KEY` or
-`JUDGE_API_KEYS`, and `JUDGE_BASE_URL` as usual. Judge generation is also
-configurable with `JUDGE_TEMPERATURE`, `JUDGE_CLIENT_MAX_TOKENS`,
-`JUDGE_MAX_TOKENS`, and `JUDGE_MCD_MAX_TOKENS`; the same values are used by
-real-time evaluation, Vertex batch evaluation, and `--rejudge`.
-
-For a Vertex or hybrid Gemini judge, add `--batch-api`. `--batch-wait` polls
-until completion; without it, resume the submitted job with the same command
-plus `--resume --batch-api`. Batch rejudge uses the normal
-`GOOGLE_BATCH_GCS_URI`/`--batch-gcs-uri` configuration and always uses Vertex.
-An `ai_studio` or non-Gemini judge falls back to its real-time client.
 
 <!-- > 💡 **Extending with a new method?** See [`methods/README.md`](methods/README.md) for the step-by-step guide. -->
 
@@ -345,7 +320,7 @@ model:
   provider: "openai"
   name: "gpt-5.1"
   temperature: 0.3
-  max_completion_tokens: 200000
+  max_completion_tokens: 100000
 
 agent_params:
   top_k: 5                          # Number of documents to retrieve
@@ -356,75 +331,6 @@ embedding:
   provider: "local"                 # openai / local / huggingface
   model: "/path/to/local/model"
 ```
-
-Gemini providers are intentionally distinct:
-
-```yaml
-# Vertex AI / Google Agent Platform (rotating service accounts; batch eligible)
-model:
-  provider: "vertex"
-  name: "gemini-2.5-flash"
-
-# Google AI Studio / Gemini Developer API (API keys; real-time only)
-model:
-  provider: "ai_studio"
-  name: "gemini-2.5-flash"
-
-# Hybrid rotation: each Vertex account, then each AI Studio key, then Vertex again
-model:
-  provider: "gemini"
-  name: "gemini-2.5-flash"
-```
-
-For Vertex, set `GOOGLE_SERVICE_ACCOUNT_FILE` to an ordered comma-separated list such as `service-account.json,service-account-2.json,service-account-3.json`. Relative paths resolve from the repository root. Each file supplies its own authentication and project ID. `GOOGLE_VERTEX_SERVICE_ACCOUNT_RETRIES` controls the per-failure-type threshold before moving to the next account and defaults to `5`; Vertex batch upload, submission, polling, output collection, and direct fallback use the same pool.
-
-For AI Studio and hybrid Gemini, set `GOOGLE_AI_STUDIO_API_KEYS_FILE` to an ordered key file such as `secrets/google_ai_studio_api_keys.txt`; paths must be relative to the repository root. Put one key on each non-empty line; lines beginning with `#` are ignored. The key-file variable takes precedence over inline values and is ignored by Git when stored under `secrets/`. `GOOGLE_AI_STUDIO_API_KEYS` remains supported as an ordered comma-separated list, while `GOOGLE_AI_STUDIO_API_KEY`, `GOOGLE_API_KEY`, and `GEMINI_API_KEY` support single-key setups. Every recognized non-critical failure type has an independent retry count and exponential-delay sequence, including retryable HTTP statuses, provider rate-limit/timeout/connection/availability exceptions, empty responses, malformed structured responses, service-account authentication/permission failures, and AI Studio key/quota/restriction failures. A transport rotates when any one failure type reaches its configured threshold. For `provider: ai_studio`, `GOOGLE_AI_STUDIO_KEY_ROTATION_MODE` defaults to `sequential`, which only advances after a failure threshold; set it to `round_robin` to advance after `GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY` successful top-level calls per key (default: `1`). Failure-driven rotation and permanent-key retirement still apply in either mode. Hybrid `gemini` retains its failure-driven Vertex/AI Studio transport rotation. `GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS` controls full passes through the key pool for one failing `ai_studio` LLM call: it defaults to `1`, accepts positive integers, and accepts `-1` to retry indefinitely. A 429 whose provider message begins `You exceeded your current quota` rotates immediately; a generic `Resource has been exhausted` 429 retries the current key `GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES` times first (default: `3`). For the same provider, explicit 401, 403, or 404 messages that identify a deleted, disabled, suspended, or revoked API key, bound service account, or project retire that key immediately; when keys come from `GOOGLE_AI_STUDIO_API_KEYS_FILE`, the matching line is removed atomically so later runs cannot use it. AI Studio logs a single-line, truncated error summary before trying the next key. For example, three HTTP 429 failures and one empty response count as `3/5` and `1/5`, not `4/5`. The shared `GEMINI_MAX_RETRIES` limit uses the same per-failure-type accounting for non-rotating shared calls. Critical failures such as invalid requests remain non-retryable.
-
-All final-answer LLM settings belong in the method YAML's `model` block. Method
-adapters with extra internal LLM calls expose those settings under
-`agent_params`:
-
-```yaml
-model:
-  temperature: 0.3
-  max_completion_tokens: 20000
-
-agent_params:
-  # A-MEM metadata/evolution and typed-relation calls
-  amem_temperature: 0.7
-  amem_retry_temperature: 0.3
-  amem_connectivity_temperature: 0.0
-  amem_relation_temperature: 0.2
-  amem_max_tokens: 1000
-
-  # MemOS extraction
-  memos_temperature: 0.0
-  memos_max_tokens: 4096
-
-  # LightMem extraction and buffering
-  lightmem_temperature: 0.1
-  lightmem_max_tokens: 2000
-  lightmem_top_p: 0.1
-  lightmem_buffer_max_tokens: 4096
-
-  # MemRL keyword, script, reflection, and extractor calls
-  memrl_keyword_temperature: 0.0
-  memrl_keyword_max_tokens: 100
-  memrl_script_temperature: 0.7
-  memrl_script_max_tokens: 500
-  memrl_reflection_temperature: 0.3
-  memrl_reflection_max_tokens: null
-  memrl_extractor_temperature: 0.0
-  memrl_extractor_max_tokens: 4096
-```
-
-These are optional and preserve the previous defaults when omitted. Other
-adapter-specific model settings already flow from `model` or their documented
-`agent_params`. Shared retry timing can be changed through `LLM_MAX_RETRIES`,
-`LLM_RETRY_MIN_DELAY`, `LLM_RETRY_MAX_DELAY`, `GEMINI_MAX_RETRIES`,
-`GEMINI_RETRY_INITIAL_DELAY`, and `GEMINI_RETRY_MAX_DELAY`.
-
-Official references: [Gemini API keys](https://ai.google.dev/gemini-api/docs/api-key), [Google Gen AI Python SDK](https://googleapis.github.io/python-genai/), and [Vertex AI batch inference](https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-from-cloud-storage).
 
 ### Dataset Configuration
 
@@ -456,53 +362,15 @@ query_types:
 
 ## 📄 Output
 
-Full runs and memory-build runs are isolated by their start timestamp. Query
-reruns that explicitly select a memory run are nested under that source:
+Evaluation results are saved under `outputs/<method>_<model>/`:
 
 ```
 outputs/
-└── amem_gemini-2.5-flash/
-    └── 20260814_093138/
-        ├── run_config.json
-        ├── evaluation.log
-        ├── memory/
-        ├── batch/
-        ├── checkpoints/
-        ├── *_memory_build.json
-        └── query_runs/
-            └── 20260814_223919/
-                ├── run_config.json
-                ├── evaluation.log
-                ├── memory_source.json
-                ├── batch/
-                ├── checkpoints/
-                ├── *_result.json
-                └── *_query_answer.json
+└── bm25_rag_gpt-5.1/
+    ├── eval_medmemorybench_20260330_181703.json    # Detailed results (JSON)
+    ├── report_medmemorybench_20260330_181703.txt   # Human-readable report
+    └── memory_builds_20260330_181703.json          # Memory build logs
 ```
-
-`run_config.json` records the effective method, dataset, judge, stage, batch,
-and resume settings with secrets redacted. AMem on MedMemoryBench can run as
-separate build and query stages:
-
-```bash
-python main.py -m persona_1/amem_gemini -d medmemorybench --stage memory
-python main.py -m persona_1/amem_gemini -d medmemorybench --stage query
-python main.py --stage query --memory-run YYYYMMDD_HHMMSS
-```
-
-Query runs select the newest compatible completed memory run by default and
-pin it in `memory_source.json`. For an explicit unified-layout memory run,
-`-m` and `-d` are optional: the CLI reads the effective method and dataset
-configs from that run's `run_config.json`, verifies its completed memory
-manifest, and records the inference source in
-`query_runs/<query-start-timestamp>/`. Query stages do not reload the current
-YAML files, so later config edits do not invalidate an existing memory run.
-Repeating the query command creates another child, so logs, batch state, and
-reports never overwrite an earlier query. Use `--resume` to continue the same
-incomplete query child.
-Legacy artifacts cannot infer these values, so they still require `-m` and
-`-d`. Legacy artifacts can be audited or migrated with
-`scripts/migrate_run_artifacts.py --dry-run` and `--apply`.
 
 ## 📝 Citations
 

@@ -1,26 +1,18 @@
 """Evaluation metrics module."""
 
-import threading
 from typing import Dict, List, Any, Type, Optional
 
 from .base import BaseMetric, MetricResult
-from .string_match import StringContainMetric, ExactMatchMetric, OptionMatchMetric, MQFixMetric
-from .llm_judge import LLMJudgeMetric, EEMJudgeMetric, LLMJudgeMCDMetric
+from .string_match import StringContainMetric, ExactMatchMetric, OptionMatchMetric
+from .llm_judge import LLMJudgeMetric, LLMJudgeMCDMetric
 from .locomo_metrics import LoCoMoF1Metric, LoCoMoAdversarialMetric, LoCoMoTemporalMetric
-from .retrieval_quality import (
-    RETRIEVAL_QUALITY_GROUP,
-    aggregate_session_retrieval_quality,
-    compute_session_retrieval_quality,
-)
 
 
 METRIC_REGISTRY: Dict[str, Type[BaseMetric]] = {
     "string_contain": StringContainMetric,
     "exact_match": ExactMatchMetric,
     "option_match": OptionMatchMetric,
-    "mq_fix": MQFixMetric,
     "llm_judge": LLMJudgeMetric,
-    "eem_judge": EEMJudgeMetric,
     "llm_judge_mcd": LLMJudgeMCDMetric,
     "locomo_f1": LoCoMoF1Metric,
     "locomo_adversarial": LoCoMoAdversarialMetric,
@@ -33,7 +25,6 @@ class MetricsCalculator:
 
     DEFAULT_METRIC_MAPPING = {
         "entity_exact_match": "string_contain",
-        "entity_exact_match_judge": "eem_judge",
         "temporal_localization": "llm_judge",
         "state_update": "llm_judge",
         "multiple_choice": "option_match",
@@ -48,49 +39,33 @@ class MetricsCalculator:
 
     def __init__(self, custom_mapping: Optional[Dict[str, str]] = None, dataset: str = "medmemorybench",
                  judge_model: str = None, judge_api_key: str = None, judge_base_url: str = None,
-                 judge_temperature: float = None, judge_reasoning_effort=None,
-                 judge_client_max_tokens: int = None,
-                 judge_max_tokens: int = None, judge_mcd_max_tokens: int = None,
                  language: str = "zh"):
         self.metric_mapping = self.DEFAULT_METRIC_MAPPING.copy()
         if custom_mapping:
             self.metric_mapping.update(custom_mapping)
         self._metric_instances: Dict[str, BaseMetric] = {}
-        self._metric_lock = threading.RLock()
         self._dataset = dataset
         self._judge_model = judge_model
         self._judge_api_key = judge_api_key
         self._judge_base_url = judge_base_url
-        self._judge_temperature = judge_temperature
-        self._judge_reasoning_effort = judge_reasoning_effort
-        self._judge_client_max_tokens = judge_client_max_tokens
-        self._judge_max_tokens = judge_max_tokens
-        self._judge_mcd_max_tokens = judge_mcd_max_tokens
         self._language = language
 
     def _get_metric(self, metric_name: str) -> BaseMetric:
-        # Worker threads share this calculator; create each metric/client once.
-        with self._metric_lock:
-            if metric_name not in self._metric_instances:
-                metric_class = METRIC_REGISTRY.get(metric_name)
-                if metric_class is None:
-                    raise ValueError(f"Unknown metric: {metric_name}, available: {list(METRIC_REGISTRY.keys())}")
-                if metric_name in ("llm_judge", "eem_judge", "llm_judge_mcd"):
-                    self._metric_instances[metric_name] = metric_class(
-                        dataset=self._dataset,
-                        judge_model=self._judge_model,
-                        judge_api_key=self._judge_api_key,
-                        judge_base_url=self._judge_base_url,
-                        judge_temperature=self._judge_temperature,
-                        judge_reasoning_effort=self._judge_reasoning_effort,
-                        judge_client_max_tokens=self._judge_client_max_tokens,
-                        judge_max_tokens=self._judge_max_tokens,
-                        judge_mcd_max_tokens=self._judge_mcd_max_tokens,
-                        language=self._language,
-                    )
-                else:
-                    self._metric_instances[metric_name] = metric_class()
-            return self._metric_instances[metric_name]
+        if metric_name not in self._metric_instances:
+            metric_class = METRIC_REGISTRY.get(metric_name)
+            if metric_class is None:
+                raise ValueError(f"Unknown metric: {metric_name}, available: {list(METRIC_REGISTRY.keys())}")
+            if metric_name in ("llm_judge", "llm_judge_mcd"):
+                self._metric_instances[metric_name] = metric_class(
+                    dataset=self._dataset,
+                    judge_model=self._judge_model,
+                    judge_api_key=self._judge_api_key,
+                    judge_base_url=self._judge_base_url,
+                    language=self._language,
+                )
+            else:
+                self._metric_instances[metric_name] = metric_class()
+        return self._metric_instances[metric_name]
 
     def compute(
         self,
@@ -131,7 +106,7 @@ class MetricsCalculator:
     ) -> Optional[Dict[str, Any]]:
         """Prepare an LLM-judge request, returning ``None`` for local metrics."""
         resolved_name = self.get_metric_name(query_type, metric_name)
-        if resolved_name not in {"llm_judge", "eem_judge", "llm_judge_mcd"}:
+        if resolved_name not in {"llm_judge", "llm_judge_mcd"}:
             return None
         metric = self._get_metric(resolved_name)
         return {
@@ -151,15 +126,15 @@ class MetricsCalculator:
         query_type: str,
         metric_name: Optional[str] = None,
     ):
-        """Return the judge's batch-capable client, or ``None`` for fallback."""
+        """Return the judge's Gemini client, or ``None`` for real-time fallback."""
         resolved_name = self.get_metric_name(query_type, metric_name)
-        if resolved_name not in {"llm_judge", "eem_judge", "llm_judge_mcd"}:
+        if resolved_name not in {"llm_judge", "llm_judge_mcd"}:
             return None
         metric = self._get_metric(resolved_name)
         return metric.get_batch_client()
 
     def finalize_batch(self, batch_payload: Dict[str, Any], result_text: str) -> MetricResult:
-        """Turn a batch judge response back into the normal metric result."""
+        """Turn a Vertex judge response back into the normal metric result."""
         metric = self._get_metric(batch_payload["metric_name"])
         return metric.finalize_batch(batch_payload["prepared"], result_text)
 
@@ -232,36 +207,6 @@ class MetricsAggregator:
 
             type_stats[query_type] = stats
 
-        metric_stats: Dict[str, Dict[str, Any]] = {}
-        for result in self.results:
-            configured_metrics = result.details.get("metrics")
-            if not isinstance(configured_metrics, dict):
-                metric_name = result.details.get("metric", "unknown")
-                configured_metrics = {
-                    metric_name: {
-                        "score": result.score,
-                        "is_correct": result.is_correct,
-                    }
-                }
-            for metric_name, metric_result in configured_metrics.items():
-                stats = metric_stats.setdefault(
-                    metric_name,
-                    {"total": 0, "correct": 0, "score": 0.0},
-                )
-                stats["total"] += 1
-                stats["correct"] += 1 if metric_result.get("is_correct", False) else 0
-                stats["score"] += float(metric_result.get("score", 0.0))
-
-        for stats in metric_stats.values():
-            total_for_metric = stats["total"]
-            stats["accuracy"] = (
-                stats["correct"] / total_for_metric if total_for_metric else 0.0
-            )
-            stats["avg_score"] = (
-                stats["score"] / total_for_metric if total_for_metric else 0.0
-            )
-            del stats["score"]
-
         total_memory_time = sum(r.memory_construction_time for r in self.results)
         total_query_time = sum(r.query_time for r in self.results)
 
@@ -272,24 +217,14 @@ class MetricsAggregator:
             "avg_query_time": total_query_time / total if total > 0 else 0.0,
         }
 
-        retrieval_quality = aggregate_session_retrieval_quality(self.results)
-        metric_groups = (
-            {"retrieval_quality": retrieval_quality}
-            if retrieval_quality else {}
-        )
-
-        summary = {
+        return {
             "total": total,
             "correct": correct_count,
             "overall_accuracy": correct_count / total if total > 0 else 0.0,
             "overall_avg_score": total_score / total if total > 0 else 0.0,
             "by_type": type_stats,
-            "by_metric": metric_stats,
             "efficiency": efficiency_stats,
         }
-        if metric_groups:
-            summary["metric_groups"] = metric_groups
-        return summary
 
     def get_detailed_results(self) -> List[Dict[str, Any]]:
         return [r.to_dict() for r in self.results]
@@ -304,16 +239,11 @@ __all__ = [
     "StringContainMetric",
     "ExactMatchMetric",
     "OptionMatchMetric",
-    "MQFixMetric",
     "LLMJudgeMetric",
-    "EEMJudgeMetric",
     "LLMJudgeMCDMetric",
     "LoCoMoF1Metric",
     "LoCoMoAdversarialMetric",
     "LoCoMoTemporalMetric",
-    "RETRIEVAL_QUALITY_GROUP",
-    "compute_session_retrieval_quality",
-    "aggregate_session_retrieval_quality",
     "MetricsCalculator",
     "MetricsAggregator",
     "METRIC_REGISTRY",

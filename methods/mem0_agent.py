@@ -1,20 +1,15 @@
 """Mem0 Agent - automatic memory extraction and retrieval using Mem0 library."""
 
 import os
+import re
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any
 
 # Disable Mem0 telemetry (PostHog) to avoid SSL errors
 os.environ["MEM0_TELEMETRY"] = "false"
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
-from utils.llm_client import (
-    create_llm_client,
-    format_messages,
-    BaseLLMClient,
-    get_usage_tracker,
-    is_gemini_provider,
-)
+from utils.llm_client import create_llm_client, format_messages, BaseLLMClient, get_usage_tracker
 
 
 class Mem0Agent(BaseAgent):
@@ -51,11 +46,16 @@ class Mem0Agent(BaseAgent):
         )
         self.max_context_tokens = int(kwargs.get("max_context_tokens", 120000))
         self.max_question_tokens = int(kwargs.get("max_question_tokens", 4096))
+        # Turn-by-turn processing (matches original Mem0 paper design)
+        self.turn_by_turn: bool = bool(kwargs.get("turn_by_turn", False))
+        self.max_recent_turns: int = int(kwargs.get("max_recent_turns", 10))
 
         # API config
-        self._api_key = api_key
-        if not is_gemini_provider(provider):
-            self._api_key = self._api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        api_key_str = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+        # If multiple keys are provided via comma-separated string, use the first one for Mem0's internal client initially
+        self._all_api_keys = [k.strip() for k in api_key_str.split(",") if k.strip()] if api_key_str else []
+        self._api_key = self._all_api_keys[0] if self._all_api_keys else ""
+        
         self._base_url = (
             base_url
             or os.environ.get("BIGMODEL_BASE_URL")
@@ -63,7 +63,6 @@ class Mem0Agent(BaseAgent):
             or self.BIGMODEL_BASE_URL
         )
         self._provider = provider
-        self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
 
         # LLM client for Q&A
         self._llm_client: BaseLLMClient = create_llm_client(
@@ -73,7 +72,6 @@ class Mem0Agent(BaseAgent):
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=base_url,
-            **kwargs.get("llm_client_kwargs", {}),
         )
 
         # Mem0 Memory instance
@@ -85,7 +83,14 @@ class Mem0Agent(BaseAgent):
         # Cache for embedding dimensions
         self._embedding_dims_cache: Dict[str, int] = {}
 
-        # Initialize Mem0
+        # Note: _init_mem0 is also called in _init_memory() after context_id is set
+        # so that the Qdrant path uses the correct persona ID.
+        # The function is idempotent - it will reinitialize when context_id changes.
+        self._init_mem0()
+
+    def _init_memory(self) -> None:
+        super()._init_memory()
+        # Re-initialize Mem0 now that self._context_id has been set
         self._init_mem0()
 
     def _get_embedding_dims(self, model_name_or_path: str) -> int:
@@ -158,53 +163,118 @@ class Mem0Agent(BaseAgent):
         return chunks
 
     def _init_mem0(self) -> None:
-        """Initialize Mem0 Memory instance."""
-        print(f"[Mem0Agent DEBUG] _init_mem0 starting...")
+        """Initialize Mem0 Memory instance. Idempotent: reinitializes if context_id changed."""
+        # Skip if already initialized with the same context_id
+        if self._memory is not None and getattr(self, '_mem0_context_id', None) == self._context_id:
+            return
+        self._mem0_context_id = self._context_id
+        print(f"[Mem0Agent DEBUG] _init_mem0 starting... (context_id={self._context_id})")
         from methods.mem0.memory.main import Memory
         import tempfile
         import os
 
+        # --- MONKEY PATCH FOR API KEY ROTATION ---
+        try:
+            from mem0.embeddings.gemini import GoogleGenAIEmbedding
+            import google.genai.errors
+            from google.genai import Client
+
+            if not hasattr(GoogleGenAIEmbedding, "_original_embed_batch"):
+                GoogleGenAIEmbedding._original_embed_batch = GoogleGenAIEmbedding.embed_batch
+                GoogleGenAIEmbedding._all_api_keys_for_rotation = self._all_api_keys
+                GoogleGenAIEmbedding._current_key_idx = 0
+                
+                def patched_embed_batch(self_emb, texts, memory_action="add"):
+                    keys = getattr(GoogleGenAIEmbedding, "_all_api_keys_for_rotation", [])
+                    max_attempts = max(1, len(keys) * 10)
+                    
+                    for attempt in range(max_attempts):
+                        try:
+                            return self_emb._original_embed_batch(texts, memory_action=memory_action)
+                        except google.genai.errors.APIError as e:
+                            if "429" in str(e) or "quota" in str(e).lower() or getattr(e, "code", None) == 429:
+                                GoogleGenAIEmbedding._current_key_idx = (GoogleGenAIEmbedding._current_key_idx + 1) % len(keys)
+                                next_key = keys[GoogleGenAIEmbedding._current_key_idx]
+                                self_emb.client = Client(api_key=next_key)
+                                
+                                if (attempt + 1) % len(keys) == 0:
+                                    print(f"\n[Mem0Agent] ALL API Keys limit! Wait 60s...")
+                                    time.sleep(60.0)
+                                else:
+                                    print(f"\n[Mem0Agent] Embedding API limit! Rotating...")
+                                    time.sleep(1.0)
+                            else:
+                                raise
+                    raise RuntimeError("All keys exhausted.")
+                    
+                GoogleGenAIEmbedding.embed_batch = patched_embed_batch
+
+            # Patch OpenAILLM
+            from methods.mem0.llms.openai import OpenAILLM
+            if not hasattr(OpenAILLM, "_original_generate_response"):
+                OpenAILLM._original_generate_response = OpenAILLM.generate_response
+                OpenAILLM._all_api_keys_for_rotation = self._all_api_keys
+                OpenAILLM._current_key_idx = 0
+                
+                def patched_generate_response(self_llm, messages, response_format=None, tools=None, tool_choice="auto"):
+                    keys = getattr(OpenAILLM, "_all_api_keys_for_rotation", [])
+                    max_attempts = max(1, len(keys) * 10)
+                    
+                    for attempt in range(max_attempts):
+                        try:
+                            return self_llm._original_generate_response(
+                                messages, response_format=response_format, tools=tools, tool_choice=tool_choice
+                            )
+                        except Exception as e:
+                            error_msg = str(e).lower()
+                            is_rate_limit = "rate limit" in error_msg or "429" in error_msg
+                            is_connection_error = any(keyword in error_msg for keyword in [
+                                "connection", "ssl", "eof", "timeout", "reset",
+                                "connect", "network", "socket", "refused", "closed"
+                            ])
+                            if is_rate_limit or is_connection_error:
+                                OpenAILLM._current_key_idx = (OpenAILLM._current_key_idx + 1) % len(keys)
+                                next_key = keys[OpenAILLM._current_key_idx]
+                                self_llm.client.api_key = next_key
+                                
+                                if (attempt + 1) % len(keys) == 0:
+                                    print(f"\n[Mem0Agent] LLM API Keys exhausted! Wait 60s...")
+                                    time.sleep(60.0)
+                                else:
+                                    print(f"\n[Mem0Agent] LLM API Error ({e})! Rotating key...")
+                                    time.sleep(1.0)
+                            else:
+                                raise
+                    raise RuntimeError("All keys exhausted.")
+                
+                OpenAILLM.generate_response = patched_generate_response
+
+        except Exception as e:
+            print(f"[Mem0Agent] Failed to patch rotation: {e}")
+        # -----------------------------------------
+
         # Create unique Qdrant path for this agent instance to avoid lock conflicts
         # Use context_id if available, otherwise use a unique timestamp
         if self._context_id is not None:
-            qdrant_path = f"/tmp/qdrant_mem0_persona_{self._context_id}"
+            qdrant_path = f"./.tmp/qdrant_{self.__class__.__name__}_persona_{self._context_id}"
         else:
             import uuid
-            qdrant_path = f"/tmp/qdrant_mem0_{uuid.uuid4().hex[:8]}"
+            qdrant_path = f"./.tmp/qdrant_{self.__class__.__name__}_pid{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
         print(f"[Mem0Agent DEBUG] Qdrant path: {qdrant_path}")
 
         # Build Mem0 config
-        use_gemini = is_gemini_provider(self._provider)
+        use_vertex_gemini = self._provider.lower() in {"gemini", "vertex", "vertex_ai"}
         mem0_config = {
+            "history_db_path": f"{qdrant_path}_history.db",
             "llm": {
-                "provider": "gemini" if use_gemini else "openai",
+                "provider": "gemini" if use_vertex_gemini else "openai",
                 "config": {
                     "model": self.model,
                     "temperature": self.temperature,
                     "max_tokens": self.max_tokens,
-                    "reasoning_effort": self._llm_client_kwargs.get("reasoning_effort"),
                     "api_key": self._api_key,
                     "openai_base_url": self._base_url,
-                    "gemini_provider": self._provider,
-                    "extra_body": (
-                        {
-                            key: value
-                            for key, value in (
-                                (
-                                    "provider",
-                                    self._llm_client_kwargs.get("provider_routing"),
-                                ),
-                                (
-                                    "service_tier",
-                                    self._llm_client_kwargs.get("service_tier"),
-                                ),
-                            )
-                            if value is not None
-                        }
-                        if self._provider == "openrouter"
-                        else None
-                    ),
                 }
             }
         }
@@ -233,14 +303,19 @@ class Mem0Agent(BaseAgent):
                 }
             }
         else:
-            embedding_dims = 2048 if "embedding-3" in self.embedding_model else 1536
+            embedding_dims = 768 if ("embedding-004" in self.embedding_model or "embedding-001" in self.embedding_model) else (2048 if "embedding-3" in self.embedding_model else 1536)
+            
+            embedder_config = {
+                "model": self.embedding_model,
+                "api_key": self._api_key,
+                "embedding_dims": embedding_dims,
+            }
+            if self.embedding_provider == "openai":
+                embedder_config["openai_base_url"] = self._base_url
+                
             mem0_config["embedder"] = {
-                "provider": "openai",
-                "config": {
-                    "model": self.embedding_model,
-                    "api_key": self._api_key,
-                    "openai_base_url": self._base_url,
-                }
+                "provider": self.embedding_provider if self.embedding_provider else "openai",
+                "config": embedder_config
             }
             # Configure vector_store with unique path
             collection_name = f"mem0_{self.embedding_model.replace('-', '_')}_{self._context_id}" if self._context_id is not None else f"mem0_{self.embedding_model.replace('-', '_')}"
@@ -319,17 +394,120 @@ class Mem0Agent(BaseAgent):
             return self._user_id
         return f"context_{self._context_id}" if self._context_id else "default_user"
 
-    def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
-        """Add text to Mem0 memory."""
-        user_id = self._get_user_id()
+    def _parse_turns_from_text(self, text: str) -> Tuple[List[Tuple[str, str]], str]:
+        """Parse Patient/Doctor conversation turns from formatted memory text.
 
+        The MedMemoryBench session text has format:
+            [YYYY-MM-DD]
+
+            Patient: <user turn content>
+
+            Doctor: <assistant turn content>
+
+            Patient: ...
+            ...
+
+        Returns:
+            - List of (patient_content, doctor_content) pairs (complete turn pairs only)
+            - Date string extracted from the header (empty string if not found)
+        """
+        # Extract date/header from text, e.g. "[2026-01-15]" or "[Health consultation record]"
+        date_str = ""
+        date_match = re.search(r'^\[([^\]]+)\]', text.strip())
+        if date_match:
+            date_str = date_match.group(1)
+
+        # Split text into segments by role markers
+        # Split at newlines followed immediately by "Patient:" or "Doctor:"
+        segments = re.split(r'\n(?=Patient:|Doctor:)', text)
+
+        turns: List[Tuple[str, str]] = []
+        pending_user: Optional[str] = None
+
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
+                continue
+            if seg.startswith("Patient:"):
+                # New user turn — flush any orphan (shouldn't happen in well-formed data)
+                pending_user = seg[len("Patient:"):].strip()
+            elif seg.startswith("Doctor:"):
+                asst_content = seg[len("Doctor:"):].strip()
+                if pending_user is not None:
+                    turns.append((pending_user, asst_content))
+                    pending_user = None
+                # else: doctor turn without preceding patient turn — skip
+
+        return turns, date_str
+
+    def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
+        """Add text to Mem0 memory.
+
+        When ``turn_by_turn=True`` (set in YAML config), each Patient/Doctor
+        exchange is fed individually to Mem0 — matching the original Mem0 paper
+        design where memory is built incrementally per conversational turn.
+
+        Falls back to the original chunked approach when turn_by_turn is False
+        or when the text cannot be parsed into turn pairs.
+        """
+        user_id = self._get_user_id()
+        memory_entries: List[Dict] = []
+
+        if self.turn_by_turn:
+            turns, date_str = self._parse_turns_from_text(text)
+
+            if turns:
+                for patient_content, doctor_content in turns:
+                    messages = []
+
+                    # Provide date as system context so the LLM knows when this
+                    # exchange happened — mirrors the "recent context" Mem0 paper uses.
+                    if date_str:
+                        messages.append({
+                            "role": "system",
+                            "content": f"Date of medical consultation: {date_str}"
+                        })
+
+                    messages.append({"role": "user",      "content": patient_content})
+                    messages.append({"role": "assistant", "content": doctor_content})
+
+                    result = self._memory.add(messages, user_id=user_id)
+                    if result and "results" in result:
+                        for entry in result.get("results", []):
+                            memory_entries.append({
+                                "event": entry.get("event", "ADD"),
+                                "memory": entry.get("memory", ""),
+                                "id": entry.get("id", ""),
+                            })
+
+                self._memory_chunks.append(text)
+                self._is_initialized = True
+
+                return MemoryBuildResult(
+                    success=True,
+                    method="mem0",
+                    action="add_to_memory",
+                    input_content=text,
+                    stored_content=text,
+                    memory_entries=memory_entries,
+                    chunk_count=len(self._memory_chunks),
+                    extra={"input_chunks": len(turns), "mode": "turn_by_turn"},
+                )
+
+            # Could not parse turns — warn and fall through to chunked mode
+            import logging
+            logging.warning(
+                "[Mem0Agent] turn_by_turn=True but no Patient/Doctor turns found. "
+                "Falling back to chunked mode."
+            )
+
+        # ── Chunked (original) mode ────────────────────────────────────────────
         chunks = self._split_text_into_chunks(text, self.max_input_tokens)
-        memory_entries = []
 
         for chunk in chunks:
             memory_messages = [
-                {"role": "user", "content": chunk},
-                {"role": "assistant", "content": "I'll make sure to remember this information."}
+                {"role": "user",      "content": chunk},
+                {"role": "assistant", "content": "I'll make sure to remember this information."},
             ]
             result = self._memory.add(memory_messages, user_id=user_id)
             if result and "results" in result:
@@ -351,11 +529,14 @@ class Mem0Agent(BaseAgent):
             stored_content=text,
             memory_entries=memory_entries,
             chunk_count=len(self._memory_chunks),
-            extra={"input_chunks": len(chunks)},
+            extra={"input_chunks": len(chunks), "mode": "chunked"},
         )
 
     def _retrieve(self, query: str) -> List[Dict[str, Any]]:
         """Retrieve relevant memories from Mem0."""
+        if self._memory is None:
+            print("[Mem0Agent] WARNING: _memory is None in _retrieve, returning empty list")
+            return []
         user_id = self._get_user_id()
         results = self._memory.search(query=query, user_id=user_id, limit=self.retrieve_num)
 

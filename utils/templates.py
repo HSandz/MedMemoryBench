@@ -9,8 +9,20 @@ from .prompts_judge import JUDGE_TEMPLATES
 
 
 SYSTEM_MESSAGES: Dict[str, str] = {
-    "medmemorybench": "You are your patient's personalized medical assistant, able to accurately memorize their complete medical history. Please make an inference reply based on the patient information in your memory, use a friendly and professional tone, answer directly, and avoid lengthy explanations and clichés.",
-    "medmemorybench_en": "You are the patient's personalized medical assistant, capable of accurately memorizing the patient's complete medical history. Please reason and respond based on patient information in memory, maintaining a warm yet professional tone, answering directly, and avoiding lengthy explanations and boilerplate.",
+    "medmemorybench": "You are the patient's personalized medical assistant, capable of accurately memorizing their complete medical history.\n\n"
+                      "GLOBAL OUTPUT RULES:\n"
+                      "1. Exact Formatting: Preserve original punctuation precisely as found in the text (e.g., do NOT convert en-dashes '–' to hyphens '-').\n"
+                      "2. Multiple Choice Questions: If options (A, B, C...) are provided, output ONLY the correct option letter(s) (e.g., 'A' or 'B, C'). Do NOT provide any explanation.\n"
+                      "3. Fact/Entity Extraction: If asked for a specific value, date, or name, output ONLY that exact value. Do NOT write full sentences.\n"
+                      "4. Reasoning: Reason based on patient information in memory, maintaining a warm tone. Answer directly and avoid boilerplate.",
+                      
+    "medmemorybench_en": "You are the patient's personalized medical assistant, capable of accurately memorizing their complete medical history.\n\n"
+                         "GLOBAL OUTPUT RULES:\n"
+                         "1. Exact Formatting: Preserve original punctuation precisely as found in the text (e.g., do NOT convert en-dashes '–' to hyphens '-').\n"
+                         "2. Multiple Choice Questions: If options (A, B, C...) are provided, output ONLY the correct option letter(s) (e.g., 'A' or 'B, C'). Do NOT provide any explanation.\n"
+                         "3. Fact/Entity Extraction: If asked for a specific value, date, or name, output ONLY that exact value. Do NOT write full sentences.\n"
+                         "4. Reasoning: Reason based on patient information in memory, maintaining a warm tone. Answer directly and avoid boilerplate.",
+                         
     "locomo": "You are a helpful assistant that can read the context and memorize it for future retrieval.",
 }
 
@@ -23,12 +35,12 @@ METHOD_TYPE_MAPPING: Dict[str, str] = {
     "self_rag": "rag",
     "memo_rag": "rag",
     "mem0": "agentic",
+    "smart_mem0": "agentic",
     "mirix": "agentic",
     "zep": "agentic",
     "letta": "agentic",
     "cognee": "agentic",
     "q2q": "agentic",
-    "amem_fix": "agentic",
 }
 
 MEMORY_SOURCE_DESCRIPTIONS: Dict[str, Dict[str, str]] = {

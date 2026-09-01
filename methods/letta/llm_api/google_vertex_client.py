@@ -1,6 +1,8 @@
 import uuid
+import os
 from typing import List, Optional
 
+from google import genai
 from google.genai.types import FunctionCallingConfig, FunctionCallingConfigMode, GenerateContentResponse, ToolConfig
 
 from letta.helpers.datetime_helpers import get_utc_time
@@ -13,7 +15,7 @@ from letta.schemas.message import Message as PydanticMessage
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse, Choice, FunctionCall, Message, ToolCall, UsageStatistics
 from letta.settings import model_settings
 from letta.utils import get_tool_call_id
-from utils.llm_client import create_llm_client
+from utils.llm_client import run_with_gemini_retry
 
 
 class GoogleVertexClient(GoogleAIClient):
@@ -22,13 +24,24 @@ class GoogleVertexClient(GoogleAIClient):
         """
         Performs underlying request to llm and returns raw response.
         """
-        if not hasattr(self, "_managed_vertex_client"):
-            self._managed_vertex_client = create_llm_client(
-                provider="vertex",
-                model=self.llm_config.model,
-                location=model_settings.google_cloud_location,
+        credential_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        credentials = None
+        if credential_file:
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_file(
+                credential_file,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
             )
-        response = self._managed_vertex_client.generate_content(
+        client = genai.Client(
+            vertexai=True,
+            credentials=credentials,
+            project=model_settings.google_cloud_project,
+            location=model_settings.google_cloud_location,
+            http_options={"api_version": "v1"},
+        )
+        response = run_with_gemini_retry(
+            client.models.generate_content,
             model=self.llm_config.model,
             contents=request_data["contents"],
             config=request_data["config"],
