@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import contextvars
@@ -21,7 +22,7 @@ from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
 from .event_state.subjects import display_subject, is_canonical_subject_id, is_valid_canonical_subject_proposal, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
-from .event_state.validation import canonical_turn_id, is_meta_claim, is_no_information_value, normalize_state_slot, validated_claim
+from .event_state.validation import canonical_turn_id, is_meta_claim, is_no_information_value, normalize_state_slot, resolve_model_turn_reference_with_form, validated_claim
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,8 @@ class EventStateAgent(BaseAgent):
         allowed_subjects = ["primary_user", "general_non_personal"] + ["speaker:" + normalize_name(name) for name in participants]
         if session.get("conversation_scope", "").startswith("third_party:"):
             allowed_subjects.append(session["conversation_scope"])
-        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\nExtract at most {self.max_claims_per_episode} claims. Prioritize distinct high-value long-term propositions; do not create low-value claims to fill the limit.\n{turn_text}"
+        allowed_ids = {turn.source_turn_id for turn in normalized}
+        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\nAllowed source_turn_ids: {sorted(allowed_ids)}\nIn JSON source_turn_ids, copy only these bare values exactly; do not include display wrappers such as [turn_id=0], turn_id=0, or turn_0.\nExtract at most {self.max_claims_per_episode} claims. Prioritize distinct high-value long-term propositions; do not create low-value claims to fill the limit.\n{turn_text}"
         repaired = False
         parse_failure = False
         structure_failure = False
@@ -235,16 +237,22 @@ class EventStateAgent(BaseAgent):
         rejected_ungrounded_claim_count = 0
         meta_claim_rejected_count = 0
         no_information_claim_rejected_count = 0
+        normalized_source_turn_reference_count = 0
+        normalized_source_turn_reference_form_counts: Dict[str, int] = {}
+        claim_level_grounding_failure_count = 0
+        valid_claims_preserved_despite_other_claim_errors = 0
+        invalid_claim_subset_repair_calls = 0
+        invalid_claim_subset_repair_successes = 0
+        invalid_claim_subset_repair_failures = 0
         grounding_invalid_keys = set()
         invalid_source_turn_id_samples: List[Dict[str, Any]] = []
         invalid_source_turn_id_sample_types: List[str] = []
         excess_claim_count = 0
-        allowed_ids = {turn.source_turn_id for turn in normalized}
         raw_turn_ids = [canonical_turn_id(item.get("source_turn_id", item.get("turn_id", item.get("dia_id"))), index) for index, item in enumerate(session["turns"])]
         turn_id_collision_count = len(raw_turn_ids) - len(set(raw_turn_ids))
 
         def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
-            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, no_information_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count
+            nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, no_information_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count, normalized_source_turn_reference_count, claim_level_grounding_failure_count, valid_claims_preserved_despite_other_claim_errors
             value = parse_json(content)
             raw_claims = value.get("claims")
             if not isinstance(raw_claims, list):
@@ -258,64 +266,79 @@ class EventStateAgent(BaseAgent):
                 excess_claim_count += max(0, len(raw_claims) - self.max_claims_per_episode)
             claims_to_validate = raw_claims[:self.max_claims_per_episode]
             claims = []
-            invalid_grounding = False
+            invalid_claims = []
+            invalid_grounding = 0
             valid_grounding_keys = set()
             for raw in claims_to_validate:
-                if isinstance(raw, dict):
-                    claim_key = tuple(str(raw.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value"))
-                    supplied = raw.get("source_turn_ids")
-                    if not isinstance(supplied, list) or not supplied:
+                claim_key = tuple(str(raw.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value")) if isinstance(raw, dict) else ()
+                normalized_raw = raw
+                grounding_bad = False
+                if not isinstance(raw, dict):
+                    invalid_claims.append(raw)
+                    validation_failures += 1
+                    continue
+                supplied = raw.get("source_turn_ids")
+                if not isinstance(supplied, list) or not supplied:
+                    if record_telemetry:
+                        missing_source_turn_id_claim_count += 1
+                    if len(allowed_ids) == 1:
+                        normalized_raw = {**raw, "source_turn_ids": [next(iter(allowed_ids))]}
                         if record_telemetry:
-                            missing_source_turn_id_claim_count += 1
-                        # With exactly one visible turn, the evidence target is
-                        # deterministic and can be repaired without guessing.
-                        if len(allowed_ids) == 1:
-                            raw = {**raw, "source_turn_ids": [next(iter(allowed_ids))]}
-                            if record_telemetry:
-                                repaired_source_turn_id_claim_count += 1
-                        else:
-                            invalid_grounding = True
-                            if record_telemetry:
-                                grounding_invalid_keys.add(claim_key)
-                                rejected_ungrounded_claim_count += 1
+                            repaired_source_turn_id_claim_count += 1
                     else:
-                        original_supplied = supplied
-                        supplied = [canonical_turn_id(item, "") for item in supplied]
-                        raw = {**raw, "source_turn_ids": supplied}
-                        unknown = [item for item in supplied if item not in allowed_ids]
-                        if unknown:
-                            if record_telemetry:
+                        grounding_bad = True
+                else:
+                    resolved_ids = []
+                    unknown_reference_seen = False
+                    for reference in supplied:
+                        resolved, form = resolve_model_turn_reference_with_form(reference, allowed_ids)
+                        if resolved is None:
+                            grounding_bad = True
+                            if record_telemetry and not unknown_reference_seen:
                                 unknown_source_turn_id_claim_count += 1
-                            invalid_grounding = True
-                            for item, normalized_id in zip(original_supplied, supplied):
-                                if normalized_id not in allowed_ids and len(invalid_source_turn_id_samples) < 5:
-                                    invalid_source_turn_id_samples.append({"value": item, "type": type(item).__name__})
-                                    invalid_source_turn_id_sample_types.append(type(item).__name__)
+                                unknown_reference_seen = True
                             if record_telemetry:
-                                grounding_invalid_keys.add(claim_key)
-                                rejected_ungrounded_claim_count += 1
-                    if is_meta_claim(raw):
-                        if record_telemetry:
-                            meta_claim_rejected_count += 1
-                        continue
-                    if is_no_information_value(raw.get("value")):
-                        if record_telemetry:
-                            no_information_claim_rejected_count += 1
-                        continue
-                item = validated_claim(raw, allowed_ids, allowed_ids)
+                                if len(invalid_source_turn_id_samples) < 5:
+                                    invalid_source_turn_id_samples.append({"value": reference, "type": type(reference).__name__})
+                                    invalid_source_turn_id_sample_types.append(type(reference).__name__)
+                        else:
+                            resolved_ids.append(resolved)
+                            if record_telemetry and form:
+                                normalized_source_turn_reference_count += 1
+                                normalized_source_turn_reference_form_counts[form] = normalized_source_turn_reference_form_counts.get(form, 0) + 1
+                    if not grounding_bad:
+                        normalized_raw = {**raw, "source_turn_ids": resolved_ids}
+                if grounding_bad:
+                    invalid_claims.append(raw)
+                    invalid_grounding += 1
+                    if record_telemetry:
+                        grounding_invalid_keys.add(claim_key)
+                    continue
+                if is_meta_claim(normalized_raw):
+                    if record_telemetry:
+                        meta_claim_rejected_count += 1
+                    continue
+                if is_no_information_value(normalized_raw.get("value")):
+                    if record_telemetry:
+                        no_information_claim_rejected_count += 1
+                    continue
+                item = validated_claim(normalized_raw, allowed_ids, allowed_ids)
+                if item is None:
+                    invalid_claims.append(raw)
+                    validation_failures += 1
+                    continue
                 claims.append(item)
-                if item is not None:
-                    valid_grounding_keys.add(tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value")))
-            validation_failures += sum(item is None for item in claims)
-            if invalid_grounding:
-                structure_failure = True
-                raise ValueError("claims must cite valid visible source_turn_ids")
-            if claims_to_validate and not any(item is not None for item in claims) and not no_information_claim_rejected_count:
-                structure_failure = True
-                raise ValueError("all claim objects failed schema validation")
+                valid_grounding_keys.add(tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value")))
+            if record_telemetry:
+                claim_level_grounding_failure_count += invalid_grounding
+                if invalid_claims and claims:
+                    valid_claims_preserved_despite_other_claim_errors += len(claims)
+                rejected_ungrounded_claim_count += invalid_grounding
             accepted = [item for item in claims if item is not None]
-            return {"episode_summary": summary, "claims": accepted, "valid_grounding_keys": valid_grounding_keys}
+            return {"episode_summary": summary, "claims": accepted, "invalid_claims": invalid_claims, "valid_grounding_keys": valid_grounding_keys, "invalid_grounding_count": invalid_grounding}
 
+        subset_repair_failure = False
+        repair_attempted = False
         try:
             with get_usage_tracker().scope("event_state.extract"):
                 messages = format_messages(prompt, EXTRACTION_SYSTEM_PROMPT)
@@ -329,8 +352,9 @@ class EventStateAgent(BaseAgent):
         except ValueError as exc:
             parse_failure = not structure_failure
             try:
+                repair_attempted = True
                 with get_usage_tracker().scope("event_state.extract_repair"):
-                    repair_prompt = f"Repair this extraction as valid JSON only. Preserve the original visible turn IDs and scope; every claim must cite valid source_turn_ids. Structural issue: {exc}\nOriginal extraction context:\n{prompt}\nPrevious output:\n{getattr(locals().get('response', None), 'content', '')}"
+                    repair_prompt = f"Repair this extraction as valid JSON only. Preserve the original visible turn IDs and scope; every claim must cite valid source_turn_ids. Do not create new claims or rewrite valid claims. Correct only the invalid claims supported by the visible turns, using only these bare allowed IDs: {sorted(allowed_ids)}. Structural issue: {exc}\nOriginal extraction context:\n{prompt}\nPrevious output:\n{getattr(locals().get('response', None), 'content', '')}"
                     messages = format_messages(repair_prompt, EXTRACTION_SYSTEM_PROMPT)
                     try:
                         response = self._memory_llm_client.chat(messages, temperature=self.extraction_temperature, max_tokens=self.extraction_max_tokens)
@@ -339,19 +363,60 @@ class EventStateAgent(BaseAgent):
                             raise
                         response = self._memory_llm_client.chat(messages)
                 repaired = True
-                parsed = parse_and_validate(response.content, record_telemetry=False)
-                repaired_count = len(grounding_invalid_keys.intersection(parsed.get("valid_grounding_keys", set())))
-                repaired_source_turn_id_claim_count += repaired_count
-                rejected_ungrounded_claim_count = max(0, rejected_ungrounded_claim_count - repaired_count)
+                parsed = parse_and_validate(response.content)
             except Exception as repair_exc:
                 if self._is_provider_error(repair_exc):
                     raise
-                return {"episode_summary": self.fallback_episode_summary(normalized), "claims": [], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": True, "repair_calls": 1, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
-        except Exception as exc:
-            if self._is_provider_error(exc):
-                raise
-            raise
-        return {"episode_summary": parsed.get("episode_summary") or self.fallback_episode_summary(normalized), "claims": parsed["claims"][:self.max_claims_per_episode], "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": False, "repair_calls": int(repaired), "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
+                parsed = {"episode_summary": None, "claims": [], "invalid_claims": []}
+                subset_repair_failure = True
+        if parsed.get("invalid_claims") and not repaired:
+            invalid_claim_subset_repair_calls = 1
+            try:
+                subset_json = json.dumps(parsed["invalid_claims"], ensure_ascii=True, default=str)
+                repair_prompt = f"Repair this extraction claim subset as valid JSON only. Return an object with a claims array containing only these claims, preserving their semantic propositions. Do not create new claims, echo valid claims, or guess provenance. Correct source_turn_ids only when supported by visible turns and use only these bare allowed IDs: {sorted(allowed_ids)}. Invalid claims:\n{subset_json}\nVisible turns:\n{turn_text}"
+                with get_usage_tracker().scope("event_state.extract_repair"):
+                    messages = format_messages(repair_prompt, EXTRACTION_SYSTEM_PROMPT)
+                    try:
+                        response = self._memory_llm_client.chat(messages, temperature=self.extraction_temperature, max_tokens=self.extraction_max_tokens)
+                    except TypeError as exc:
+                        if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
+                            raise
+                        response = self._memory_llm_client.chat(messages)
+                subset = parse_and_validate(response.content, record_telemetry=False)
+                existing = {json.dumps(item, sort_keys=True, default=str) for item in parsed["claims"]}
+                repairable_keys = {
+                    tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value"))
+                    for item in parsed["invalid_claims"]
+                    if isinstance(item, dict)
+                }
+                repaired_items = []
+                for item in subset["claims"]:
+                    item_key = tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value"))
+                    if item_key not in repairable_keys:
+                        continue
+                    identity = json.dumps(item, sort_keys=True, default=str)
+                    if identity not in existing:
+                        existing.add(identity)
+                        repaired_items.append(item)
+                repaired_count = sum(tuple(str(item.get(key) or "").strip().casefold() for key in ("subject", "predicate", "value")) in grounding_invalid_keys for item in repaired_items)
+                parsed["claims"].extend(repaired_items)
+                repaired_source_turn_id_claim_count += repaired_count
+                rejected_ungrounded_claim_count = max(0, rejected_ungrounded_claim_count - repaired_count)
+                if repaired_items:
+                    invalid_claim_subset_repair_successes = 1
+                else:
+                    invalid_claim_subset_repair_failures = 1
+                    subset_repair_failure = True
+                if subset.get("invalid_claims"):
+                    subset_repair_failure = True
+            except Exception as repair_exc:
+                if self._is_provider_error(repair_exc):
+                    raise
+                invalid_claim_subset_repair_failures = 1
+                subset_repair_failure = True
+        claims = parsed.get("claims", [])[:self.max_claims_per_episode]
+        repair_failed = subset_repair_failure or (bool(parsed.get("invalid_claims")) and repaired)
+        return {"episode_summary": parsed.get("episode_summary") or (self.fallback_episode_summary(normalized) if not claims else ""), "claims": claims, "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": repair_failed, "repair_calls": int(repair_attempted) + invalid_claim_subset_repair_calls, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "normalized_source_turn_reference_count": normalized_source_turn_reference_count, "normalized_source_turn_reference_form_counts": normalized_source_turn_reference_form_counts, "claim_level_grounding_failure_count": claim_level_grounding_failure_count, "valid_claims_preserved_despite_other_claim_errors": valid_claims_preserved_despite_other_claim_errors, "invalid_claim_subset_repair_calls": invalid_claim_subset_repair_calls, "invalid_claim_subset_repair_successes": invalid_claim_subset_repair_successes, "invalid_claim_subset_repair_failures": invalid_claim_subset_repair_failures, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
 
     @staticmethod
     def _is_provider_error(exc: Exception) -> bool:
@@ -453,8 +518,10 @@ class EventStateAgent(BaseAgent):
         counts["extracted_state_claim_count"] += sum(item.get("persistence") == "state" for item in extracted.get("claims", []))
         counts["extracted_history_claim_count"] += sum(item.get("persistence") == "history" for item in extracted.get("claims", []))
         counts["extracted_episode_claim_count"] += sum(item.get("persistence") == "episode" for item in extracted.get("claims", []))
-        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "no_information_claim_rejected_count", "state_claim_slot_fallback_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
+        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "no_information_claim_rejected_count", "normalized_source_turn_reference_count", "claim_level_grounding_failure_count", "valid_claims_preserved_despite_other_claim_errors", "invalid_claim_subset_repair_calls", "invalid_claim_subset_repair_successes", "invalid_claim_subset_repair_failures", "state_claim_slot_fallback_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
             counts[key] += int(extracted.get(key, 0))
+        for form, count in extracted.get("normalized_source_turn_reference_form_counts", {}).items():
+            counts["normalized_source_turn_reference_form_counts"][form] = counts["normalized_source_turn_reference_form_counts"].get(form, 0) + int(count)
         counts["invalid_source_turn_id_samples"].extend(extracted.get("invalid_source_turn_id_samples", []))
         counts["invalid_source_turn_id_sample_types"].extend(extracted.get("invalid_source_turn_id_sample_types", []))
         counts["allowed_source_turn_ids"].extend(extracted.get("allowed_source_turn_ids", []))
@@ -537,6 +604,7 @@ class EventStateAgent(BaseAgent):
         context_id = self._context_id if context_id is None else context_id
         store = self._store(context_id)
         counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extracted_state_claim_count": 0, "extracted_history_claim_count": 0, "extracted_episode_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "no_information_claim_rejected_count": 0, "state_claim_slot_fallback_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "excess_claim_count": 0, "turn_id_collision_count": 0, "invalid_source_turn_id_samples": [], "invalid_source_turn_id_sample_types": [], "allowed_source_turn_ids": [], "invalid_update_output_previews": [], "invalid_update_output_sha256": [], "same_session_transition_guard_count": 0, "same_session_supersede_guard_count": 0, "same_session_refine_guard_count": 0, "same_session_conflict_guard_count": 0, "same_session_corrob_downgraded_to_duplicate_count": 0, "same_session_duplicate_count": 0, "same_session_corroborate_count": 0, "same_session_corrob_count": 0, "same_session_refine_count": 0, "same_session_supersede_count": 0, "same_session_conflict_count": 0, "cross_session_duplicate_count": 0, "cross_session_corroborate_count": 0, "cross_session_corrob_count": 0, "cross_session_refine_count": 0, "cross_session_supersede_count": 0, "cross_session_conflict_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "update_repair_calls": 0, "update_repair_successes": 0, "update_repair_failures": 0, "state_candidate_queries": 0, "state_candidate_no_match_count": 0, "state_candidate_exact_slot_match_count": 0, "state_candidate_semantic_slot_match_count": 0, "state_candidates_rejected_below_threshold": 0, "different_state_dimension_guard_count": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
+        counts.update({"normalized_source_turn_reference_count": 0, "normalized_source_turn_reference_form_counts": {}, "claim_level_grounding_failure_count": 0, "valid_claims_preserved_despite_other_claim_errors": 0, "invalid_claim_subset_repair_calls": 0, "invalid_claim_subset_repair_successes": 0, "invalid_claim_subset_repair_failures": 0})
         added_records: List[Dict[str, Any]] = []
         for prepared in prepared_sessions:
             self._commit_prepared(prepared, store, counts, added_records)

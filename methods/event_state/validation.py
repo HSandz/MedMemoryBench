@@ -30,6 +30,38 @@ def canonical_turn_id(value: Any, fallback_index: Any) -> str:
     return text or str(fallback_index)
 
 
+_MODEL_TURN_REFERENCE_PATTERNS = (
+    ("bracket_turn_id", re.compile(r"^\[\s*turn_id\s*=\s*([^\[\]]+?)\s*\]$")),
+    ("assignment_turn_id", re.compile(r"^turn_id\s*=\s*(.+)$")),
+    ("turn_prefix", re.compile(r"^turn_(.+)$")),
+)
+
+
+def resolve_model_turn_reference_with_form(value: Any, allowed_turn_ids: Iterable[Any]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a model reference and report the deterministic wrapper form."""
+    allowed = {canonical_turn_id(item, "") for item in allowed_turn_ids}
+    text = canonical_turn_id(value, "")
+    if text in allowed:
+        return text, None
+    candidates = []
+    for form, pattern in _MODEL_TURN_REFERENCE_PATTERNS:
+        match = pattern.fullmatch(text)
+        if not match:
+            continue
+        candidate = canonical_turn_id(match.group(1), "")
+        if candidate in allowed:
+            candidates.append((candidate, form))
+    distinct_candidates = {candidate for candidate, _ in candidates}
+    if len(distinct_candidates) == 1:
+        return candidates[0]
+    return None, None
+
+
+def resolve_model_turn_reference(value: Any, allowed_turn_ids: Iterable[Any]) -> Optional[str]:
+    """Resolve an untrusted model reference to an existing visible turn ID."""
+    return resolve_model_turn_reference_with_form(value, allowed_turn_ids)[0]
+
+
 def enum(value: Any, field: str, default: str) -> str:
     normalized = str(value or default).strip().casefold()
     return normalized if normalized in ENUMS[field] else default

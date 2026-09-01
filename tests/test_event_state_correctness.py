@@ -9,6 +9,7 @@ from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidenc
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
 from methods.event_state_agent import EventStateAgent
+from methods.event_state.validation import resolve_model_turn_reference, resolve_model_turn_reference_with_form
 from benchmarks.medmemorybench.checkpoint import compute_build_config_hash
 
 
@@ -119,14 +120,39 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    snapshot["semantic_version"] = "2.4"
+    snapshot["semantic_version"] = "2.5"
     try:
         EventStateStore.from_export(snapshot)
     except ValueError as exc:
         assert "semantic version" in str(exc)
     else:
         raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.5"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.6"
+
+
+@pytest.mark.parametrize(
+    ("value", "allowed", "expected", "form"),
+    [
+        ("0", {"0", "1"}, "0", None),
+        (0, {"0", "1"}, "0", None),
+        ("[turn_id=0]", {"0"}, "0", "bracket_turn_id"),
+        ("turn_id=0", {"0"}, "0", "assignment_turn_id"),
+        ("turn_14", {"14"}, "14", "turn_prefix"),
+        ("[turn_id=abc-17]", {"abc-17"}, "abc-17", "bracket_turn_id"),
+        ("turn_14", {"turn_14"}, "turn_14", None),
+        ("turn_14", {"14", "turn_14"}, "turn_14", None),
+        ("[turn_id=turn_14]", {"turn_14"}, "turn_14", "bracket_turn_id"),
+    ],
+)
+def test_model_turn_reference_resolution_is_exact_then_narrow(value, allowed, expected, form):
+    assert resolve_model_turn_reference(value, allowed) == expected
+    assert resolve_model_turn_reference_with_form(value, allowed)[1] == form
+
+
+def test_model_turn_reference_resolution_rejects_unknown_and_off_by_one():
+    assert resolve_model_turn_reference("turn_99", {"0", "1"}) is None
+    assert resolve_model_turn_reference("2", {"0", "1"}) is None
+    assert resolve_model_turn_reference("turn_id=0", {"0", "id=0"}) is None
 
 
 def test_event_state_semantic_version_changes_build_hash_only():
@@ -143,7 +169,7 @@ def test_event_state_semantic_version_changes_build_hash_only():
             return self.build_config
 
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.4"), dataset) != compute_build_config_hash(Config("2.5"), dataset)
+    assert compute_build_config_hash(Config("2.5"), dataset) != compute_build_config_hash(Config("2.6"), dataset)
 
 
 def test_preparation_omits_slot_embeddings_for_non_state_claims():
@@ -249,6 +275,119 @@ def test_ungrounded_claim_is_dropped_but_episode_is_retained():
     assert len(agent._store().episodes) == 1
     assert not agent._store().claims
     assert result.extra["unknown_source_turn_id_claim_count"] == 1
+    assert result.extra["rejected_ungrounded_claim_count"] == 1
+
+
+def test_wrapper_references_preserve_mixed_multi_turn_claims_without_repair():
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(content=json.dumps({
+                "episode_summary": "preferences",
+                "claims": [
+                    {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["[turn_id=0]"]},
+                    {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["turn_2"]},
+                ],
+            }))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("wrapper", source_session_id=1, memory_items=[
+        {"role": "user", "content": "I use vim."},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "The deadline is Friday."},
+    ])
+    assert llm.calls == 1
+    assert {claim.evidence[0].source_turn_ids[0] for claim in agent._store().claims.values()} == {"0", "2"}
+    assert result.extra["normalized_source_turn_reference_count"] == 2
+    assert result.extra["unknown_source_turn_id_claim_count"] == 0
+
+
+def test_invalid_claim_subset_does_not_delete_valid_claims_when_repair_fails():
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content=json.dumps({"episode_summary": "facts", "claims": [
+                    {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"]},
+                    {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["turn_99"]},
+                    {"subject": "User", "predicate": "shell", "value": "zsh", "source_turn_ids": ["2"]},
+                ]}))
+            return SimpleNamespace(content="not json")
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("wrapper", source_session_id=1, memory_items=[
+        {"role": "user", "content": "I use vim."},
+        {"role": "assistant", "content": "Noted."},
+        {"role": "user", "content": "I use zsh."},
+    ])
+    assert len(agent._store().claims) == 2
+    assert result.extra["valid_claims_preserved_despite_other_claim_errors"] == 2
+    assert result.extra["invalid_claim_subset_repair_calls"] == 1
+    assert result.extra["invalid_claim_subset_repair_failures"] == 1
+
+
+def test_invalid_claim_subset_repair_merges_only_newly_valid_claims():
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content=json.dumps({"episode_summary": "facts", "claims": [
+                    {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"]},
+                    {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["turn_99"]},
+                ]}))
+            return SimpleNamespace(content=json.dumps({"claims": [
+                {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0"]},
+                {"subject": "User", "predicate": "deadline", "value": "Friday", "source_turn_ids": ["1"]},
+            ]}))
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("wrapper", source_session_id=1, memory_items=[
+        {"role": "user", "content": "I use vim."},
+        {"role": "user", "content": "The deadline is Friday."},
+    ])
+    assert len(agent._store().claims) == 2
+    assert result.extra["invalid_claim_subset_repair_successes"] == 1
+    assert result.extra["repaired_source_turn_id_claim_count"] == 1
+
+
+def test_literal_external_wrapper_like_source_id_is_preserved():
+    class LLM:
+        def chat(self, messages, **kwargs):
+            return SimpleNamespace(content=json.dumps({"episode_summary": "fact", "claims": [
+                {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["turn_2"]},
+            ]}))
+
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder(), enable_state_compilation=False)
+    result = agent.memorize("wrapper", source_session_id=1, memory_items=[{"role": "user", "content": "I use vim.", "source_turn_id": "turn_2"}])
+    claim = next(iter(agent._store().claims.values()))
+    assert claim.evidence[0].source_turn_ids == ["turn_2"]
+    assert result.extra["normalized_source_turn_reference_count"] == 0
+
+
+def test_multi_source_grounding_is_atomic():
+    class LLM:
+        def chat(self, messages, **kwargs):
+            if "claim subset" in messages[-1]["content"]:
+                return SimpleNamespace(content="not json")
+            return SimpleNamespace(content=json.dumps({"episode_summary": "fact", "claims": [
+                {"subject": "User", "predicate": "editor", "value": "vim", "source_turn_ids": ["0", "turn_99"]},
+            ]}))
+
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
+    result = agent.memorize("wrapper", source_session_id=1, memory_items=[{"role": "user", "content": "I use vim."}])
+    assert not agent._store().claims
     assert result.extra["rejected_ungrounded_claim_count"] == 1
 
 
