@@ -122,7 +122,7 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
     snapshot["schema_version"] = 4
-    for legacy_version in ("2.5", "2.6", "2.7"):
+    for legacy_version in ("2.5", "2.6", "2.7", "2.8"):
         snapshot["semantic_version"] = legacy_version
         try:
             EventStateStore.from_export(snapshot)
@@ -130,7 +130,7 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
             assert "semantic version" in str(exc)
         else:
             raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.8"
+    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.9"
 
 
 @pytest.mark.parametrize(
@@ -426,9 +426,9 @@ def test_event_state_semantic_version_and_query_evidence_budget_hash_ownership()
             return self.retrieval_config
 
     dataset = SimpleNamespace(dataset_name="synthetic")
-    assert compute_build_config_hash(Config("2.7"), dataset) != compute_build_config_hash(Config("2.8"), dataset)
-    assert compute_build_config_hash(Config("2.8", 2), dataset) == compute_build_config_hash(Config("2.8", 3), dataset)
-    assert compute_query_config_hash(Config("2.8", 2), dataset) != compute_query_config_hash(Config("2.8", 3), dataset)
+    assert compute_build_config_hash(Config("2.8"), dataset) != compute_build_config_hash(Config("2.9"), dataset)
+    assert compute_build_config_hash(Config("2.9", 2), dataset) == compute_build_config_hash(Config("2.9", 3), dataset)
+    assert compute_query_config_hash(Config("2.9", 2), dataset) != compute_query_config_hash(Config("2.9", 3), dataset)
 
 
 def test_preparation_omits_slot_embeddings_for_non_state_claims():

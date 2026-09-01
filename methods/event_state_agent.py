@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import contextvars
@@ -22,11 +23,105 @@ from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
 from .event_state.subjects import display_subject, is_canonical_subject_id, is_valid_canonical_subject_proposal, is_visible_subject_identity, normalize_name, normalize_scope, resolve_subject_id
-from .event_state.validation import canonical_turn_id, claim_repair_identity, claim_semantic_fingerprint, is_meta_claim, is_no_information_value, normalize_state_slot, resolve_model_turn_reference_with_form, validated_claim
+from .event_state.validation import canonical_turn_id, claim_repair_identity, claim_semantic_fingerprint, is_meta_claim, is_no_information_value, normalize_ingress_temporal_bounds, normalize_state_slot, resolve_model_turn_reference_with_form, validated_claim
 
 logger = logging.getLogger(__name__)
 
 SELF_REFERENCES = {"i", "me", "my", "myself", "self"}
+
+
+def _balanced_json_end(text: str, start: int) -> Optional[int]:
+    """Return the exclusive end of one complete JSON object or array."""
+    if start >= len(text) or text[start] not in "[{":
+        return None
+    stack = [text[start]]
+    in_string = False
+    escaped = False
+    for index in range(start + 1, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            stack.append(character)
+        elif character in "]}":
+            expected = "[" if character == "]" else "{"
+            if not stack or stack[-1] != expected:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+    return None
+
+
+def _json_string_value(text: str, start: int) -> tuple[Optional[Any], Optional[int]]:
+    try:
+        value, consumed = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None, None
+    return value, start + consumed
+
+
+def salvage_extraction_fragments(content: str) -> Dict[str, Any]:
+    """Recover literal complete extraction fragments without repairing content."""
+    summary = None
+    claims: List[Dict[str, Any]] = []
+    claims_array_start = None
+    index = 0
+    while index < len(content):
+        if content[index] != '"':
+            index += 1
+            continue
+        key, end = _json_string_value(content, index)
+        if not isinstance(key, str) or end is None:
+            index += 1
+            continue
+        cursor = end
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if cursor >= len(content) or content[cursor] != ":":
+            index = end
+            continue
+        cursor += 1
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if key == "episode_summary":
+            value, value_end = _json_string_value(content, cursor)
+            if isinstance(value, str):
+                summary = value
+            index = value_end or end
+            continue
+        if key == "claims" and cursor < len(content) and content[cursor] == "[":
+            claims_array_start = cursor + 1
+            break
+        index = end
+
+    if claims_array_start is not None:
+        cursor = claims_array_start
+        while cursor < len(content):
+            while cursor < len(content) and (content[cursor].isspace() or content[cursor] == ","):
+                cursor += 1
+            if cursor >= len(content) or content[cursor] == "]":
+                break
+            end = _balanced_json_end(content, cursor)
+            if end is None:
+                break
+            try:
+                value = json.loads(content[cursor:end])
+            except json.JSONDecodeError:
+                cursor = end
+                continue
+            if isinstance(value, dict):
+                claims.append(value)
+            cursor = end
+    return {"episode_summary": summary, "claims": claims}
 
 
 @dataclass
@@ -249,9 +344,37 @@ class EventStateAgent(BaseAgent):
         grounding_invalid_keys = set()
         invalid_source_turn_id_samples: List[Dict[str, Any]] = []
         invalid_source_turn_id_sample_types: List[str] = []
+        invalid_extraction_output_previews: List[str] = []
+        invalid_extraction_output_sha256: List[str] = []
         excess_claim_count = 0
         raw_turn_ids = [canonical_turn_id(item.get("source_turn_id", item.get("turn_id", item.get("dia_id"))), index) for index, item in enumerate(session["turns"])]
         turn_id_collision_count = len(raw_turn_ids) - len(set(raw_turn_ids))
+
+        def extraction_messages(extraction_prompt: str) -> List[Dict[str, str]]:
+            return format_messages(extraction_prompt, EXTRACTION_SYSTEM_PROMPT)
+
+        def request_json(messages: List[Dict[str, str]]):
+            try:
+                return self._memory_llm_client.chat(
+                    messages,
+                    temperature=self.extraction_temperature,
+                    max_tokens=self.extraction_max_tokens,
+                    response_format={"type": "json_object"},
+                )
+            except TypeError as exc:
+                message = str(exc).casefold()
+                if "response_format" not in message and "unexpected keyword" not in message and "positional" not in message:
+                    raise
+                # Keep extraction decoding settings when a client lacks JSON mode.
+                return self._memory_llm_client.chat(
+                    messages,
+                    temperature=self.extraction_temperature,
+                    max_tokens=self.extraction_max_tokens,
+                )
+
+        def record_invalid_output(content: str) -> None:
+            invalid_extraction_output_previews.append(content[:1000])
+            invalid_extraction_output_sha256.append(hashlib.sha256(content.encode("utf-8", "replace")).hexdigest())
 
         def parse_and_validate(content: str, record_telemetry: bool = True) -> Dict[str, Any]:
             nonlocal structure_failure, validation_failures, missing_source_turn_id_claim_count, unknown_source_turn_id_claim_count, repaired_source_turn_id_claim_count, rejected_ungrounded_claim_count, meta_claim_rejected_count, no_information_claim_rejected_count, grounding_invalid_keys, invalid_source_turn_id_samples, invalid_source_turn_id_sample_types, excess_claim_count, normalized_source_turn_reference_count, claim_level_grounding_failure_count, valid_claims_preserved_despite_other_claim_errors
@@ -345,36 +468,62 @@ class EventStateAgent(BaseAgent):
 
         subset_repair_failure = False
         repair_attempted = False
+        structural_repair_success = 0
+        structural_repair_failure = 0
+        fragment_salvage_attempt_count = 0
+        fragment_salvage_success_count = 0
+        fragment_salvaged_claim_count = 0
+        recovery_calls = 0
+        recovery_successes = 0
+        recovery_failures = 0
+        semantic_extraction_unavailable_count = 0
+        response_content = ""
         try:
             with get_usage_tracker().scope("event_state.extract"):
-                messages = format_messages(prompt, EXTRACTION_SYSTEM_PROMPT)
-                try:
-                    response = self._memory_llm_client.chat(messages, temperature=self.extraction_temperature, max_tokens=self.extraction_max_tokens)
-                except TypeError as exc:
-                    if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
-                        raise
-                    response = self._memory_llm_client.chat(messages)
-            parsed = parse_and_validate(response.content)
+                response = request_json(extraction_messages(prompt))
+            response_content = str(getattr(response, "content", "") or "")
+            parsed = parse_and_validate(response_content)
         except ValueError as exc:
             parse_failure = not structure_failure
+            record_invalid_output(response_content)
+            fragment_salvage_attempt_count = 1
+            fragments = salvage_extraction_fragments(response_content)
+            salvaged = parse_and_validate(json.dumps(fragments), record_telemetry=True)
+            fragment_salvaged_claim_count = len(salvaged["claims"])
+            fragment_salvage_success_count = int(bool(salvaged["claims"]) or fragments["episode_summary"] is not None)
             try:
                 repair_attempted = True
                 with get_usage_tracker().scope("event_state.extract_repair"):
-                    repair_prompt = f"Repair this extraction as valid JSON only. Preserve the original visible turn IDs and scope; every claim must cite valid source_turn_ids. Do not create new claims or rewrite valid claims. Correct only the invalid claims supported by the visible turns, using only these bare allowed IDs: {sorted(allowed_ids)}. Structural issue: {exc}\nOriginal extraction context:\n{prompt}\nPrevious output:\n{getattr(locals().get('response', None), 'content', '')}"
-                    messages = format_messages(repair_prompt, EXTRACTION_SYSTEM_PROMPT)
-                    try:
-                        response = self._memory_llm_client.chat(messages, temperature=self.extraction_temperature, max_tokens=self.extraction_max_tokens)
-                    except TypeError as retry_exc:
-                        if "unexpected keyword" not in str(retry_exc).lower() and "positional" not in str(retry_exc).lower():
-                            raise
-                        response = self._memory_llm_client.chat(messages)
+                    repair_prompt = (
+                        "Perform JSON / structure repair only. Return a JSON object with an "
+                        "episode_summary string or null and a claims array. Preserve only complete "
+                        "claims literally present in the previous output; do not add or reinterpret "
+                        f"claims. Claims may cite only these source_turn_ids: {sorted(allowed_ids)}. "
+                        f"Structural issue: {exc}\nPrevious output:\n{response_content}"
+                    )
+                    response = request_json(extraction_messages(repair_prompt))
                 repaired = True
-                parsed = parse_and_validate(response.content, record_telemetry=False)
-            except Exception as repair_exc:
-                if self._is_provider_error(repair_exc):
-                    raise
-                parsed = {"episode_summary": None, "claims": [], "invalid_claims": []}
-                subset_repair_failure = True
+                repaired_content = str(getattr(response, "content", "") or "")
+                parsed = parse_and_validate(repaired_content, record_telemetry=False)
+                structural_repair_success = 1
+            except ValueError:
+                structural_repair_failure = 1
+                record_invalid_output(str(getattr(locals().get("response", None), "content", "") or ""))
+                if salvaged["claims"]:
+                    parsed = salvaged
+                else:
+                    recovery_calls = 1
+                    try:
+                        with get_usage_tracker().scope("event_state.extract_recovery"):
+                            response = request_json(extraction_messages(prompt))
+                        recovery_content = str(getattr(response, "content", "") or "")
+                        parsed = parse_and_validate(recovery_content, record_telemetry=False)
+                        recovery_successes = 1
+                    except ValueError:
+                        recovery_failures = 1
+                        record_invalid_output(str(getattr(locals().get("response", None), "content", "") or ""))
+                        parsed = {"episode_summary": salvaged.get("episode_summary"), "claims": [], "invalid_claims": []}
+                        semantic_extraction_unavailable_count = 1
         if parsed.get("invalid_claims") and not repaired:
             invalid_claim_subset_repair_calls = 1
             try:
@@ -382,12 +531,7 @@ class EventStateAgent(BaseAgent):
                 repair_prompt = f"Repair this extraction claim subset as valid JSON only. Return an object with a claims array containing only these claims, preserving their semantic propositions. Do not create new claims, echo valid claims, or guess provenance. Correct source_turn_ids only when supported by visible turns and use only these bare allowed IDs: {sorted(allowed_ids)}. Invalid claims:\n{subset_json}\nVisible turns:\n{turn_text}"
                 with get_usage_tracker().scope("event_state.extract_repair"):
                     messages = format_messages(repair_prompt, EXTRACTION_SYSTEM_PROMPT)
-                    try:
-                        response = self._memory_llm_client.chat(messages, temperature=self.extraction_temperature, max_tokens=self.extraction_max_tokens)
-                    except TypeError as exc:
-                        if "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
-                            raise
-                        response = self._memory_llm_client.chat(messages)
+                    response = request_json(messages)
                 subset = parse_and_validate(response.content, record_telemetry=False)
                 existing = {
                     claim_repair_identity(item)
@@ -437,8 +581,8 @@ class EventStateAgent(BaseAgent):
                 invalid_claim_subset_repair_failures = 1
                 subset_repair_failure = True
         claims = parsed.get("claims", [])[:self.max_claims_per_episode]
-        repair_failed = subset_repair_failure or (bool(parsed.get("invalid_claims")) and repaired)
-        return {"episode_summary": parsed.get("episode_summary") or (self.fallback_episode_summary(normalized) if not claims else ""), "claims": claims, "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": repair_failed, "repair_calls": int(repair_attempted) + invalid_claim_subset_repair_calls, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "normalized_source_turn_reference_count": normalized_source_turn_reference_count, "normalized_source_turn_reference_form_counts": normalized_source_turn_reference_form_counts, "claim_level_grounding_failure_count": claim_level_grounding_failure_count, "valid_claims_preserved_despite_other_claim_errors": valid_claims_preserved_despite_other_claim_errors, "invalid_claim_subset_repair_calls": invalid_claim_subset_repair_calls, "invalid_claim_subset_repair_successes": invalid_claim_subset_repair_successes, "invalid_claim_subset_repair_failures": invalid_claim_subset_repair_failures, "grounding_repair_semantic_change_rejected_count": grounding_repair_semantic_change_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
+        repair_failed = bool(structural_repair_failure) or subset_repair_failure or (bool(parsed.get("invalid_claims")) and repaired)
+        return {"episode_summary": parsed.get("episode_summary") or (self.fallback_episode_summary(normalized) if not claims else ""), "claims": claims, "parse_failure": parse_failure, "json_parse_failure": parse_failure, "structure_failure": structure_failure, "claim_validation_failures": validation_failures, "repair_failure": repair_failed, "repair_calls": int(repair_attempted) + invalid_claim_subset_repair_calls, "structural_repair_success_count": structural_repair_success, "structural_repair_failure_count": structural_repair_failure, "fragment_salvage_attempt_count": fragment_salvage_attempt_count, "fragment_salvage_success_count": fragment_salvage_success_count, "fragment_salvaged_claim_count": fragment_salvaged_claim_count, "recovery_calls": recovery_calls, "recovery_successes": recovery_successes, "recovery_failures": recovery_failures, "semantic_extraction_unavailable_count": semantic_extraction_unavailable_count, "invalid_extraction_output_previews": invalid_extraction_output_previews, "invalid_extraction_output_sha256": invalid_extraction_output_sha256, "missing_source_turn_id_claim_count": missing_source_turn_id_claim_count, "unknown_source_turn_id_claim_count": unknown_source_turn_id_claim_count, "repaired_source_turn_id_claim_count": repaired_source_turn_id_claim_count, "rejected_ungrounded_claim_count": rejected_ungrounded_claim_count, "meta_claim_rejected_count": meta_claim_rejected_count, "no_information_claim_rejected_count": no_information_claim_rejected_count, "normalized_source_turn_reference_count": normalized_source_turn_reference_count, "normalized_source_turn_reference_form_counts": normalized_source_turn_reference_form_counts, "claim_level_grounding_failure_count": claim_level_grounding_failure_count, "valid_claims_preserved_despite_other_claim_errors": valid_claims_preserved_despite_other_claim_errors, "invalid_claim_subset_repair_calls": invalid_claim_subset_repair_calls, "invalid_claim_subset_repair_successes": invalid_claim_subset_repair_successes, "invalid_claim_subset_repair_failures": invalid_claim_subset_repair_failures, "grounding_repair_semantic_change_rejected_count": grounding_repair_semantic_change_rejected_count, "invalid_source_turn_id_samples": invalid_source_turn_id_samples, "invalid_source_turn_id_sample_types": invalid_source_turn_id_sample_types, "allowed_source_turn_ids": sorted(allowed_ids), "excess_claim_count": excess_claim_count, "turn_id_collision_count": turn_id_collision_count}
 
     @staticmethod
     def _is_provider_error(exc: Exception) -> bool:
@@ -486,8 +630,15 @@ class EventStateAgent(BaseAgent):
                     extracted["invalid_proposed_subject_id_count"] = extracted.get("invalid_proposed_subject_id_count", 0) + 1
                     extracted["subject_resolution_override_count"] = extracted.get("subject_resolution_override_count", 0) + 1
                 persistence = raw_claim["persistence"]
-                valid_from = self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time)
-                valid_to = raw_claim.get("valid_to") if self.enable_bitemporal_time else None
+                temporal_raw = dict(raw_claim)
+                temporal_raw["valid_from"] = self._valid_from(raw_claim.get("valid_from"), session.get("timestamp"), raw_claim.get("valid_time_text"), self.enable_bitemporal_time)
+                temporal_raw, temporal_telemetry = normalize_ingress_temporal_bounds(
+                    temporal_raw, session.get("timestamp"), self.enable_bitemporal_time
+                )
+                for key, value in temporal_telemetry.items():
+                    extracted[key] = extracted.get(key, 0) + value
+                valid_from = temporal_raw["valid_from"]
+                valid_to = temporal_raw["valid_to"]
                 state_slot = raw_claim.get("state_slot") if persistence == "state" else None
                 if persistence == "state" and not state_slot:
                     state_slot = normalize_state_slot(raw_claim["predicate"])
@@ -562,12 +713,14 @@ class EventStateAgent(BaseAgent):
         counts["extracted_state_claim_count"] += sum(item.get("persistence") == "state" for item in extracted.get("claims", []))
         counts["extracted_history_claim_count"] += sum(item.get("persistence") == "history" for item in extracted.get("claims", []))
         counts["extracted_episode_claim_count"] += sum(item.get("persistence") == "episode" for item in extracted.get("claims", []))
-        for key in ("missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "no_information_claim_rejected_count", "normalized_source_turn_reference_count", "claim_level_grounding_failure_count", "valid_claims_preserved_despite_other_claim_errors", "invalid_claim_subset_repair_calls", "invalid_claim_subset_repair_successes", "invalid_claim_subset_repair_failures", "grounding_repair_semantic_change_rejected_count", "state_claim_slot_fallback_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
+        for key in ("structural_repair_success_count", "structural_repair_failure_count", "fragment_salvage_attempt_count", "fragment_salvage_success_count", "fragment_salvaged_claim_count", "recovery_calls", "recovery_successes", "recovery_failures", "semantic_extraction_unavailable_count", "temporal_ingress_guard_count", "temporal_ingress_future_valid_from_cleared_count", "temporal_ingress_state_valid_to_cleared_count", "temporal_ingress_invalid_interval_count", "missing_source_turn_id_claim_count", "unknown_source_turn_id_claim_count", "repaired_source_turn_id_claim_count", "rejected_ungrounded_claim_count", "meta_claim_rejected_count", "no_information_claim_rejected_count", "normalized_source_turn_reference_count", "claim_level_grounding_failure_count", "valid_claims_preserved_despite_other_claim_errors", "invalid_claim_subset_repair_calls", "invalid_claim_subset_repair_successes", "invalid_claim_subset_repair_failures", "grounding_repair_semantic_change_rejected_count", "state_claim_slot_fallback_count", "invalid_proposed_subject_id_count", "subject_resolution_override_count", "excess_claim_count", "turn_id_collision_count"):
             counts[key] += int(extracted.get(key, 0))
         for form, count in extracted.get("normalized_source_turn_reference_form_counts", {}).items():
             counts["normalized_source_turn_reference_form_counts"][form] = counts["normalized_source_turn_reference_form_counts"].get(form, 0) + int(count)
         counts["invalid_source_turn_id_samples"].extend(extracted.get("invalid_source_turn_id_samples", []))
         counts["invalid_source_turn_id_sample_types"].extend(extracted.get("invalid_source_turn_id_sample_types", []))
+        counts["invalid_extraction_output_previews"].extend(extracted.get("invalid_extraction_output_previews", []))
+        counts["invalid_extraction_output_sha256"].extend(extracted.get("invalid_extraction_output_sha256", []))
         counts["allowed_source_turn_ids"].extend(extracted.get("allowed_source_turn_ids", []))
         episode = prepared.episode
         if self.enable_episodes:
@@ -661,13 +814,13 @@ class EventStateAgent(BaseAgent):
         context_id = self._context_id if context_id is None else context_id
         store = self._store(context_id)
         counts = {"episodes_added": 0, "claims_extracted": 0, "accepted_claim_count": 0, "rejected_claim_count": 0, "canonical_claims_added": 0, "episodic_claims_added": 0, "uncompiled_claim_count": 0, "extracted_state_claim_count": 0, "extracted_history_claim_count": 0, "extracted_episode_claim_count": 0, "extract_parse_failures": 0, "extract_json_parse_failures": 0, "extract_structure_failures": 0, "extract_claim_validation_failures": 0, "extract_repair_calls": 0, "extract_repair_failures": 0, "ambiguous_subject_claim_count": 0, "missing_source_turn_id_claim_count": 0, "unknown_source_turn_id_claim_count": 0, "repaired_source_turn_id_claim_count": 0, "rejected_ungrounded_claim_count": 0, "meta_claim_rejected_count": 0, "no_information_claim_rejected_count": 0, "state_claim_slot_fallback_count": 0, "invalid_proposed_subject_id_count": 0, "subject_resolution_override_count": 0, "excess_claim_count": 0, "turn_id_collision_count": 0, "invalid_source_turn_id_samples": [], "invalid_source_turn_id_sample_types": [], "allowed_source_turn_ids": [], "invalid_update_output_previews": [], "invalid_update_output_sha256": [], "same_session_transition_guard_count": 0, "same_session_supersede_guard_count": 0, "same_session_refine_guard_count": 0, "same_session_conflict_guard_count": 0, "same_session_corrob_downgraded_to_duplicate_count": 0, "same_session_duplicate_count": 0, "same_session_corroborate_count": 0, "same_session_corrob_count": 0, "same_session_refine_count": 0, "same_session_supersede_count": 0, "same_session_conflict_count": 0, "cross_session_duplicate_count": 0, "cross_session_corroborate_count": 0, "cross_session_corrob_count": 0, "cross_session_refine_count": 0, "cross_session_supersede_count": 0, "cross_session_conflict_count": 0, "primary_user_claim_count": 0, "third_party_claim_count": 0, "general_non_personal_claim_count": 0, "real_speaker_claim_count": 0, "update_llm_calls": 0, "update_parse_failures": 0, "update_repair_calls": 0, "update_repair_successes": 0, "update_repair_failures": 0, "state_candidate_queries": 0, "state_candidate_no_match_count": 0, "state_candidate_exact_slot_match_count": 0, "state_candidate_semantic_slot_match_count": 0, "state_candidates_rejected_below_threshold": 0, "different_state_dimension_guard_count": 0, "supersede_temporal_guard_count": 0, "supersede_record_time_fallback_count": 0, "retroactive_correction_applied_count": 0, "state_value_relation_equivalent_count": 0, "state_value_relation_refinement_count": 0, "state_value_relation_changed_count": 0, "state_value_relation_contradictory_count": 0, "state_value_relation_uncertain_count": 0, "state_value_relation_guard_count": 0, "low_confidence_new_count": 0, "low_extraction_confidence_count": 0, "new_count": 0, "duplicate_count": 0, "corroborate_count": 0, "refine_count": 0, "supersede_count": 0, "conflict_count": 0, "episodic_count": 0}
-        counts.update({"normalized_source_turn_reference_count": 0, "normalized_source_turn_reference_form_counts": {}, "claim_level_grounding_failure_count": 0, "valid_claims_preserved_despite_other_claim_errors": 0, "invalid_claim_subset_repair_calls": 0, "invalid_claim_subset_repair_successes": 0, "invalid_claim_subset_repair_failures": 0, "grounding_repair_semantic_change_rejected_count": 0})
+        counts.update({"normalized_source_turn_reference_count": 0, "normalized_source_turn_reference_form_counts": {}, "claim_level_grounding_failure_count": 0, "valid_claims_preserved_despite_other_claim_errors": 0, "invalid_claim_subset_repair_calls": 0, "invalid_claim_subset_repair_successes": 0, "invalid_claim_subset_repair_failures": 0, "grounding_repair_semantic_change_rejected_count": 0, "structural_repair_success_count": 0, "structural_repair_failure_count": 0, "fragment_salvage_attempt_count": 0, "fragment_salvage_success_count": 0, "fragment_salvaged_claim_count": 0, "recovery_calls": 0, "recovery_successes": 0, "recovery_failures": 0, "semantic_extraction_unavailable_count": 0, "invalid_extraction_output_previews": [], "invalid_extraction_output_sha256": [], "temporal_ingress_guard_count": 0, "temporal_ingress_future_valid_from_cleared_count": 0, "temporal_ingress_state_valid_to_cleared_count": 0, "temporal_ingress_invalid_interval_count": 0})
         added_records: List[Dict[str, Any]] = []
         for prepared in prepared_sessions:
             self._commit_prepared(prepared, store, counts, added_records)
         self._memory_chunks = [episode.summary for episode in store.episodes.values()]
         self._is_initialized = bool(store.episodes or store.claims)
-        extra = {**counts, **store.claim_counts(), "invalid_update_output_previews": counts["invalid_update_output_previews"][:3], "invalid_update_output_preview": counts["invalid_update_output_previews"][:3], "invalid_update_output_sha256": counts["invalid_update_output_sha256"][:3], "state_claim_count_with_slot": sum(claim.persistence == "state" and bool(claim.state_slot) for claim in store.claims.values()), "distinct_active_state_slot_count": len({claim.state_slot for claim in store.claims.values() if claim.persistence == "state" and claim.status in {"active", "contested"} and claim.state_slot}), "invalid_source_turn_id_samples": counts["invalid_source_turn_id_samples"][:5], "invalid_source_turn_id_sample_types": sorted(set(counts["invalid_source_turn_id_sample_types"][:5])), "allowed_source_turn_ids": sorted(set(counts["allowed_source_turn_ids"])), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "standalone_history_count": sum(claim.status == "standalone" and claim.persistence == "history" for claim in store.claims.values()), "standalone_episode_count": sum(claim.status == "standalone" and claim.persistence == "episode" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
+        extra = {**counts, **store.claim_counts(), "invalid_update_output_previews": counts["invalid_update_output_previews"][:3], "invalid_update_output_preview": counts["invalid_update_output_previews"][:3], "invalid_update_output_sha256": counts["invalid_update_output_sha256"][:3], "invalid_extraction_output_previews": counts["invalid_extraction_output_previews"][:3], "invalid_extraction_output_preview": counts["invalid_extraction_output_previews"][:3], "invalid_extraction_output_sha256": counts["invalid_extraction_output_sha256"][:3], "state_claim_count_with_slot": sum(claim.persistence == "state" and bool(claim.state_slot) for claim in store.claims.values()), "distinct_active_state_slot_count": len({claim.state_slot for claim in store.claims.values() if claim.persistence == "state" and claim.status in {"active", "contested"} and claim.state_slot}), "invalid_source_turn_id_samples": counts["invalid_source_turn_id_samples"][:5], "invalid_source_turn_id_sample_types": sorted(set(counts["invalid_source_turn_id_sample_types"][:5])), "allowed_source_turn_ids": sorted(set(counts["allowed_source_turn_ids"])), "inserted_count": len(added_records), "active_state_count": sum(claim.status == "active" for claim in store.claims.values()), "superseded_state_count": sum(claim.status == "superseded" for claim in store.claims.values()), "refined_state_count": sum(claim.status == "refined" for claim in store.claims.values()), "standalone_claim_count": sum(claim.status == "standalone" for claim in store.claims.values()), "standalone_history_count": sum(claim.status == "standalone" and claim.persistence == "history" for claim in store.claims.values()), "standalone_episode_count": sum(claim.status == "standalone" and claim.persistence == "episode" for claim in store.claims.values()), "contested_state_count": sum(claim.status == "contested" for claim in store.claims.values()), "claims_with_multiple_provenance_references": sum(len(claim.evidence) > 1 for claim in store.claims.values()), "claims_with_evidence_from_multiple_sessions": sum(len({ref.source_session_id for ref in claim.evidence}) > 1 for claim in store.claims.values()), "claims_with_multi_turn_evidence": sum(any(len(ref.source_turn_ids) > 1 for ref in claim.evidence) for claim in store.claims.values()), "edge_count": len(store.edges), "raw_evidence_turn_count": sum(len(episode.turn_evidence) for episode in store.episodes.values()), "distinct_persistent_subject_id_count": len({claim.subject_id for claim in store.claims.values() if claim.persistence == "state"})}
         return MemoryBuildResult(success=True, method="event_state", action="compile", input_content=text, stored_content="\n".join(item["memory"] for item in added_records), memory_entries=added_records, chunk_count=len(added_records), extra=extra, all_passages=added_records)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:

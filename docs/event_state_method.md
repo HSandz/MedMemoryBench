@@ -32,9 +32,8 @@ In primary-user scope, unrecognized attribute-like subjects resolve to
 Generic consultations remain `general_non_personal`, and third-party scopes stay
 isolated. Claims must cite valid source turn IDs; model-facing wrappers are
 resolved only when they map deterministically to an existing visible ID (exact
-matches always win). Malformed or ungrounded claims are repaired once as an
-invalid subset and then dropped while independently valid claims and the episode
-archive are retained.
+matches always win). Independently valid claims and the episode archive are
+retained when another claim is malformed or ungrounded.
 Grounding-only repair must preserve the claim's normalized semantic fingerprint
 (subject, subject ID, predicate, value, qualifiers, polarity, modality,
 persistence, state slot, and valid-time fields); only provenance may change.
@@ -46,10 +45,8 @@ evidence (for example, numeric `0` becomes `"0"`); equivalent JSON
 representations do not trigger repair. Duplicate canonical IDs within a session
 are deterministically namespaced. Build telemetry exposes allowed IDs, capped
 invalid-ID samples, normalized presentation-reference counts, claim-level
-grounding failures, preserved-valid-claim counts, subset-repair outcomes, and
-claim-limit overflow counts. Subset repair reports successes for partial recovery
-and failures for unresolved requested claims; a repair failure does not imply that
-retained valid claims are unusable.
+grounding failures, preserved-valid-claim counts, repair outcomes, and claim-limit
+overflow counts.
 The configured `max_claims_per_episode` is applied before claim validation;
 claims beyond the limit are ignored in source order and counted only as excess.
 Setting it to `0` retains the episode while accepting no state claims.
@@ -81,25 +78,45 @@ the store and are rendered as a bounded, predecessor-first `Prior states` sectio
 when their current representative is shown; they do not independently compete
 in the current-state claim pool.
 
-If extraction and its single repair attempt both fail, the retained episode
-summary is a bounded chronological rendering of all visible turns with speaker
-and turn labels. Each turn receives a share of the budget and long turns
-preserve both their beginning and ending text, so late-session information is
-not silently discarded.
+Extraction requests JSON-object mode when the configured client supports it. If
+the complete envelope cannot be parsed, Event-State first scans the literal
+response for complete JSON claim objects using quote-, escape-, and nesting-aware
+balancing, then makes one JSON/structure-only repair request. If the repair also
+fails and no salvaged claim passed normal validation, it makes one final extraction
+from the original visible conversation. The sequence is bounded to three LLM
+calls. Unsupported JSON mode retries the same call without `response_format` and
+retains the configured extraction temperature and token limit. Provider failures
+are not treated as malformed JSON.
+
+If every semantic extraction attempt fails, the immutable episode, raw text, and
+turn evidence are still stored. Its summary becomes a bounded chronological
+rendering of all visible turns with speaker and turn labels. Each turn receives a
+share of the budget and long turns preserve both their beginning and ending text,
+so late-session information is not silently discarded. Build telemetry separates
+fragment salvage, structural repair, recovery extraction, and semantic-unavailable
+counts; malformed outputs also retain bounded previews and SHA-256 diagnostics.
 
 Snapshots use schema version 4 plus the Event-State build semantic version.
-Semantic version `2.8` adds explicit non-exact state-value relation semantics:
-equivalent observations corroborate an active claim across sessions (or are
+Semantic version `2.9` adds extraction recovery and temporal-ingress validation
+to the `2.8` non-exact state-value relation semantics: equivalent observations
+corroborate an active claim across sessions (or are
 duplicates in the same episode), refinements become more specific current
 representations, material changes supersede, contradictions remain contested,
-and uncertain decisions create a new claim. The classifier must provide
+and uncertain decisions create a new claim. New `state` observations enter the
+compiler with an open `valid_to`; an extractor-provided closing bound is cleared.
+For observed/asserted state, a safely comparable `valid_from` later than the
+record time is cleared. Closed historical intervals and future planned episodic
+dates remain valid, while any safely comparable reversed interval is cleared.
+Temporal wording is retained in `valid_time_text`; no replacement date is
+invented. Build telemetry reports ingress guard, future-state-start, state-end,
+and invalid-interval counts. The classifier must provide
 `state_value_relation` as one of `equivalent`, `refinement`, `changed`,
 `contradictory`, or `uncertain`; incompatible operation/relation pairs safely
-fall back to `NEW`. `2.5`, `2.6`, and `2.7` snapshots use older build semantics
-and must be rebuilt. Version 1 and 2 snapshots are rejected rather than
-silently reinterpreted. Claims retain canonical subject IDs and lifecycle statuses (`active`,
-`superseded`, `refined`, `contested`, or `standalone`) together with their
-evidence references.
+fall back to `NEW`. `2.5`, `2.6`, `2.7`, and `2.8` snapshots use older build
+semantics and must be rebuilt. Version 1 and 2 snapshots are rejected rather
+than silently reinterpreted. Claims retain canonical subject IDs and lifecycle
+statuses (`active`, `superseded`, `refined`, `contested`, or `standalone`)
+together with their evidence references.
 
 ## Configuration
 

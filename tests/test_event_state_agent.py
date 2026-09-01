@@ -13,7 +13,7 @@ class FakeEmbedder:
 
 
 class FakeLLM:
-    def chat(self, messages):
+    def chat(self, messages, **kwargs):
         system = messages[0]["content"]
         if "Extract conversational memory" in system:
             return SimpleNamespace(content='{"episode_summary":"Alice discussed treatment", "claims":[{"subject":"Alice","predicate":"dose","value":"500 mg","source_turn_ids":["t1"]}]}')

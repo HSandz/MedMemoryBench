@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 ENUMS = {
@@ -117,6 +118,69 @@ def claim_semantic_fingerprint(raw: Dict[str, Any]) -> str:
 def claim_repair_identity(raw: Dict[str, Any]) -> tuple[str, tuple[str, ...]]:
     """Identify a validated claim using semantic fields and canonical evidence IDs."""
     return claim_semantic_fingerprint(raw), tuple(canonical_turn_id(item, "") for item in raw.get("source_turn_ids", []))
+
+
+def _parse_iso_date(value: Any):
+    """Parse only explicit ISO-like dates; prose temporal text remains opaque."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def normalize_ingress_temporal_bounds(
+    raw: Dict[str, Any], recorded_at: Any, enabled: bool = True
+) -> tuple[Dict[str, Any], Dict[str, int]]:
+    """Conservatively remove impossible extractor-proposed claim bounds."""
+    normalized = dict(raw)
+    telemetry = {
+        "temporal_ingress_guard_count": 0,
+        "temporal_ingress_future_valid_from_cleared_count": 0,
+        "temporal_ingress_state_valid_to_cleared_count": 0,
+        "temporal_ingress_invalid_interval_count": 0,
+    }
+    if not enabled:
+        normalized["valid_from"] = None
+        normalized["valid_to"] = None
+        return normalized, telemetry
+
+    persistence = enum(raw.get("persistence"), "persistence", "state")
+    modality = enum(raw.get("modality"), "modality", "asserted")
+    valid_from = raw.get("valid_from") if isinstance(raw.get("valid_from"), str) else None
+    valid_to = raw.get("valid_to") if isinstance(raw.get("valid_to"), str) else None
+    start, end, recorded = _parse_iso_date(valid_from), _parse_iso_date(valid_to), _parse_iso_date(recorded_at)
+
+    # Count a concrete reversed proposal even when a more specific rule below
+    # clears one of its bounds first.
+    reversed_interval = start is not None and end is not None and start > end
+    if reversed_interval:
+        telemetry["temporal_ingress_invalid_interval_count"] += 1
+
+    if persistence == "state" and valid_to is not None:
+        valid_to = None
+        telemetry["temporal_ingress_state_valid_to_cleared_count"] += 1
+
+    if persistence == "state" and modality in {"asserted", "observed"} and start is not None and recorded is not None and start > recorded:
+        valid_from = None
+        telemetry["temporal_ingress_future_valid_from_cleared_count"] += 1
+
+    if persistence == "history" and modality in {"asserted", "observed"} and recorded is not None:
+        if start is not None and start > recorded:
+            valid_from = None
+        if end is not None and end > recorded:
+            valid_to = None
+
+    if reversed_interval and persistence != "state":
+        valid_from = None
+        valid_to = None
+
+    if valid_from != raw.get("valid_from") or valid_to != raw.get("valid_to"):
+        telemetry["temporal_ingress_guard_count"] += 1
+    normalized["valid_from"] = valid_from
+    normalized["valid_to"] = valid_to
+    return normalized, telemetry
 
 
 def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: Set[Any]) -> Optional[Dict[str, Any]]:
