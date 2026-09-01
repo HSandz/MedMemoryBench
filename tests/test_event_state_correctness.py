@@ -6,7 +6,7 @@ import pytest
 
 import methods.event_state_agent as module
 from methods.event_state.compiler import StateCompiler, parse_json, validate_update_decision
-from methods.event_state.context import expand_claim_evidence, render_claim, select_episode_evidence
+from methods.event_state.context import expand_claim_evidence, render_claim, select_claim_evidence, select_episode_evidence
 from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import resolve_subject_id
@@ -188,6 +188,75 @@ class _PatchEmbedder:
 
     def embed_documents(self, texts):
         return [[1.0, 0.0] if "Acme" in text else [0.0, 1.0] for text in texts]
+
+
+class _ProvenanceEmbedder:
+    def embed_documents(self, texts):
+        return [[1.0, 0.0] if "target" in text else [0.0, 1.0] for text in texts]
+
+    def embed_query(self, text):
+        return [1.0, 0.0]
+
+
+def _provenance_episode(episode_id, session_id, index, texts):
+    turns = [TurnEvidence(str(turn_index), "User", "user", text) for turn_index, text in enumerate(texts)]
+    return Episode(episode_id, "ctx", session_id, index, None, None, ["User"], "primary_user", "", "summary", turns)
+
+
+def test_claim_provenance_selector_prefers_late_query_relevant_refs_and_is_bounded():
+    episodes = {f"E{index}": _provenance_episode(f"E{index}", f"s{index}", index, ["irrelevant"] if index < 4 else ["target evidence"]) for index in range(1, 6)}
+    claim = Claim("C", "User", "primary_user", "project", "status", evidence=[EvidenceRef(f"E{index}", f"s{index}", ["0"]) for index in range(1, 6)])
+    selected = select_claim_evidence(claim, episodes, [1.0, 0.0], _ProvenanceEmbedder(), 2)
+    assert len(selected) == 2
+    assert [item.episode.episode_id for item in selected] == ["E4", "E5"]
+
+
+def test_claim_provenance_selector_ranks_turns_then_restores_source_order():
+    episode = _provenance_episode("E", "s", 0, ["old one", "target later", "old two", "target latest", "old three"])
+    claim = Claim("C", "User", "primary_user", "travel", "Paris", evidence=[EvidenceRef("E", "s", ["0", "1", "2", "3", "4"])])
+    selected = select_claim_evidence(claim, {"E": episode}, [1.0, 0.0], _ProvenanceEmbedder(), 1, turn_limit=3)
+    assert [turn.turn_id for turn in selected[0].turns] == ["0", "1", "3"]
+
+
+def test_claim_provenance_selector_ties_fallback_and_zero_limit_are_deterministic():
+    episodes = {"E1": _provenance_episode("E1", "s1", 0, ["same"]), "E2": _provenance_episode("E2", "s2", 1, ["same"])}
+    claim = Claim("C", "User", "primary_user", "job", "builder", evidence=[EvidenceRef("E1", "s1", ["0"]), EvidenceRef("E2", "s2", ["0"])])
+    embedder = _ProvenanceEmbedder()
+    outputs = [select_claim_evidence(claim, episodes, [1.0, 0.0], embedder, 1)[0].episode.episode_id for _ in range(4)]
+    assert outputs == ["E1"] * 4
+    unresolved = Claim("U", "User", "primary_user", "job", "builder", evidence=[EvidenceRef("E1", "s1", ["missing"])])
+    assert [turn.turn_id for turn in select_claim_evidence(unresolved, episodes, [1.0, 0.0], embedder, 1)[0].turns] == ["0"]
+    assert select_claim_evidence(claim, episodes, [1.0, 0.0], embedder, 0) == []
+
+
+def test_query_context_uses_selected_provenance_for_dedup_metadata_and_does_not_mutate_store(monkeypatch):
+    class LLM:
+        def chat(self, *args, **kwargs):
+            return SimpleNamespace(content="ok")
+
+    agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=_ProvenanceEmbedder(), max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=1)
+    episode_items = [
+        _provenance_episode("E1", "s1", 0, ["irrelevant origin"]),
+        _provenance_episode("E2", "s2", 1, ["irrelevant corroboration"]),
+        _provenance_episode("E3", "s3", 2, ["irrelevant corroboration"]),
+        _provenance_episode("E4", "s4", 3, ["target corroboration"]),
+        _provenance_episode("E5", "s5", 4, ["target latest corroboration"]),
+    ]
+    claim = Claim("C", "User", "primary_user", "project", "target status", evidence=[EvidenceRef(item.episode_id, item.source_session_id, ["0"]) for item in episode_items])
+    for item in episode_items:
+        agent._store().add_episode(item, [1.0, 0.0])
+    agent._store().add_claim(claim, [1.0, 0.0])
+    selected = [{"id": "C", "type": "state_claim", "selected_rank": 1}, {"id": "E5", "type": "episode", "selected_rank": 2}]
+    monkeypatch.setattr(module.EventStateRetriever, "retrieve", lambda self, question, query_vector: (selected, {}))
+    before = agent.export_memory_state()
+    prepared = agent.prepare_batch_query("Which project status has target evidence?")
+    after = agent.export_memory_state()
+    context = prepared["messages"][-1]["content"]
+    assert "target corroboration" in context and "target latest corroboration" in context
+    assert prepared["extra"]["episode_evidence_deduplicated_against_claim_count"] == 1
+    included = prepared["extra"]["included_provenance_evidence"]
+    assert {item["evidence"]["source_session_id"] for item in included} == {"s4", "s5"}
+    assert before == after
 
 
 def _patch_episode():

@@ -7,6 +7,7 @@ import hashlib
 import logging
 import re
 import contextvars
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,7 +17,7 @@ from methods.base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import BaseLLMClient, LLMAPIError, create_llm_client, format_messages, get_usage_tracker
 
 from .event_state.compiler import StateCompiler, parse_json
-from .event_state.context import claim_evidence_turn_keys, expand_claim_evidence, fit_context, render_claim, render_episode, render_episode_evidence, select_global_episode_evidence
+from .event_state.context import fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
 from .event_state.embeddings import DenseEmbedder
 from .event_state.prompts import EXTRACTION_SYSTEM_PROMPT
 from .event_state.retrieval import EventStateRetriever
@@ -845,10 +846,21 @@ class EventStateAgent(BaseAgent):
         with get_usage_tracker().scope("event_state.retrieval"):
             selected, retrieval_extra = EventStateRetriever(store, self._embedder, **self._retrieval_config).retrieve(retrieval_question, query_vector=query_vector)
         selected_claims = [store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
+        selected_claim_evidence = {}
         claimed_turns = set()
         if self.inject_source_evidence:
+            turn_vector_cache = {}
             for claim in selected_claims:
-                claimed_turns.update(claim_evidence_turn_keys(claim, store.episodes, self.max_source_excerpts_per_claim))
+                selections = select_claim_evidence(
+                    claim,
+                    store.episodes,
+                    query_vector,
+                    self._embedder,
+                    self.max_source_excerpts_per_claim,
+                    turn_vector_cache=turn_vector_cache,
+                )
+                selected_claim_evidence[claim.claim_id] = selections
+                claimed_turns.update(selected_claim_evidence_turn_keys(selections))
         selected_episodes = [
             (index, store.episodes[item["id"]])
             for index, item in enumerate(selected)
@@ -865,7 +877,19 @@ class EventStateAgent(BaseAgent):
         blocks = [{"text": record["memory"], "kind": "state" if record["type"] == "state_claim" else "episode", "record_id": record["id"]} for record in records]
         if self.inject_source_evidence:
             rendered_turns = set()
-            blocks.extend({"text": block, "kind": "source", "record_id": None} for record in records if record["type"] == "state_claim" for block in expand_claim_evidence(store.claims[record["id"]], store.episodes, rendered_turns, self.max_source_excerpts_per_claim))
+            for record in records:
+                if record["type"] != "state_claim":
+                    continue
+                rendered = render_selected_claim_evidence(selected_claim_evidence.get(record["id"], []), rendered_turns)
+                record["selected_provenance_evidence"] = [item.metadata() for item in rendered]
+                for item in rendered:
+                    episode = item.selection.episode
+                    excerpt = "\n".join(
+                        f"  {turn.speaker} ({turn.timestamp or episode.recorded_at or 'unknown'}): {turn.text}"
+                        + (f" [Shared image: {turn.image_caption}]" if turn.image_caption else "")
+                        for turn in item.turns
+                    )
+                    blocks.append({"text": f"[Supporting Evidence {episode.episode_id} / session {episode.source_session_id}]\n{excerpt}", "kind": "source", "record_id": None, "provenance_record_id": record["id"], "provenance_evidence": item.metadata()})
         blocks.extend(
             {"text": render_episode_evidence(store.episodes[record["id"]], episode_evidence_by_id[record["id"]]), "kind": "source", "record_id": record["id"]}
             for record in records if record["type"] == "episode" and episode_evidence_by_id.get(record["id"])
@@ -875,12 +899,17 @@ class EventStateAgent(BaseAgent):
         included_ids = [record["id"] for record in records if record["memory"] in included_blocks]
         for record in records:
             record["included_in_context"] = record["id"] in included_ids
-        included_evidence_episodes = set(re.findall(r"\[(?:Supporting |Episode )Evidence ([^ /]+)", "\n".join(included_blocks)))
-        included_evidence_episodes.update(record["id"] for record in records if record["type"] == "episode" and record["id"] in included_ids)
+        included_source_counts = Counter(included_blocks)
+        included_provenance_by_claim = {}
+        for block in blocks:
+            if not block.get("provenance_evidence") or included_source_counts[block["text"]] <= 0:
+                continue
+            included_source_counts[block["text"]] -= 1
+            included_provenance_by_claim.setdefault(block["provenance_record_id"], []).append(block["provenance_evidence"])
         for record in records:
             if record["type"] != "state_claim":
                 continue
-            record["included_provenance_evidence"] = [item for item in record.get("all_provenance_evidence", []) if item.get("evidence", {}).get("episode_id") in included_evidence_episodes]
+            record["included_provenance_evidence"] = included_provenance_by_claim.get(record["id"], [])
         context = "\n\n".join(included_blocks)
         user_content = f"{instruction}\n\n{context}\n\n{question}" if context else f"{instruction}\n\n{question}"
         extra = {**retrieval_extra, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": sum(self.count_tokens(block["text"]) for block in blocks), "included_context_tokens": included_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}

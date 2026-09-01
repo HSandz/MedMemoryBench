@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from .embeddings import cosine
-from .schemas import Claim, Episode
+from .schemas import Claim, Episode, EvidenceRef
 from .subjects import display_subject
 
 
@@ -79,6 +80,142 @@ def episode_turn_embedding_text(turn: Any) -> str:
     return f"{turn.speaker}{role}: {turn.text}{caption}".strip()
 
 
+@dataclass(frozen=True)
+class SelectedClaimEvidence:
+    """One query-selected immutable provenance reference and its turns."""
+
+    ref_index: int
+    ref: EvidenceRef
+    episode: Episode
+    turns: Tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class RenderedClaimEvidence:
+    """The exact selected provenance turns rendered into one source block."""
+
+    selection: SelectedClaimEvidence
+    turns: Tuple[Any, ...]
+
+    def metadata(self) -> Dict[str, Any]:
+        ref = self.selection.ref
+        return {
+            "evidence": {
+                "source_session_id": ref.source_session_id,
+                "episode_id": ref.episode_id,
+                "source_turn_ids": [turn.turn_id for turn in self.turns],
+                "support_type": ref.support_type,
+            }
+        }
+
+
+def _source_order(episode: Episode) -> Tuple[int, Any, str]:
+    """Order selected evidence by immutable session order when it is available."""
+    index = episode.source_session_index
+    if isinstance(index, int):
+        return 0, index, episode.episode_id
+    return 1, str(index if index is not None else episode.source_session_id), episode.episode_id
+
+
+def _reference_turns(ref: EvidenceRef, episode: Episode) -> List[Tuple[int, Any]]:
+    """Resolve cited immutable turns, retaining the legacy first-turn fallback."""
+    turns = [
+        (index, turn)
+        for index, turn in enumerate(episode.turn_evidence)
+        if not ref.source_turn_ids or turn.turn_id in ref.source_turn_ids
+    ]
+    if not turns and episode.turn_evidence:
+        turns = [(0, episode.turn_evidence[0])]
+    return turns
+
+
+def select_claim_evidence(
+    claim: Claim,
+    episodes: Dict[str, Episode],
+    query_vector: Sequence[float],
+    embedder: Any,
+    ref_limit: int,
+    turn_limit: int = 3,
+    turn_vector_cache: Dict[Tuple[str, Any], Sequence[float]] | None = None,
+) -> List[SelectedClaimEvidence]:
+    """Select bounded claim provenance by query similarity without mutating memory."""
+    if ref_limit <= 0 or turn_limit <= 0:
+        return []
+    candidates: List[Tuple[int, EvidenceRef, Episode, List[Tuple[int, Any]]]] = []
+    vectors = turn_vector_cache if turn_vector_cache is not None else {}
+    missing: List[Tuple[Tuple[str, Any], Any]] = []
+    for ref_index, ref in enumerate(claim.evidence):
+        episode = episodes.get(ref.episode_id)
+        if episode is None:
+            continue
+        turns = _reference_turns(ref, episode)
+        if not turns:
+            continue
+        candidates.append((ref_index, ref, episode, turns))
+        for _, turn in turns:
+            key = (episode.episode_id, turn.turn_id)
+            if key not in vectors:
+                vectors[key] = ()
+                missing.append((key, turn))
+    if not candidates:
+        return []
+    if missing:
+        texts = [episode_turn_embedding_text(turn) for _, turn in missing]
+        try:
+            embedded = embedder.embed_documents(texts)
+        except AttributeError:
+            embedded = [embedder.embed_query(text) for text in texts]
+        for (key, _), vector in zip(missing, embedded):
+            vectors[key] = vector
+
+    scored_refs = []
+    for ref_index, ref, episode, turns in candidates:
+        scored_turns = [
+            (cosine(query_vector, vectors[(episode.episode_id, turn.turn_id)]), turn_index, str(turn.turn_id), turn)
+            for turn_index, turn in turns
+        ]
+        score = max(item[0] for item in scored_turns)
+        scored_refs.append((score, ref_index, ref, episode, scored_turns))
+    selected_refs = sorted(
+        scored_refs,
+        key=lambda item: (-item[0], item[1], *_source_order(item[3]), str(item[2].source_session_id)),
+    )[:ref_limit]
+
+    selected = []
+    for _, ref_index, ref, episode, scored_turns in selected_refs:
+        chosen = sorted(scored_turns, key=lambda item: (-item[0], item[1], item[2]))[:turn_limit]
+        turns = tuple(item[3] for item in sorted(chosen, key=lambda item: (item[1], item[2])))
+        selected.append(SelectedClaimEvidence(ref_index, ref, episode, turns))
+    return sorted(selected, key=lambda item: (*_source_order(item.episode), item.ref_index))
+
+
+def selected_claim_evidence_turn_keys(selections: Iterable[SelectedClaimEvidence]) -> set[Tuple[str, Any]]:
+    """Return the exact selected immutable turns used for rendering and deduplication."""
+    return {
+        (selection.episode.episode_id, turn.turn_id)
+        for selection in selections
+        for turn in selection.turns
+    }
+
+
+def render_selected_claim_evidence(
+    selections: Iterable[SelectedClaimEvidence], already: set[Tuple[str, Any]]
+) -> List[RenderedClaimEvidence]:
+    """Render only selected claim provenance turns that have not already appeared."""
+    rendered = []
+    for selection in selections:
+        turns = tuple(
+            turn
+            for turn in selection.turns
+            if (selection.episode.episode_id, turn.turn_id) not in already
+        )
+        if not turns:
+            continue
+        already.update((selection.episode.episode_id, turn.turn_id) for turn in turns)
+        rendered.append(RenderedClaimEvidence(selection, turns))
+    return rendered
+
+
 def select_episode_evidence(episode: Episode, query_vector: Sequence[float], embedder: Any, limit: int = 2) -> List[Any]:
     """Select query-relevant turns from one episode in source order.
 
@@ -142,8 +279,18 @@ def select_global_episode_evidence(
     return selected, len(candidates), deduplicated
 
 
-def claim_evidence_turn_keys(claim: Claim, episodes: Dict[str, Episode], limit: int) -> set[Tuple[str, Any]]:
-    """Return the exact immutable turns that claim evidence will expose."""
+def claim_evidence_turn_keys(
+    claim: Claim,
+    episodes: Dict[str, Episode],
+    limit: int,
+    query_vector: Sequence[float] | None = None,
+    embedder: Any | None = None,
+) -> set[Tuple[str, Any]]:
+    """Return exact immutable turns for query-selected or legacy evidence."""
+    if query_vector is not None and embedder is not None:
+        return selected_claim_evidence_turn_keys(
+            select_claim_evidence(claim, episodes, query_vector, embedder, limit)
+        )
     keys: set[Tuple[str, Any]] = set()
     for ref in claim.evidence[:max(0, limit)]:
         episode = episodes.get(ref.episode_id)
@@ -176,7 +323,25 @@ def render_episode_evidence(episode: Episode, evidence_turns: Sequence[Any]) -> 
     return f"[Episode Evidence {episode.episode_id} / session {episode.source_session_id}]\n{excerpt}"
 
 
-def expand_claim_evidence(claim: Claim, episodes: Dict[str, Episode], already: set[Any], limit: int) -> List[str]:
+def expand_claim_evidence(
+    claim: Claim,
+    episodes: Dict[str, Episode],
+    already: set[Any],
+    limit: int,
+    query_vector: Sequence[float] | None = None,
+    embedder: Any | None = None,
+) -> List[str]:
+    """Render selected claim evidence, retaining a legacy compatibility path."""
+    if query_vector is not None and embedder is not None:
+        rendered = render_selected_claim_evidence(
+            select_claim_evidence(claim, episodes, query_vector, embedder, limit),
+            already,
+        )
+        return [
+            f"[Supporting Evidence {item.selection.episode.episode_id} / session {item.selection.episode.source_session_id}]\n"
+            + "\n".join(f"  {_turn_text(turn, item.selection.episode.recorded_at)}" for turn in item.turns)
+            for item in rendered
+        ]
     blocks = []
     for ref in claim.evidence[:max(0, limit)]:
         episode = episodes.get(ref.episode_id)

@@ -195,11 +195,18 @@ Query diagnostics keep dense, fusion, PPR, final, and selection scores
 separate, and report `selected_ids` independently from `included_ids`. State
 claims expose `all_provenance_evidence` for complete lineage and
 `included_provenance_evidence` for evidence that survived context budgeting.
-When enabled, source expansion follows claim references to compact turn
-excerpts, prefers referenced turn IDs, and supplements them with the global
-episode source set. `selected_episode_evidence_excerpt_count` is the total
-generic excerpt count for the query; candidate and claim-dedup counts are also
-reported. Build telemetry reports state-value relation counts, the relation
+When enabled, claim source expansion scores every immutable turn cited by every
+claim EvidenceRef with the query embedding, ranks each reference by its best
+cited-turn cosine score, and keeps at most `max_source_excerpts_per_claim`
+references with at most three turns each. Selected turns are rendered back in
+immutable source order. The same selected turn keys drive claim blocks,
+claim-vs-episode deduplication, and `included_provenance_evidence`; lineage
+metadata therefore reports only supporting blocks actually included in the
+answer context. Legacy EvidenceRefs whose cited IDs cannot be resolved retain
+the deterministic first-turn fallback. Generic episode source evidence remains
+under the separate global budget, and `selected_episode_evidence_excerpt_count`
+is its total excerpt count for the query; candidate and claim-dedup counts are
+also reported. Build telemetry reports state-value relation counts, the relation
 consistency guard count, and cross-session corroboration counts alongside
 multi-reference and multi-session provenance totals.
 
