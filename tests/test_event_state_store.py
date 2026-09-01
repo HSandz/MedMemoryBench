@@ -451,6 +451,17 @@ def test_cross_session_equivalent_paraphrase_corroborates_and_accumulates_proven
     assert compiler.state_value_relation_equivalent_count == 1
 
 
+def test_cross_session_equivalent_duplicate_is_canonicalized_to_corroboration():
+    store = EventStateStore("p")
+    old = Claim("ACME", "Alice", "alice", "employer", "Acme", state_slot="employer", evidence=[EvidenceRef("s1", "s1", ["1"])])
+    store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content='{"matched_claim_id":"ACME","operation":"DUPLICATE","state_value_relation":"equivalent","same_state_dimension":true,"same_episode_relation":"none","confidence":1}'))
+    result = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1).apply(Claim("ACME2", "Alice", "alice", "employer", "still employed by Acme", state_slot="employer", evidence=[EvidenceRef("s2", "s2", ["2"])]), "s2", [1.0, 0.0], [1.0, 0.0])
+
+    assert result.operation == "CORROBORATE"
+    assert old.evidence[-1].support_type == "corroboration"
+
+
 @pytest.mark.parametrize(
     ("operation", "relation", "expected", "old_status"),
     [

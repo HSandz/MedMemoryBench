@@ -413,6 +413,10 @@ class StateCompiler:
             operation, matched_id = "NEW", None
             fallback_reason = "state_value_relation_guard"
             self.state_value_relation_guard_count += 1
+        elif decision["state_value_relation"] == "equivalent" and matched_id and operation == "DUPLICATE":
+            matched = self.store.claims[matched_id]
+            if not self._shared_episode_ids(claim, matched):
+                operation = "CORROBORATE"
         if matched_id:
             matched = self.store.claims[matched_id]
             same_session = bool(self._shared_episode_ids(claim, matched))
