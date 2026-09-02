@@ -253,7 +253,7 @@ class WriteLifecycleMixin:
                         "provisional_tokens": 0,
                     })
                     
-                    response_text, window_memories, window_links = self._extract_write_window(
+                    response_text, capsule_draft, window_memories, window_links = self._extract_write_window(
                         window,
                         continuity_turn,
                         document_time,
@@ -262,6 +262,10 @@ class WriteLifecycleMixin:
                     )
                     responses.append(response_text)
                     write_context_trace[-1]["extracted_count"] = len(window_memories)
+                    
+                    if not hasattr(context, "provisional_capsules"):
+                        context.provisional_capsules = []
+                    context.provisional_capsules.append(capsule_draft)
                     
                     # Instead of complex provisional merging, just append directly to our session memories
                     local_to_session = {}
@@ -284,6 +288,8 @@ class WriteLifecycleMixin:
                 self._memory_seq,
                 self._evidence_seq,
                 self._session_seq,
+                len(getattr(self, "_capsules", [])),
+                getattr(self, "_capsule_seq", 0),
             )
             old_write_stats = self._snapshot(self._last_write_stats)
             try:
@@ -297,6 +303,18 @@ class WriteLifecycleMixin:
                         document_time,
                         turn_map,
                     )
+                    
+                    if not hasattr(self, "_capsules"):
+                        self._capsules = []
+                    
+                    for cap_draft in getattr(context, "provisional_capsules", []):
+                        cap_draft["facet_ids"] = [
+                            m["id"] for m in added 
+                            if m.get("capsule_id") == cap_draft["id"]
+                        ]
+                        self._capsules.append(cap_draft)
+                        self._capsule_seq = getattr(self, "_capsule_seq", 0) + 1
+                        
                     self._refresh_index()
                 else:
                     added = []
@@ -314,14 +332,19 @@ class WriteLifecycleMixin:
                     memory_seq,
                     evidence_seq,
                     session_seq,
+                    capsule_count,
+                    capsule_seq,
                 ) = old_counts
                 del self._memories[memory_count:]
                 del self._relations[relation_count:]
                 del self._evidence[evidence_count:]
-                self._memory_seq, self._evidence_seq, self._session_seq = (
+                if hasattr(self, "_capsules"):
+                    del self._capsules[capsule_count:]
+                self._memory_seq, self._evidence_seq, self._session_seq, self._capsule_seq = (
                     memory_seq,
                     evidence_seq,
                     session_seq,
+                    capsule_seq,
                 )
                 self._last_write_stats = old_write_stats
                 valid_ids = {memory["id"] for memory in self._memories}

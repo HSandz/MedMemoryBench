@@ -34,35 +34,6 @@ except ImportError as exc:
     raise ImportError(f"[SmartMem0] Missing dependency: {exc}")
 
 
-class StateSpine:
-    def __init__(self, identity: str):
-        self.identity = identity
-        self.versions: List[Dict[str, Any]] = []
-
-    def add_version(self, memory: Dict[str, Any]):
-        self.versions.append(memory)
-        # Sort by event_time, fallback to document_time
-        self.versions.sort(key=lambda x: (x.get("event_time") or x.get("document_time") or "", x.get("id")))
-
-    def latest(self) -> Optional[Dict[str, Any]]:
-        if not self.versions:
-            return None
-        return self.versions[-1]
-        
-    def earliest(self) -> Optional[Dict[str, Any]]:
-        if not self.versions:
-            return None
-        return self.versions[0]
-        
-    def as_of(self, target_date_str: str) -> Optional[Dict[str, Any]]:
-        if not self.versions:
-            return None
-        valid = None
-        for v in self.versions:
-            t = v.get("event_time") or v.get("document_time") or ""
-            if t <= target_date_str:
-                valid = v
-        return valid
 
 class CoreMemoryMixin:
     """Owns runtime state and deterministic memory/index primitives."""
@@ -561,45 +532,6 @@ class CoreMemoryMixin:
         return SCOPE_ALIASES.get(scope, scope)
 
     @classmethod
-    def _state_identity(cls, memory: Dict[str, Any]) -> str:
-        # P0C Canonical Identity
-        state_key = cls._canonical_state_key(memory.get("state_key") or "")
-        if not state_key:
-            return ""
-        subject = str(memory.get("subject_id") or "primary_user").strip().lower()
-        anchor = cls._canonical_identifier(memory.get("object_anchor"))
-        # We don't include scope in the identity for P0C to avoid artificial silos
-        return "|".join((subject, state_key, anchor))
-
-    @classmethod
-    def _state_lineage_identity(cls, memory: Dict[str, Any]) -> str:
-        """Return a scope-tolerant key used only to reconcile write-time drift.
-
-        Durable state identity still includes scope.  This weaker key is never a
-        state head and never merges values on its own; it only lets a new card
-        inherit the already committed scope when subject, attribute and object
-        owner are identical.
-        """
-        state_key = cls._canonical_state_key(memory.get("state_key") or "")
-        if not state_key:
-            return ""
-        subject = cls._canonical_identifier(memory.get("subject"), "patient")
-        anchor = cls._canonical_identifier(memory.get("object_anchor"))
-        return "|".join((subject, state_key, anchor))
-
-    @staticmethod
-    def _memory_value(memory: Dict[str, Any]) -> str:
-        return re.sub(
-            r"\s+",
-            " ",
-            str(memory.get("value") or memory.get("verbatim_value") or "").strip(),
-        )
-
-    @classmethod
-    def _normalised_value(cls, memory: Dict[str, Any]) -> str:
-        return cls._canonical_identifier(cls._memory_value(memory))
-
-    @classmethod
     def _state_value_signature(cls, memory: Dict[str, Any]) -> str:
         """Collapse same-measurement paraphrases without hiding numeric changes."""
         value = cls._memory_value(memory).lower()
@@ -1082,7 +1014,7 @@ class CoreMemoryMixin:
                 self._predicate_postings.setdefault(sk, set()).add(m_id)
                 
             if memory.get("kind") == "STATE" and tier == "HOT":
-                ident = self._state_identity(memory)
+                ident = state_identity(memory)
                 if ident:
                     if ident not in self._state_spine:
                         self._state_spine[ident] = StateSpine(ident)

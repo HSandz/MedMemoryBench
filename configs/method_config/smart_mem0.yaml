@@ -32,6 +32,7 @@ agent_params:
   write_context_mode: none
   write_prior_belief_limit: 8
   write_provisional_limit: 4
+  max_new_memories: 12
 
   # Baseline read route: answerability gate for a possible direct seed, then a
   # typed planner only when the gate cannot answer. The unified controller below

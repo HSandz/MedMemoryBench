@@ -99,7 +99,7 @@ class ConsolidationMixin:
 
             # Keep recent exact-identity versions available to consolidation.
             # Ledger-order truncation previously favored the oldest versions.
-            m_ident = self._state_identity(memory)
+            m_ident = state_identity(memory)
             m_lineage = self._state_lineage_identity(memory)
             if m_ident or m_lineage:
                 identity_matches = sorted(
@@ -107,7 +107,7 @@ class ConsolidationMixin:
                         old_mem
                         for old_mem in self._memories
                         if (
-                            (m_ident and self._state_identity(old_mem) == m_ident)
+                            (m_ident and state_identity(old_mem) == m_ident)
                             or (
                                 m_lineage
                                 and self._state_lineage_identity(old_mem) == m_lineage
@@ -189,7 +189,7 @@ class ConsolidationMixin:
         literal transition, or a changed numeric measurement with a later
         source date, may create the deterministic replacement edge.
         """
-        if self._state_identity(newer) != self._state_identity(older):
+        if state_identity(newer) != state_identity(older):
             return False
         if self._explicit_state_transition(newer):
             return True
@@ -287,8 +287,8 @@ class ConsolidationMixin:
         if (
             len(candidates) > 1
             and candidates[0][0] == candidates[1][0]
-            and self._state_identity(candidates[0][2])
-            != self._state_identity(candidates[1][2])
+            and state_identity(candidates[0][2])
+            != state_identity(candidates[1][2])
         ):
             return None
         return candidates[0][2]
@@ -306,13 +306,13 @@ class ConsolidationMixin:
                 if memory.get("kind") in STATE_LIKE_KINDS:
                     provisional_states.append(memory)
                 continue
-            previous_identity = self._state_identity(memory)
+            previous_identity = state_identity(memory)
             if memory.get("kind") not in STATE_LIKE_KINDS:
                 memory["kind"] = "STATE"
                 stats["promoted_state_updates"] += 1
             for field in ("subject", "scope", "state_key", "object_anchor"):
                 memory[field] = predecessor.get(field, memory.get(field, ""))
-            if self._state_identity(memory) != previous_identity:
+            if state_identity(memory) != previous_identity:
                 stats["reused_state_identities"] += 1
             provisional_states.append(memory)
         return stats
@@ -496,8 +496,8 @@ class ConsolidationMixin:
             if not source or not target:
                 continue
             if relation_type in {"REFINE", "SUPERSEDE", "CONFLICT"}:
-                source_identity = self._state_identity(source)
-                target_identity = self._state_identity(target)
+                source_identity = state_identity(source)
+                target_identity = state_identity(target)
                 if not source_identity or source_identity != target_identity:
                     continue
             if (
@@ -575,7 +575,7 @@ class ConsolidationMixin:
                 continue
             if status.get(memory["id"]) not in {"active", "refined", "conflicting"}:
                 continue
-            identity = self._state_identity(memory)
+            identity = state_identity(memory)
             if identity:
                 head_candidates[identity].append(memory)
         heads: Dict[str, List[str]] = {}
@@ -697,7 +697,7 @@ class ConsolidationMixin:
             kind_counts[memory.get("kind", "UNKNOWN")] += 1
             if memory.get("state_key") and memory.get("kind") in STATE_LIKE_KINDS:
                 key_counts[memory["state_key"]] += 1
-                identity = self._state_identity(memory)
+                identity = state_identity(memory)
                 if identity:
                     identity_values[identity].append(self._normalised_value(memory))
             speakers = memory.get("source_speakers") or ["unknown"]
@@ -713,7 +713,7 @@ class ConsolidationMixin:
             not memory.get("evidence_ids") for memory in self._memories
         )
         state_like_missing_identity = sum(
-            memory.get("kind") in STATE_LIKE_KINDS and not self._state_identity(memory)
+            memory.get("kind") in STATE_LIKE_KINDS and not state_identity(memory)
             for memory in self._memories
         )
         invalid_relation_endpoints = 0
@@ -728,8 +728,8 @@ class ConsolidationMixin:
                 invalid_relation_endpoints += 1
                 continue
             if relation.get("type") in {"SUPERSEDE", "REFINE"}:
-                source_identity = self._state_identity(source)
-                target_identity = self._state_identity(target)
+                source_identity = state_identity(source)
+                target_identity = state_identity(target)
                 if (
                     source_identity
                     and target_identity
@@ -777,7 +777,25 @@ class ConsolidationMixin:
             + relation_identity_violations
             + causal_provenance_violations
         )
+        capsules = getattr(self, "_capsules", [])
+        capsule_by_id = {c["id"]: c for c in capsules}
+        
+        orphan_capsule_count = sum(1 for c in capsules if not c.get("facet_ids"))
+        missing_capsule_pointer_count = sum(1 for m in self._memories if m.get("capsule_id") and m.get("capsule_id") not in capsule_by_id)
+        
+        missing_facet_pointer_count = 0
+        for c in capsules:
+            for facet_id in c.get("facet_ids", []):
+                if facet_id not in by_id:
+                    missing_facet_pointer_count += 1
+                    
+        identity_anchor_conflict_count = sum(1 for m in self._memories if m.get("kind") == "STATE" and m.get("object_anchor") and "::" not in state_identity(m))
+
         return {
+            "orphan_capsule_count": orphan_capsule_count,
+            "missing_capsule_pointer_count": missing_capsule_pointer_count,
+            "missing_facet_pointer_count": missing_facet_pointer_count,
+            "identity_anchor_conflict_count": identity_anchor_conflict_count,
             "memory_count": len(self._memories),
             "kind_counts": dict(kind_counts),
             "unique_state_keys": len(key_counts),
@@ -811,33 +829,6 @@ class ConsolidationMixin:
         }
 
     @staticmethod
-    def _inherit_state_keys(
-        new_memories: List[Dict[str, Any]],
-        old_memories: Dict[str, Dict[str, Any]],
-        relations: List[Dict[str, Any]],
-    ) -> None:
-        """Keep one canonical key across semantically linked state versions."""
-        inherited = set()
-        for relation in sorted(
-            relations, key=lambda item: item["confidence"], reverse=True
-        ):
-            if relation["type"] not in {"SUPPORT", "REFINE", "SUPERSEDE", "CONFLICT"}:
-                continue
-            match = re.fullmatch(r"new_(\d+)", relation["source_id"])
-            old = old_memories.get(relation["target_id"])
-            if not match or not old or not old.get("state_key"):
-                continue
-            index = int(match.group(1))
-            if index >= len(new_memories) or index in inherited:
-                continue
-            memory = new_memories[index]
-            if memory["kind"] in STATE_LIKE_KINDS:
-                memory["state_key"] = old["state_key"]
-                for field in ("subject", "scope", "object_anchor"):
-                    if old.get(field) not in (None, ""):
-                        memory[field] = old[field]
-                inherited.add(index)
-
     def _sanitize_state_relations(
         self,
         new_memories: Sequence[Dict[str, Any]],
@@ -870,8 +861,8 @@ class ConsolidationMixin:
             source = new_memories[index]
             relation_type = str(relation.get("type") or "")
             if relation_type in {"REFINE", "SUPERSEDE", "CONFLICT"}:
-                source_identity = self._state_identity(source)
-                target_identity = self._state_identity(target)
+                source_identity = state_identity(source)
+                target_identity = state_identity(target)
                 if (
                     not source_identity
                     or not target_identity
@@ -882,21 +873,14 @@ class ConsolidationMixin:
                 relation_type == "SUPERSEDE"
                 and not self._explicit_state_replacement(source, target)
             ):
-                # Preserve the link as a weak topical relation rather than
-                # allowing an unsupported replacement to poison state heads.
-                relation_type = "RELATED"
+                # DROP unsupported SUPERSEDE instead of turning to RELATED
+                continue
             if relation_type == "SUPERSEDE":
                 if source_ref in supersede_per_source:
                     continue
                 supersede_per_source.add(source_ref)
-            if relation_type == "RELATED":
-                if related_per_source[source_ref] >= 1:
-                    continue
-                related_per_source[source_ref] += 1
-            if relation_type == "SUPPORT":
-                if support_per_source[source_ref] >= 2:
-                    continue
-                support_per_source[source_ref] += 1
+            if relation_type not in {"REFINE", "SUPERSEDE", "CONFLICT", "CAUSES"}:
+                continue
             normalized_relation = self._snapshot(relation)
             normalized_relation["type"] = relation_type
             output.append(normalized_relation)
@@ -957,7 +941,7 @@ class ConsolidationMixin:
             if (
                 memory.get("kind") not in state_kinds
                 or memory.get("assertion_mode", "DIRECT") != "DIRECT"
-                or not self._state_identity(memory)
+                or not state_identity(memory)
                 or not self._normalised_value(memory)
             ):
                 continue
@@ -979,7 +963,7 @@ class ConsolidationMixin:
                         and self._belief_status.get(old.get("id"), "active")
                         == "superseded"
                     )
-                    or self._state_identity(memory) != self._state_identity(old)
+                    or state_identity(memory) != state_identity(old)
                     or not self._normalised_value(old)
                     or not self._explicit_state_replacement(
                         {**memory, "document_time": document_time}, old
@@ -1161,7 +1145,11 @@ class ConsolidationMixin:
             }
             self._memories.append(card)
             added.append(card)
+        from methods.smart_mem0.contracts import VALID_RELATIONS
+        
         for relation in consolidation:
+            if relation.get("type") not in VALID_RELATIONS:
+                continue
             source = local_ids.get(relation["source_id"])
             target = local_ids.get(relation["target_id"], relation["target_id"])
             if source and target and source != target:

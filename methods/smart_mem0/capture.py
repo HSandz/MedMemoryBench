@@ -401,12 +401,6 @@ class CaptureMixin:
             raw_to_accepted[raw_index] = len(accepted)
             accepted.append(normalized)
 
-        # Store facet ids in the capsule
-        capsule["facet_ids"] = [m.get("id") for m in accepted if m.get("id")]
-        if not hasattr(self, "_capsules"):
-            self._capsules = []
-        self._capsules.append(capsule)
-
         # Keep a compact pointer when a source turn contains an exact
         # quantitative/temporal observation that the model's extraction
         # accidentally skipped. This is especially important for later
@@ -450,4 +444,13 @@ class CaptureMixin:
                     "confidence": link.get("confidence", 0.75),
                 }
             )
-        return response.content, accepted, links
+        # Apply final deterministic enrichment to recovered atoms
+        for atom in accepted:
+            if not atom.get("capsule_id"):
+                atom["capsule_id"] = capsule_id
+                atom["memory_tier"] = "COLD"
+                atom["semantic_role"] = "OBSERVATION"
+                atom["subject_id"] = "primary_user"
+                atom["subject_class"] = "PRIMARY_USER"
+                
+        return response.content, capsule, accepted, links

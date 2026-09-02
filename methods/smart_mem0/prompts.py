@@ -20,9 +20,16 @@ EPISODE (the only allowed source evidence):
 
 Return JSON only:
 {{
+  "episode": {{
+    "abstraction": "Brief 1-sentence summary of the episode context",
+    "cues": ["key", "contextual", "cues"]
+  }},
   "memories": [{{
     "claim": "self-contained atomic claim",
     "kind": "FACT|EVENT|STATE",
+    "semantic_role": "MEASUREMENT|OBSERVATION|SAFETY_CONSTRAINT|ACCEPTED_POLICY|PREFERENCE|GUIDANCE|IDENTITY",
+    "subject_id": "primary_user|third_party:mother|general",
+    "subject_class": "PRIMARY_USER|THIRD_PARTY|GENERAL_KNOWLEDGE",
     "entities": ["canonical entity"],
     "subject": "canonical owner of the memory, usually a person",
     "scope": "stable semantic scope such as medication, symptom, test, or general",
