@@ -19,6 +19,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         return None
     
     if decision.route == "HARD":
+        telemetry_out["fallback_reason"] = "HARD_SURFACE_OR_UNRESOLVED"
         return None
         
     start_time = time.time()
@@ -28,26 +29,30 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
     # 1. Subject Firewall
     subject_ids = agent._subject_postings.get(decision.subject_id, set())
     if not subject_ids:
-        # Ambiguous or unknown subject fails HARD
+        telemetry_out["fallback_reason"] = "SUBJECT_NOT_AUTHORIZED"
         return None
         
     if decision.route == "STATE_LATEST":
         # Target concept -> canonical identity
         ident = _resolve_canonical_identity(agent, decision.content_terms, decision.subject_id)
         if not ident:
+            telemetry_out["fallback_reason"] = "STATE_IDENTITY_UNRESOLVED"
             return None
             
         spine = agent._state_spine.get(ident)
         if not spine:
+            telemetry_out["fallback_reason"] = "STATE_SPINE_MISSING"
             return None
             
         latest = spine.latest()
         if not latest:
+            telemetry_out["fallback_reason"] = "STATE_LATEST_MISSING"
             return None
             
         val = str(latest.get("value") or "").strip()
         if not val:
-            return None
+                telemetry_out["fallback_reason"] = "VALUE_MISSING"
+                return None
             
         if decision.answer_slot == "VALUE":
             precomputed = val
@@ -64,6 +69,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         # Axis constraint
         dated_pool = [m for m in pool if _get_date(m, decision.temporal_axis)]
         if not dated_pool:
+            telemetry_out["fallback_reason"] = "TEMPORAL_NO_DATES"
             return None
             
         # Arbitration
@@ -103,6 +109,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
                     matched.append(m)
                 
                 if not matched:
+                    telemetry_out["fallback_reason"] = "TEMPORAL_NO_MATCH_FOR_ANCHOR"
                     return None
                 selected = min(matched, key=temp_key)
             else:
@@ -110,6 +117,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
                 telemetry_out["fallback_reason"] = "TEMPORAL_MATCH_AMBIGUOUS"
                 return None
         else:
+            telemetry_out["fallback_reason"] = "ROUTE_UNKNOWN"
             return None
             
         if decision.answer_slot == "DATE":
@@ -117,9 +125,11 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         elif decision.answer_slot == "VALUE":
             val = str(selected.get("value") or "").strip()
             if not val:
+                telemetry_out["fallback_reason"] = "VALUE_MISSING"
                 return None
             precomputed = val
         else:
+            telemetry_out["fallback_reason"] = "ROUTE_UNKNOWN"
             return None
             
         used_ids.add(selected["id"])
@@ -141,7 +151,8 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         # DO NOT precompute answer, let the 1 answer LLM format it
         
     else:
-        return None
+            telemetry_out["fallback_reason"] = "ROUTE_UNKNOWN"
+            return None
         
     telemetry_out["accepted"] = True
     elapsed = (time.time() - start_time) * 1000
@@ -205,7 +216,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         ret["raw_context"] = evidence_text
         ret["messages"] = [
             {"role": "system", "content": "Ground every subject-specific claim in supplied memory evidence. For inference, general knowledge may connect grounded endpoints, but must not substitute for missing subject-specific evidence. Never invent subject history, values, events, decisions, or states."},
-            {"role": "user", "content": f"Context:\n{evidence_text}\n\nQuestion: {question}"}
+            {"role": "user", "content": f"Context:\n{evidence_text}\n\nQuestion: {answer_question}"}
         ]
         
     return ret
@@ -214,26 +225,41 @@ def _resolve_canonical_identity(agent, content_terms: list, subject_id: str):
     if not content_terms:
         return None
         
-    matches = set()
+    scores = {}
     for ident, spine in agent._state_spine.items():
         if not ident.startswith(f"{subject_id}::"):
             continue
             
+        score = 0
         parts = ident.split("::")
         if len(parts) >= 2:
             sk = parts[1].lower()
-            if all(t in sk for t in content_terms):
-                matches.add(ident)
-                continue
+            if sk and all(t in sk for t in content_terms):
+                score += 10
+            elif sk and any(t in sk for t in content_terms):
+                score += sum(3 for t in content_terms if t in sk)
                 
         for m in spine.versions:
             obj = str(m.get("object_anchor") or "").lower()
-            if all(t in obj for t in content_terms):
-                matches.add(ident)
+            if obj and all(t in obj for t in content_terms):
+                score += 8
+                break
+            elif obj and any(t in obj for t in content_terms):
+                score += sum(2 for t in content_terms if t in obj)
                 break
                 
-    if len(matches) == 1:
-        return list(matches)[0]
+        if score > 0:
+            scores[ident] = score
+            
+    if not scores:
+        return None
+        
+    # Find unique winner with margin
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if len(ranked) == 1:
+        return ranked[0][0]
+    if ranked[0][1] > ranked[1][1]: # Strict margin > 0
+        return ranked[0][0]
         
     return None
 
@@ -241,54 +267,70 @@ def _candidate_pool(agent, content_terms: list, subject_ids: set) -> list:
     if not content_terms:
         return []
     
-    exact_obj = []
-    exact_ent = []
-    exact_pred = []
-    bm25 = []
-    
-    query_terms = set(content_terms)
+    scores = []
     
     for m in agent._memories:
         if m["id"] not in subject_ids:
             continue
             
+        score = 0
         obj = str(m.get("object_anchor") or "").lower()
         sk = str(m.get("state_key") or "").lower()
         ents = [str(e).lower() for e in m.get("entities", [])]
         claim = str(m.get("claim") or "").lower()
         
         # EXACT OBJECT
-        if obj and all(t in obj for t in content_terms):
-            exact_obj.append(m)
-            continue
+        if obj and all(t in obj for t in content_terms): score += 20
+        elif obj and any(t in obj for t in content_terms): score += sum(5 for t in content_terms if t in obj)
             
         # EXACT ENTITY
-        if any(all(t in e for t in content_terms) for e in ents):
-            exact_ent.append(m)
-            continue
+        if any(all(t in e for t in content_terms) for e in ents): score += 15
+        else:
+            for e in ents:
+                if any(t in e for t in content_terms): score += sum(3 for t in content_terms if t in e)
             
         # EXACT PREDICATE / Canonical Key
-        if sk and all(t in sk for t in content_terms):
-            exact_pred.append(m)
-            continue
+        if sk and all(t in sk for t in content_terms): score += 12
+        elif sk and any(t in sk for t in content_terms): score += sum(3 for t in content_terms if t in sk)
             
         # BOUNDED Lexical Fallback
-        combined = set(obj.split() + sk.split() + claim.split())
-        for e in ents: combined.update(e.split())
+        claim_words = set(claim.split())
+        overlap = sum(1 for t in content_terms if t in claim_words)
+        score += overlap * 2
         
-        overlap = len(query_terms.intersection(combined))
-        if overlap == len(query_terms):
-            bm25.append((overlap, m))
+        if score > 0:
+            scores.append((score, m))
             
-    bm25.sort(key=lambda x: x[0], reverse=True)
-    bm25 = [m for _, m in bm25]
+    scores.sort(key=lambda x: x[0], reverse=True)
     
-    if exact_obj: return exact_obj
-    if exact_ent: return exact_ent
-    if exact_pred: return exact_pred
-    if bm25: return bm25
+    # If we have strong lexical candidates (threshold 8+)
+    if scores and scores[0][0] >= 8:
+        # Return all that share the top tier, or just top ones above threshold
+        return [m for s, m in scores if s >= 8]
+        
+    # BOUNDED Dense Fallback
+    import numpy as np
+    try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        if agent._embedder and getattr(agent, "_embedding_cache", None):
+            q_emb = agent._embedder.encode([" ".join(content_terms)], show_progress_bar=False)
+            dense_scores = []
+            for m in agent._memories:
+                if m["id"] not in subject_ids: continue
+                m_emb = agent._embedding_cache.get(m["id"])
+                if m_emb is not None:
+                    # m_emb is usually 1D. cosine_similarity takes 2D.
+                    sim = cosine_similarity(q_emb, np.array([m_emb]))[0][0]
+                    dense_scores.append((sim, m))
+            
+            dense_scores.sort(key=lambda x: x[0], reverse=True)
+            if dense_scores and dense_scores[0][0] >= 0.70: # Bounded threshold
+                # return top 3 above threshold
+                return [m for s, m in dense_scores if s >= 0.70][:3]
+    except Exception:
+        pass
     
-    return []
+    return [m for s, m in scores if s > 0]
 
 def _get_date(m: dict, axis: str) -> str:
     val = str(m.get(axis) or "").strip()

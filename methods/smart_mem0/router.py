@@ -151,7 +151,7 @@ class DeterministicRouter:
         # 4. EXACT
         if question.lower().startswith("what"):
             terms = self._extract_terms(question)
-            if concept:
+            if terms:
                 return RouteDecision(
                     route="EXACT",
                     subject_id=subject_id,
@@ -186,19 +186,25 @@ class DeterministicRouter:
 
     def _extract_terms(self, question: str) -> list:
         q = question.lower()
+        # Normalize possessives before punctuation filter
+        q = re.sub(r"\b(\w+)['’]s\b", r"\1", q)
         q = re.sub(r'[^a-z0-9\s]', ' ', q)
         
         stopwords = {
             "what", "when", "where", "who", "why", "how", "is", "are", "was", "were", 
-            "do", "does", "did", "the", "a", "an", "my", "patient", "user", "i", "me", "he", "she", "his", "her",
+            "do", "does", "did", "the", "a", "an", "my", "user", "i", "me", "he", "she", "his", "her",
             "current", "latest", "now", "documented", "recorded", "reported", "mentioned",
             "started", "start", "began", "first", "appeared", "onset", "occurred", "earliest",
             "date", "time", "status", "value", "level", "taking", "took", "visit", "on", "in", "at",
             "of", "for", "to", "with", "recent", "about", "there", "any", "mine", "we", "our",
             "has", "have", "had", "been", "that", "this", "these", "those", "which", "name",
-            "clearly", "instructed", "avoid", "past", "history", "medical", "patient's",
+            "clearly", "instructed", "avoid", "past", "history", 
             "can", "could", "would", "should", "tell", "say", "know"
         }
+        
+        # Add dynamic subject aliases
+        for alias in self.subject_aliases.keys():
+            stopwords.add(alias.lower())
         
         words = q.split()
         concept_words = [w for w in words if w not in stopwords and not w.isdigit()]

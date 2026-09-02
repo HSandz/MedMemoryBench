@@ -136,5 +136,67 @@ class TestP1A(unittest.TestCase):
         
         # Should NOT hit HARD because of "earliest" or "exact" in the wrapper
         self.assertEqual(r["precomputed_answer"], "2024-01-01")
+
+    def test_exact_antibiotic(self):
+        # "What antibiotic was I told to avoid?" -> EXACT route, no NameError
+        q = "What antibiotic was I told to avoid?"
+        self.agent._memories = [{
+            "id": "m_abx", "kind": "STATE", "semantic_role": "ALLERGY", "assertion_mode": "DIRECT",
+            "subject_id": "primary_user", "object_anchor": "cefuroxime", "entities": ["antibiotic"], 
+            "claim": "instructed to avoid antibiotic cefuroxime", "memory_tier": "HOT"
+        }]
+        self.agent._subject_postings = {"primary_user": {"m_abx"}}
+        
+        t_out = {}
+        r = _prepare_p1a_query(self.agent, q, q, telemetry_out=t_out)
+        self.assertEqual(t_out["route"], "EXACT")
+        self.assertTrue(t_out["accepted"])
+        # Should populate exact route without crashing
+        self.assertIn("Question: What antibiotic", r["messages"][1]["content"])
+        
+    def test_exact_chronic_disease(self):
+        q = "What chronic metabolic disease is mentioned in the patient's past medical history?"
+        self.agent._memories = [{
+            "id": "m_disease", "kind": "STATE", "semantic_role": "CONDITION", "assertion_mode": "DIRECT",
+            "subject_id": "primary_user", "object_anchor": "diabetes", "entities": ["chronic metabolic disease"], 
+            "claim": "patient has chronic metabolic disease diabetes", "memory_tier": "HOT",
+            "embedding": [0.1]*384
+        }]
+        self.agent._subject_postings = {"primary_user": {"m_disease"}}
+        self.agent.subject_aliases = {"patient": "primary_user"}
+        
+        t_out = {}
+        r = _prepare_p1a_query(self.agent, q, q, subject_aliases=self.agent.subject_aliases, telemetry_out=t_out)
+        self.assertEqual(t_out["route"], "EXACT")
+        self.assertTrue(t_out["accepted"])
+
+    def test_metformin_complex(self):
+        q = "When did the patient start taking metformin 1500 mg/day as prescribed?"
+        self.agent._memories = [{
+            "id": "m_met", "kind": "EVENT", "semantic_role": "MEDICATION_START", "assertion_mode": "DIRECT",
+            "subject_id": "primary_user", "object_anchor": "metformin", "event_time": "2024-01-06",
+            "claim": "started metformin 1500 mg/day", "memory_tier": "HOT"
+        }]
+        self.agent._subject_postings = {"primary_user": {"m_met"}}
+        self.agent.subject_aliases = {"patient": "primary_user"}
+        
+        t_out = {}
+        r = _prepare_p1a_query(self.agent, q, q, subject_aliases=self.agent.subject_aliases, telemetry_out=t_out)
+        self.assertEqual(t_out["route"], "TEMPORAL")
+        self.assertTrue(t_out["accepted"])
+        self.assertEqual(r["precomputed_answer"], "2024-01-06")
+
+    def test_patient_possessive(self):
+        q = "What is the patient's current medication status regarding empagliflozin?"
+        self.agent.subject_aliases = {"patient": "primary_user"}
+        from methods.smart_mem0.router import DeterministicRouter
+        r = DeterministicRouter(subject_aliases=self.agent.subject_aliases)
+        terms = r._extract_terms(q)
+        # "patient's" should be stripped entirely, not leave "s"
+        self.assertNotIn("s", terms)
+        self.assertNotIn("patient", terms)
+        self.assertIn("empagliflozin", terms)
+        self.assertIn("medication", terms)
+
 if __name__ == "__main__":
     unittest.main()
