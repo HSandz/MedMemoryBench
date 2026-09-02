@@ -155,7 +155,7 @@ class EventStateAgent(BaseAgent):
 
     METHOD_TYPE = "agentic_memory"
 
-    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, claim_top_k=30, episode_top_k=20, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_temperature=0.0, planner_max_tokens=1200, **kwargs):
+    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, claim_top_k=30, episode_top_k=20, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_temperature=0.0, planner_max_tokens=1200, planner_merge_mode="coverage_interleave", **kwargs):
         super().__init__(model, temperature, max_tokens, **kwargs)
         if fusion_mode != "rrf":
             raise ValueError("Event-State fusion_mode currently supports only 'rrf'")
@@ -184,13 +184,16 @@ class EventStateAgent(BaseAgent):
         self.planner_max_requests = int(planner_max_requests)
         self.planner_temperature = float(planner_temperature)
         self.planner_max_tokens = int(planner_max_tokens)
+        if planner_merge_mode not in {"coverage_interleave", "sum_rrf"}:
+            raise ValueError("planner_merge_mode must be coverage_interleave or sum_rrf")
+        self.planner_merge_mode = planner_merge_mode
         self._llm_client: BaseLLMClient = llm_client or create_llm_client(provider=provider, model=model, temperature=temperature, max_tokens=max_tokens, api_key=api_key, base_url=base_url, **(llm_client_kwargs or {}))
         self._memory_llm_client: BaseLLMClient = memory_llm_client or create_llm_client(provider=memory_provider or provider, model=memory_model or model, temperature=memory_temperature if memory_model else temperature, max_tokens=memory_max_tokens if memory_model else max_tokens, api_key=memory_api_key if memory_model else api_key, base_url=memory_base_url if memory_model else base_url, **(memory_llm_client_kwargs or {}))
         self._embedder = embedding_client or DenseEmbedder(embedding_provider, embedding_model, embedding_model_path, embedding_api_key or api_key, embedding_base_url or base_url)
         self._stores: Dict[Any, EventStateStore] = {}
         self._context_id = None
         self._build_config = {"enable_episodes": self.enable_episodes, "enable_state_claims": self.enable_state_claims, "enable_state_compilation": self.enable_state_compilation, "extraction_max_tokens": self.extraction_max_tokens, "extraction_temperature": self.extraction_temperature, "max_claims_per_episode": self.max_claims_per_episode, "state_candidate_top_k": int(state_candidate_top_k), "state_current_candidate_top_k": max(1, int(state_current_candidate_top_k)), "state_candidate_min_similarity": float(state_candidate_min_similarity), "update_min_confidence": float(update_min_confidence), "update_temperature": self.update_temperature, "update_max_tokens": self.update_max_tokens, "store_raw_episode_text": self.store_raw_episode_text, "enable_bitemporal_time": self.enable_bitemporal_time, "preserve_turn_evidence": self.preserve_turn_evidence}
-        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "planner_rounds": self.planner_rounds, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens}
+        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "planner_rounds": self.planner_rounds, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens, "planner_merge_mode": self.planner_merge_mode}
 
     def _store(self, context_id=None) -> EventStateStore:
         key = self._context_id if context_id is None else context_id
@@ -991,7 +994,7 @@ class EventStateAgent(BaseAgent):
                 telemetry["planner_early_answer"] = True
                 final_ids = [item["id"] for item in prepared["retrieved_memories"]]
                 telemetry.update({"final_selected_ids": final_ids, "planner_added_ids": [item for item in final_ids if item not in base_selected_ids], "planner_removed_ids": [item for item in base_selected_ids if item not in final_ids]})
-                return AgentResponse(decision.answer or "", retrieved_count=prepared["retrieved_count"], retrieved_memories=prepared["retrieved_memories"], extra={**prepared["extra"], **telemetry})
+                return AgentResponse(decision.answer or "", retrieved_count=prepared["retrieved_count"], retrieved_memories=prepared["retrieved_memories"], extra={**prepared["extra"], **telemetry, "planner": self._planner_artifact(telemetry)})
             new_requests = [request for request in decision.requests if request.key() not in attempted]
             telemetry["planner_duplicate_request_count"] += len(decision.requests) - len(new_requests)
             telemetry["planner_request_count"] += len(decision.requests)
@@ -1014,7 +1017,30 @@ class EventStateAgent(BaseAgent):
             final_response = self._llm_client.chat(prepared["messages"])
         final_ids = [item["id"] for item in prepared["retrieved_memories"]]
         telemetry.update({"final_selected_ids": final_ids, "planner_added_ids": [item for item in final_ids if item not in base_selected_ids], "planner_removed_ids": [item for item in base_selected_ids if item not in final_ids]})
-        return AgentResponse(final_response.content, retrieved_count=prepared["retrieved_count"], retrieved_memories=prepared["retrieved_memories"], extra={**prepared["extra"], **telemetry})
+        return AgentResponse(final_response.content, retrieved_count=prepared["retrieved_count"], retrieved_memories=prepared["retrieved_memories"], extra={**prepared["extra"], **telemetry, "planner": self._planner_artifact(telemetry)})
+
+    @staticmethod
+    def _planner_artifact(telemetry: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the bounded planner diagnostics persisted in query artifacts."""
+        mapping = {
+            "rounds_configured": "planner_rounds_configured",
+            "rounds_used": "planner_rounds_used",
+            "decision_call_count": "planner_decision_call_count",
+            "retrieval_round_count": "planner_retrieval_round_count",
+            "request_count": "planner_request_count",
+            "valid_request_count": "planner_valid_request_count",
+            "invalid_request_count": "planner_invalid_request_count",
+            "duplicate_request_count": "planner_duplicate_request_count",
+            "parse_failure_count": "planner_parse_failure_count",
+            "early_answer": "planner_early_answer",
+            "forced_final_answer": "planner_forced_final_answer",
+            "requests": "planner_requests",
+            "base_selected_ids": "base_selected_ids",
+            "final_selected_ids": "final_selected_ids",
+            "added_ids": "planner_added_ids",
+            "removed_ids": "planner_removed_ids",
+        }
+        return {name: telemetry.get(source, [] if name in {"requests", "base_selected_ids", "final_selected_ids", "added_ids", "removed_ids"} else 0) for name, source in mapping.items()}
 
     def supports_memory_snapshots(self) -> bool:
         return True

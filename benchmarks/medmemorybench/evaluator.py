@@ -1337,6 +1337,8 @@ class MedMemoryBenchEvaluator:
         judge_total = llm_usage.get("judge_phase", {})
         answer_batch = query_operations.get("query.answer_batch", {})
         answer_realtime = query_operations.get("query.answer_realtime", {})
+        planner_controller = query_operations.get("event_state.plan_or_answer", {})
+        event_state_final = query_operations.get("event_state.final_answer", {})
         # Read legacy operation names so older in-memory snapshots remain reportable.
         judge_batch = judge_operations.get("judge.batch") or query_operations.get(
             "query.judge_batch", {}
@@ -1345,7 +1347,9 @@ class MedMemoryBenchEvaluator:
             "query.judge_realtime", {}
         )
         retrieval = query_operations.get("query.retrieval_preparation", {})
-        attributed_query = self._usage_total(answer_batch, answer_realtime, retrieval)
+        attributed_query = self._usage_total(
+            answer_batch, answer_realtime, retrieval, planner_controller, event_state_final
+        )
         attributed_judge = self._usage_total(judge_batch, judge_realtime)
         unattributed_query = TokenUsage.from_dict(query_total).subtract(
             TokenUsage.from_dict(attributed_query)
@@ -1391,7 +1395,12 @@ class MedMemoryBenchEvaluator:
                 "cost": cost_unavailable,
             },
             "answer": {
-                "usage": self._usage_total(answer_batch, answer_realtime),
+                "usage": self._usage_total(answer_batch, answer_realtime, event_state_final),
+                "models": [answer_model],
+                "cost": cost_unavailable,
+            },
+            "planner_controller": {
+                "usage": planner_controller,
                 "models": [answer_model],
                 "cost": cost_unavailable,
             },
@@ -3175,9 +3184,9 @@ class MedMemoryBenchEvaluator:
                 total_query_time += result.query_time
                 if not result.is_correct:
                     self._log(
-                        f"  Query failed | id={result.query_id} | "
+                        f"  Query not fully correct | id={result.query_id} | "
                         f"type={result.query_type} | score={result.score:.2f}",
-                        level="WARNING",
+                        level="INFO",
                     )
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
@@ -3223,9 +3232,9 @@ class MedMemoryBenchEvaluator:
 
                 if not result.is_correct:
                     self._log(
-                        f"  Query failed | id={query.query_id} | "
+                        f"  Query not fully correct | id={query.query_id} | "
                         f"type={query.query_type} | score={result.score:.2f}",
-                        level="WARNING",
+                        level="INFO",
                     )
 
                 if self._checkpoint_manager:
@@ -3936,18 +3945,21 @@ class MedMemoryBenchEvaluator:
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
             response_usage = response.get("answer_usage")
+            response_extra = response.get("extra", {})
         elif hasattr(response, "output"):
             model_output = response.output
             query_time = getattr(response, "query_time", 0.0)
             retrieved_memories = getattr(response, "retrieved_memories", [])
             retrieved_count = getattr(response, "retrieved_count", 0)
             response_usage = None
+            response_extra = getattr(response, "extra", {})
         else:
             model_output = str(response)
             query_time = 0.0
             retrieved_memories = []
             retrieved_count = 0
             response_usage = None
+            response_extra = {}
 
         resolved_execution_usage = copy.deepcopy(execution_usage or {})
         if isinstance(response_usage, dict) and "answer" not in resolved_execution_usage:
@@ -4037,6 +4049,8 @@ class MedMemoryBenchEvaluator:
         )
         result.details["artifact_references"] = references
         result.details["execution_usage"] = resolved_execution_usage
+        if isinstance(response_extra, dict) and isinstance(response_extra.get("planner"), dict):
+            result.details["planner"] = copy.deepcopy(response_extra["planner"])
 
         return result
 

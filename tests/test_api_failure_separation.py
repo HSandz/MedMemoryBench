@@ -219,6 +219,7 @@ def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_pat
         expected_answer="answer",
         retrieved_count=1,
         retrieved_memories=[{"memory_id": "m2", "content": "raw only once"}],
+        details={"planner": {"rounds_configured": 1, "rounds_used": 1}},
     )
     collector.add_result(batch_result, context_id=1)
     collector.add_result(realtime_result, context_id=2)
@@ -278,6 +279,14 @@ def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_pat
     assert retrieval_data["records"][0]["retrieved_memories"] == [
         {"memory_id": "m2", "content": "raw only once"}
     ]
+    assert query_data["queries"][1]["planner"] == {
+        "rounds_configured": 1,
+        "rounds_used": 1,
+    }
+    assert retrieval_data["records"][0]["planner"] == {
+        "rounds_configured": 1,
+        "rounds_used": 1,
+    }
 
 
 def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path):
@@ -362,6 +371,23 @@ def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path
         "fallback_reason": None,
     }]
     assert stage_usage["answer"]["cost"]["available"] is False
+
+
+def test_stage_usage_attributes_event_state_planner_calls_once():
+    tracker = get_usage_tracker()
+    tracker.reset()
+    for operation in ("event_state.plan_or_answer", "event_state.plan_or_answer", "event_state.final_answer"):
+        tracker.set_phase("query")
+        with tracker.scope(operation):
+            tracker.record(LLMResponse(content="ok", input_tokens=1, output_tokens=1, model="test-model"))
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(model=SimpleNamespace(provider="openai", name="test-model"))
+    evaluator._batch_client = None
+    evaluator._judge_batch_client = None
+    stage_usage = evaluator._stage_usage_report(tracker.get_stats())
+    assert stage_usage["planner_controller"]["usage"]["call_count"] == 2
+    assert stage_usage["answer"]["usage"]["call_count"] == 1
+    assert stage_usage["unattributed_query_usage"]["call_count"] == 0
 
 
 def test_true_duration_subtracts_measured_api_failure_time(tmp_path):

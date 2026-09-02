@@ -42,6 +42,7 @@ retrieval_config:
   planner_max_requests: 3
   planner_temperature: 0.0
   planner_max_tokens: 1200
+  planner_merge_mode: coverage_interleave
   max_context_tokens: 120000
   retrieve_claims: true
   retrieve_episodes: true

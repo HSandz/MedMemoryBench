@@ -990,6 +990,7 @@ class AgentManager:
             "query_time": time.time() - staged_query["started_at"],
             "retrieved_count": finalized.retrieved_count,
             "retrieved_memories": finalized.retrieved_memories,
+            "extra": finalized.extra,
             "answer_usage": {
                 "transport": "realtime",
                 "input_tokens": getattr(response, "input_tokens", 0),

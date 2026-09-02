@@ -433,6 +433,9 @@ class ResultCollector:
             answer_reference = artifact_references.get("answer", {})
             if not isinstance(answer_reference, dict):
                 answer_reference = {}
+            planner = details.get("planner")
+            if not isinstance(planner, dict):
+                planner = None
             has_batch_retrieval = bool(
                 answer_reference.get("transport") == "batch"
                 and answer_reference.get("manifest_path")
@@ -446,7 +449,7 @@ class ResultCollector:
                     "request_id": answer_reference["request_id"],
                     "prepared_query_key": "prepared_query",
                 }
-            elif retrieved_memories:
+            elif retrieved_memories or planner is not None:
                 retrieval_records.append({
                     "query_id": result.get("query_id", ""),
                     "context_id": (
@@ -454,6 +457,7 @@ class ResultCollector:
                         if result_object is not None else None
                     ),
                     "retrieved_memories": retrieved_memories,
+                    **({"planner": planner} if planner is not None else {}),
                 })
                 retrieval_reference = {
                     "source": "retrieval_records",
@@ -480,6 +484,7 @@ class ResultCollector:
                 "query_time": result.get("query_time", 0.0),
                 "execution_references": artifact_references,
                 "execution_usage": execution_usage,
+                **({"planner": planner} if planner is not None else {}),
                 "timing": {
                     "kind": (
                         "per_request_latency_unavailable_for_batch"

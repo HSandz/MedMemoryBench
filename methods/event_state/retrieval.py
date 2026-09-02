@@ -131,9 +131,10 @@ class EventStateRetriever:
         return self.select_candidates(candidates, extra)
 
     def merge_rank_channels(self, channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Fuse base and planner request rank channels with equal-weight RRF."""
+        """Fuse planner channels, interleaving coverage before final selection."""
         values: Dict[str, Dict[str, Any]] = {}
         rrf_k = float(self.config.get("rrf_k", 60.0))
+        merge_mode = self.config.get("planner_merge_mode", "coverage_interleave")
         for channel_index, channel in enumerate(channels):
             for rank, item in enumerate(channel, 1):
                 identifier = item["id"]
@@ -142,14 +143,34 @@ class EventStateRetriever:
                     merged.setdefault("planner_request_indices", []).append(channel_index - 1)
                 merged["planner_request_indices"] = sorted(set(merged.get("planner_request_indices", [])))
                 merged["planner_channel_support_count"] = int(merged.get("planner_channel_support_count", 0)) + 1
-                merged["planner_fusion_score"] = float(merged.get("planner_fusion_score", 0.0)) + 1.0 / (rrf_k + rank)
+                contribution = 1.0 / (rrf_k + rank)
+                if merge_mode == "sum_rrf":
+                    merged["planner_fusion_score"] = float(merged.get("planner_fusion_score", 0.0)) + contribution
+                else:
+                    merged["planner_fusion_score"] = max(float(merged.get("planner_fusion_score", 0.0)), contribution)
                 merged["score"] = merged["planner_fusion_score"]
                 merged["fusion_score"] = merged["score"]
                 if channel_index == 0:
                     merged["base_rank"] = rank
-        rows = list(values.values())
-        rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["id"]))
-        return rows[:int(self.config.get("candidate_count", 40))]
+        candidate_count = int(self.config.get("candidate_count", 40))
+        if merge_mode == "sum_rrf":
+            rows = list(values.values())
+            rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["id"]))
+            return rows[:candidate_count]
+        ordered: List[Dict[str, Any]] = []
+        seen = set()
+        max_depth = max((len(channel) for channel in channels), default=0)
+        for depth in range(max_depth):
+            for channel in channels:
+                if depth >= len(channel):
+                    continue
+                identifier = channel[depth]["id"]
+                if identifier not in seen:
+                    seen.add(identifier)
+                    ordered.append(values[identifier])
+                    if len(ordered) >= candidate_count:
+                        return ordered
+        return ordered
 
     def _claim_is_directly_visible(self, claim_id: str, temporal: TemporalQueryConstraint | None = None, state_view: str = "current") -> bool:
         claim = self.store.claims.get(claim_id)

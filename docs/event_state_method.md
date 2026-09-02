@@ -136,11 +136,19 @@ planner_rounds: 0       # preserves the ordinary one-call query flow
 planner_max_requests: 3
 planner_temperature: 0.0
 planner_max_tokens: 1200
+planner_merge_mode: coverage_interleave
 ```
 
 When enabled, the answer model chooses either a final answer or a bounded JSON
-retrieval plan. Valid plans execute locally with the existing claim/episode
-retrieval, RRF, MMR, provenance, and context limits. At most
+retrieval plan. The controller answers only when current personalized evidence
+explicitly supports every personalized premise; missing, ambiguous,
+contradicted, or temporally incompatible premises trigger retrieval. General
+knowledge may support reasoning after those premises are present, but never
+substitutes for personal memory. Valid plans execute locally with the existing
+claim/episode retrieval, RRF, MMR, provenance, and context limits. Planner
+requests with explicit or safely derivable dates carry normalized structured
+time constraints; the planner path does not invoke the lexical temporal parser.
+At most
 `planner_rounds + 1` query-model calls are made. Planner mode does not use the
 lexical temporal cue parser; temporal requests must contain validated
 structured dates. Supported modes are exact record date, before, after,
@@ -149,6 +157,18 @@ requests are skipped and malformed planner output falls back to one ordinary
 final-answer call. Planner mode is realtime-only because dependent rounds cannot
 use the existing single-stage batch-answer transport; `planner_rounds: 0`
 retains batch support unchanged.
+
+Planner-enabled outer fusion uses `coverage_interleave` by default: relevance
+for a memory is the maximum reciprocal rank contributed by any channel, while
+channel support is diagnostic only. The bounded candidate pool is built by
+deterministically interleaving rank 1 from the base channel and each planner
+request, then rank 2 from each channel, and so on; the existing state-aware MMR
+selector remains the final evidence selector. `planner_merge_mode: sum_rrf`
+is available only to reproduce the historical agreement-weighted behavior.
+Planner diagnostics are persisted per query in both the query-answer artifact
+and its retrieval-record sidecar. Query usage reports expose
+`event_state.plan_or_answer` as `planner_controller` and
+`event_state.final_answer` alongside ordinary answer operations.
 
 The default `state_current_candidate_top_k` is `3`; lower it only when the
 classifier prompt budget requires fewer current-state candidates.
