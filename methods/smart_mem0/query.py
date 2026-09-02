@@ -238,25 +238,36 @@ class QueryMixin:
     def prepare_batch_query(
         self, question: str, system_message: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
+        started = time.time()
+        retrieval_question = self._unwrap_question(question)
+        
         # P1A FAST PATH INTERCEPTION
         try:
             from methods.smart_mem0.p1a_execution import _prepare_p1a_query
-            fast_frame = _prepare_p1a_query(self, question, subject_aliases=kwargs.get("subject_aliases"))
+            p1a_telemetry = {}
+            # Use self.subject_aliases configured in agent init
+            fast_frame = _prepare_p1a_query(
+                self, 
+                routing_question=retrieval_question, 
+                answer_question=question,
+                subject_aliases=getattr(self, "subject_aliases", {}),
+                telemetry_out=p1a_telemetry
+            )
             if fast_frame:
                 if system_message:
                     fast_frame["system_message"] = system_message
                     if "messages" in fast_frame and fast_frame["messages"]:
                         existing = fast_frame["messages"][0]["content"]
                         fast_frame["messages"][0]["content"] = f"{system_message}\n\n{existing}" 
+                # Add telemetry to fast_frame's extra
+                fast_frame.setdefault("extra", {})["p1a_attempt"] = p1a_telemetry
                 return fast_frame
         except Exception as e:
             # P1A fail open
             import traceback
             traceback.print_exc()
+            p1a_telemetry = {"attempted": True, "accepted": False, "fallback_reason": "EXCEPTION", "error": str(e)}
             pass
-
-        started = time.time()
-        retrieval_question = self._unwrap_question(question)
         question_options = self._question_options(retrieval_question)
         frame = self._query_frame(retrieval_question)
 
@@ -809,16 +820,16 @@ class QueryMixin:
         context = self._truncate_to_tokens("\n\n".join(blocks), budget)
 
         core_instruction = (
-            "Ground every patient-specific claim in the supplied memory context. "
+            "Ground every subject-specific claim in the supplied memory context. "
             "For inference or reasoning questions, use general domain knowledge to connect grounded "
             "endpoints and make the intermediate mechanism explicit; clearly distinguish that inferred "
-            "bridge from remembered patient history. Never invent patient history, measurements, or treatment. "
+            "bridge from remembered subject history. Never invent subject history, events, measurements, states, decisions, preferences, or actions. "
             "Preserve exact names, values, units, qualifiers, and dates. For each TEMPORAL slot, answer from its "
             "declared time_axis, not from another date displayed on the same memory. Respect relation direction; "
             "never substitute one temporal axis for another. Answer only the comparison "
             "or temporal scope requested, without adding a different baseline. "
             "If conflicts remain, state uncertainty. Pointer evidence supports only its linked memory. "
-            "For a multi-step clinical question, preserve exact measurements and chronology and present a "
+            "For a multi-step reasoning question, preserve exact measurements and chronology and present a "
             "complete cause-to-effect chain rather than merely restating retrieved facts. Follow the requested "
             "output format and answer directly."
         )

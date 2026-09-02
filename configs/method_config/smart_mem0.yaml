@@ -10,6 +10,8 @@ model:
   max_completion_tokens: 8192
 
 agent_params:
+  subject_aliases:
+    patient: "primary_user"
   # Accuracy-first bounded retrieval. Reduce these only after measuring the
   # accuracy/token trade-off on both MedMemoryBench and LoCoMo.
   retrieve_num: 8

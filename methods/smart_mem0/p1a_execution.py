@@ -2,9 +2,21 @@ from typing import Dict, Any, Optional
 import time
 from methods.smart_mem0.router import DeterministicRouter, RouteDecision
 
-def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Optional[Dict[str, Any]]:
+def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subject_aliases: dict = None, telemetry_out: dict = None) -> Optional[Dict[str, Any]]:
+    if telemetry_out is None: telemetry_out = {}
     router = DeterministicRouter(subject_postings=agent._subject_postings, subject_aliases=subject_aliases)
-    decision = router.route_query(question)
+    telemetry_out.update({
+        "attempted": True,
+        "routing_question": routing_question,
+        "accepted": False
+    })
+    
+    decision = router.route_query(routing_question)
+    telemetry_out["route"] = decision.route
+    
+    if decision.route == "HARD":
+        telemetry_out["fallback_reason"] = "HARD_SURFACE_OR_UNRESOLVED"
+        return None
     
     if decision.route == "HARD":
         return None
@@ -46,6 +58,7 @@ def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Op
         # Candidate pool
         pool = _temporal_candidate_pool(agent, decision.target_concept, subject_ids)
         if not pool:
+            telemetry_out["fallback_reason"] = "NO_EXACT_CANDIDATE"
             return None
             
         # Axis constraint
@@ -91,6 +104,7 @@ def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Op
                 selected = min(matched, key=temp_key)
             else:
                 # Unanchored MATCH fails HARD for now until focal-event relevance is implemented
+                telemetry_out["fallback_reason"] = "TEMPORAL_MATCH_AMBIGUOUS"
                 return None
         else:
             return None
@@ -110,6 +124,7 @@ def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Op
     elif decision.route == "EXACT":
         pool = _temporal_candidate_pool(agent, decision.target_concept, subject_ids)
         if not pool:
+            telemetry_out["fallback_reason"] = "NO_EXACT_CANDIDATE"
             return None
             
         # exact/bm25 bounded
@@ -125,6 +140,7 @@ def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Op
     else:
         return None
         
+    telemetry_out["accepted"] = True
     elapsed = (time.time() - start_time) * 1000
     
     # Return fast path frame
@@ -146,7 +162,7 @@ def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Op
         "supports": None,
         "controller_usage": {},
         "planner_usage": {},
-        "question": question,
+        "question": answer_question,
         "system_message": None, 
         "extra": {
             "planner_called": False,

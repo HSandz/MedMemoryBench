@@ -90,6 +90,7 @@ class CoreMemoryMixin:
         self.retrieve_num = min(8, max(3, int(retrieve_num or self.INITIAL_TOP_K)))
         self.max_context_tokens = int(kwargs.get("max_context_tokens") or 32768)
         self.max_question_tokens = int(kwargs.get("max_question_tokens") or 1200)
+        self.subject_aliases = kwargs.get("subject_aliases", {})
         self.enable_memory_write = bool(
             kwargs.get(
                 "enable_memory_write", kwargs.get("enable_profile_extraction", True)
