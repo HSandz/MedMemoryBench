@@ -15,7 +15,18 @@ class StateSpine:
 
     def add_version(self, memory: Dict[str, Any]):
         self.versions.append(memory)
-        self.versions.sort(key=lambda x: (effective_time(x), x.get("id")))
+        
+        def _numeric_memory_seq(m_id: str) -> int:
+            if not m_id: return 0
+            match = re.search(r'\d+', str(m_id))
+            return int(match.group(0)) if match else 0
+            
+        self.versions.sort(key=lambda x: (
+            effective_time(x),
+            x.get("document_time", ""),
+            x.get("session_idx", 0),
+            _numeric_memory_seq(x.get("id", ""))
+        ))
 
     def latest(self) -> Optional[Dict[str, Any]]:
         if not self.versions:
@@ -105,29 +116,28 @@ def has_exact_measurement_identity(memory: dict) -> bool:
     return bool(measurement_identity(memory))
 
 def is_state_projection_eligible(memory: dict) -> bool:
-    if memory.get("kind") == "STATE":
-        return True
-    return (
-        memory.get("semantic_role") == "MEASUREMENT"
-        and memory.get("memory_tier", "HOT") == "HOT"
-        and has_exact_measurement_identity(memory)
-    )
+    return bool(state_identity(memory))
 
 def state_identity(memory: dict) -> str:
-    if not is_state_projection_eligible(memory):
-        return ""
-        
     subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
     
-    # If it's an event projected to a measurement state
-    meas_id = measurement_identity(memory)
-    if meas_id:
-        # Override to measurement identity
-        return f"{str(subject_id).lower().strip()}::{meas_id}::"
+    # 1. Measurement projection (role-gated & DIRECT-only)
+    if memory.get("semantic_role") == "MEASUREMENT":
+        if memory.get("assertion_mode", "DIRECT") != "DIRECT":
+            # RECAP measurements should never become a State Spine head
+            return ""
+        meas_id = measurement_identity(memory)
+        if meas_id:
+            return f"{str(subject_id).lower().strip()}::{meas_id}::"
+            
+    # 2. Ordinary STATE processing
+    if memory.get("kind") != "STATE":
+        return ""
         
     state_key = memory.get("state_key") or ""
     if not state_key:
         return ""
+        
     object_anchor = memory.get("object_anchor") or ""
     return build_state_identity(subject_id, state_key, object_anchor)
 

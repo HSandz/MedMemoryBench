@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .contracts import STATE_LIKE_KINDS, VALID_RELATIONS
 from .core import CoreMemoryMixin
 from .prompts import CONSOLIDATION_PROMPT
-from .canonicalization import state_identity, is_state_projection_eligible
+from .canonicalization import state_identity, is_state_projection_eligible, measurement_identity
 
 
 class ConsolidationMixin:
@@ -770,8 +770,18 @@ class ConsolidationMixin:
             and memory.get("kind") not in STATE_LIKE_KINDS
             for memory in self._memories
         )
-        state_projection_eligible_count = sum(1 for m in self._memories if is_state_projection_eligible(m))
-        state_projection_missing_identity_count = sum(1 for m in self._memories if is_state_projection_eligible(m) and not state_identity(m))
+        projection_candidates = [
+            m for m in self._memories
+            if m.get("semantic_role") == "MEASUREMENT"
+            and m.get("memory_tier", "HOT") == "HOT"
+            and m.get("assertion_mode", "DIRECT") == "DIRECT"
+        ]
+        state_projection_eligible_count = len(projection_candidates)
+        state_projection_missing_identity_count = sum(
+            1 for m in projection_candidates
+            if not measurement_identity(m)
+            and not (m.get("kind") == "STATE" and m.get("state_key"))
+        )
 
         capsules = getattr(self, "_capsules", [])
         capsule_by_id = {c["id"]: c for c in capsules}
