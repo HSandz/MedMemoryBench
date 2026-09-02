@@ -348,7 +348,7 @@ class CaptureMixin:
         # prior_by_id removed
         # Parse episode into a capsule
         episode_data = parsed.get("episode") or {}
-        capsule_id = f"temp_window_{turn_idx}"
+        capsule_id = f"temp_window_{window_idx}"
         
         capsule = {
             "id": capsule_id,
