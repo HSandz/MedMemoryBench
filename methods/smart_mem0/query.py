@@ -917,6 +917,7 @@ class QueryMixin:
                 "raw_evidence_injected": bool(evidence),
                 "memory_tokens": len(self._tokenizer.encode(context)),
                 "context_temporal_axis": context_time_axis or "mixed",
+                "p1a_attempt": p1a_telemetry if "p1a_telemetry" in locals() else {},
                 "retrieval_question": retrieval_question,
                 "query_dates": list(frame.dates),
                 "query_speaker_role": frame.speaker_role,

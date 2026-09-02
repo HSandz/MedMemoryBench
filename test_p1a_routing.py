@@ -67,7 +67,8 @@ class TestP1A(unittest.TestCase):
         self.assertEqual(r.route_query("What was hba1c on April 3?").route, "TEMPORAL")
         
     def test_unanchored_match(self):
-        r = _prepare_p1a_query(self.agent, "When was the recent weight change documented?", "When was the recent weight change documented?")
+        telemetry_out = {}; r = _prepare_p1a_query(self.agent, "When was the recent weight change documented?", "When was the recent weight change documented?", telemetry_out=telemetry_out)
+        if r: r["extra"]["p1a_attempt"] = telemetry_out
         self.assertIsNone(r) # Should fail HARD
         
     def test_subject_resolution(self):
@@ -78,9 +79,10 @@ class TestP1A(unittest.TestCase):
         self.assertEqual(r._resolve_subject("What is the latest hba1c?"), "HARD")
         
     def test_state_spine(self):
-        r = _prepare_p1a_query(self.agent, "What is my latest hba1c?", "What is my latest hba1c?")
+        telemetry_out = {}; r = _prepare_p1a_query(self.agent, "What is my latest hba1c?", "What is my latest hba1c?", telemetry_out=telemetry_out)
+        if r: r["extra"]["p1a_attempt"] = telemetry_out
         self.assertIsNotNone(r)
-        self.assertEqual(r["extra"]["p1a"]["route"], "STATE_LATEST")
+        self.assertEqual(r["extra"]["p1a_attempt"]["route"], "STATE_LATEST")
         self.assertEqual(r["precomputed_answer"], "8.8")
         
         # RECAP test - try to query weight which is only a RECAP measurement, not in State Spine
@@ -88,9 +90,10 @@ class TestP1A(unittest.TestCase):
         self.assertIsNone(r_recap) # Should fail HARD
         
     def test_metformin_start(self):
-        r = _prepare_p1a_query(self.agent, "When did I start taking metformin?", "When did I start taking metformin?")
+        telemetry_out = {}; r = _prepare_p1a_query(self.agent, "When did I start taking metformin?", "When did I start taking metformin?", telemetry_out=telemetry_out)
+        if r: r["extra"]["p1a_attempt"] = telemetry_out
         self.assertIsNotNone(r)
-        self.assertEqual(r["extra"]["p1a"]["route"], "TEMPORAL")
+        self.assertEqual(r["extra"]["p1a_attempt"]["route"], "TEMPORAL")
         self.assertEqual(r["precomputed_answer"], "2024-01-06")
         
     def test_reset_isolation(self):
@@ -102,11 +105,16 @@ class TestP1A(unittest.TestCase):
     def test_determinism(self):
         # same query 10 times
         q = "When did I start taking metformin?"
-        results = [_prepare_p1a_query(self.agent, q, q) for _ in range(10)]
+        results = []
+        for _ in range(10):
+            t_out = {}
+            r = _prepare_p1a_query(self.agent, q, q, telemetry_out=t_out)
+            r["extra"]["p1a_attempt"] = t_out
+            results.append(r)
         for res in results:
-            self.assertEqual(res["extra"]["p1a"]["route"], "TEMPORAL")
-            self.assertEqual(res["extra"]["p1a"]["candidate_ids"], results[0]["extra"]["p1a"]["candidate_ids"])
-            self.assertEqual(res["extra"]["p1a"]["selected_memory_id"], results[0]["extra"]["p1a"]["selected_memory_id"])
+            self.assertEqual(res["extra"]["p1a_attempt"]["route"], "TEMPORAL")
+            self.assertEqual(res["extra"]["p1a_attempt"]["candidate_ids"], results[0]["extra"]["p1a_attempt"]["candidate_ids"])
+            self.assertEqual(res["extra"]["p1a_attempt"]["selected_memory_id"], results[0]["extra"]["p1a_attempt"]["selected_memory_id"])
 
     def test_evaluator_wrapper_integration(self):
         # The wrapper includes prompt text that could confuse the router
@@ -114,14 +122,17 @@ class TestP1A(unittest.TestCase):
         wrapped_question = f"Please answer the following question: {raw_question}. Requirements: Be exact and report the earliest date."
         
         # P1A should use routing_question for routing but preserve wrapped_question for answer
+        telemetry_out = {}
         r = _prepare_p1a_query(
             self.agent,
             routing_question=raw_question,
             answer_question=wrapped_question,
-            subject_aliases=self.agent.subject_aliases
+            subject_aliases=self.agent.subject_aliases,
+            telemetry_out=telemetry_out
         )
+        if r: r["extra"]["p1a_attempt"] = telemetry_out
         self.assertIsNotNone(r)
-        self.assertEqual(r["extra"]["p1a"]["route"], "TEMPORAL")
+        self.assertEqual(r["extra"]["p1a_attempt"]["route"], "TEMPORAL")
         
         # Should NOT hit HARD because of "earliest" or "exact" in the wrapper
         self.assertEqual(r["precomputed_answer"], "2024-01-01")

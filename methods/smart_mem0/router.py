@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 class RouteDecision:
     route: str  # EXACT, STATE_LATEST, TEMPORAL, HARD
     subject_id: str = "primary_user"
-    target_concept: str = ""
+    content_terms: list = None
     answer_slot: str = "VALUE"  # VALUE, DATE
     temporal_axis: str = "event_time"  # event_time, document_time
     temporal_relation: str = "MATCH"  # EARLIEST, LATEST, MATCH
@@ -118,14 +118,14 @@ class DeterministicRouter:
             elif self.RE_LATEST_TEMP.search(question):
                 relation = "LATEST"
                 
-            concept = self._extract_concept(question)
-            if not concept:
+            terms = self._extract_terms(question)
+            if not terms:
                 return RouteDecision(route="HARD")
                 
             return RouteDecision(
                 route="TEMPORAL",
                 subject_id=subject_id,
-                target_concept=concept,
+                content_terms=terms,
                 answer_slot=slot,
                 temporal_axis=axis,
                 temporal_relation=relation,
@@ -138,24 +138,24 @@ class DeterministicRouter:
             
         # 3. STATE_LATEST
         if self.RE_STATE_LATEST.search(question):
-            concept = self._extract_concept(question)
-            if not concept:
+            terms = self._extract_terms(question)
+            if not terms:
                 return RouteDecision(route="HARD")
             return RouteDecision(
                 route="STATE_LATEST",
                 subject_id=subject_id,
-                target_concept=concept,
+                content_terms=terms,
                 answer_slot="VALUE"
             )
             
         # 4. EXACT
         if question.lower().startswith("what"):
-            concept = self._extract_concept(question)
+            terms = self._extract_terms(question)
             if concept:
                 return RouteDecision(
                     route="EXACT",
                     subject_id=subject_id,
-                    target_concept=concept,
+                    content_terms=terms,
                     answer_slot="VALUE"
                 )
                 
@@ -184,17 +184,20 @@ class DeterministicRouter:
             
         return "HARD"
 
-    def _extract_concept(self, question: str) -> str:
+    def _extract_terms(self, question: str) -> list:
         q = question.lower()
-        q = re.sub(r'[^a-z0-9\s]', '', q)
+        q = re.sub(r'[^a-z0-9\s]', ' ', q)
         
         stopwords = {
             "what", "when", "where", "who", "why", "how", "is", "are", "was", "were", 
-            "do", "does", "did", "the", "a", "an", "my", "patient", "user", "i", "me",
+            "do", "does", "did", "the", "a", "an", "my", "patient", "user", "i", "me", "he", "she", "his", "her",
             "current", "latest", "now", "documented", "recorded", "reported", "mentioned",
             "started", "start", "began", "first", "appeared", "onset", "occurred", "earliest",
             "date", "time", "status", "value", "level", "taking", "took", "visit", "on", "in", "at",
-            "of", "for", "to", "with", "recent", "about", "there", "any", "mine", "we", "our"
+            "of", "for", "to", "with", "recent", "about", "there", "any", "mine", "we", "our",
+            "has", "have", "had", "been", "that", "this", "these", "those", "which", "name",
+            "clearly", "instructed", "avoid", "past", "history", "medical", "patient's",
+            "can", "could", "would", "should", "tell", "say", "know"
         }
         
         words = q.split()
@@ -203,7 +206,5 @@ class DeterministicRouter:
         months = set(self.MONTHS.keys())
         concept_words = [w for w in concept_words if w not in months]
         
-        if not concept_words:
-            return ""
-        return " ".join(concept_words)
+        return concept_words
 

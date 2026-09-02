@@ -33,7 +33,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         
     if decision.route == "STATE_LATEST":
         # Target concept -> canonical identity
-        ident = _resolve_canonical_identity(agent, decision.target_concept, decision.subject_id)
+        ident = _resolve_canonical_identity(agent, decision.content_terms, decision.subject_id)
         if not ident:
             return None
             
@@ -56,7 +56,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         
     elif decision.route == "TEMPORAL":
         # Candidate pool
-        pool = _temporal_candidate_pool(agent, decision.target_concept, subject_ids)
+        pool = _candidate_pool(agent, decision.content_terms, subject_ids)
         if not pool:
             telemetry_out["fallback_reason"] = "NO_EXACT_CANDIDATE"
             return None
@@ -77,6 +77,9 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
             
         if decision.temporal_relation == "EARLIEST":
             selected = min(dated_pool, key=temp_key)
+            if selected.get("assertion_mode") == "RECAP":
+                telemetry_out["fallback_reason"] = "TEMPORAL_RECAP_ONSET_UNSAFE"
+                return None
         elif decision.temporal_relation == "LATEST":
             selected = max(dated_pool, key=temp_key)
         elif decision.temporal_relation == "MATCH":
@@ -122,7 +125,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         used_ids.add(selected["id"])
         
     elif decision.route == "EXACT":
-        pool = _temporal_candidate_pool(agent, decision.target_concept, subject_ids)
+        pool = _candidate_pool(agent, decision.content_terms, subject_ids)
         if not pool:
             telemetry_out["fallback_reason"] = "NO_EXACT_CANDIDATE"
             return None
@@ -175,21 +178,23 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
                 "answer": 0,
                 "total": 0
             },
-            "retrieval_elapsed_ms": elapsed,
-            "p1a": {
-                "route": decision.route,
-                "subject_id": decision.subject_id,
-                "target_concept": decision.target_concept,
-                "answer_slot": decision.answer_slot,
-                "temporal_axis": decision.temporal_axis,
-                "temporal_relation": decision.temporal_relation,
-                "temporal_anchor": decision.temporal_anchor,
-                "candidate_ids": [m["id"] for m in pool] if 'pool' in locals() else list(used_ids),
-                "selected_memory_id": selected["id"] if 'selected' in locals() and isinstance(selected, dict) else (list(used_ids)[0] if len(used_ids) == 1 else None),
-                "precomputed": precomputed is not None
-            }
+            "retrieval_elapsed_ms": elapsed
         }
     }
+    
+    telemetry_out.update({
+        "route": decision.route,
+        "subject_id": decision.subject_id,
+        "content_terms": decision.content_terms,
+        "answer_slot": decision.answer_slot,
+        "temporal_axis": decision.temporal_axis,
+        "temporal_relation": decision.temporal_relation,
+        "temporal_anchor": decision.temporal_anchor,
+        "candidate_ids": [m["id"] for m in pool] if 'pool' in locals() else list(used_ids),
+        "selected_memory_id": selected["id"] if 'selected' in locals() and isinstance(selected, dict) else (list(used_ids)[0] if len(used_ids) == 1 else None),
+        "precomputed": precomputed is not None,
+        "accepted_reason": f"{decision.route}_RESOLVED"
+    })
     
     if precomputed is not None:
         ret["precomputed_answer"] = precomputed
@@ -205,112 +210,88 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
         
     return ret
 
-def _resolve_canonical_identity(agent, concept: str, subject_id: str) -> Optional[str]:
-    # Check if exact identity exists
-    concept = concept.lower()
-    
-    # Try exact state_keys from spine
-    matches = []
-    for ident in agent._state_spine.keys():
-        if not ident.startswith(f"{subject_id}::"):
-            continue
-        parts = ident.split("::")
-        if len(parts) >= 2:
-            sk = parts[1].lower()
-            if concept in sk or sk in concept:
-                matches.append(ident)
-                
-    if len(matches) == 1:
-        return matches[0]
+def _resolve_canonical_identity(agent, content_terms: list, subject_id: str):
+    if not content_terms:
+        return None
         
-    # Check object anchor
-    matches = []
+    matches = set()
     for ident, spine in agent._state_spine.items():
         if not ident.startswith(f"{subject_id}::"):
             continue
+            
+        parts = ident.split("::")
+        if len(parts) >= 2:
+            sk = parts[1].lower()
+            if all(t in sk for t in content_terms):
+                matches.add(ident)
+                continue
+                
         for m in spine.versions:
             obj = str(m.get("object_anchor") or "").lower()
-            if concept in obj or obj in concept:
-                matches.append(ident)
+            if all(t in obj for t in content_terms):
+                matches.add(ident)
                 break
                 
     if len(matches) == 1:
-        return matches[0]
+        return list(matches)[0]
         
     return None
 
-def _temporal_candidate_pool(agent, concept: str, subject_ids: set) -> list:
-    # Build ranked candidates
-    concept = concept.lower()
-    words = set(concept.split())
+def _candidate_pool(agent, content_terms: list, subject_ids: set) -> list:
+    if not content_terms:
+        return []
     
     exact_obj = []
     exact_ent = []
     exact_pred = []
-    alias = []
     bm25 = []
+    
+    query_terms = set(content_terms)
     
     for m in agent._memories:
         if m["id"] not in subject_ids:
             continue
             
-        # Subject Firewall is implicitly enforced by subject_ids
+        obj = str(m.get("object_anchor") or "").lower()
+        sk = str(m.get("state_key") or "").lower()
+        ents = [str(e).lower() for e in m.get("entities", [])]
+        claim = str(m.get("claim") or "").lower()
         
         # EXACT OBJECT
-        obj = str(m.get("object_anchor") or "").lower()
-        if obj and (obj == concept):
+        if obj and all(t in obj for t in content_terms):
             exact_obj.append(m)
             continue
             
         # EXACT ENTITY
-        ents = [str(e).lower() for e in m.get("entities", [])]
-        if concept in ents:
+        if any(all(t in e for t in content_terms) for e in ents):
             exact_ent.append(m)
             continue
             
         # EXACT PREDICATE / Canonical Key
-        sk = str(m.get("state_key") or "").lower()
-        if sk and sk == concept:
+        if sk and all(t in sk for t in content_terms):
             exact_pred.append(m)
             continue
             
-        # ALIAS / Substring Object
-        if obj and (concept in obj or obj in concept):
-            alias.append(m)
-            continue
-            
-        if sk and (concept in sk or sk in concept):
-            alias.append(m)
-            continue
-            
-        # BOUNDED Lexical Fallback (strict match)
-        claim = str(m.get("claim") or "").lower()
-        claim_words = set(claim.split())
-        overlap = len(words.intersection(claim_words))
-        # require all words to match for strict lexical recovery
-        if overlap == len(words):
+        # BOUNDED Lexical Fallback
+        combined = set(obj.split() + sk.split() + claim.split())
+        for e in ents: combined.update(e.split())
+        
+        overlap = len(query_terms.intersection(combined))
+        if overlap == len(query_terms):
             bm25.append((overlap, m))
             
     bm25.sort(key=lambda x: x[0], reverse=True)
     bm25 = [m for _, m in bm25]
     
-    # Return the highest authorized tier that has candidates
     if exact_obj: return exact_obj
     if exact_ent: return exact_ent
     if exact_pred: return exact_pred
-    if alias: return alias
-    
-    # Require bounded margin/threshold
-    if bm25:
-        # Just return the top matches (tie-broken later)
-        return bm25
+    if bm25: return bm25
     
     return []
-    
+
 def _get_date(m: dict, axis: str) -> str:
-    # Handle "UNKNOWN"
     val = str(m.get(axis) or "").strip()
     if not val or val.upper() == "UNKNOWN":
         return ""
     return val
-
