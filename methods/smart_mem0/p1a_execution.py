@@ -225,112 +225,67 @@ def _resolve_canonical_identity(agent, content_terms: list, subject_id: str):
     if not content_terms:
         return None
         
-    scores = {}
+    matches = set()
     for ident, spine in agent._state_spine.items():
         if not ident.startswith(f"{subject_id}::"):
             continue
             
-        score = 0
+        canonical_text = set()
         parts = ident.split("::")
         if len(parts) >= 2:
-            sk = parts[1].lower()
-            if sk and all(t in sk for t in content_terms):
-                score += 10
-            elif sk and any(t in sk for t in content_terms):
-                score += sum(3 for t in content_terms if t in sk)
-                
-        for m in spine.versions:
-            obj = str(m.get("object_anchor") or "").lower()
-            if obj and all(t in obj for t in content_terms):
-                score += 8
-                break
-            elif obj and any(t in obj for t in content_terms):
-                score += sum(2 for t in content_terms if t in obj)
-                break
-                
-        if score > 0:
-            scores[ident] = score
+            canonical_text.update(parts[1].lower().split())
             
-    if not scores:
-        return None
-        
-    # Find unique winner with margin
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    if len(ranked) == 1:
-        return ranked[0][0]
-    if ranked[0][1] > ranked[1][1]: # Strict margin > 0
-        return ranked[0][0]
+        for m in spine.versions:
+            if "object_anchor" in m and m["object_anchor"]:
+                canonical_text.update(str(m["object_anchor"]).lower().split())
+            if "entities" in m:
+                for e in m["entities"]:
+                    canonical_text.update(str(e).lower().split())
+                    
+        if any(t in canonical_text for t in content_terms):
+            matches.add(ident)
+            
+    if len(matches) == 1:
+        return list(matches)[0]
         
     return None
 
 def _candidate_pool(agent, content_terms: list, subject_ids: set) -> list:
     if not content_terms:
         return []
-    
-    scores = []
-    
+        
+    matched_memories = []
     for m in agent._memories:
         if m["id"] not in subject_ids:
             continue
             
-        score = 0
-        obj = str(m.get("object_anchor") or "").lower()
-        sk = str(m.get("state_key") or "").lower()
-        ents = [str(e).lower() for e in m.get("entities", [])]
-        claim = str(m.get("claim") or "").lower()
+        canonical_text = set()
+        if "object_anchor" in m and m["object_anchor"]:
+            canonical_text.update(str(m["object_anchor"]).lower().split())
+        if "state_key" in m and m["state_key"]:
+            canonical_text.update(str(m["state_key"]).lower().split())
+        if "entities" in m:
+            for e in m["entities"]:
+                canonical_text.update(str(e).lower().split())
+                
+        if any(t in canonical_text for t in content_terms):
+            matched_memories.append(m)
+            
+    if not matched_memories:
+        return []
         
-        # EXACT OBJECT
-        if obj and all(t in obj for t in content_terms): score += 20
-        elif obj and any(t in obj for t in content_terms): score += sum(5 for t in content_terms if t in obj)
+    # Check coherence: do they all belong to the same canonical concept family?
+    distinct_anchors = set()
+    for m in matched_memories:
+        anchor = str(m.get("object_anchor") or "").lower().strip()
+        if anchor:
+            distinct_anchors.add(anchor)
             
-        # EXACT ENTITY
-        if any(all(t in e for t in content_terms) for e in ents): score += 15
-        else:
-            for e in ents:
-                if any(t in e for t in content_terms): score += sum(3 for t in content_terms if t in e)
-            
-        # EXACT PREDICATE / Canonical Key
-        if sk and all(t in sk for t in content_terms): score += 12
-        elif sk and any(t in sk for t in content_terms): score += sum(3 for t in content_terms if t in sk)
-            
-        # BOUNDED Lexical Fallback
-        claim_words = set(claim.split())
-        overlap = sum(1 for t in content_terms if t in claim_words)
-        score += overlap * 2
+    if len(distinct_anchors) > 1:
+        # Ambiguous distinct concepts mixed together -> HARD
+        return []
         
-        if score > 0:
-            scores.append((score, m))
-            
-    scores.sort(key=lambda x: x[0], reverse=True)
-    
-    # If we have strong lexical candidates (threshold 8+)
-    if scores and scores[0][0] >= 8:
-        # Return all that share the top tier, or just top ones above threshold
-        return [m for s, m in scores if s >= 8]
-        
-    # BOUNDED Dense Fallback
-    import numpy as np
-    try:
-        from sklearn.metrics.pairwise import cosine_similarity
-        if agent._embedder and getattr(agent, "_embedding_cache", None):
-            q_emb = agent._embedder.encode([" ".join(content_terms)], show_progress_bar=False)
-            dense_scores = []
-            for m in agent._memories:
-                if m["id"] not in subject_ids: continue
-                m_emb = agent._embedding_cache.get(m["id"])
-                if m_emb is not None:
-                    # m_emb is usually 1D. cosine_similarity takes 2D.
-                    sim = cosine_similarity(q_emb, np.array([m_emb]))[0][0]
-                    dense_scores.append((sim, m))
-            
-            dense_scores.sort(key=lambda x: x[0], reverse=True)
-            if dense_scores and dense_scores[0][0] >= 0.70: # Bounded threshold
-                # return top 3 above threshold
-                return [m for s, m in dense_scores if s >= 0.70][:3]
-    except Exception:
-        pass
-    
-    return [m for s, m in scores if s > 0]
+    return matched_memories
 
 def _get_date(m: dict, axis: str) -> str:
     val = str(m.get(axis) or "").strip()
