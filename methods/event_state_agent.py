@@ -19,7 +19,12 @@ from utils.llm_client import BaseLLMClient, LLMAPIError, create_llm_client, form
 from .event_state.compiler import StateCompiler, parse_json
 from .event_state.context import fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
 from .event_state.embeddings import DenseEmbedder
-from .event_state.prompts import EXTRACTION_SYSTEM_PROMPT, QUERY_PLANNER_SYSTEM_PROMPT
+from .event_state.prompts import (
+    ANSWER_SYSTEM_PROMPT,
+    EXTRACTION_SYSTEM_PROMPT,
+    QUERY_PLANNER_SYSTEM_PROMPT,
+    STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT,
+)
 from .event_state.planner import validate_planner_output
 from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
@@ -333,7 +338,7 @@ class EventStateAgent(BaseAgent):
         if session.get("conversation_scope", "").startswith("third_party:"):
             allowed_subjects.append(session["conversation_scope"])
         allowed_ids = {turn.source_turn_id for turn in normalized}
-        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\nAllowed source_turn_ids: {sorted(allowed_ids)}\nIn JSON source_turn_ids, copy one of these allowed IDs exactly as written. The surrounding display syntax [turn_id=...] is not part of the ID. Do not add brackets, turn_id=, or any other prefix/suffix unless that text is itself part of an allowed source_turn_id. If allowed contains \"0\", use \"0\", not \"[turn_id=0]\" or \"turn_id=0\". If allowed contains \"turn_0\", \"turn_0\" is valid because it is the actual source ID.\nExtract at most {self.max_claims_per_episode} claims. Prioritize distinct high-value long-term propositions; do not create low-value claims to fill the limit.\n{turn_text}"
+        prompt = f"Known session timestamp: {session.get('timestamp')}\nConversation scope: {session.get('conversation_scope')}\nParticipants: {participants}\nAllowed canonical subject IDs: {allowed_subjects}\nAllowed source_turn_ids: {sorted(allowed_ids)}\nUse only these canonical source_turn_ids exactly as listed; display wrappers such as [turn_id=...] are not IDs.\nExtract at most {self.max_claims_per_episode} claims. Prioritize distinct high-value long-term propositions; do not create low-value claims to fill the limit.\n{turn_text}"
         repaired = False
         parse_failure = False
         structure_failure = False
@@ -512,7 +517,7 @@ class EventStateAgent(BaseAgent):
                         f"claims. Claims may cite only these source_turn_ids: {sorted(allowed_ids)}. "
                         f"Structural issue: {exc}\nPrevious output:\n{response_content}"
                     )
-                    response = request_json(extraction_messages(repair_prompt))
+                    response = request_json(format_messages(repair_prompt, STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT))
                 repaired = True
                 repaired_content = str(getattr(response, "content", "") or "")
                 parsed = parse_and_validate(repaired_content, record_telemetry=False)
@@ -541,7 +546,7 @@ class EventStateAgent(BaseAgent):
                 subset_json = json.dumps([item["raw_claim"] for item in parsed["invalid_claims"]], ensure_ascii=True, default=str)
                 repair_prompt = f"Repair this extraction claim subset as valid JSON only. Return an object with a claims array containing only these claims, preserving their semantic propositions. Do not create new claims, echo valid claims, or guess provenance. Correct source_turn_ids only when supported by visible turns and use only these bare allowed IDs: {sorted(allowed_ids)}. Invalid claims:\n{subset_json}\nVisible turns:\n{turn_text}"
                 with get_usage_tracker().scope("event_state.extract_repair"):
-                    messages = format_messages(repair_prompt, EXTRACTION_SYSTEM_PROMPT)
+                    messages = format_messages(repair_prompt, STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT)
                     response = request_json(messages)
                 subset = parse_and_validate(response.content, record_telemetry=False)
                 existing = {
@@ -750,8 +755,6 @@ class EventStateAgent(BaseAgent):
         counts["real_speaker_claim_count"] += sum(claim.subject_id.startswith("speaker:") for claim in prepared.claims)
         compiler = StateCompiler(store, self._embedder, self._memory_llm_client, candidate_top_k=self._build_config["state_candidate_top_k"], current_candidate_top_k=self._build_config["state_current_candidate_top_k"], min_similarity=self._build_config["state_candidate_min_similarity"], min_confidence=self._build_config["update_min_confidence"], update_temperature=self._build_config["update_temperature"], update_max_tokens=self._build_config["update_max_tokens"])
         for claim, claim_embedding, slot_embedding in zip(prepared.claims, prepared.claim_embeddings, prepared.claim_slot_embeddings):
-            if claim.confidence < 0.55:
-                counts["low_extraction_confidence_count"] += 1
             if not self.enable_state_compilation:
                 store.add_claim(claim, claim_embedding, slot_embedding)
                 counts["uncompiled_claim_count"] += 1
@@ -911,7 +914,8 @@ class EventStateAgent(BaseAgent):
             for record in records if record["type"] == "episode" and episode_evidence_by_id.get(record["id"])
         )
         instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
-        included_blocks, included_tokens = fit_context(blocks, system_message or "", instruction, question, self.max_context_tokens, self.max_tokens, self.count_tokens, self.truncate_to_tokens)
+        answer_system = "\n\n".join(item for item in (ANSWER_SYSTEM_PROMPT, (system_message or "").strip()) if item)
+        included_blocks, included_tokens = fit_context(blocks, answer_system, instruction, question, self.max_context_tokens, self.max_tokens, self.count_tokens, self.truncate_to_tokens)
         included_ids = [record["id"] for record in records if record["memory"] in included_blocks]
         for record in records:
             record["included_in_context"] = record["id"] in included_ids
@@ -929,7 +933,7 @@ class EventStateAgent(BaseAgent):
         context = "\n\n".join(included_blocks)
         user_content = f"{instruction}\n\n{context}\n\n{question}" if context else f"{instruction}\n\n{question}"
         extra = {**retrieval_extra, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": sum(self.count_tokens(block["text"]) for block in blocks), "included_context_tokens": included_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
-        return {"messages": format_messages(user_content, system_message), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
+        return {"messages": format_messages(user_content, answer_system), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     def _initial_query_context(self, question: str, system_message: Optional[str], **kwargs):
         store = self._store(kwargs.get("context_id"))
@@ -974,7 +978,7 @@ class EventStateAgent(BaseAgent):
             telemetry["planner_rounds_used"] = round_index + 1
             previous = json.dumps(telemetry["planner_requests"], ensure_ascii=True)
             planner_user = f"[ORIGINAL QUESTION]\n{question}\n\n[CURRENT PERSONALIZED MEMORY EVIDENCE]\n{prepared.get('context', '') or 'none'}\n\n[PREVIOUS RETRIEVAL REQUESTS]\n{previous if telemetry['planner_requests'] else 'none'}\n\n[PLANNER BUDGET]\nretrieval rounds available including this decision: {self.planner_rounds - round_index}\nadditional retrieval rounds after this decision: {self.planner_rounds - round_index - 1}\nmaximum requests this round: {self.planner_max_requests}"
-            planner_system = ((system_message or "").strip() + "\n\n" + QUERY_PLANNER_SYSTEM_PROMPT).strip()
+            planner_system = "\n\n".join(item for item in (QUERY_PLANNER_SYSTEM_PROMPT, (system_message or "").strip()) if item)
             try:
                 with get_usage_tracker().scope("event_state.plan_or_answer"):
                     response = self._llm_client.chat(format_messages(planner_user, planner_system), temperature=self.planner_temperature, max_tokens=self.planner_max_tokens, response_format={"type": "json_object"})

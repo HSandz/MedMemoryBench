@@ -202,11 +202,9 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
     allowed = {canonical_turn_id(item, "") for item in allowed_turn_ids}
     if allowed and any(item not in allowed for item in supplied):
         return None
-    confidence = raw.get("confidence", 1.0)
-    try:
-        confidence = float(confidence)
-    except (TypeError, ValueError):
-        confidence = 0.0
+    # Extractor confidence is retained for snapshot compatibility only. ESHM
+    # does not use it for semantic decisions, so store one neutral sentinel.
+    confidence = 0.5
     return {
         **raw,
         "subject": str(raw.get("subject") or ""),
@@ -221,7 +219,7 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
         if enum(raw.get("persistence"), "persistence", "state") == "state"
         else None,
         "source_turn_ids": supplied,
-        "confidence": max(0.0, min(1.0, confidence if math.isfinite(confidence) else 0.0)),
+        "confidence": confidence,
         "valid_from": raw.get("valid_from") if isinstance(raw.get("valid_from"), str) else None,
         "valid_to": raw.get("valid_to") if isinstance(raw.get("valid_to"), str) else None,
         "valid_time_text": raw.get("valid_time_text") if isinstance(raw.get("valid_time_text"), str) else None,

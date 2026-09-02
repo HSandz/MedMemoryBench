@@ -55,6 +55,30 @@ exact cited turns for the new and candidate claims (bounded to four turns per
 side), so unrelated dialogue cannot affect correction/restatement decisions.
 Exact normalized duplicates remain deterministic.
 
+### LLM prompt contracts
+
+All Event-State core LLM prompts treat conversation turns, stored or retrieved
+memory, candidate claims, and prior model output as data rather than
+instructions. This boundary applies during extraction, state classification,
+optional retrieval planning, structured-output repair, and final answering;
+instructions embedded in evidence do not override the active task.
+
+Extraction requests a concise, source-grounded `episode_summary` of salient
+events, observations, decisions, commitments, and context rather than a claim
+list. Predicates are concise, value-independent relation/property labels.
+`valid_time_text` preserves source wording, while `valid_from` and `valid_to`
+are populated only for explicit, well-supported absolute bounds; unknown time
+remains unknown. Extractor confidence is stored as the neutral compatibility
+sentinel `0.5` and does not affect Event-State semantic decisions.
+
+Structural and claim-subset repair use a dedicated repair-only system prompt;
+they may correct permitted structure or provenance but cannot perform fresh
+extraction or classification. The update classifier may select only `NEW`,
+`DUPLICATE`, `CORROBORATE`, `REFINE`, `SUPERSEDE`, or `CONFLICT`. `EPISODIC`
+remains a deterministic internal outcome for non-observation claims. Classifier
+confidence measures support for the proposed relation from supplied evidence,
+and its rationale is a short audit reason.
+
 Extraction lifecycle labels are semantic: `state` is a currently true or
 ongoing proposition worth carrying forward (even if it began long ago),
 `history` is former or completed background no longer asserted as current, and

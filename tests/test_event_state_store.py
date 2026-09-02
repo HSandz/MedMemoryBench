@@ -475,7 +475,8 @@ def test_state_value_relation_controls_non_exact_lifecycle(operation, relation, 
     store = EventStateStore("p")
     old = Claim("OLD", "Alice", "alice", "preference", "email", state_slot="contact_preference", evidence=[EvidenceRef("s1", "s1", ["1"])])
     store.add_claim(old, [1.0, 0.0], [1.0, 0.0])
-    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content=f'{{"matched_claim_id":"OLD","operation":"{operation}","state_value_relation":"{relation}","same_state_dimension":true,"same_episode_relation":"none","confidence":1}}'))
+    matched_claim_id = "null" if operation == "NEW" else '"OLD"'
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content=f'{{"matched_claim_id":{matched_claim_id},"operation":"{operation}","state_value_relation":"{relation}","same_state_dimension":true,"same_episode_relation":"none","confidence":1}}'))
     compiler = StateCompiler(store, FakeEmbedder(), llm, min_similarity=0.1)
     result = compiler.apply(Claim("NEW", "Alice", "alice", "contact", "work email rather than personal email", state_slot="contact_preference", evidence=[EvidenceRef("s2", "s2", ["2"])]), "s2", [1.0, 0.0], [1.0, 0.0])
 

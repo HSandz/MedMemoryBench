@@ -178,8 +178,8 @@ def test_extraction_prompt_allows_literal_wrapper_like_ids():
     llm = LLM()
     agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=Embedder())
     agent.memorize("fact", source_session_id=1, memory_items=[{"role": "user", "content": "fact", "source_turn_id": "turn_0"}])
-    assert "copy one of these allowed IDs exactly as written" in captured[0]
-    assert '"turn_0" is valid because it is the actual source ID' in captured[0]
+    assert "Use only these canonical source_turn_ids exactly as listed" in captured[0]
+    assert "display wrappers such as [turn_id=...] are not IDs" in captured[0]
 
 
 class _PatchEmbedder:
@@ -354,7 +354,7 @@ def test_claim_provenance_is_excluded_from_global_episode_evidence(monkeypatch):
 @pytest.mark.parametrize("relation", ["equivalent", "refinement", "changed", "contradictory", "uncertain"])
 def test_update_schema_accepts_all_state_value_relations(relation):
     operation = {"equivalent": "CORROBORATE", "refinement": "REFINE", "changed": "SUPERSEDE", "contradictory": "CONFLICT", "uncertain": "NEW"}[relation]
-    decision = validate_update_decision({"matched_claim_id": "C", "operation": operation, "same_state_dimension": True, "state_value_relation": relation, "same_episode_relation": "none", "confidence": 1})
+    decision = validate_update_decision({"matched_claim_id": None if operation == "NEW" else "C", "operation": operation, "same_state_dimension": True, "state_value_relation": relation, "same_episode_relation": "none", "confidence": 1})
     assert decision["state_value_relation"] == relation
 
 

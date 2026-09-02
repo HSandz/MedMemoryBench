@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .embeddings import cosine
-from .prompts import UPDATE_SYSTEM_PROMPT
+from .prompts import STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT, UPDATE_SYSTEM_PROMPT
 from .schemas import Claim, EvidenceRef, StateOperation
 from .store import EventStateStore
 from .validation import normalize_state_slot
@@ -19,6 +19,7 @@ from utils.llm_client import format_messages, get_usage_tracker
 
 
 OPERATIONS = {"NEW", "DUPLICATE", "CORROBORATE", "REFINE", "SUPERSEDE", "CONFLICT", "EPISODIC"}
+CLASSIFIER_OPERATIONS = OPERATIONS - {"EPISODIC"}
 NON_OBSERVATION_MODALITIES = {"planned", "recommended", "hypothetical"}
 SAME_EPISODE_RELATIONS = {"restatement", "correction", "state_change", "refinement", "contradiction", "none"}
 STATE_VALUE_RELATIONS = {"equivalent", "refinement", "changed", "contradictory", "uncertain"}
@@ -196,18 +197,18 @@ class StateCompiler:
                 "Convert the previous classifier output to the required schema. "
                 "Do not reconsider evidence, invent a new semantic judgment, or add facts. "
                 "Return one valid JSON object only. Required schema: "
-                '{"matched_claim_id": string|null, "operation": "NEW|DUPLICATE|CORROBORATE|REFINE|SUPERSEDE|CONFLICT|EPISODIC", '
+                '{"matched_claim_id": string|null, "operation": "NEW|DUPLICATE|CORROBORATE|REFINE|SUPERSEDE|CONFLICT", '
                 '"same_state_dimension": boolean, "state_value_relation": "equivalent|refinement|changed|contradictory|uncertain", "same_episode_relation": "restatement|correction|state_change|refinement|contradiction|none", '
                 '"confidence": number, "rationale": string}. Previous output:\n' + raw_content
             )
             try:
                 with get_usage_tracker().scope("event_state.update_repair"):
                     try:
-                        repaired = self.llm_client.chat(format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT), temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
+                        repaired = self.llm_client.chat(format_messages(repair_prompt, STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT), temperature=self.update_temperature, max_tokens=self.update_max_tokens, response_format={"type": "json_object"})
                     except TypeError as exc:
                         if "response_format" not in str(exc).lower() and "unexpected keyword" not in str(exc).lower() and "positional" not in str(exc).lower():
                             raise
-                        repair_messages = format_messages(repair_prompt, UPDATE_SYSTEM_PROMPT)
+                        repair_messages = format_messages(repair_prompt, STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT)
                         try:
                             repaired = self.llm_client.chat(repair_messages, temperature=self.update_temperature, max_tokens=self.update_max_tokens)
                         except TypeError as fallback_exc:
@@ -485,18 +486,26 @@ def parse_json(content: str) -> Dict[str, Any]:
     raise ValueError("missing JSON object")
 
 
-def validate_update_decision(value: Any) -> Dict[str, Any]:
+def validate_update_decision(
+    value: Any,
+    candidate_claim_ids: Optional[set[str]] = None,
+) -> Dict[str, Any]:
     """Validate and normalize the classifier decision schema."""
     if not isinstance(value, dict):
         raise ValueError("classifier decision must be an object")
     operation = value.get("operation")
-    if not isinstance(operation, str) or operation.upper() not in OPERATIONS:
+    if not isinstance(operation, str) or operation.upper() not in CLASSIFIER_OPERATIONS:
         raise ValueError("invalid classifier operation")
     if "matched_claim_id" not in value:
         raise ValueError("matched_claim_id is required")
     matched = value.get("matched_claim_id")
     if matched is not None and not isinstance(matched, str):
         raise ValueError("matched_claim_id must be a string or null")
+    normalized_operation = operation.upper()
+    if normalized_operation == "NEW" and matched is not None:
+        raise ValueError("NEW must use a null matched_claim_id")
+    if normalized_operation != "NEW" and candidate_claim_ids is not None and matched not in candidate_claim_ids:
+        raise ValueError("matched_claim_id must be a supplied candidate")
     if "same_state_dimension" not in value:
         raise ValueError("same_state_dimension is required")
     same_state_dimension = value.get("same_state_dimension")
@@ -524,7 +533,7 @@ def validate_update_decision(value: Any) -> Dict[str, Any]:
     if not isinstance(rationale, str):
         raise ValueError("rationale must be a string")
     return {
-        "operation": operation.upper(),
+        "operation": normalized_operation,
         "matched_claim_id": matched,
         "same_state_dimension": same_state_dimension,
         "same_episode_relation": relation.casefold(),
