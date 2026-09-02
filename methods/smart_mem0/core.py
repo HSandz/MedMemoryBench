@@ -532,6 +532,19 @@ class CoreMemoryMixin:
         scope = CoreMemoryMixin._canonical_identifier(raw, "general")
         return SCOPE_ALIASES.get(scope, scope)
 
+    @staticmethod
+    def _memory_value(memory: Dict[str, Any]) -> str:
+        import re
+        return re.sub(
+            r"\s+",
+            " ",
+            str(memory.get("value") or memory.get("verbatim_value") or "").strip(),
+        )
+
+    @classmethod
+    def _normalised_value(cls, memory: Dict[str, Any]) -> str:
+        return cls._canonical_identifier(cls._memory_value(memory))
+
     @classmethod
     def _state_value_signature(cls, memory: Dict[str, Any]) -> str:
         """Collapse same-measurement paraphrases without hiding numeric changes."""
