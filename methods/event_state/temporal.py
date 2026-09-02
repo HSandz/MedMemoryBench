@@ -102,9 +102,6 @@ def _date_matches(value: date, constraint: TemporalQueryConstraint) -> bool:
 
 def episode_temporal_match(episode: Episode, constraint: TemporalQueryConstraint) -> Optional[TemporalMatch]:
     """Match immutable episode record time against an explicit query bound."""
-    # Episodes have no authoritative event/valid-time field.  Valid-time
-    # requests therefore leave the dense episode channel available without
-    # pretending that recorded_at is when the event occurred.
     if constraint.intent == "valid_time":
         return None
     recorded_at = parse_stored_date(episode.recorded_at)
@@ -123,6 +120,7 @@ def _evidence_record_match(claim: Claim, episodes: dict[str, Episode], constrain
 
 
 def _valid_interval_contains(claim: Claim, target: date) -> Optional[TemporalMatch]:
+    """Resolve stored valid intervals for historical visibility or known hybrid matches."""
     valid_from = parse_stored_date(claim.valid_from)
     valid_to = parse_stored_date(claim.valid_to)
     if valid_from is not None and valid_from > target:
@@ -155,37 +153,17 @@ def _interval_overlaps(claim: Claim, start: date, end: date) -> bool:
     return (valid_to is None or start < valid_to) and (valid_from is None or valid_from <= end)
 
 
-def _valid_time_match(claim: Claim, constraint: TemporalQueryConstraint) -> Optional[TemporalMatch]:
-    target = constraint.target_date
-    if constraint.kind == "exact_valid_time" and target is not None:
-        return _valid_interval_contains(claim, target)
-    valid_from = parse_stored_date(claim.valid_from)
-    valid_to = parse_stored_date(claim.valid_to)
-    if constraint.kind == "before_valid_time" and target is not None:
-        if valid_from is None:
-            return None
-        return TemporalMatch(1.0, "valid_interval") if valid_from < target else None
-    if constraint.kind == "after_valid_time" and target is not None:
-        if valid_to is not None:
-            return TemporalMatch(1.0, "valid_interval") if valid_to > target else None
-        if valid_from is not None:
-            return TemporalMatch(1.0, "valid_interval") if valid_from > target else None
-        return None
-    if constraint.kind == "valid_interval" and constraint.start_date is not None and constraint.end_date is not None:
-        return TemporalMatch(1.0, "valid_interval") if _interval_overlaps(claim, constraint.start_date, constraint.end_date) else None
-    return None
-
-
 def claim_temporal_match(claim: Claim, episodes: dict[str, Episode], constraint: TemporalQueryConstraint) -> Optional[TemporalMatch]:
     """Match claim valid time and its own evidence, never unrelated episodes."""
     if constraint.kind == "as_of":
         return claim_visible_as_of(claim, constraint.target_date)  # type: ignore[arg-type]
-    if constraint.intent == "valid_time":
-        return _valid_time_match(claim, constraint)
     if _evidence_record_match(claim, episodes, constraint):
         return TemporalMatch(1.0, "evidence_record_time")
     if constraint.kind == "exact_record_time" and constraint.intent == "hybrid":
-        return _valid_interval_contains(claim, constraint.target_date)  # type: ignore[arg-type]
+        valid_from = parse_stored_date(claim.valid_from)
+        valid_to = parse_stored_date(claim.valid_to)
+        if valid_from is not None or valid_to is not None:
+            return _valid_interval_contains(claim, constraint.target_date)  # type: ignore[arg-type]
     if constraint.kind == "interval" and _interval_overlaps(claim, constraint.start_date, constraint.end_date):  # type: ignore[arg-type]
         return TemporalMatch(1.0, "valid_interval")
     recorded_at = parse_stored_date(claim.recorded_at)

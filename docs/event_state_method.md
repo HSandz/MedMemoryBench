@@ -151,11 +151,18 @@ time constraints; the planner path does not invoke the lexical temporal parser.
 At most
 `planner_rounds + 1` query-model calls are made. Planner mode does not use the
 lexical temporal cue parser; temporal requests must contain validated
-structured dates. Supported record-axis modes are `record_exact`,
-`record_before`, `record_after`, and `record_interval`; valid/event-axis modes
-are `valid_exact`, `valid_before`, `valid_after`, and `valid_interval`.
+structured dates. Structured planner filtering supports only record-axis modes:
+`record_exact`, `record_before`, `record_after`, and `record_interval`.
 `knowledge_as_of` with `state_view: as_of` retains historical knowledge
-semantics. Invalid or duplicate
+semantics. ESHM continues to store bitemporal claim state (`t_record` and
+`t_valid`), including valid intervals used for state versioning and
+knowledge-as-of interpretation. It does not expose arbitrary valid/event-time
+filters to the planner because episodes do not carry universally authoritative
+event time. Event-date questions without an explicit record-date axis remain
+semantic retrieval requests with no hard temporal filter; unknown time is not
+treated as weak temporal evidence. Older experimental artifacts may retain
+`valid_*` request data as diagnostics, but those modes are rejected for new
+planner output and are never remapped to record-time modes. Invalid or duplicate
 requests are skipped and malformed planner output falls back to one ordinary
 final-answer call. Planner mode is realtime-only because dependent rounds cannot
 use the existing single-stage batch-answer transport; `planner_rounds: 0`
