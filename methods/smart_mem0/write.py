@@ -68,52 +68,42 @@ class WriteLifecycleMixin:
         for index, raw in enumerate(
             data.get("memories") or data.get("cards") or [], start=1
         ):
-            normalized = self._normalise_memory(raw)
-            if not normalized:
+            if not raw.get("claim"):
                 continue
+            
+            # Trust the persisted snapshot to be correctly formed.
+            # Do not re-run extraction-time normalisation logic which might
+            # try to repair missing fields or mutate RECAP into DIRECT.
             self._memories.append(
                 {
                     "id": str(raw.get("id") or f"m_{index}"),
-                    "claim": normalized["claim"],
-                    "kind": normalized["kind"],
-                    "semantic_role": normalized.get("semantic_role", "OBSERVATION"),
+                    "claim": str(raw.get("claim") or ""),
+                    "kind": str(raw.get("kind") or "FACT"),
+                    "semantic_role": str(raw.get("semantic_role") or "OBSERVATION"),
                     "memory_tier": str(raw.get("memory_tier", "COLD")),
                     "capsule_id": str(raw.get("capsule_id", "")),
-                    "subject_id": normalized.get("subject_id", "primary_user"),
-                    "subject_class": normalized.get("subject_class", "PRIMARY_USER"),
-                    "entities": normalized["entities"],
-                    "subject": normalized["subject"],
-                    "scope": normalized["scope"],
-                    "state_key": normalized["state_key"],
-                    "object_anchor": normalized["object_anchor"],
-                    "scope_entities": normalized["scope_entities"],
-                    "value": normalized["value"],
-                    "stance": normalized["stance"],
-                    "verbatim_value": normalized["verbatim_value"],
-                    "event_time": str(
-                        raw.get("event_time") or normalized["event_time"]
-                    ),
-                    "time_expression": normalized["time_expression"],
-                    "document_time": str(
-                        raw.get("document_time") or raw.get("timestamp") or ""
-                    ),
-                    "origin_document_time": str(
-                        raw.get("origin_document_time")
-                        or raw.get("document_time")
-                        or raw.get("timestamp")
-                        or ""
-                    ),
-                    "assertion_mode": normalized["assertion_mode"],
-                    "origin_memory_id": normalized["origin_memory_id"],
-                    "planning_tags": list(normalized.get("planning_tags") or []),
-                    "decision_salience": float(
-                        normalized.get("decision_salience", 0.0) or 0.0
-                    ),
-                    "evidence_ids": list(
-                        raw.get("evidence_ids") or raw.get("source_turn_ids") or []
-                    ),
+                    "subject_id": str(raw.get("subject_id") or "primary_user"),
+                    "subject_class": str(raw.get("subject_class") or "PRIMARY_USER"),
+                    "entities": list(raw.get("entities") or []),
+                    "subject": str(raw.get("subject") or "patient"),
+                    "scope": str(raw.get("scope") or ""),
+                    "state_key": str(raw.get("state_key") or ""),
+                    "object_anchor": str(raw.get("object_anchor") or ""),
+                    "scope_entities": list(raw.get("scope_entities") or []),
+                    "value": str(raw.get("value") or ""),
+                    "stance": str(raw.get("stance") or "AFFIRM"),
+                    "verbatim_value": str(raw.get("verbatim_value") or ""),
+                    "event_time": str(raw.get("event_time") or "UNKNOWN"),
+                    "time_expression": str(raw.get("time_expression") or ""),
+                    "document_time": str(raw.get("document_time") or raw.get("timestamp") or ""),
+                    "origin_document_time": str(raw.get("origin_document_time") or raw.get("document_time") or raw.get("timestamp") or ""),
+                    "assertion_mode": str(raw.get("assertion_mode") or "DIRECT").upper(),
+                    "origin_memory_id": str(raw.get("origin_memory_id") or ""),
+                    "planning_tags": list(raw.get("planning_tags") or []),
+                    "decision_salience": float(raw.get("decision_salience", 0.0) or 0.0),
+                    "evidence_ids": list(raw.get("evidence_ids") or raw.get("source_turn_ids") or []),
                     "source_speakers": list(raw.get("source_speakers") or []),
-                    "confidence": normalized["confidence"],
+                    "confidence": float(raw.get("confidence", 0.8) or 0.8),
                     "session_idx": int(raw.get("session_idx", 0)),
                 }
             )
