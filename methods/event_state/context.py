@@ -137,12 +137,14 @@ def select_claim_evidence(
     ref_limit: int,
     turn_limit: int = 3,
     turn_vector_cache: Dict[Tuple[str, Any], Sequence[float]] | None = None,
+    query_vectors: Sequence[Sequence[float]] | None = None,
 ) -> List[SelectedClaimEvidence]:
     """Select bounded claim provenance by query similarity without mutating memory."""
     if ref_limit <= 0 or turn_limit <= 0:
         return []
     candidates: List[Tuple[int, EvidenceRef, Episode, List[Tuple[int, Any]]]] = []
     vectors = turn_vector_cache if turn_vector_cache is not None else {}
+    query_vectors = [list(vector) for vector in (query_vectors or [query_vector])]
     missing: List[Tuple[Tuple[str, Any], Any]] = []
     for ref_index, ref in enumerate(claim.evidence):
         episode = episodes.get(ref.episode_id)
@@ -171,7 +173,7 @@ def select_claim_evidence(
     scored_refs = []
     for ref_index, ref, episode, turns in candidates:
         scored_turns = [
-            (cosine(query_vector, vectors[(episode.episode_id, turn.turn_id)]), turn_index, str(turn.turn_id), turn)
+            (max(cosine(query, vectors[(episode.episode_id, turn.turn_id)]) for query in query_vectors), turn_index, str(turn.turn_id), turn)
             for turn_index, turn in turns
         ]
         score = max(item[0] for item in scored_turns)
@@ -234,6 +236,7 @@ def select_global_episode_evidence(
     embedder: Any,
     limit: int = 2,
     excluded_turns: set[Tuple[str, Any]] | None = None,
+    query_vectors: Sequence[Sequence[float]] | None = None,
 ) -> Tuple[Dict[str, List[Any]], int, int]:
     """Select a small non-duplicate source-evidence set across episodes.
 
@@ -256,10 +259,11 @@ def select_global_episode_evidence(
         vectors = embedder.embed_documents(texts)
     except AttributeError:
         vectors = [embedder.embed_query(text) for text in texts]
+    query_vectors = [list(vector) for vector in (query_vectors or [query_vector])]
     scored = sorted(
         (
             (
-                cosine(query_vector, vector),
+                max(cosine(query, vector) for query in query_vectors),
                 episode_rank,
                 turn_index,
                 episode.episode_id,

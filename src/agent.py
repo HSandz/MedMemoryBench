@@ -945,6 +945,9 @@ class AgentManager:
 
     def supports_staged_queries(self) -> bool:
         """Return whether retrieval and final generation can run separately."""
+        adapter_support = getattr(self._agent, "supports_staged_queries", None)
+        if callable(adapter_support) and not adapter_support():
+            return False
         return bool(
             hasattr(self._agent, "prepare_batch_query")
             and hasattr(self._agent, "finalize_batch_query")

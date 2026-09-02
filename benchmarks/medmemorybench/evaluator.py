@@ -1093,6 +1093,15 @@ class MedMemoryBenchEvaluator:
         support = getattr(self.agent_manager, "supports_memory_snapshots", None)
         return bool(callable(support) and support())
 
+    def _supports_staged_queries(self) -> bool:
+        manager = getattr(self, "agent_manager", None)
+        if manager is None:
+            # Lightweight test doubles and legacy callers only expose the
+            # snapshot capability; preserve their historical dispatch.
+            return self._supports_memory_snapshots()
+        support = getattr(manager, "supports_staged_queries", None)
+        return bool(callable(support) and support())
+
     def _memory_snapshot_root(self) -> Path:
         if getattr(self, "run_scoped_output", False):
             return self.output_dir / "memory"
@@ -2666,7 +2675,7 @@ class MedMemoryBenchEvaluator:
                                 len(unit.queries_to_evaluate),
                             )
                         )
-                        if worker._supports_memory_snapshots():
+                        if worker._supports_staged_queries():
                             result = worker._evaluate_query_staged(
                                 query,
                                 unit.context_id,
@@ -3180,7 +3189,7 @@ class MedMemoryBenchEvaluator:
             if self.batch_api and not self.dry_run and not self._batch_fallback_logged:
                 self._log(
                     "Batch API is unavailable for this adapter; "
-                    "using real-time final-answer generation.",
+                    "using real-time query execution.",
                     level="WARNING",
                 )
                 self._batch_fallback_logged = True
@@ -3241,7 +3250,7 @@ class MedMemoryBenchEvaluator:
         """Run independent answer-and-score pairs with bounded concurrency."""
         def evaluate_one(query: MedQuery) -> tuple[MedQuery, Optional[MetricResult]]:
             try:
-                if self._supports_memory_snapshots():
+                if self._supports_staged_queries():
                     result = self._evaluate_query_staged(
                         query,
                         context_id,

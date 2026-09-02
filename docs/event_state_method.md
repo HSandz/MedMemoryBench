@@ -127,6 +127,29 @@ Start with `configs/method_config/event_state_gemini.yaml` (or the
 controls final answers. The embedding backend supports repository-compatible
 local/HuggingFace and OpenAI configurations.
 
+### Optional adaptive retrieval planner
+
+The query-only planner is disabled by default. Under `retrieval_config`, use:
+
+```yaml
+planner_rounds: 0       # preserves the ordinary one-call query flow
+planner_max_requests: 3
+planner_temperature: 0.0
+planner_max_tokens: 1200
+```
+
+When enabled, the answer model chooses either a final answer or a bounded JSON
+retrieval plan. Valid plans execute locally with the existing claim/episode
+retrieval, RRF, MMR, provenance, and context limits. At most
+`planner_rounds + 1` query-model calls are made. Planner mode does not use the
+lexical temporal cue parser; temporal requests must contain validated
+structured dates. Supported modes are exact record date, before, after,
+interval, and knowledge-as-of (`state_view: as_of`). Invalid or duplicate
+requests are skipped and malformed planner output falls back to one ordinary
+final-answer call. Planner mode is realtime-only because dependent rounds cannot
+use the existing single-stage batch-answer transport; `planner_rounds: 0`
+retains batch support unchanged.
+
 The default `state_current_candidate_top_k` is `3`; lower it only when the
 classifier prompt budget requires fewer current-state candidates.
 

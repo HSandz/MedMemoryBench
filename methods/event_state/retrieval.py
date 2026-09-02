@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+from copy import deepcopy
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .embeddings import cosine
@@ -12,10 +13,13 @@ from .temporal import (
     claim_temporal_match,
     claim_visible_as_of,
     episode_temporal_match,
-    parse_temporal_query,
+    parse_temporal_query as parse_temporal_query_fn,
     parse_stored_date,
 )
 from utils.llm_client import get_usage_tracker
+
+# Keep the historical module-level hook patchable for compatibility tests.
+parse_temporal_query = parse_temporal_query_fn
 
 
 def dense_rank(query: Sequence[float], vectors: Dict[str, Sequence[float]], top_k: int) -> List[Tuple[str, float]]:
@@ -36,29 +40,41 @@ class EventStateRetriever:
     def __init__(self, store: EventStateStore, embedder: Any, **config: Any) -> None:
         self.store, self.embedder, self.config = store, embedder, config
 
-    def retrieve(self, question: str, query_vector: Sequence[float] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    def rank_candidates(
+        self,
+        question: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        temporal_constraint: TemporalQueryConstraint | None = None,
+        parse_temporal_query: bool = True,
+        retrieve_claims_override: bool | None = None,
+        retrieve_episodes_override: bool | None = None,
+        state_view: str = "current",
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         query_vector = list(query_vector) if query_vector is not None else self.embedder.embed_query(question)
-        temporal = parse_temporal_query(question) if self.config.get("temporal_retrieval_enabled", True) else None
-        claim_vectors, hidden_prior_state_count = self._visible_claim_vectors(temporal)
-        claim_rank = dense_rank(query_vector, claim_vectors, self.config.get("claim_top_k", 30)) if self.config.get("retrieve_claims", True) else []
-        episode_rank = dense_rank(query_vector, self.store.episode_embeddings, self.config.get("episode_top_k", 20)) if self.config.get("retrieve_episodes", True) else []
+        temporal = temporal_constraint
+        if temporal is None and parse_temporal_query and self.config.get("temporal_retrieval_enabled", True):
+            temporal = globals()["parse_temporal_query"](question)
+        retrieve_claims = self.config.get("retrieve_claims", True) if retrieve_claims_override is None else retrieve_claims_override
+        retrieve_episodes = self.config.get("retrieve_episodes", True) if retrieve_episodes_override is None else retrieve_episodes_override
+        claim_vectors, hidden_prior_state_count = self._visible_claim_vectors(temporal, state_view)
+        claim_rank = dense_rank(query_vector, claim_vectors, self.config.get("claim_top_k", 30)) if retrieve_claims else []
+        episode_rank = dense_rank(query_vector, self.store.episode_embeddings, self.config.get("episode_top_k", 20)) if retrieve_episodes else []
         temporal_claim_rank, temporal_episode_rank = [], []
         if temporal is not None:
-            temporal_claim_rank = self._temporal_claim_rank(query_vector, temporal) if self.config.get("retrieve_claims", True) else []
-            temporal_episode_rank = self._temporal_episode_rank(query_vector, temporal) if self.config.get("retrieve_episodes", True) else []
+            temporal_claim_rank = self._temporal_claim_rank(query_vector, temporal, state_view) if retrieve_claims else []
+            temporal_episode_rank = self._temporal_episode_rank(query_vector, temporal) if retrieve_episodes else []
         candidates = self._rrf(claim_rank, episode_rank, temporal_claim_rank, temporal_episode_rank)
         if self.config.get("ppr_enabled", False):
             candidates = self._ppr(candidates)
-        candidates = [item for item in candidates if item["type"] != "state_claim" or self._claim_is_directly_visible(item["id"], temporal)]
+        candidates = [item for item in candidates if item["type"] != "state_claim" or self._claim_is_directly_visible(item["id"], temporal, state_view)]
         values = normalize_scores([item.get("score", 0.0) for item in candidates])
         for item, final_score in zip(candidates, values):
             item["final_score"] = final_score
         candidates.sort(key=lambda item: (-item["final_score"], item["id"]))
         candidate_count = int(self.config.get("candidate_count", 40))
         candidates = candidates[:candidate_count]
-        selected = self._select(candidates, int(self.config.get("evidence_count", 8)))
         claim_candidate_statuses = Counter(self.store.claims[identifier].status for identifier, _ in claim_rank)
-        selected_claims = [self.store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
         temporal_historical = sum(
             1 for identifier, _score, _match in temporal_claim_rank
             if self.store.claims[identifier].status in {"superseded", "refined"}
@@ -73,16 +89,16 @@ class EventStateRetriever:
                 and parse_stored_date(claim.recorded_at) is not None
                 and parse_stored_date(claim.recorded_at) > target
             )
-        return selected, {
+        return candidates, {
             "claim_candidates": len(claim_rank),
             "episode_candidates": len(episode_rank),
             "candidate_count": len(candidates),
             "ppr_enabled": bool(self.config.get("ppr_enabled", False)),
             "selector_mode": self.config.get("selector_mode", "state_mmr"),
-            "selected_ids": [item["id"] for item in selected],
+            "selected_ids": [],
             "claim_candidate_status_counts": dict(sorted(claim_candidate_statuses.items())),
-            "selected_claim_status_counts": dict(sorted(Counter(claim.status for claim in selected_claims).items())),
-            "selected_claim_persistence_counts": dict(sorted(Counter(claim.persistence for claim in selected_claims).items())),
+            "selected_claim_status_counts": {},
+            "selected_claim_persistence_counts": {},
             "hidden_prior_state_candidate_count": hidden_prior_state_count,
             "temporal_constraint_detected": temporal is not None,
             "temporal_constraint_kind": temporal.kind if temporal else None,
@@ -93,11 +109,49 @@ class EventStateRetriever:
             "temporal_episode_candidate_count": len(temporal_episode_rank),
             "temporal_historical_state_candidate_count": temporal_historical,
             "temporal_future_state_filtered_count": future_filtered,
-            "selected_temporal_claim_count": sum(1 for item in selected if item["type"] == "state_claim" and item.get("temporal_score", 0.0)),
-            "selected_temporal_episode_count": sum(1 for item in selected if item["type"] == "episode" and item.get("temporal_score", 0.0)),
+            "selected_temporal_claim_count": 0,
+            "selected_temporal_episode_count": 0,
         }
 
-    def _claim_is_directly_visible(self, claim_id: str, temporal: TemporalQueryConstraint | None = None) -> bool:
+    def select_candidates(self, candidates: Sequence[Dict[str, Any]], extra: Dict[str, Any] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        selected = self._select(candidates, int(self.config.get("evidence_count", 8)))
+        diagnostics = dict(extra or {})
+        selected_claims = [self.store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
+        diagnostics.update({
+            "selected_ids": [item["id"] for item in selected],
+            "selected_claim_status_counts": dict(sorted(Counter(claim.status for claim in selected_claims).items())),
+            "selected_claim_persistence_counts": dict(sorted(Counter(claim.persistence for claim in selected_claims).items())),
+            "selected_temporal_claim_count": sum(1 for item in selected if item["type"] == "state_claim" and item.get("temporal_score", 0.0)),
+            "selected_temporal_episode_count": sum(1 for item in selected if item["type"] == "episode" and item.get("temporal_score", 0.0)),
+        })
+        return selected, diagnostics
+
+    def retrieve(self, question: str, query_vector: Sequence[float] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        candidates, extra = self.rank_candidates(question, query_vector=query_vector)
+        return self.select_candidates(candidates, extra)
+
+    def merge_rank_channels(self, channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Fuse base and planner request rank channels with equal-weight RRF."""
+        values: Dict[str, Dict[str, Any]] = {}
+        rrf_k = float(self.config.get("rrf_k", 60.0))
+        for channel_index, channel in enumerate(channels):
+            for rank, item in enumerate(channel, 1):
+                identifier = item["id"]
+                merged = values.setdefault(identifier, deepcopy(item))
+                if channel_index:
+                    merged.setdefault("planner_request_indices", []).append(channel_index - 1)
+                merged["planner_request_indices"] = sorted(set(merged.get("planner_request_indices", [])))
+                merged["planner_channel_support_count"] = int(merged.get("planner_channel_support_count", 0)) + 1
+                merged["planner_fusion_score"] = float(merged.get("planner_fusion_score", 0.0)) + 1.0 / (rrf_k + rank)
+                merged["score"] = merged["planner_fusion_score"]
+                merged["fusion_score"] = merged["score"]
+                if channel_index == 0:
+                    merged["base_rank"] = rank
+        rows = list(values.values())
+        rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["id"]))
+        return rows[:int(self.config.get("candidate_count", 40))]
+
+    def _claim_is_directly_visible(self, claim_id: str, temporal: TemporalQueryConstraint | None = None, state_view: str = "current") -> bool:
         claim = self.store.claims.get(claim_id)
         if not claim:
             return False
@@ -113,13 +167,13 @@ class EventStateRetriever:
             valid_from = parse_stored_date(claim.valid_from)
             if valid_from is not None and valid_from >= temporal.target_date:
                 return False
-        return claim.persistence != "state" or claim.status in {"active", "contested"}
+        return claim.persistence != "state" or state_view == "all_versions" or claim.status in {"active", "contested"}
 
-    def _visible_claim_vectors(self, temporal: TemporalQueryConstraint | None = None) -> Tuple[Dict[str, Sequence[float]], int]:
+    def _visible_claim_vectors(self, temporal: TemporalQueryConstraint | None = None, state_view: str = "current") -> Tuple[Dict[str, Sequence[float]], int]:
         vectors = {}
         hidden = 0
         for claim_id, embedding in self.store.claim_embeddings.items():
-            if self._claim_is_directly_visible(claim_id, temporal):
+            if self._claim_is_directly_visible(claim_id, temporal, state_view):
                 vectors[claim_id] = embedding
             elif self.store.claims.get(claim_id) and self.store.claims[claim_id].status in {"superseded", "refined"}:
                 hidden += 1
@@ -134,11 +188,11 @@ class EventStateRetriever:
         rows.sort(key=lambda item: (-item[1], self.store.episodes[item[0]].source_session_index is None, self.store.episodes[item[0]].source_session_index or 0, item[0]))
         return rows[: max(0, int(self.config.get("episode_top_k", 20)))]
 
-    def _temporal_claim_rank(self, query_vector: Sequence[float], temporal: TemporalQueryConstraint) -> List[Tuple[str, float, str]]:
+    def _temporal_claim_rank(self, query_vector: Sequence[float], temporal: TemporalQueryConstraint, state_view: str = "current") -> List[Tuple[str, float, str]]:
         rows = []
         for identifier, claim in self.store.claims.items():
             match = claim_temporal_match(claim, self.store.episodes, temporal)
-            if match is not None and self._claim_is_directly_visible(identifier, temporal):
+            if match is not None and self._claim_is_directly_visible(identifier, temporal, state_view):
                 rows.append((identifier, cosine(query_vector, self.store.claim_embeddings.get(identifier, [])), match.match_type))
         rows.sort(key=lambda item: (-item[1], self.store.claims[item[0]].recorded_at or "", item[0]))
         return rows[: max(0, int(self.config.get("claim_top_k", 30)))]

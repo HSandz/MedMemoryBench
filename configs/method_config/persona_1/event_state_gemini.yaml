@@ -32,6 +32,10 @@ build_config:
   enable_bitemporal_time: true
   preserve_turn_evidence: true
 retrieval_config:
+  planner_rounds: 1
+  planner_max_requests: 3
+  planner_temperature: 0.0
+  planner_max_tokens: 1200
   max_context_tokens: 120000
   retrieve_claims: true
   retrieve_episodes: true
