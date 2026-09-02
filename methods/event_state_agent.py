@@ -966,6 +966,9 @@ class EventStateAgent(BaseAgent):
         query_vectors = [query_vector]
         base_selected_ids = [item["id"] for item in prepared["retrieved_memories"]]
         telemetry = {"planner_rounds_configured": self.planner_rounds, "planner_rounds_used": 0, "planner_decision_call_count": 0, "planner_retrieval_round_count": 0, "planner_request_count": 0, "planner_valid_request_count": 0, "planner_invalid_request_count": 0, "planner_duplicate_request_count": 0, "planner_parse_failure_count": 0, "planner_early_answer": False, "planner_forced_final_answer": False, "planner_requests": [], "planner_invalid_output_previews": [], "planner_invalid_output_sha256": [], "base_selected_ids": base_selected_ids}
+        trace_limit = int(self._retrieval_config.get("candidate_count", 40))
+        base_ranked = channels[0] if channels else []
+        telemetry.update({"planner_json_parse_failure_count": 0, "planner_schema_validation_failure_count": 0, "planner_failure_diagnostics": [], "candidate_trace": {"base_ranked": self._candidate_trace(base_ranked, store, trace_limit), "planner_channels": [], "merged_preselect": []}})
         attempted = set()
         for round_index in range(self.planner_rounds):
             telemetry["planner_rounds_used"] = round_index + 1
@@ -981,13 +984,27 @@ class EventStateAgent(BaseAgent):
                 with get_usage_tracker().scope("event_state.plan_or_answer"):
                     response = self._llm_client.chat(format_messages(planner_user, planner_system), temperature=self.planner_temperature, max_tokens=self.planner_max_tokens)
             telemetry["planner_decision_call_count"] += 1
+            raw_output = getattr(response, "content", "")
+            raw_text = raw_output if isinstance(raw_output, str) else str(raw_output or "")
+            output_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
             try:
-                decision = validate_planner_output(json.loads(response.content), self.planner_max_requests)
-            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_output = json.loads(raw_output)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                telemetry["planner_json_parse_failure_count"] += 1
                 telemetry["planner_parse_failure_count"] += 1
-                raw_output = str(getattr(response, "content", "") or "")
-                telemetry["planner_invalid_output_previews"].append(raw_output[:500])
-                telemetry["planner_invalid_output_sha256"].append(hashlib.sha256(raw_output.encode("utf-8")).hexdigest())
+                telemetry["planner_invalid_output_previews"].append(raw_text[:500])
+                telemetry["planner_invalid_output_sha256"].append(output_hash)
+                telemetry["planner_failure_diagnostics"].append({"failure_stage": "json_parse", "failure_reason": str(exc)[:300], "invalid_output_sha256": output_hash, "invalid_output_preview": raw_text[:500]})
+                telemetry["planner_forced_final_answer"] = True
+                break
+            try:
+                decision = validate_planner_output(parsed_output, self.planner_max_requests)
+            except ValueError as exc:
+                telemetry["planner_schema_validation_failure_count"] += 1
+                telemetry["planner_parse_failure_count"] += 1
+                telemetry["planner_invalid_output_previews"].append(raw_text[:500])
+                telemetry["planner_invalid_output_sha256"].append(output_hash)
+                telemetry["planner_failure_diagnostics"].append({"failure_stage": "schema_validation", "failure_reason": str(exc)[:300], "invalid_output_sha256": output_hash, "invalid_output_preview": raw_text[:500]})
                 telemetry["planner_forced_final_answer"] = True
                 break
             telemetry["planner_invalid_request_count"] += decision.invalid_request_count
@@ -1010,8 +1027,11 @@ class EventStateAgent(BaseAgent):
                 telemetry["planner_requests"].append(request.to_dict())
                 vector = self._embedder.embed_query(request.query)
                 query_vectors.append(vector)
-                channels.append(retriever.rank_candidates(request.query, query_vector=vector, temporal_constraint=request.temporal_constraint, parse_temporal_query=False, retrieve_claims_override=request.sources in {"claims", "both"}, retrieve_episodes_override=request.sources in {"episodes", "both"}, state_view=request.state_view)[0])
+                ranked_request, _request_extra = retriever.rank_candidates(request.query, query_vector=vector, temporal_constraint=request.temporal_constraint, parse_temporal_query=False, retrieve_claims_override=request.sources in {"claims", "both"}, retrieve_episodes_override=request.sources in {"episodes", "both"}, state_view=request.state_view)
+                channels.append(ranked_request)
+                telemetry["candidate_trace"]["planner_channels"].append({"request_index": len(telemetry["candidate_trace"]["planner_channels"]), "request": request.to_dict(), "ranked": self._candidate_trace(ranked_request, store, trace_limit)})
             merged = retriever.merge_rank_channels(channels)
+            telemetry["candidate_trace"]["merged_preselect"] = self._candidate_trace(merged, store, trace_limit)
             selected, retrieval_extra = retriever.select_candidates(merged)
             base_selected_id_set = set(base_selected_ids)
             for item in selected:
@@ -1037,6 +1057,9 @@ class EventStateAgent(BaseAgent):
             "invalid_request_count": "planner_invalid_request_count",
             "duplicate_request_count": "planner_duplicate_request_count",
             "parse_failure_count": "planner_parse_failure_count",
+            "json_parse_failure_count": "planner_json_parse_failure_count",
+            "schema_validation_failure_count": "planner_schema_validation_failure_count",
+            "failure_diagnostics": "planner_failure_diagnostics",
             "early_answer": "planner_early_answer",
             "forced_final_answer": "planner_forced_final_answer",
             "requests": "planner_requests",
@@ -1044,8 +1067,22 @@ class EventStateAgent(BaseAgent):
             "final_selected_ids": "final_selected_ids",
             "added_ids": "planner_added_ids",
             "removed_ids": "planner_removed_ids",
+            "candidate_trace": "candidate_trace",
         }
-        return {name: telemetry.get(source, [] if name in {"requests", "base_selected_ids", "final_selected_ids", "added_ids", "removed_ids"} else 0) for name, source in mapping.items()}
+        return {name: telemetry.get(source, [] if name in {"requests", "base_selected_ids", "final_selected_ids", "added_ids", "removed_ids", "failure_diagnostics", "candidate_trace"} else 0) for name, source in mapping.items()}
+
+    @staticmethod
+    def _candidate_trace(candidates: List[Dict[str, Any]], store: EventStateStore, limit: int) -> List[Dict[str, Any]]:
+        rows = []
+        for rank, item in enumerate(list(candidates)[:max(0, limit)], 1):
+            identifier = item.get("id")
+            source_ids = set()
+            if item.get("type") == "episode" and identifier in store.episodes:
+                source_ids.add(store.episodes[identifier].source_session_id)
+            elif item.get("type") == "state_claim" and identifier in store.claims:
+                source_ids.update(ref.source_session_id for ref in store.claims[identifier].evidence)
+            rows.append({"id": identifier, "type": item.get("type"), "rank": rank, "source_session_ids": sorted(str(value) for value in source_ids if value is not None), "final_score": float(item.get("final_score", item.get("score", 0.0)) or 0.0), **({"planner_fusion_score": float(item["planner_fusion_score"])} if "planner_fusion_score" in item else {}), "temporal_score": float(item.get("temporal_score", 0.0) or 0.0), "temporal_match_type": item.get("temporal_match_type")})
+        return rows
 
     def supports_memory_snapshots(self) -> bool:
         return True

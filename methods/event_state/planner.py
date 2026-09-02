@@ -18,6 +18,10 @@ _TIME_MODES = {
     "record_after",
     "record_interval",
     "knowledge_as_of",
+    "valid_exact",
+    "valid_before",
+    "valid_after",
+    "valid_interval",
 }
 
 
@@ -56,6 +60,10 @@ class PlannerRequest:
                         "after": "record_after",
                         "interval": "record_interval",
                         "as_of": "knowledge_as_of",
+                        "exact_valid_time": "valid_exact",
+                        "before_valid_time": "valid_before",
+                        "after_valid_time": "valid_after",
+                        "valid_interval": "valid_interval",
                     }[temporal.kind],
                     "date": temporal.target_date.isoformat() if temporal.target_date else None,
                     "start": temporal.start_date.isoformat() if temporal.start_date else None,
@@ -103,9 +111,9 @@ def _parse_request(value: Any) -> PlannerRequest:
         raise ValueError("invalid temporal mode")
     mode = raw_time["mode"]
     target = start = end = None
-    if mode in {"record_exact", "record_before", "record_after", "knowledge_as_of"}:
+    if mode in {"record_exact", "record_before", "record_after", "knowledge_as_of", "valid_exact", "valid_before", "valid_after"}:
         target = _parse_date(raw_time.get("date"))
-    elif mode == "record_interval":
+    elif mode in {"record_interval", "valid_interval"}:
         start, end = _parse_date(raw_time.get("start")), _parse_date(raw_time.get("end"))
         if start > end:
             raise ValueError("interval start must not exceed end")
@@ -117,8 +125,13 @@ def _parse_request(value: Any) -> PlannerRequest:
         "record_after": "after",
         "record_interval": "interval",
         "knowledge_as_of": "as_of",
+        "valid_exact": "exact_valid_time",
+        "valid_before": "before_valid_time",
+        "valid_after": "after_valid_time",
+        "valid_interval": "valid_interval",
     }[mode]
-    temporal = TemporalQueryConstraint(kind, target_date=target, start_date=start, end_date=end, intent="record_time")
+    intent = "valid_time" if mode.startswith("valid_") else "record_time"
+    temporal = TemporalQueryConstraint(kind, target_date=target, start_date=start, end_date=end, intent=intent)
     return PlannerRequest(query, sources, state_view, temporal)
 
 

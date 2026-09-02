@@ -151,8 +151,11 @@ time constraints; the planner path does not invoke the lexical temporal parser.
 At most
 `planner_rounds + 1` query-model calls are made. Planner mode does not use the
 lexical temporal cue parser; temporal requests must contain validated
-structured dates. Supported modes are exact record date, before, after,
-interval, and knowledge-as-of (`state_view: as_of`). Invalid or duplicate
+structured dates. Supported record-axis modes are `record_exact`,
+`record_before`, `record_after`, and `record_interval`; valid/event-axis modes
+are `valid_exact`, `valid_before`, `valid_after`, and `valid_interval`.
+`knowledge_as_of` with `state_view: as_of` retains historical knowledge
+semantics. Invalid or duplicate
 requests are skipped and malformed planner output falls back to one ordinary
 final-answer call. Planner mode is realtime-only because dependent rounds cannot
 use the existing single-stage batch-answer transport; `planner_rounds: 0`
@@ -173,7 +176,15 @@ channel and `planner_added_to_final` when it was absent from the base selected
 evidence and newly selected after planner fusion; the legacy
 `planner_retrieval` field remains an alias for channel participation.
 Planner diagnostics are persisted per query in both the query-answer artifact
-and its retrieval-record sidecar. Query usage reports expose
+and its retrieval-record sidecar. Planner failures distinguish
+`json_parse_failure_count` from `schema_validation_failure_count`; the legacy
+`parse_failure_count` is their aggregate. Bounded failure diagnostics include
+the stage, a validator/decoder reason, SHA-256, and a maximum 500-character
+preview, never hidden reasoning. Planner artifacts also include a bounded
+`candidate_trace` with `base_ranked`, each executed `planner_channels` entry,
+and `merged_preselect`; entries contain IDs, type, rank, scores, temporal
+metadata, and sorted source-session provenance only. This is diagnostic
+telemetry and does not add retrieval logic. Query usage reports expose
 `event_state.plan_or_answer` as `planner_controller` and
 `event_state.final_answer` alongside ordinary answer operations.
 
@@ -185,7 +196,10 @@ Temporal retrieval is query-only and is enabled by `temporal_retrieval_enabled`
 The deterministic parser recognizes explicit `YYYY-MM-DD` and `YYYY/MM/DD`
 dates with `as of`/`by` (state as-of), `before`, `after`, `between ... and ...`
 or `from ... to ...` (record-time bounds), and record cues such as `record
-dated DATE` (exact record time). A date without a clear axis uses a hybrid
+dated DATE` (exact record time). Planner valid-time constraints consume claim
+`valid_from`/`valid_to` metadata and never reinterpret an episode's
+`recorded_at` as event time. Episodes remain available through the ordinary
+dense channel when valid-time metadata is absent. A date without a clear axis uses a hybrid
 record/valid-time candidate channel; incomplete expressions such as "around the
 5th" are ignored and use ordinary retrieval.
 
@@ -200,6 +214,15 @@ added to the existing claim/episode RRF channels and still pass the unchanged
 candidate limit and state-aware MMR selector. Query diagnostics expose the
 constraint, candidate counts, future-state filtering, and temporal contribution
 on selected records; querying never mutates a snapshot.
+
+Answer judging is independent from query execution. If a response and
+retrieval complete but the later judge fails, the query remains in the query
+answer and retrieval-record artifacts with `evaluation_status: "judge_failed"`,
+`score: null`, `is_correct: null`, model output, retrieval quality, planner
+diagnostics, execution usage, and bounded judge-failure metadata. Answer
+metrics exclude it; retrieval metrics include it when retrieval ground truth is
+available. Resuming deferred judges is idempotent. This query-only work does
+not change the write-side semantic version, which remains `2.9`.
 
 `max_episode_source_excerpts_total` is an optional query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of

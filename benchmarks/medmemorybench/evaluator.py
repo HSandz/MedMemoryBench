@@ -25,7 +25,6 @@ from src.result import EvaluationReport, ResultCollector
 from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery, MedSession
 from benchmarks.base import EvaluationUnit
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
-from metrics.base import MetricResult as BaseMetricResult
 from metrics.retrieval_quality import (
     RETRIEVAL_QUALITY_GROUP,
     compute_session_retrieval_quality,
@@ -3986,6 +3985,15 @@ class MedMemoryBenchEvaluator:
         if prepared_metric is not None and judge_client is not None:
             judge_payload = prepared_metric["prepared"]["judge_payload"]
             if "immediate" not in judge_payload:
+                deferred_references = copy.deepcopy(artifact_references or {})
+                deferred_references["retrieval"] = {
+                    "payload_sha256": self._artifact_content_hash(retrieved_memories),
+                    "memory_ids_sha256": self._artifact_content_hash([
+                        memory.get("memory_id", memory.get("id"))
+                        for memory in retrieved_memories
+                        if isinstance(memory, dict)
+                    ]),
+                }
                 deferred_judge = {
                     "query_id": query.query_id,
                     "persona_id": context_id,
@@ -3993,13 +4001,16 @@ class MedMemoryBenchEvaluator:
                     "expected_answers": query.get_correct_answers(),
                     "metric_kwargs": metric_kwargs,
                     "query_time": query_time,
+                    "question": query.question,
+                    "model_output": model_output,
+                    "response_extra": copy.deepcopy(response_extra) if isinstance(response_extra, dict) else {},
                     "memory_construction_time": memory_construction_time,
                     "retrieved_memories": retrieved_memories,
                     "retrieved_count": retrieved_count,
                     "retrieval_quality": self._session_retrieval_quality(
                         query, retrieved_memories
                     ),
-                    "artifact_references": copy.deepcopy(artifact_references or {}),
+                    "artifact_references": deferred_references,
                     "execution_usage": resolved_execution_usage,
                 }
                 if isinstance(response_extra, dict) and isinstance(response_extra.get("planner"), dict):
@@ -4125,6 +4136,7 @@ class MedMemoryBenchEvaluator:
                     query_type=prepared["query_type"],
                     context_id=item["persona_id"],
                 )
+                finalized.append({"persona_id": item["persona_id"], "result": self._make_unscored_execution_result(item, error)})
                 self._advance_query_progress(
                     item["query_id"],
                     context_id=item["persona_id"],
@@ -4149,6 +4161,7 @@ class MedMemoryBenchEvaluator:
                     query_type=prepared["query_type"],
                     context_id=item["persona_id"],
                 )
+                finalized.append({"persona_id": item["persona_id"], "result": self._make_unscored_execution_result(item, str(e))})
                 self._advance_query_progress(
                     item["query_id"],
                     context_id=item["persona_id"],
@@ -4188,6 +4201,26 @@ class MedMemoryBenchEvaluator:
         self._clear_deferred_judges()
         return finalized
 
+    def _make_unscored_execution_result(self, item: Dict[str, Any], judge_error: str) -> MetricResult:
+        """Preserve a completed answer/retrieval when only the judge failed."""
+        details: Dict[str, Any] = {
+            "evaluation_status": "judge_failed",
+            "judge_failure": {"error": truncate_error_message(judge_error)},
+            "artifact_references": copy.deepcopy(item.get("artifact_references") or {}),
+            "execution_usage": copy.deepcopy(item.get("execution_usage") or {}),
+        }
+        result = MetricResult(
+            query_id=item["query_id"], query_type=item["prepared_metric"]["prepared"]["query_type"],
+            score=None, is_correct=None, model_output=item.get("model_output", ""),
+            expected_answer="\n".join(item.get("expected_answers", [])), question=item.get("question", ""),
+            details=details, query_time=item.get("query_time", 0.0), memory_construction_time=item.get("memory_construction_time", 0.0),
+            retrieved_memories=item.get("retrieved_memories", []), retrieved_count=item.get("retrieved_count", 0),
+        )
+        self._attach_session_retrieval_quality(result, item.get("retrieval_quality"))
+        if isinstance(item.get("planner"), dict):
+            result.details["planner"] = copy.deepcopy(item["planner"])
+        return result
+
     def _generate_report(
         self,
         start_time: datetime,
@@ -4208,10 +4241,23 @@ class MedMemoryBenchEvaluator:
                 failed_query_ids.add(failure["query_id"])
             failed_query_ids.update(failure.get("affected_query_ids", []))
         expected_queries = self._expected_query_count()
-        scored_queries = len(self.aggregator.results)
+        executed_queries = len(self.aggregator.results)
+        scored_queries = sum(
+            1 for result in self.aggregator.results
+            if result.score is not None and result.is_correct is not None
+        )
+        retrieval_evaluated_queries = sum(
+            1 for result in self.aggregator.results
+            if isinstance(result.details.get("metric_groups"), dict)
+            and RETRIEVAL_QUALITY_GROUP in result.details.get("metric_groups", {})
+        )
         evaluation_coverage = {
             "expected_queries": expected_queries,
             "scored_queries": scored_queries,
+            "executed_queries": executed_queries,
+            "query_execution_coverage": executed_queries / expected_queries if expected_queries else 1.0,
+            "retrieval_evaluation_queries": retrieval_evaluated_queries,
+            "retrieval_evaluation_coverage": retrieval_evaluated_queries / expected_queries if expected_queries else 1.0,
             "omitted_queries": max(expected_queries - scored_queries, 0),
             "api_failed_queries": len(failed_query_ids),
             "api_failure_events": len(self._api_failures),

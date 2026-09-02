@@ -180,12 +180,13 @@ class MetricsAggregator:
         if not self.results:
             return {"total": 0, "message": "No results"}
 
-        total = len(self.results)
-        correct_count = sum(1 for r in self.results if r.is_correct)
-        total_score = sum(r.score for r in self.results)
+        scored_results = [r for r in self.results if r.score is not None and r.is_correct is not None]
+        total = len(scored_results)
+        correct_count = sum(1 for r in scored_results if r.is_correct)
+        total_score = sum(float(r.score) for r in scored_results)
 
         by_type: Dict[str, List[MetricResult]] = {}
-        for result in self.results:
+        for result in scored_results:
             if result.query_type not in by_type:
                 by_type[result.query_type] = []
             by_type[result.query_type].append(result)
@@ -194,7 +195,7 @@ class MetricsAggregator:
         for query_type, type_results in by_type.items():
             type_total = len(type_results)
             type_correct = sum(1 for r in type_results if r.is_correct)
-            type_score = sum(r.score for r in type_results)
+            type_score = sum(float(r.score) for r in type_results)
 
             stats = {
                 "total": type_total,
@@ -233,7 +234,7 @@ class MetricsAggregator:
             type_stats[query_type] = stats
 
         metric_stats: Dict[str, Dict[str, Any]] = {}
-        for result in self.results:
+        for result in scored_results:
             configured_metrics = result.details.get("metrics")
             if not isinstance(configured_metrics, dict):
                 metric_name = result.details.get("metric", "unknown")
@@ -280,6 +281,8 @@ class MetricsAggregator:
 
         summary = {
             "total": total,
+            "executed": len(self.results),
+            "unscored": len(self.results) - total,
             "correct": correct_count,
             "overall_accuracy": correct_count / total if total > 0 else 0.0,
             "overall_avg_score": total_score / total if total > 0 else 0.0,

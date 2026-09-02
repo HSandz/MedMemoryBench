@@ -10,8 +10,8 @@ class MetricResult:
     """Metric evaluation result."""
     query_id: str
     query_type: str
-    score: float
-    is_correct: bool
+    score: Optional[float]
+    is_correct: Optional[bool]
     model_output: str
     expected_answer: str
     question: str = ""

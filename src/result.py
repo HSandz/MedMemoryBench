@@ -457,6 +457,9 @@ class ResultCollector:
                         if result_object is not None else None
                     ),
                     "retrieved_memories": retrieved_memories,
+                    "retrieved_count": result.get("retrieved_count", 0),
+                    "evaluation_status": details.get("evaluation_status", "scored"),
+                    "retrieval_quality": (details.get("metric_groups", {}) or {}).get("retrieval_quality"),
                     **({"planner": planner} if planner is not None else {}),
                 })
                 retrieval_reference = {
@@ -476,8 +479,9 @@ class ResultCollector:
                 "question": result.get("question", ""),
                 "expected_answer": result.get("expected_answer", ""),
                 "model_output": result.get("model_output", ""),
-                "score": result.get("score", 0.0),
-                "is_correct": result.get("is_correct", False),
+                "score": result.get("score"),
+                "is_correct": result.get("is_correct"),
+                "evaluation_status": details.get("evaluation_status", "scored"),
                 "retrieved_count": result.get("retrieved_count", 0),
                 "retrieved_memory_ids": memory_ids,
                 "retrieval_reference": retrieval_reference,
@@ -535,7 +539,7 @@ class ResultCollector:
 
         query_summary = {
             "total_queries": len(query_details),
-            "correct_count": sum(1 for q in query_details if q["is_correct"]),
+            "correct_count": sum(1 for q in query_details if q["is_correct"] is True),
             "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
             "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
             "by_type": report.summary.get("by_type", {}),
