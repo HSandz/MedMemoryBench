@@ -2,8 +2,8 @@ from typing import Dict, Any, Optional
 import time
 from methods.smart_mem0.router import DeterministicRouter, RouteDecision
 
-def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
-    router = DeterministicRouter(subject_postings=agent._subject_postings)
+def _prepare_p1a_query(agent, question: str, subject_aliases: dict = None) -> Optional[Dict[str, Any]]:
+    router = DeterministicRouter(subject_postings=agent._subject_postings, subject_aliases=subject_aliases)
     decision = router.route_query(question)
     
     if decision.route == "HARD":
@@ -90,8 +90,8 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
                     return None
                 selected = min(matched, key=temp_key)
             else:
-                # Unanchored MATCH
-                selected = min(dated_pool, key=temp_key)
+                # Unanchored MATCH fails HARD for now until focal-event relevance is implemented
+                return None
         else:
             return None
             
@@ -148,9 +148,9 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
         "planner_usage": {},
         "question": question,
         "system_message": None, 
-        "planner_called": False,
-        "semantic_controller": {"called": False},
         "extra": {
+            "planner_called": False,
+            "semantic_controller": {"called": False},
             "query_tokens": {
                 "fast_gate": 0,
                 "planner": 0,
@@ -267,12 +267,12 @@ def _temporal_candidate_pool(agent, concept: str, subject_ids: set) -> list:
             alias.append(m)
             continue
             
-        # BOUNDED BM25 Fallback (simple lexical overlap threshold)
+        # BOUNDED Lexical Fallback (strict match)
         claim = str(m.get("claim") or "").lower()
         claim_words = set(claim.split())
         overlap = len(words.intersection(claim_words))
-        if overlap > 0:
-            # We store overlap for sorting later
+        # require all words to match for strict lexical recovery
+        if overlap == len(words):
             bm25.append((overlap, m))
             
     bm25.sort(key=lambda x: x[0], reverse=True)
@@ -284,9 +284,12 @@ def _temporal_candidate_pool(agent, concept: str, subject_ids: set) -> list:
     if exact_pred: return exact_pred
     if alias: return alias
     
-    # Only if empty, use lexical recovery
-    # Margin check: for P1A, we just take the top-tier of BM25 if it exists
-    return bm25
+    # Require bounded margin/threshold
+    if bm25:
+        # Just return the top matches (tie-broken later)
+        return bm25
+    
+    return []
     
 def _get_date(m: dict, axis: str) -> str:
     # Handle "UNKNOWN"

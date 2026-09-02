@@ -52,8 +52,9 @@ class DeterministicRouter:
         'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
     }
     
-    def __init__(self, subject_postings: dict = None):
+    def __init__(self, subject_postings: dict = None, subject_aliases: dict = None):
         self.subject_postings = subject_postings or {}
+        self.subject_aliases = subject_aliases or {}
 
     def _parse_temporal_anchor(self, question: str):
         # Look for combinations of Month Day, Year or YYYY-MM-DD
@@ -104,7 +105,10 @@ class DeterministicRouter:
         temporal_date = self.RE_TEMPORAL_DATE.search(question)
         
         # 2. TEMPORAL
-        if temporal_date or anchor_str or self.RE_EARLIEST.search(question) or self.RE_LATEST_TEMP.search(question):
+        has_latest = self.RE_LATEST_TEMP.search(question)
+        has_temporal_surface = bool(temporal_date or anchor_str or self.RE_DOC_TIME.search(question))
+        is_temporal = temporal_date or anchor_str or self.RE_EARLIEST.search(question) or (has_latest and has_temporal_surface)
+        if is_temporal:
             axis = "document_time" if self.RE_DOC_TIME.search(question) else "event_time"
             slot = "DATE" if temporal_date else "VALUE"
             
@@ -159,6 +163,10 @@ class DeterministicRouter:
 
     def _resolve_subject(self, question: str) -> str:
         """Resolve the subject of the question deterministically."""
+        for alias, subj_id in self.subject_aliases.items():
+            if re.search(r'\b' + re.escape(alias) + r'\b', question, re.IGNORECASE):
+                return subj_id
+                
         tp_matches = self.RE_THIRD_PARTY.finditer(question)
         for tp_match in tp_matches:
             noun = tp_match.group(1).lower()

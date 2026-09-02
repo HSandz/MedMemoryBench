@@ -241,7 +241,7 @@ class QueryMixin:
         # P1A FAST PATH INTERCEPTION
         try:
             from methods.smart_mem0.p1a_execution import _prepare_p1a_query
-            fast_frame = _prepare_p1a_query(self, question)
+            fast_frame = _prepare_p1a_query(self, question, subject_aliases=kwargs.get("subject_aliases"))
             if fast_frame:
                 if system_message:
                     fast_frame["system_message"] = system_message
@@ -1013,6 +1013,13 @@ class QueryMixin:
     def reset(self) -> None:
         super().reset()
         self._memories, self._evidence, self._relations = [], [], []
+        self._state_spine = {}
+        self._subject_postings = {}
+        self._object_postings = {}
+        self._entity_postings = {}
+        self._value_postings = {}
+        self._unit_postings = {}
+        self._predicate_postings = {}
         self._belief_status, self._state_heads, self._profile_pack = {}, {}, {}
         self._memory_seq = self._evidence_seq = self._session_seq = 0
         self._loaded_frozen = False
