@@ -110,17 +110,21 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
     elapsed = (time.time() - start_time) * 1000
     
     # Return fast path frame
+    retrieved_mems = pool if 'pool' in locals() else [agent._state_spine[ident].latest()] if decision.route == "STATE_LATEST" else []
     ret = {
-        "evidence": "", # we don't need formatted evidence if precomputed, but exact needs it
+        "evidence": "", 
         "raw_context": "",
         "used_memory_ids": list(used_ids),
+        "retrieved_memories": retrieved_mems,
+        "retrieved_count": len(retrieved_mems),
         "gate": {"called": False, "skip_reason": f"p1a_{decision.route.lower()}"},
         "supports": None,
         "controller_usage": {},
         "planner_usage": {},
         "question": question,
-        "system_message": None, # will be populated
+        "system_message": None, 
         "extra": {
+            "query_tokens": {"controller": 0, "planner": 0},
             "retrieval_elapsed_ms": elapsed,
             "p1a": {
                 "route": decision.route,
