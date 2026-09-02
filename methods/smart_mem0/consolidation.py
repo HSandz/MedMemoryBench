@@ -829,7 +829,6 @@ class ConsolidationMixin:
             "freeze_ready": hard_violations == 0,
         }
 
-    @staticmethod
     def _sanitize_state_relations(
         self,
         new_memories: Sequence[Dict[str, Any]],
