@@ -1012,50 +1012,73 @@ class ExecutionMixin:
                 frame,
                 context_map=planning_context,
             )
+        elif getattr(self, "enable_legacy_semantic_controller", False) and getattr(self, "enable_unified_controller", False):
+            fast_supports, routed_plan, controller = self._semantic_controller(
+                question, planned_seed_set, frame, context_map=planning_context
+            )
+            usage = controller.get("usage", {})
+            controller_stage = "fast_gate" if controller.get("route") == "DIRECT" else "planner"
+            query_tokens[controller_stage] = int(usage.get("total_tokens", 0) or 0)
+            query_latency[controller_stage] = round(float(usage.get("latency", 0.0) or 0.0), 3)
+            if fast_supports is None:
+                plan = routed_plan
+                planner_called = True
         elif getattr(self, "enable_unified_controller", False):
-            from methods.smart_mem0.p1b_execution import _evaluate_seed_gate
-            # Zero-Gap Seed Gate
+            from methods.smart_mem0.p1b_execution import _evaluate_seed_gate, EvidenceLattice
+            from methods.smart_mem0.p1b_planning import _gap_planner
+            
             is_accepted, fast_supports, reason = _evaluate_seed_gate(self, question, frame, planned_seed_set)
             
-            # Telemetry for P1B Seed Gate
             self._seed_gate_telemetry = {
                 "attempted": True,
                 "eligible": True,
                 "accepted": is_accepted,
                 "selected_memory_id": fast_supports[0]["id"] if fast_supports else None,
                 "reason": reason,
-                "conflict": False
+                "conflict": (reason == "CONFLICTING_CANDIDATES")
             }
             
-            routed_plan = None
-            if not is_accepted:
-                # Call Evidence-Gap Planner
-                fast_supports = None
-                # routed_plan, usage = self._gap_planner(...) # To be implemented
-                # For now, we can fallback to legacy planner by leaving routed_plan = None
-                pass
+            self._evidence_lattice = EvidenceLattice()
+            plan = {
+                "required_slots": [],
+                "seed_coverage": [],
+                "operations": [],
+                "need_evidence": False,
+                "budget_tier": "SMALL",
+                "max_memories": 3,
+                "planner_fallback": False,
+                "valid": True,
+            }
             
+            usage = {}
+            if not is_accepted:
+                evidence_gaps, usage = _gap_planner(self, question, planned_seed_set, frame)
+                planner_called = True
+                query_tokens["planner"] = int(usage.get("total_tokens", 0) or 0)
+                query_latency["planner"] = round(float(usage.get("latency", 0.0) or 0.0), 3)
+                
+                if not evidence_gaps:
+                    fast_supports = planned_seed_set[:1] if planned_seed_set else None
+                    if fast_supports:
+                        plan["valid"] = True
+                        plan["required_slots"] = []
+                        self._seed_gate_telemetry["reason"] = "PLANNER_DECLARED_ZERO_GAP"
+                else:
+                    fast_supports = None
+                    for gap in evidence_gaps:
+                        self._evidence_lattice.add_gap(gap)
+                    
+                    plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
+                    plan["need_evidence"] = True
+                    plan["budget_tier"] = "SMALL" if len(evidence_gaps) <= 1 else "MEDIUM"
+                    
             controller = {
-                "called": not is_accepted,
+                "called": False,
                 "route": "DIRECT" if is_accepted else "PLAN",
                 "support_ref": fast_supports[0]["id"] if fast_supports else "",
                 "fallback_reason": reason,
-                "usage": {}, # Will be updated by gap planner
+                "usage": usage, 
             }
-            usage = controller.get("usage", {})
-            controller_stage = (
-                "fast_gate" if controller.get("route") == "DIRECT" else "planner"
-            )
-            query_tokens[controller_stage] = int(
-                usage.get("total_tokens", 0) or 0
-            )
-            query_latency[controller_stage] = round(
-                float(usage.get("latency", 0.0) or 0.0), 3
-            )
-            if fast_supports is None:
-                plan = routed_plan
-                planner_called = True
-
         if fast_supports is not None:
             beliefs, relations = self._reconstruct_beliefs(
                 fast_supports, min(3, len(fast_supports))

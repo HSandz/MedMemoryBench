@@ -2,13 +2,14 @@ import json
 from typing import Any, Dict, List, Tuple
 from methods.smart_mem0.p1b_execution import EvidenceGap
 
-GAP_PLANNER_PROMPT = """You are an Evidence-Gap Planner for a medical and general-domain memory retrieval agent.
+GAP_PLANNER_PROMPT = """You are an Evidence-Gap Planner for a general-domain evidence-grounded memory retrieval agent.
 Your task is to decompose a complex query into specific, missing pieces of evidence ("gaps") that are required to answer the question, but are NOT already present in the provided local seed evidence.
 
 DO NOT output a monolithic slot for the whole query.
 DO NOT output memory IDs.
 DO NOT provide the final answer.
 One gap must correspond to one independently retrievable evidence requirement.
+Limit to a MAXIMUM of 4 gaps.
 
 VALID ROLES:
 FOCAL_TRIGGER: The event that initiated a causal chain.
@@ -25,9 +26,9 @@ REQUIRED JSON OUTPUT FORMAT:
         {
             "id": "g1",
             "role": "FOCAL_TRIGGER",
-            "description": "Event that immediately preceded the failure",
+            "description": "Event that immediately preceded the delay",
             "required": true,
-            "target_entities": ["heart failure", "symptoms"],
+            "target_entities": ["project alpha", "blockers"],
             "temporal_axis": "event_time"
         }
     ]
@@ -41,7 +42,7 @@ def _gap_planner(
     question: str,
     seeds: List[Dict[str, Any]],
     frame: Any
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[List[EvidenceGap], Dict[str, Any]]:
     # Format the seeds as compact representation
     compact_seeds = []
     for s in seeds[:3]:
@@ -76,38 +77,40 @@ def _gap_planner(
         parsed = {"evidence_gaps": []}
         
     gaps_data = parsed.get("evidence_gaps", [])
-    
-    # Convert to legacy Plan dictionary structure so existing executor doesn't break
-    required_slots = []
-    for g in gaps_data:
-        slot = {
-            "id": g.get("id", "gap_1"),
-            "type": "SEMANTIC",
-            "evidence_role": g.get("role", "GENERIC_EVIDENCE"),
-            "description": g.get("description", ""),
-            "required": g.get("required", True),
-            "resolution_strategy": "RETRIEVE",
-            "subject": getattr(frame, "speaker_role", "primary_user"),
-            "time_axis": g.get("temporal_axis", "")
-        }
-        required_slots.append(slot)
+    if not isinstance(gaps_data, list):
+        gaps_data = []
         
-    plan = {
-        "required_slots": required_slots,
-        "seed_coverage": [],
-        "operations": [], # P1B.1 deterministic executor will just do a fallback search per missing slot
-        "need_evidence": True,
-        "budget_tier": "SMALL" if len(required_slots) <= 1 else "MEDIUM",
-        "max_memories": 3,
-        "planner_fallback": False,
-        "valid": True,
-    }
+    # Validation
+    gaps_data = gaps_data[:4]
+    valid_roles = {"FOCAL_TRIGGER", "PRIOR_TRAJECTORY", "CAUSAL_BRIDGE", "OUTCOME", "OPTION_SUPPORT", "COMPARISON_SIDE", "GENERIC_EVIDENCE"}
     
-    # We will let the existing _execute_plan handle the operations by creating a deterministic recovery pass
-    # since operations is empty, `_execute_plan` will see `unresolved` slots. 
-    # But wait, `_execute_plan` executes `plan.get("operations")`. If it's empty, it relies on seeds.
-    # If seeds don't fulfill the slots, it goes to replan!
-    # The user says: "One deterministic recovery pass. No replan LLM".
-    
-    return plan, usage
-
+    evidence_gaps = []
+    used_ids = set()
+    for i, g in enumerate(gaps_data):
+        if not isinstance(g, dict): continue
+        
+        gid = str(g.get("id", f"gap_{i}"))
+        if gid in used_ids:
+            gid = f"{gid}_{i}"
+        used_ids.add(gid)
+        
+        role = str(g.get("role", "GENERIC_EVIDENCE")).upper()
+        if role not in valid_roles:
+            role = "GENERIC_EVIDENCE"
+            
+        required = bool(g.get("required", True))
+        
+        gap = EvidenceGap(
+            id=gid,
+            role=role,
+            required=required,
+            subject_id=getattr(frame, "speaker_role", "primary_user"),
+            target_entities=g.get("target_entities", []),
+            target_property=g.get("target_property", ""),
+            temporal_axis=g.get("temporal_axis", "")
+        )
+        # Store description via generic property for adapter
+        gap.description = str(g.get("description", ""))
+        evidence_gaps.append(gap)
+        
+    return evidence_gaps, usage
