@@ -770,14 +770,6 @@ class ConsolidationMixin:
             and memory.get("kind") not in STATE_LIKE_KINDS
             for memory in self._memories
         )
-        hard_violations = (
-            missing_evidence_pointers
-            + memory_without_evidence
-            + state_like_missing_identity
-            + invalid_relation_endpoints
-            + relation_identity_violations
-            + causal_provenance_violations
-        )
         capsules = getattr(self, "_capsules", [])
         capsule_by_id = {c["id"]: c for c in capsules}
         
@@ -790,13 +782,24 @@ class ConsolidationMixin:
                 if facet_id not in by_id:
                     missing_facet_pointer_count += 1
                     
-        identity_anchor_conflict_count = sum(1 for m in self._memories if m.get("kind") == "STATE" and m.get("object_anchor") and "::" not in state_identity(m))
-
+        hard_violations = (
+            missing_evidence_pointers
+            + memory_without_evidence
+            + state_like_missing_identity
+            + invalid_relation_endpoints
+            + relation_identity_violations
+            + causal_provenance_violations
+            + orphan_capsule_count
+            + missing_capsule_pointer_count
+            + missing_facet_pointer_count
+        )
         return {
             "orphan_capsule_count": orphan_capsule_count,
             "missing_capsule_pointer_count": missing_capsule_pointer_count,
             "missing_facet_pointer_count": missing_facet_pointer_count,
-            "identity_anchor_conflict_count": identity_anchor_conflict_count,
+            "orphan_capsule_count": orphan_capsule_count,
+            "missing_capsule_pointer_count": missing_capsule_pointer_count,
+            "missing_facet_pointer_count": missing_facet_pointer_count,
             "memory_count": len(self._memories),
             "kind_counts": dict(kind_counts),
             "unique_state_keys": len(key_counts),

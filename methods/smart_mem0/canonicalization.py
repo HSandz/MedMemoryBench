@@ -54,13 +54,19 @@ def canonical_object_key(object_anchor: str) -> str:
     
 def build_state_identity(subject_id: str, state_key: str, object_anchor: str) -> str:
     pred_key = canonical_predicate_key(state_key)
+    if not pred_key:
+        return ""
     obj_key = canonical_object_key(object_anchor)
     subject = str(subject_id or "").lower().strip()
     return f"{subject}::{pred_key}::{obj_key}"
 
 def state_identity(memory: dict) -> str:
-    subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
+    if memory.get("kind") != "STATE":
+        return ""
     state_key = memory.get("state_key") or ""
+    if not state_key:
+        return ""
+    subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
     object_anchor = memory.get("object_anchor") or ""
     return build_state_identity(subject_id, state_key, object_anchor)
 

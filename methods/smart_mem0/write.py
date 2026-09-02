@@ -308,12 +308,19 @@ class WriteLifecycleMixin:
                         self._capsules = []
                     
                     for cap_draft in getattr(context, "provisional_capsules", []):
-                        cap_draft["facet_ids"] = [
-                            m["id"] for m in added 
-                            if m.get("capsule_id") == cap_draft["id"]
-                        ]
-                        self._capsules.append(cap_draft)
+                        temp_id = cap_draft["id"]
                         self._capsule_seq = getattr(self, "_capsule_seq", 0) + 1
+                        real_id = f"cap_{self._capsule_seq}"
+                        cap_draft["id"] = real_id
+                        
+                        facet_ids = []
+                        for m in added:
+                            if m.get("capsule_id") == temp_id:
+                                m["capsule_id"] = real_id
+                                facet_ids.append(m["id"])
+                                
+                        cap_draft["facet_ids"] = facet_ids
+                        self._capsules.append(cap_draft)
                         
                     self._refresh_index()
                 else:

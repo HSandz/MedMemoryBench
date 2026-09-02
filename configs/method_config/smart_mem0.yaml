@@ -19,7 +19,7 @@ agent_params:
   enable_memory_write: true
   frozen_memory_path: null
   # Increment when capture/consolidation semantics change incompatibly.
-  memory_snapshot_revision: 14
+  memory_snapshot_revision: 15
   # Split long sessions at complete turn boundaries so extraction preserves
   # low-salience atomic facts instead of compressing them away.
   write_window_max_turns: 64

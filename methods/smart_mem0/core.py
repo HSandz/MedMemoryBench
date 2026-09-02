@@ -1005,27 +1005,28 @@ class CoreMemoryMixin:
         if not hasattr(self, "_state_spine"):
             self._state_spine = {}
         self._state_spine.clear()
-        self._state_heads.clear()
+
         
         import re
         for memory in self._memories:
             m_id = memory["id"]
             tier = memory.get("memory_tier", "COLD")
             
-            # Exact Indexing
-            for ent in memory.get("entities", []):
-                self._entity_postings.setdefault(str(ent).lower(), set()).add(m_id)
-            
-            val = str(memory.get("value") or memory.get("verbatim_value") or "").strip().lower()
-            if val:
-                self._value_postings.setdefault(val, set()).add(m_id)
-                match = re.search(r'([a-z/%]+)$', val)
-                if match:
-                    self._unit_postings.setdefault(match.group(1), set()).add(m_id)
-            
-            sk = str(memory.get("state_key") or "").strip().lower()
-            if sk:
-                self._predicate_postings.setdefault(sk, set()).add(m_id)
+            # Exact Indexing (HOT only for fast path)
+            if tier == "HOT":
+                for ent in memory.get("entities", []):
+                    self._entity_postings.setdefault(str(ent).lower(), set()).add(m_id)
+                
+                val = str(memory.get("value") or memory.get("verbatim_value") or "").strip().lower()
+                if val:
+                    self._value_postings.setdefault(val, set()).add(m_id)
+                    match = re.search(r'([a-z/%]+)$', val)
+                    if match:
+                        self._unit_postings.setdefault(match.group(1), set()).add(m_id)
+                
+                sk = str(memory.get("state_key") or "").strip().lower()
+                if sk:
+                    self._predicate_postings.setdefault(sk, set()).add(m_id)
                 
             if memory.get("kind") == "STATE" and tier == "HOT":
                 ident = state_identity(memory)
@@ -1034,8 +1035,7 @@ class CoreMemoryMixin:
                         self._state_spine[ident] = StateSpine(ident)
                     self._state_spine[ident].add_version(memory)
                     
-        for ident, spine in self._state_spine.items():
-            self._state_heads[ident] = [m["id"] for m in spine.versions]
+
 
 
     def _refresh_index(self) -> None:

@@ -311,7 +311,7 @@ class CaptureMixin:
         document_time: str,
         session_idx: int = 0,
         window_idx: int = 0,
-    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
         focal_ids = {turn["turn_idx"] for turn in focal_turns}
         local_context = (
             self._truncate_to_tokens(
