@@ -64,9 +64,24 @@ STOPWORDS = frozenset(
 
 VALID_KINDS = {"FACT", "EVENT", "STATE"}
 
+VALID_SUBJECT_CLASSES = {"PRIMARY_USER", "THIRD_PARTY", "GENERAL_KNOWLEDGE"}
+
+VALID_SEMANTIC_ROLES = {
+    "MEASUREMENT",
+    "OBSERVATION",
+    "SAFETY_CONSTRAINT",
+    "ACCEPTED_POLICY",
+    "PREFERENCE",
+    "GUIDANCE",
+    "IDENTITY",
+}
+
+VALID_MEMORY_TIERS = {"HOT", "COLD"}
+
+
 # Bump this whenever capture, normalization, identity, or consolidation changes
 # can alter the durable ledger. It is included in the snapshot fingerprint.
-MEMORY_WRITE_SCHEMA_VERSION = 6
+MEMORY_WRITE_SCHEMA_VERSION = 7
 
 # These are topical labels, not versionable attributes. If a capture model emits
 # one without an object owner, treating every later symptom/emotion as a new
@@ -114,14 +129,7 @@ STATE_LIKE_KINDS = frozenset({"STATE"})
 
 VALID_ASSERTION_MODES = {"DIRECT", "RECAP", "INFERRED"}
 
-VALID_RELATIONS = {
-    "SUPPORT",
-    "REFINE",
-    "SUPERSEDE",
-    "CONFLICT",
-    "RELATED",
-    "CAUSES",
-}
+VALID_RELATIONS = {"REFINE", "SUPERSEDE", "CONFLICT", "CAUSES"}
 
 VALID_OPERATIONS = {
     "SEMANTIC_SEARCH",

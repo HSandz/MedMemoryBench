@@ -10,9 +10,9 @@ data:
 
 evaluation:
   mode: "independent"  # independent / merged
-  persona_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  persona_ids: [1]
   max_personas: null  
-  max_sessions_per_persona: null 
+  max_sessions_per_persona: 50 
 
   evaluation_interval: 10 
 

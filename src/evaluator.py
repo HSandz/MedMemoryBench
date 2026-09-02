@@ -125,11 +125,11 @@ class Evaluator:
         eligible_methods = (
             "long_context", "embedding_rag", "bm25_rag", "lightmem",
             "zep", "remem", "graph_rag", "amem", "mem0", "memos",
-            "memrl", "mirix",
+            "memrl", "mirix", "smart_mem0",
         )
         agent_params = getattr(self.method_config, "raw_config", {}).get("agent_params", {})
         has_method_stage = (
-            provider in {"gemini", "vertex", "vertex_ai"}
+            (provider in {"gemini", "vertex", "vertex_ai"} or "gemini" in self.method_config.model.name.lower())
             and any(name in method_name for name in eligible_methods)
             and not (
                 "mirix" in method_name
@@ -138,7 +138,7 @@ class Evaluator:
         )
         has_medmemorybench_judge = (
             self.dataset_config.dataset_name.lower() == "medmemorybench"
-            and get_api_config().get_judge_provider().lower() in {"gemini", "vertex", "vertex_ai"}
+            and (get_api_config().get_judge_provider().lower() in {"gemini", "vertex", "vertex_ai"} or "gemini" in get_api_config().get_judge_model().lower())
         )
         if not has_method_stage and not has_medmemorybench_judge:
             raise ValueError(
