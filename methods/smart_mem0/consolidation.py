@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .contracts import STATE_LIKE_KINDS, VALID_RELATIONS
 from .core import CoreMemoryMixin
 from .prompts import CONSOLIDATION_PROMPT
+from .canonicalization import state_identity
 
 
 class ConsolidationMixin:

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from utils.llm_client import create_llm_client
 
+from .canonicalization import StateSpine, canonicalize_state, state_identity
 from .contracts import (
     GENERIC_OBJECT_ANCHORS,
     GENERIC_STATE_KEYS,
