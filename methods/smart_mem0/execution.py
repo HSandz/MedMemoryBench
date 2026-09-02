@@ -1005,13 +1005,43 @@ class ExecutionMixin:
             "usage": {},
         }
 
-        if getattr(self, "enable_unified_controller", False):
+        if getattr(self, "enable_legacy_semantic_controller", False) and getattr(self, "enable_unified_controller", False):
             fast_supports, routed_plan, controller = self._semantic_controller(
                 question,
                 planned_seed_set,
                 frame,
                 context_map=planning_context,
             )
+        elif getattr(self, "enable_unified_controller", False):
+            from methods.smart_mem0.p1b_execution import _evaluate_seed_gate
+            # Zero-Gap Seed Gate
+            is_accepted, fast_supports, reason = _evaluate_seed_gate(self, question, frame, planned_seed_set)
+            
+            # Telemetry for P1B Seed Gate
+            self._seed_gate_telemetry = {
+                "attempted": True,
+                "eligible": True,
+                "accepted": is_accepted,
+                "selected_memory_id": fast_supports[0]["id"] if fast_supports else None,
+                "reason": reason,
+                "conflict": False
+            }
+            
+            routed_plan = None
+            if not is_accepted:
+                # Call Evidence-Gap Planner
+                fast_supports = None
+                # routed_plan, usage = self._gap_planner(...) # To be implemented
+                # For now, we can fallback to legacy planner by leaving routed_plan = None
+                pass
+            
+            controller = {
+                "called": not is_accepted,
+                "route": "DIRECT" if is_accepted else "PLAN",
+                "support_ref": fast_supports[0]["id"] if fast_supports else "",
+                "fallback_reason": reason,
+                "usage": {}, # Will be updated by gap planner
+            }
             usage = controller.get("usage", {})
             controller_stage = (
                 "fast_gate" if controller.get("route") == "DIRECT" else "planner"
@@ -1077,10 +1107,13 @@ class ExecutionMixin:
                 if not slot_coverage.get(slot["id"], False)
             ]
             unified = bool(getattr(self, "enable_unified_controller", False))
-            broad_replan = bool(getattr(self, "enable_replan", False)) and not unified
-            deterministic_recovery = bool(
-                getattr(self, "enable_zero_result_recovery", False)
-            )
+            if getattr(self, "enable_legacy_semantic_controller", False) == False and unified:
+                # P1B.1 overrides
+                broad_replan = False
+                deterministic_recovery = True
+            else:
+                broad_replan = bool(getattr(self, "enable_replan", False)) and not unified
+                deterministic_recovery = bool(getattr(self, "enable_zero_result_recovery", False))
 
             replan = None
             if not sufficient and deterministic_recovery and missing_slots:
@@ -1194,12 +1227,29 @@ class ExecutionMixin:
         query_latency["retrieval_wall"] = round(
             time.perf_counter() - retrieval_started, 3
         )
+        
+        lattice_telemetry = {}
+        if getattr(self, "_evidence_lattice", None):
+            # Update lattice with slot coverage
+            for slot_id, cov in slot_coverage.items():
+                if cov:
+                    self._evidence_lattice.update_gap(slot_id, "FILLED", slot_support.get(slot_id, []))
+            
+            lattice_telemetry = {
+                "required_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["gap"].required]),
+                "filled_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["status"] == "FILLED"]),
+                "missing_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["status"] != "FILLED" and g["gap"].required]),
+                "recovery_used": replan_called
+            }
+            
         return {
             "query_tokens": query_tokens,
             "query_latency": query_latency,
             "controller": controller,
             "fast_supports": fast_supports,
             "precomputed_answer": str(controller.get("answer") or ""),
+            "seed_gate": getattr(self, "_seed_gate_telemetry", {}),
+            "evidence_lattice": lattice_telemetry,
             "plan": plan,
             "replan": replan,
             "planner_called": planner_called,
