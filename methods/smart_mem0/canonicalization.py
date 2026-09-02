@@ -60,13 +60,74 @@ def build_state_identity(subject_id: str, state_key: str, object_anchor: str) ->
     subject = str(subject_id or "").lower().strip()
     return f"{subject}::{pred_key}::{obj_key}"
 
+
+MEASUREMENT_ALIASES = {
+    "hba1c": "lab.hba1c",
+    "hba1c_level": "lab.hba1c",
+    "patient_hba1c_level": "lab.hba1c",
+    "c-peptide": "lab.c_peptide",
+    "c_peptide": "lab.c_peptide",
+    "c_peptide_level": "lab.c_peptide",
+    "c-peptide concentration": "lab.c_peptide",
+    "uacr": "lab.uacr",
+    "urine_albumin_creatinine_ratio": "lab.uacr",
+}
+
+def measurement_identity(memory: dict) -> str:
+    raw_keys = [
+        memory.get("object_anchor"),
+        memory.get("state_key")
+    ]
+    raw_keys.extend(memory.get("entities", []))
+    
+    for raw in raw_keys:
+        if not raw:
+            continue
+        normalized = str(raw).lower().strip().replace(" ", "_")
+        if normalized in MEASUREMENT_ALIASES:
+            return MEASUREMENT_ALIASES[normalized]
+        # Also check without underscores
+        if normalized.replace("_", "-") in MEASUREMENT_ALIASES:
+            return MEASUREMENT_ALIASES[normalized.replace("_", "-")]
+    
+    # Try searching the claim
+    claim = str(memory.get("claim", "")).lower()
+    if "hba1c" in claim:
+        return "lab.hba1c"
+    if "c-peptide" in claim or "c peptide" in claim:
+        return "lab.c_peptide"
+    if "uacr" in claim or "albumin" in claim and "creatinine" in claim:
+        return "lab.uacr"
+        
+    return ""
+
+def has_exact_measurement_identity(memory: dict) -> bool:
+    return bool(measurement_identity(memory))
+
+def is_state_projection_eligible(memory: dict) -> bool:
+    if memory.get("kind") == "STATE":
+        return True
+    return (
+        memory.get("semantic_role") == "MEASUREMENT"
+        and memory.get("memory_tier", "HOT") == "HOT"
+        and has_exact_measurement_identity(memory)
+    )
+
 def state_identity(memory: dict) -> str:
-    if memory.get("kind") != "STATE":
+    if not is_state_projection_eligible(memory):
         return ""
+        
+    subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
+    
+    # If it's an event projected to a measurement state
+    meas_id = measurement_identity(memory)
+    if meas_id:
+        # Override to measurement identity
+        return f"{str(subject_id).lower().strip()}::{meas_id}::"
+        
     state_key = memory.get("state_key") or ""
     if not state_key:
         return ""
-    subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
     object_anchor = memory.get("object_anchor") or ""
     return build_state_identity(subject_id, state_key, object_anchor)
 

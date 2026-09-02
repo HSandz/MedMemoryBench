@@ -348,8 +348,7 @@ class CaptureMixin:
         # prior_by_id removed
         # Parse episode into a capsule
         episode_data = parsed.get("episode") or {}
-        self._capsule_seq = getattr(self, "_capsule_seq", 0) + 1
-        capsule_id = f"cap_{self._capsule_seq}"
+        capsule_id = f"temp_window_{turn_idx}"
         
         capsule = {
             "id": capsule_id,

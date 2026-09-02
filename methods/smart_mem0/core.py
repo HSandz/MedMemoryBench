@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from utils.llm_client import create_llm_client
 
-from .canonicalization import StateSpine, canonicalize_state, state_identity
+from .canonicalization import StateSpine, canonicalize_state, state_identity, is_state_projection_eligible
 from .contracts import (
     GENERIC_OBJECT_ANCHORS,
     GENERIC_STATE_KEYS,
@@ -1028,7 +1028,7 @@ class CoreMemoryMixin:
                 if sk:
                     self._predicate_postings.setdefault(sk, set()).add(m_id)
                 
-            if memory.get("kind") == "STATE" and tier == "HOT":
+            if tier == "HOT" and is_state_projection_eligible(memory):
                 ident = state_identity(memory)
                 if ident:
                     if ident not in self._state_spine:
