@@ -101,7 +101,7 @@ class ConsolidationMixin:
             # Keep recent exact-identity versions available to consolidation.
             # Ledger-order truncation previously favored the oldest versions.
             m_ident = state_identity(memory)
-            m_lineage = self._state_lineage_identity(memory)
+            m_lineage = state_identity(memory)
             if m_ident or m_lineage:
                 identity_matches = sorted(
                     (
@@ -111,7 +111,7 @@ class ConsolidationMixin:
                             (m_ident and state_identity(old_mem) == m_ident)
                             or (
                                 m_lineage
-                                and self._state_lineage_identity(old_mem) == m_lineage
+                                and state_identity(old_mem) == m_lineage
                             )
                         )
                     ),

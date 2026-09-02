@@ -8,6 +8,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from .contracts import MemoryWriteContext
 from .core import CoreMemoryMixin
+from .canonicalization import state_identity
 from .prompts import MEMORY_WRITE_PROMPT
 
 
@@ -229,13 +230,13 @@ class CaptureMixin:
             )
             overlap = len(claim_terms & prior_terms)
             same_identity = bool(
-                self._state_identity(memory)
-                and self._state_identity(memory) == self._state_identity(prior)
+                state_identity(memory)
+                and state_identity(memory) == state_identity(prior)
             )
             same_lineage = bool(
-                self._state_lineage_identity(memory)
-                and self._state_lineage_identity(memory)
-                == self._state_lineage_identity(prior)
+                state_identity(memory)
+                and state_identity(memory)
+                == state_identity(prior)
             )
             same_numbers = bool(
                 set(re.findall(r"\d+(?:\.\d+)?", self._memory_value(memory)))
