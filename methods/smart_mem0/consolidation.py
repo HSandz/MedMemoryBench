@@ -1021,7 +1021,6 @@ class ConsolidationMixin:
             new_memories, nearby, turn_map, document_time
         )
         old_by_id = {item["id"]: item for item in nearby}
-        self._inherit_state_keys(new_memories, old_by_id, consolidation)
         self._reuse_nearby_state_keys(new_memories, nearby)
         consolidation = self._sanitize_state_relations(
             new_memories, old_by_id, consolidation

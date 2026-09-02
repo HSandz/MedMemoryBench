@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .canonicalization import state_identity
 from .contracts import (
     CLINICAL_SCOPES,
     RETRIEVAL_BUDGETS,
@@ -56,7 +57,7 @@ class PlanningMixin:
             "state_key": memory.get("state_key", ""),
             "object_anchor": memory.get("object_anchor", ""),
             "assertion_mode": memory.get("assertion_mode", "DIRECT"),
-            "state_identity": self._state_identity(memory),
+            "state_identity": state_identity(memory),
             "value": self._memory_value(memory),
             "verbatim_value": memory.get("verbatim_value", ""),
             "event_time": memory.get("event_time", "UNKNOWN"),
@@ -349,7 +350,7 @@ class PlanningMixin:
         return True
 
     def _has_competing_active_value(self, memory: Dict[str, Any]) -> bool:
-        identity = self._state_identity(memory)
+        identity = state_identity(memory)
         if not identity:
             return False
         by_id = {item["id"]: item for item in self._memories}

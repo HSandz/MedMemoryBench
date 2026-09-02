@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .contracts import VALID_TEMPORAL_AXES, QueryFrame
+from .canonicalization import state_identity
 from .prompts import SLOT_SUPPORT_GATE_PROMPT
 
 
@@ -14,7 +15,7 @@ class ExecutionMixin:
 
     def _is_state_head(self, memory: Dict[str, Any]) -> bool:
         """Return whether a state-like memory is in its resolved head set."""
-        identity = self._state_identity(memory)
+        identity = state_identity(memory)
         return bool(
             identity and memory.get("id") in self._state_heads.get(identity, [])
         )
@@ -127,7 +128,7 @@ class ExecutionMixin:
                 in {"active", "refined", "conflicting"}
                 and self._memory_value(memory)
             ]
-            identities = {self._state_identity(memory) for memory in heads}
+            identities = {state_identity(memory) for memory in heads}
             values = {self._state_value_signature(memory) for memory in heads}
             if len(heads) < 1 or len(identities) != 1 or len(values) != 1:
                 return False
@@ -170,9 +171,9 @@ class ExecutionMixin:
                 target = by_id.get(relation.get("target_id"))
                 if not source or not target:
                     continue
-                same_identity = self._state_identity(source) and self._state_identity(
+                same_identity = state_identity(source) and state_identity(
                     source
-                ) == self._state_identity(target)
+                ) == state_identity(target)
                 values_differ = (
                     self._normalised_value(source)
                     and self._normalised_value(target)
@@ -292,11 +293,11 @@ class ExecutionMixin:
             )
             if not best:
                 return []
-            identity = self._state_identity(best)
+            identity = state_identity(best)
             return [
                 memory
                 for memory in ranked
-                if self._state_identity(memory) == identity
+                if state_identity(memory) == identity
                 and self._is_state_head(memory)
                 and self._memory_value(memory)
                 and self._memory_matches_slot_role(slot, memory)
@@ -334,8 +335,8 @@ class ExecutionMixin:
                 if (
                     source
                     and target
-                    and self._state_identity(source)
-                    and self._state_identity(source) == self._state_identity(target)
+                    and state_identity(source)
+                    and state_identity(source) == state_identity(target)
                     and self._normalised_value(source) != self._normalised_value(target)
                 ):
                     endpoint_ids.update((source["id"], target["id"]))
@@ -411,7 +412,7 @@ class ExecutionMixin:
                             "origin_memory_id": by_id[memory_id].get(
                                 "origin_memory_id", ""
                             ),
-                            "state_identity": self._state_identity(by_id[memory_id]),
+                            "state_identity": state_identity(by_id[memory_id]),
                             "event_time": by_id[memory_id].get("event_time", "UNKNOWN"),
                             "document_time": by_id[memory_id].get("document_time", ""),
                             "origin_document_time": by_id[memory_id].get(
@@ -1241,8 +1242,8 @@ class ExecutionMixin:
                 source = selected[relation["source_id"]]
                 target = selected[relation["target_id"]]
                 if (
-                    not self._state_identity(source)
-                    or self._state_identity(source) != self._state_identity(target)
+                    not state_identity(source)
+                    or state_identity(source) != state_identity(target)
                 ):
                     continue
             relevant.append(self._snapshot(relation))

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .contracts import VALID_SEARCH_STRATEGIES, QueryFrame
 from .core import CoreMemoryMixin
+from .canonicalization import state_identity
 
 
 class RetrievalOperationsMixin:
@@ -260,20 +261,20 @@ class RetrievalOperationsMixin:
             # for write-time reconciliation and must not mix distinct state
             # families in the final evidence set.
             anchor_lineage = (
-                self._state_identity(focal_anchor) if focal_anchor else ""
+                state_identity(focal_anchor) if focal_anchor else ""
             )
             focal_lineages = {anchor_lineage} if anchor_lineage else set()
         else:
             focal_lineages = {
-                self._state_identity(memory)
+                state_identity(memory)
                 for memory in (*base[:4], *routed[:4])
-                if self._state_identity(memory)
+                if state_identity(memory)
             }
         lineage_versions = [
             memory
             for memory in self._memories
             if memory["id"] in eligible_ids
-            and self._state_identity(memory) in focal_lineages
+            and state_identity(memory) in focal_lineages
             and memory.get("assertion_mode", "DIRECT") == "DIRECT"
         ]
         if strategy == "TRAJECTORY" and focal_lineages:
@@ -314,7 +315,7 @@ class RetrievalOperationsMixin:
                     (
                         memory
                         for memory in lineage_versions
-                        if self._state_identity(memory) == lineage
+                        if state_identity(memory) == lineage
                     ),
                     key=lambda memory: (
                         self._recency_date(memory),
@@ -418,12 +419,12 @@ class RetrievalOperationsMixin:
         # A query trajectory is a strict state family. Scope-tolerant lineage
         # matching is only a write-time repair mechanism, never read-time
         # evidence expansion.
-        anchor_lineage = self._state_identity(anchor) if anchor else ""
+        anchor_lineage = state_identity(anchor) if anchor else ""
         lineages = {anchor_lineage} if anchor_lineage else set()
         family = [
             memory
             for memory in self._memories
-            if self._state_identity(memory) in lineages
+            if state_identity(memory) in lineages
             and memory.get("assertion_mode", "DIRECT") == "DIRECT"
         ]
         family_sorted = sorted(
@@ -464,7 +465,7 @@ class RetrievalOperationsMixin:
             versions = [
                 memory
                 for memory in family_sorted
-                if self._state_identity(memory) == lineage
+                if state_identity(memory) == lineage
             ]
             family_endpoints.extend((*versions[:2], *versions[-2:]))
         for memory in (*focal_candidates, *family_endpoints, *ranked):
@@ -607,7 +608,7 @@ class RetrievalOperationsMixin:
                 best = ranked[0]
                 query_numbers = set(re.findall(r"\d+(?:\.\d+)?", query))
                 focal_identities = {
-                    self._state_identity(memory): {
+                    state_identity(memory): {
                         token
                         for token in self._tokenize(self._memory_value(memory))
                         if len(token) > 3
@@ -615,7 +616,7 @@ class RetrievalOperationsMixin:
                         not in {"patient", "current", "recent", "state"}
                     }
                     for memory in relevant
-                    if self._state_identity(memory)
+                    if state_identity(memory)
                 }
                 if focal_identities:
                     identity_versions = []
@@ -629,8 +630,8 @@ class RetrievalOperationsMixin:
                         )
                         if (
                             memory["id"] in eligible_ids
-                            and self._state_identity(memory) in focal_identities
-                            and focal_identities[self._state_identity(memory)].intersection(
+                            and state_identity(memory) in focal_identities
+                            and focal_identities[state_identity(memory)].intersection(
                                 self._tokenize(text)
                             )
                             and query_numbers.issubset(
@@ -693,9 +694,9 @@ class RetrievalOperationsMixin:
         # like valid coverage and creates artificial conflicts.
         best_identity = next(
             (
-                self._state_identity(candidate)
+                state_identity(candidate)
                 for candidate in candidates
-                if self._state_identity(candidate)
+                if state_identity(candidate)
             ),
             "",
         )

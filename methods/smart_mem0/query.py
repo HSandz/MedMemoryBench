@@ -7,6 +7,7 @@ from methods.base import AgentResponse
 from utils.llm_client import format_messages
 
 from .contracts import CLINICAL_SCOPES
+from .canonicalization import state_identity
 
 QUERY_TOKEN_STAGES = ("fast_gate", "planner", "slot_validation", "replan", "answer")
 
@@ -225,7 +226,7 @@ class QueryMixin:
             f"effective_event_time={self._date_for(memory, 'effective_event_time') or 'UNKNOWN'} "
             f"assertion_mode={memory.get('assertion_mode', 'DIRECT')} "
             f"source={','.join(memory.get('source_speakers', [])) or 'UNKNOWN'} "
-            f"state_identity={self._state_identity(memory) or 'NONE'} "
+            f"state_identity={state_identity(memory) or 'NONE'} "
             f"value={self._memory_value(memory) or 'NONE'}: {memory['claim']}"
             + (
                 f" [verbatim_value={memory['verbatim_value']}]"
