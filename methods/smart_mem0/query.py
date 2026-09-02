@@ -246,7 +246,8 @@ class QueryMixin:
                 if system_message:
                     fast_frame["system_message"] = system_message
                     if "messages" in fast_frame and fast_frame["messages"]:
-                        fast_frame["messages"][0]["content"] = system_message
+                        existing = fast_frame["messages"][0]["content"]
+                        fast_frame["messages"][0]["content"] = f"{system_message}\n\n{existing}" 
                 return fast_frame
         except Exception as e:
             # P1A fail open

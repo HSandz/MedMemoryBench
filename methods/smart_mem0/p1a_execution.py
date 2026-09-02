@@ -67,14 +67,31 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
         elif decision.temporal_relation == "LATEST":
             selected = max(dated_pool, key=temp_key)
         elif decision.temporal_relation == "MATCH":
-            # Match needs an anchor
-            if not decision.temporal_anchor:
-                return None
-            matched = [m for m in dated_pool if _get_date(m, decision.temporal_axis).startswith(decision.temporal_anchor)]
-            if not matched:
-                return None
-            # tie break
-            selected = min(matched, key=temp_key) # just pick earliest tie-breaker
+            if decision.temporal_anchor:
+                matched = []
+                for m in dated_pool:
+                    date_str = _get_date(m, decision.temporal_axis)
+                    # YYYY-MM-DD
+                    m_year, m_month, m_day = None, None, None
+                    parts = date_str.split('-')
+                    if len(parts) >= 1 and parts[0].isdigit(): m_year = int(parts[0])
+                    if len(parts) >= 2 and parts[1].isdigit(): m_month = int(parts[1])
+                    if len(parts) >= 3 and parts[2].isdigit(): m_day = int(parts[2])
+                    
+                    if decision.temporal_year and m_year != decision.temporal_year:
+                        continue
+                    if decision.temporal_month and m_month != decision.temporal_month:
+                        continue
+                    if decision.temporal_day and m_day != decision.temporal_day:
+                        continue
+                    matched.append(m)
+                
+                if not matched:
+                    return None
+                selected = min(matched, key=temp_key)
+            else:
+                # Unanchored MATCH
+                selected = min(dated_pool, key=temp_key)
         else:
             return None
             
@@ -98,7 +115,8 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
         # exact/bm25 bounded
         # if only a few, just pass them to answer LLM
         # pick highest confidence or just up to 3
-        pool.sort(key=lambda m: (-float(m.get("confidence", 0.8)), int(m["id"].split("_")[-1]) if "_" in m["id"] and m["id"].split("_")[-1].isdigit() else 0))
+        # exact pool is already ranked by tier, just tie-break by confidence and recency if needed
+        # Actually it's ordered by tier, so we just take up to top 3
         selected = pool[:3]
         for m in selected:
             used_ids.add(m["id"])
@@ -110,7 +128,14 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
     elapsed = (time.time() - start_time) * 1000
     
     # Return fast path frame
-    retrieved_mems = pool if 'pool' in locals() else [agent._state_spine[ident].latest()] if decision.route == "STATE_LATEST" else []
+    if decision.route == "STATE_LATEST":
+        retrieved_mems = [agent._state_spine[ident].latest()] if 'ident' in locals() and ident in agent._state_spine else []
+    elif decision.route == "TEMPORAL" and 'selected' in locals() and isinstance(selected, dict):
+        retrieved_mems = [selected]
+    elif decision.route == "EXACT" and 'selected' in locals() and isinstance(selected, list):
+        retrieved_mems = selected
+    else:
+        retrieved_mems = []
     ret = {
         "evidence": "", 
         "raw_context": "",
@@ -123,8 +148,17 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
         "planner_usage": {},
         "question": question,
         "system_message": None, 
+        "planner_called": False,
+        "semantic_controller": {"called": False},
         "extra": {
-            "query_tokens": {"controller": 0, "planner": 0},
+            "query_tokens": {
+                "fast_gate": 0,
+                "planner": 0,
+                "slot_validation": 0,
+                "replan": 0,
+                "answer": 0,
+                "total": 0
+            },
             "retrieval_elapsed_ms": elapsed,
             "p1a": {
                 "route": decision.route,
@@ -149,7 +183,7 @@ def _prepare_p1a_query(agent, question: str) -> Optional[Dict[str, Any]]:
         ret["evidence"] = evidence_text
         ret["raw_context"] = evidence_text
         ret["messages"] = [
-            {"role": "system", "content": "You are a precise medical assistant. Answer the user's question concisely using only the provided memory context."},
+            {"role": "system", "content": "Ground every subject-specific claim in supplied memory evidence. For inference, general knowledge may connect grounded endpoints, but must not substitute for missing subject-specific evidence. Never invent subject history, values, events, decisions, or states."},
             {"role": "user", "content": f"Context:\n{evidence_text}\n\nQuestion: {question}"}
         ]
         
@@ -190,34 +224,69 @@ def _resolve_canonical_identity(agent, concept: str, subject_id: str) -> Optiona
     return None
 
 def _temporal_candidate_pool(agent, concept: str, subject_ids: set) -> list:
+    # Build ranked candidates
     concept = concept.lower()
     words = set(concept.split())
-    pool = []
+    
+    exact_obj = []
+    exact_ent = []
+    exact_pred = []
+    alias = []
+    bm25 = []
+    
     for m in agent._memories:
         if m["id"] not in subject_ids:
             continue
             
+        # Subject Firewall is implicitly enforced by subject_ids
+        
+        # EXACT OBJECT
         obj = str(m.get("object_anchor") or "").lower()
-        if obj and (obj == concept or concept in obj or obj in concept):
-            pool.append(m)
+        if obj and (obj == concept):
+            exact_obj.append(m)
             continue
             
-        sk = str(m.get("state_key") or "").lower()
-        if sk and (sk == concept or concept in sk or sk in concept):
-            pool.append(m)
-            continue
-            
+        # EXACT ENTITY
         ents = [str(e).lower() for e in m.get("entities", [])]
-        if concept in ents or any(w in ents for w in words):
-            pool.append(m)
+        if concept in ents:
+            exact_ent.append(m)
             continue
             
+        # EXACT PREDICATE / Canonical Key
+        sk = str(m.get("state_key") or "").lower()
+        if sk and sk == concept:
+            exact_pred.append(m)
+            continue
+            
+        # ALIAS / Substring Object
+        if obj and (concept in obj or obj in concept):
+            alias.append(m)
+            continue
+            
+        if sk and (concept in sk or sk in concept):
+            alias.append(m)
+            continue
+            
+        # BOUNDED BM25 Fallback (simple lexical overlap threshold)
         claim = str(m.get("claim") or "").lower()
-        if any(w in claim for w in words):
-            pool.append(m)
-            continue
+        claim_words = set(claim.split())
+        overlap = len(words.intersection(claim_words))
+        if overlap > 0:
+            # We store overlap for sorting later
+            bm25.append((overlap, m))
             
-    return pool
+    bm25.sort(key=lambda x: x[0], reverse=True)
+    bm25 = [m for _, m in bm25]
+    
+    # Return the highest authorized tier that has candidates
+    if exact_obj: return exact_obj
+    if exact_ent: return exact_ent
+    if exact_pred: return exact_pred
+    if alias: return alias
+    
+    # Only if empty, use lexical recovery
+    # Margin check: for P1A, we just take the top-tier of BM25 if it exists
+    return bm25
     
 def _get_date(m: dict, axis: str) -> str:
     # Handle "UNKNOWN"

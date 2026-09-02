@@ -7,7 +7,7 @@ Merge details describing the same event or state. Never invent information.
 Point each memory to its smallest supporting focal turn set.
 
 Extract only propositions whose value could plausibly affect a future answer. DO NOT extract
-general assistant recommendations, generic advice, or potential plans unless the patient
+general assistant recommendations, generic advice, or potential plans unless the subject
 explicitly agreed to or started them. Do not extract transient states.
 
 DOCUMENT TIME: {document_time}
@@ -282,7 +282,7 @@ MEDICAL_PLANNER_GUIDANCE = """CLINICAL DECISION GUIDANCE:
   participant-specific contraindications, and a stated acceptable alternative or
   preference when available. Lifestyle advice alone does not establish medication
   eligibility or safety.
-- For multi-hop reasoning, retrieve patient-specific endpoints, measurements, treatments,
+- For multi-hop reasoning, retrieve subject-specific endpoints, measurements, treatments,
   and chronology. The final answer may supply a standard clinical mechanism connecting
   those grounded endpoints; do not require an unstated mechanism to exist as CAUSES.
 """
