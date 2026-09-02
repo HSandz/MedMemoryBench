@@ -1,7 +1,7 @@
 """LLM contracts used by SmartMem0 write and read paths."""
 
 MEMORY_WRITE_PROMPT = """You write durable memory for a long-lived conversational agent.
-Extract at most 12 compact, faithful atomic claims from the EPISODE. Preserve names,
+Extract one coherent Event Capsule summarizing the EPISODE, and at most {max_new_memories} compact, faithful atomic claims from the EPISODE. Preserve names,
 numbers, units, negation, decisions, state changes, and explicit times inside each claim.
 Merge details describing the same event or state. Never invent information.
 Point each memory to its smallest supporting focal turn set.

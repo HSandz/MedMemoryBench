@@ -14,219 +14,6 @@ from .prompts import MEMORY_WRITE_PROMPT
 class CaptureMixin:
     """Extracts focal-turn memories without persisting interpretation context."""
 
-    def _select_provisional_memories(
-        self,
-        query: str,
-        provisional: List[Dict[str, Any]],
-        limit: int = 4,
-    ) -> List[Dict[str, Any]]:
-        if not provisional or limit <= 0:
-            return []
-        query_terms = set(self._tokenize(query))
-        memory_texts = [self._memory_text(memory) for memory in provisional]
-        try:
-            vectors = self._embedder.encode(
-                [query, *memory_texts], show_progress_bar=False
-            )
-            dense_scores = cosine_similarity(vectors[:1], vectors[1:])[0]
-        except Exception:
-            dense_scores = [0.0] * len(provisional)
-        ranked = []
-        for index, memory in enumerate(provisional):
-            memory_terms = set(self._tokenize(memory_texts[index]))
-            overlap = len(query_terms & memory_terms)
-            dense_score = float(dense_scores[index])
-            combined = dense_score + 0.03 * min(overlap, 4)
-            ranked.append((combined, overlap, index, memory))
-        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        return [self._snapshot(item[3]) for item in ranked[:limit]]
-
-    def _select_write_beliefs(
-        self,
-        query: str,
-        limit: int,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Retrieve current and relevant historical beliefs for write interpretation."""
-        if not self._memories or limit <= 0:
-            return [], []
-        candidates = self._hybrid_search(
-            query,
-            top_k=min(max(24, limit * 4), len(self._memories)),
-        )
-        if not candidates:
-            return [], []
-
-        # Hybrid recall can surface either the old or current version. Add the
-        # closest same-identity counterparts and scope-tolerant lineage matches
-        # so extraction can reuse an established scope instead of fragmenting a
-        # state merely because one session says "lab result" and another says
-        # "glycemic control".
-        candidate_by_id = {memory["id"]: memory for memory in candidates}
-        for anchor in candidates[: max(5, limit)]:
-            identity = self._state_identity(anchor)
-            lineage = self._state_lineage_identity(anchor)
-            if not identity and not lineage:
-                continue
-            versions = sorted(
-                (
-                    memory
-                    for memory in self._memories
-                    if (
-                        (identity and self._state_identity(memory) == identity)
-                        or (
-                            lineage
-                            and self._state_lineage_identity(memory) == lineage
-                        )
-                    )
-                ),
-                key=lambda memory: (
-                    self._belief_status.get(memory["id"], "active")
-                    in {"active", "refined", "conflicting"},
-                    self._recency_date(memory),
-                    memory.get("document_time", ""),
-                    memory["id"],
-                ),
-                reverse=True,
-            )
-            for version in versions[:2]:
-                if version["id"] in candidate_by_id:
-                    continue
-                enriched = self._snapshot(version)
-                enriched.update(
-                    {
-                        "_score": float(anchor.get("_score", 0.0)) * 0.97,
-                        "_bm25_score": 0.0,
-                        "_dense_score": float(anchor.get("_dense_score", 0.0)),
-                        "_overlap": 0,
-                        "_status": self._belief_status.get(
-                            version["id"], "active"
-                        ),
-                    }
-                )
-                candidate_by_id[version["id"]] = enriched
-        candidates = list(candidate_by_id.values())
-
-        profile_ids = set(self._profile_pack.get("stable_facts", []))
-        profile_ids.update(self._profile_pack.get("preferences", []))
-        profile_ids.update(self._profile_pack.get("plans", []))
-        state_head_ids = {
-            memory_id
-            for values in self._profile_pack.get("state_heads", {}).values()
-            for memory_id in values
-        }
-        profile_ids.update(state_head_ids)
-        top_ids = {memory["id"] for memory in candidates[:5]}
-        related_ids = {
-            endpoint
-            for relation in self._relations
-            if relation["source_id"] in top_ids or relation["target_id"] in top_ids
-            for endpoint in (relation["source_id"], relation["target_id"])
-        }
-        query_terms = set(self._tokenize(query))
-        scored = []
-        for rank, memory in enumerate(candidates):
-            entity_terms = set(self._tokenize(" ".join(memory.get("entities", []))))
-            entity_match = len(query_terms & entity_terms)
-            active_status = self._belief_status.get(memory["id"], "active") in {
-                "active",
-                "refined",
-                "conflicting",
-            }
-            bonus = (
-                0.008 * min(entity_match, 3)
-                + (0.009 if memory["id"] in state_head_ids else 0.0)
-                + (0.004 if memory["id"] in related_ids else 0.0)
-                + (0.006 if active_status else 0.0)
-            )
-            scored.append((float(memory.get("_score", 0.0)) + bonus, -rank, memory))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        ranked = [item[2] for item in scored]
-
-        core = [
-            self._snapshot(memory)
-            for memory in ranked
-            if memory["id"] in profile_ids
-            and memory["kind"] in {"FACT", "STATE"}
-            and self._belief_status.get(memory["id"], "active")
-            in {"active", "refined", "conflicting"}
-        ][: min(2, limit)]
-        core_ids = {memory["id"] for memory in core}
-        relevant = [
-            self._snapshot(memory) for memory in ranked if memory["id"] not in core_ids
-        ][: max(0, limit - len(core))]
-        return core, relevant
-
-    def _update_write_context(
-        self,
-        context: MemoryWriteContext,
-        focal_turns: List[Dict[str, Any]],
-        previous_turn: Optional[Dict[str, Any]],
-        document_time: str,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        continuity_enabled = self.write_context_mode in {"window", "full"}
-        prior_enabled = self.write_context_mode == "full"
-        query_parts = [document_time]
-        if continuity_enabled and previous_turn:
-            query_parts.append(self._format_turn(previous_turn, "CONTEXT TURN"))
-        query_parts.extend(self._format_turn(turn) for turn in focal_turns)
-        query = "\n".join(query_parts)
-        selected_provisional = (
-            self._select_provisional_memories(
-                query,
-                context.provisional_memories,
-                limit=self.write_provisional_limit,
-            )
-            if continuity_enabled
-            else []
-        )
-        core, relevant = (
-            self._select_write_beliefs(query, self.write_prior_belief_limit)
-            if prior_enabled
-            else ([], [])
-        )
-        context.local_turn_context = (
-            [self._snapshot(previous_turn)]
-            if continuity_enabled and previous_turn
-            else []
-        )
-        context.core_beliefs = core
-        context.relevant_prior_beliefs = relevant
-        return core + relevant, selected_provisional
-
-    @staticmethod
-    def _write_memory_payload(memories: Sequence[Dict[str, Any]]) -> str:
-        if not memories:
-            return "[]"
-        fields = (
-            "id",
-            "claim",
-            "kind",
-            "entities",
-            "subject",
-            "scope",
-            "state_key",
-            "object_anchor",
-            "scope_entities",
-            "value",
-            "verbatim_value",
-            "stance",
-            "event_time",
-            "document_time",
-            "origin_document_time",
-            "assertion_mode",
-        )
-        return json.dumps(
-            [
-                {
-                    key: memory.get(key)
-                    for key in fields
-                    if memory.get(key) not in (None, "")
-                }
-                for memory in memories
-            ],
-            ensure_ascii=False,
-        )
-
     @staticmethod
     def _contains_recap_reference(text: str) -> bool:
         patterns = (
@@ -521,6 +308,8 @@ class CaptureMixin:
         focal_turns: List[Dict[str, Any]],
         previous_turn: Optional[Dict[str, Any]],
         document_time: str,
+        session_idx: int = 0,
+        window_idx: int = 0,
     ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         focal_ids = {turn["turn_idx"] for turn in focal_turns}
         local_context = (
@@ -538,6 +327,7 @@ class CaptureMixin:
                     "content": MEMORY_WRITE_PROMPT.format(
                         document_time=document_time,
                         local_context=local_context,
+                        max_new_memories=self.max_new_memories,
                         focal_turns="\n".join(
                             self._format_turn(turn) for turn in focal_turns
                         ),
@@ -555,9 +345,23 @@ class CaptureMixin:
         accepted, raw_to_accepted = [], {}
         focal_by_id = {turn["turn_idx"]: turn for turn in focal_turns}
         # prior_by_id removed
-        for raw_index, raw in enumerate(
-            (parsed.get("memories") or [])[: self.MAX_NEW_MEMORIES]
-        ):
+        # Parse episode into a capsule
+        episode_data = parsed.get("episode") or {}
+        self._capsule_seq = getattr(self, "_capsule_seq", 0) + 1
+        capsule_id = f"cap_{self._capsule_seq}"
+        
+        capsule = {
+            "id": capsule_id,
+            "session_idx": session_idx,
+            "window_idx": window_idx,
+            "document_time": document_time,
+            "abstraction": str(episode_data.get("abstraction", "")),
+            "cues": [str(c) for c in episode_data.get("cues") or []],
+            "facet_ids": [],
+            "evidence_ids": [f"ev_{session_idx}_{turn['turn_idx']}" for turn in focal_turns],
+        }
+
+        for raw_index, raw in enumerate(parsed.get("memories") or []):
             if not isinstance(raw, dict):
                 continue
             normalized = self._normalise_memory(raw)
@@ -574,8 +378,34 @@ class CaptureMixin:
             else:
                 normalized["assertion_mode"] = "DIRECT"
             normalized["origin_memory_id"] = ""
+            
+            # P0B Semantic Promotion
+            semantic_role = str(normalized.get("semantic_role", "")).upper()
+            kind = str(normalized.get("kind", "")).upper()
+            value = str(normalized.get("value", ""))
+            entities = normalized.get("entities", [])
+            
+            hot_roles = {"SAFETY_CONSTRAINT", "MEASUREMENT", "ACCEPTED_POLICY", "PREFERENCE", "IDENTITY"}
+            
+            is_hot = False
+            if semantic_role in hot_roles:
+                is_hot = True
+            elif kind == "STATE":
+                is_hot = True
+            elif any(c.isdigit() for c in value) or any(any(c.isdigit() for c in ent) for ent in entities):
+                is_hot = True
+                
+            normalized["memory_tier"] = "HOT" if is_hot else "COLD"
+            normalized["capsule_id"] = capsule_id
+            
             raw_to_accepted[raw_index] = len(accepted)
             accepted.append(normalized)
+
+        # Store facet ids in the capsule
+        capsule["facet_ids"] = [m.get("id") for m in accepted if m.get("id")]
+        if not hasattr(self, "_capsules"):
+            self._capsules = []
+        self._capsules.append(capsule)
 
         # Keep a compact pointer when a source turn contains an exact
         # quantitative/temporal observation that the model's extraction

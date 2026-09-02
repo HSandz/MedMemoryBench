@@ -21,9 +21,11 @@ class WriteLifecycleMixin:
             "method": "smart_mem0",
             "memory_health": self._memory_health_stats(),
             "memories": self._snapshot(self._memories),
+            "capsules": self._snapshot(self._capsules),
             "relations": self._snapshot(self._relations),
             "evidence": self._snapshot(self._evidence),
             "memory_seq": int(self._memory_seq),
+            "capsule_seq": int(getattr(self, "_capsule_seq", 0)),
             "evidence_seq": int(self._evidence_seq),
             "session_seq": int(self._session_seq),
             "is_initialized": bool(self._is_initialized),
@@ -37,7 +39,7 @@ class WriteLifecycleMixin:
             raise ValueError("Unsupported SmartMem0 snapshot version")
         if data.get("method") != "smart_mem0":
             raise ValueError("Snapshot belongs to a different memory method")
-        for field in ("memories", "relations", "evidence"):
+        for field in ("memories", "relations", "evidence", "capsules"):
             if not isinstance(data.get(field), list):
                 raise ValueError(f"SmartMem0 snapshot field '{field}' must be a list")
 
@@ -46,6 +48,7 @@ class WriteLifecycleMixin:
         self._memory_chunks = []
         self._memory_seq = max(int(data.get("memory_seq", 0)), len(self._memories))
         self._evidence_seq = max(int(data.get("evidence_seq", 0)), len(self._evidence))
+        self._capsule_seq = max(int(data.get("capsule_seq", 0)), len(self._capsules))
         self._session_seq = max(
             int(data.get("session_seq", 0)),
             self._session_seq,
@@ -61,6 +64,7 @@ class WriteLifecycleMixin:
         self._bm25 = self._embedding_matrix = None
         self._embedding_cache = {}
         self._memories = []
+        self._capsules = data.get("capsules", [])
         for index, raw in enumerate(
             data.get("memories") or data.get("cards") or [], start=1
         ):
@@ -72,6 +76,11 @@ class WriteLifecycleMixin:
                     "id": str(raw.get("id") or f"m_{index}"),
                     "claim": normalized["claim"],
                     "kind": normalized["kind"],
+                    "semantic_role": normalized.get("semantic_role", "OBSERVATION"),
+                    "memory_tier": str(raw.get("memory_tier", "COLD")),
+                    "capsule_id": str(raw.get("capsule_id", "")),
+                    "subject_id": normalized.get("subject_id", "primary_user"),
+                    "subject_class": normalized.get("subject_class", "PRIMARY_USER"),
                     "entities": normalized["entities"],
                     "subject": normalized["subject"],
                     "scope": normalized["scope"],
@@ -248,6 +257,8 @@ class WriteLifecycleMixin:
                         window,
                         continuity_turn,
                         document_time,
+                        session_idx=next_session,
+                        window_idx=window_index,
                     )
                     responses.append(response_text)
                     write_context_trace[-1]["extracted_count"] = len(window_memories)

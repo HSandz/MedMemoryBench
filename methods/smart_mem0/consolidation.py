@@ -471,7 +471,7 @@ class ConsolidationMixin:
                 )
         return valid
 
-    def _rebuild_belief_view(self) -> None:
+    def _rebuild_relations_and_status(self) -> None:
         # Imported/legacy stores may contain relations produced before the
         # identity and provenance contracts were tightened. Remove those edges
         # before deriving status or heads, otherwise one invalid edge can poison
@@ -1122,6 +1122,11 @@ class ConsolidationMixin:
                 "id": memory_id,
                 "claim": memory["claim"],
                 "kind": memory["kind"],
+                "semantic_role": memory.get("semantic_role", "OBSERVATION"),
+                "memory_tier": memory.get("memory_tier", "COLD"),
+                "capsule_id": memory.get("capsule_id", ""),
+                "subject_id": memory.get("subject_id", "primary_user"),
+                "subject_class": memory.get("subject_class", "PRIMARY_USER"),
                 "entities": memory["entities"],
                 "subject": memory.get("subject", "patient"),
                 "scope": memory.get("scope", "general"),

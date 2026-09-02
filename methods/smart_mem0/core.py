@@ -17,6 +17,8 @@ from .contracts import (
     STATE_LIKE_KINDS,
     STOPWORDS,
     VALID_ASSERTION_MODES,
+    VALID_SEMANTIC_ROLES,
+    VALID_SUBJECT_CLASSES,
     VALID_KINDS,
     VALID_PLANNING_TAGS,
     MemoryWriteContext,
@@ -31,6 +33,36 @@ try:
 except ImportError as exc:
     raise ImportError(f"[SmartMem0] Missing dependency: {exc}")
 
+
+class StateSpine:
+    def __init__(self, identity: str):
+        self.identity = identity
+        self.versions: List[Dict[str, Any]] = []
+
+    def add_version(self, memory: Dict[str, Any]):
+        self.versions.append(memory)
+        # Sort by event_time, fallback to document_time
+        self.versions.sort(key=lambda x: (x.get("event_time") or x.get("document_time") or "", x.get("id")))
+
+    def latest(self) -> Optional[Dict[str, Any]]:
+        if not self.versions:
+            return None
+        return self.versions[-1]
+        
+    def earliest(self) -> Optional[Dict[str, Any]]:
+        if not self.versions:
+            return None
+        return self.versions[0]
+        
+    def as_of(self, target_date_str: str) -> Optional[Dict[str, Any]]:
+        if not self.versions:
+            return None
+        valid = None
+        for v in self.versions:
+            t = v.get("event_time") or v.get("document_time") or ""
+            if t <= target_date_str:
+                valid = v
+        return valid
 
 class CoreMemoryMixin:
     """Owns runtime state and deterministic memory/index primitives."""
@@ -107,6 +139,7 @@ class CoreMemoryMixin:
         self.write_window_max_turns = max(
             1, int(kwargs.get("write_window_max_turns") or self.WRITE_WINDOW_MAX_TURNS)
         )
+        self.max_new_memories = max(1, int(kwargs.get("max_new_memories", 12)))
         self.write_window_max_tokens = max(
             256,
             int(kwargs.get("write_window_max_tokens") or self.WRITE_WINDOW_MAX_TOKENS),
@@ -145,10 +178,17 @@ class CoreMemoryMixin:
         self._memories: List[Dict[str, Any]] = []
         self._evidence: List[Dict[str, Any]] = []
         self._relations: List[Dict[str, Any]] = []
+        self._capsules: List[Dict[str, Any]] = []
         self._belief_status: Dict[str, str] = {}
+        
+        # Exactness Channel Postings
+        self._entity_postings: Dict[str, set] = {}
+        self._value_postings: Dict[str, set] = {}
+        self._unit_postings: Dict[str, set] = {}
+        self._predicate_postings: Dict[str, set] = {}
         self._state_heads: Dict[str, List[str]] = {}
         self._profile_pack: Dict[str, Any] = {}
-        self._memory_seq = self._evidence_seq = self._session_seq = 0
+        self._memory_seq = self._evidence_seq = self._session_seq = self._capsule_seq = 0
         self._loaded_frozen = False
         self._bm25 = None
         self._embedding_matrix = None
@@ -264,8 +304,18 @@ class CoreMemoryMixin:
             }
         memories, bad_memories = cls._json_array_objects(raw, "memories")
         links, bad_links = cls._json_array_objects(raw, "causal_links")
+        # Just best-effort the episode if it failed.
+        episode = {}
+        try:
+            import json
+            for line in raw.split('\n'):
+                if '"abstraction"' in line:
+                    episode["abstraction"] = line.split(':', 1)[1].strip('," ') 
+        except:
+            pass
         valid_items = sum(item is not None for item in (*memories, *links))
         return {
+            "episode": episode,
             "memories": memories,
             "causal_links": links,
         }, {
@@ -512,13 +562,14 @@ class CoreMemoryMixin:
 
     @classmethod
     def _state_identity(cls, memory: Dict[str, Any]) -> str:
+        # P0C Canonical Identity
         state_key = cls._canonical_state_key(memory.get("state_key") or "")
         if not state_key:
             return ""
-        subject = cls._canonical_identifier(memory.get("subject"), "patient")
-        scope = cls._canonical_scope(memory.get("scope"))
+        subject = str(memory.get("subject_id") or "primary_user").strip().lower()
         anchor = cls._canonical_identifier(memory.get("object_anchor"))
-        return "|".join((subject, scope, state_key, anchor))
+        # We don't include scope in the identity for P0C to avoid artificial silos
+        return "|".join((subject, state_key, anchor))
 
     @classmethod
     def _state_lineage_identity(cls, memory: Dict[str, Any]) -> str:
@@ -837,9 +888,20 @@ class CoreMemoryMixin:
         ):
             kind = "FACT"
             state_key = ""
+        semantic_role = str(item.get("semantic_role") or "OBSERVATION").strip().upper()
+        if semantic_role not in VALID_SEMANTIC_ROLES:
+            semantic_role = "OBSERVATION"
+        subject_id = str(item.get("subject_id") or "primary_user").strip().lower()
+        subject_class = str(item.get("subject_class") or "PRIMARY_USER").strip().upper()
+        if subject_class not in VALID_SUBJECT_CLASSES:
+            subject_class = "PRIMARY_USER"
+            
         return {
             "claim": claim,
             "kind": kind,
+            "semantic_role": semantic_role,
+            "subject_id": subject_id,
+            "subject_class": subject_class,
             "entities": [
                 str(value).strip() for value in entities if str(value).strip()
             ][:8],
@@ -985,7 +1047,53 @@ class CoreMemoryMixin:
             )
         )
 
+    def _rebuild_belief_view(self):
+        """Build the State Spine view and inverted exactness indexes from the atomic ledger."""
+        if hasattr(self, '_rebuild_relations_and_status'):
+            self._rebuild_relations_and_status()
+        self._entity_postings.clear()
+        self._value_postings.clear()
+        self._unit_postings.clear()
+        self._predicate_postings.clear()
+        
+        if not hasattr(self, "_state_spine"):
+            self._state_spine = {}
+        self._state_spine.clear()
+        self._state_heads.clear()
+        
+        import re
+        for memory in self._memories:
+            m_id = memory["id"]
+            tier = memory.get("memory_tier", "COLD")
+            
+            # Exact Indexing
+            for ent in memory.get("entities", []):
+                self._entity_postings.setdefault(str(ent).lower(), set()).add(m_id)
+            
+            val = str(memory.get("value") or memory.get("verbatim_value") or "").strip().lower()
+            if val:
+                self._value_postings.setdefault(val, set()).add(m_id)
+                match = re.search(r'([a-z/%]+)$', val)
+                if match:
+                    self._unit_postings.setdefault(match.group(1), set()).add(m_id)
+            
+            sk = str(memory.get("state_key") or "").strip().lower()
+            if sk:
+                self._predicate_postings.setdefault(sk, set()).add(m_id)
+                
+            if memory.get("kind") == "STATE" and tier == "HOT":
+                ident = self._state_identity(memory)
+                if ident:
+                    if ident not in self._state_spine:
+                        self._state_spine[ident] = StateSpine(ident)
+                    self._state_spine[ident].add_version(memory)
+                    
+        for ident, spine in self._state_spine.items():
+            self._state_heads[ident] = [m["id"] for m in spine.versions]
+
+
     def _refresh_index(self) -> None:
+        self._rebuild_belief_view()
         if not self._index_dirty:
             return
         texts = [self._memory_text(memory) for memory in self._memories]
