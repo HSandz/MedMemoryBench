@@ -281,9 +281,7 @@ class PlanningMixin:
             "EXPOSURE",
             "RESPONSE",
             "TRAJECTORY",
-            "PREFERENCE",
             "RESOURCE",
-            "PLAN",
             "STATE",
         )
         anchors = [by_id[memory_id] for memory_id in anchor_ids]
@@ -1457,7 +1455,6 @@ class PlanningMixin:
                 fallback,
                 {
                     "called": False,
-                    "route": "PLAN",
                     "support_ref": "",
                     "fallback_reason": reason,
                     "usage": {},
@@ -1502,7 +1499,6 @@ class PlanningMixin:
                 fallback,
                 {
                     "called": True,
-                    "route": "PLAN",
                     "support_ref": "",
                     "fallback_reason": "controller_error",
                     "usage": {},
@@ -1518,7 +1514,6 @@ class PlanningMixin:
                     plan,
                     {
                         "called": True,
-                        "route": "PLAN",
                         "support_ref": "",
                         "fallback_reason": "",
                         "usage": usage,
@@ -1563,7 +1558,6 @@ class PlanningMixin:
             fallback,
             {
                 "called": True,
-                "route": "PLAN",
                 "support_ref": "",
                 "fallback_reason": reason,
                 "usage": usage,

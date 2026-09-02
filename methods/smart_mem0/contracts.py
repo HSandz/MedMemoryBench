@@ -62,7 +62,7 @@ STOPWORDS = frozenset(
     }
 )
 
-VALID_KINDS = {"FACT", "EVENT", "STATE", "PREFERENCE", "PLAN"}
+VALID_KINDS = {"FACT", "EVENT", "STATE"}
 
 # Bump this whenever capture, normalization, identity, or consolidation changes
 # can alter the durable ledger. It is included in the snapshot fingerprint.
@@ -110,7 +110,7 @@ GENERIC_OBJECT_ANCHORS = frozenset(
 
 # Only these kinds participate in versioned state-head resolution. FACT and
 # EVENT nodes may mention a state-like topic without being state versions.
-STATE_LIKE_KINDS = frozenset({"STATE", "PREFERENCE", "PLAN"})
+STATE_LIKE_KINDS = frozenset({"STATE"})
 
 VALID_ASSERTION_MODES = {"DIRECT", "RECAP", "INFERRED"}
 
@@ -209,9 +209,7 @@ VALID_PLANNING_TAGS = {
     "TRAJECTORY",
     "RISK",
     "CONSTRAINT",
-    "PREFERENCE",
     "RESOURCE",
-    "PLAN",
 }
 
 VALID_TEMPORAL_AXES = {

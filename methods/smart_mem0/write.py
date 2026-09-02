@@ -231,67 +231,40 @@ class WriteLifecycleMixin:
                 for window_index, window in enumerate(windows):
                     first_turn = window[0]["turn_idx"]
                     previous_turn = turns[first_turn - 1] if first_turn > 0 else None
-                    continuity_turn = (
-                        previous_turn
-                        if self.write_context_mode in {"window", "full"}
-                        else None
-                    )
-                    prior, provisional_view = self._update_write_context(
-                        context,
+                    continuity_turn = previous_turn if self.write_context_mode in {"window", "full"} else None
+                    
+                    write_context_trace.append({
+                        "window_index": window_index,
+                        "focal_turn_ids": [turn["turn_idx"] for turn in window],
+                        "focal_tokens": sum(len(self._tokenizer.encode(self._format_turn(turn))) for turn in window),
+                        "local_context_turn_ids": ([continuity_turn["turn_idx"]] if continuity_turn else []),
+                        "prior_belief_ids": [],
+                        "prior_belief_tokens": 0,
+                        "provisional_count": 0,
+                        "provisional_tokens": 0,
+                    })
+                    
+                    response_text, window_memories, window_links = self._extract_write_window(
                         window,
                         continuity_turn,
                         document_time,
                     )
-                    prior_payload = self._write_memory_payload(prior)
-                    provisional_payload = self._write_memory_payload(provisional_view)
-                    write_context_trace.append(
-                        {
-                            "window_index": window_index,
-                            "focal_turn_ids": [turn["turn_idx"] for turn in window],
-                            "focal_tokens": sum(
-                                len(self._tokenizer.encode(self._format_turn(turn)))
-                                for turn in window
-                            ),
-                            "local_context_turn_ids": (
-                                [continuity_turn["turn_idx"]] if continuity_turn else []
-                            ),
-                            "prior_belief_ids": [
-                                memory["id"] for memory in prior if memory.get("id")
-                            ],
-                            "prior_belief_tokens": len(
-                                self._tokenizer.encode(prior_payload)
-                            ),
-                            "provisional_count": len(provisional_view),
-                            "provisional_tokens": len(
-                                self._tokenizer.encode(provisional_payload)
-                            ),
-                        }
-                    )
-                    response_text, window_memories, window_links = (
-                        self._extract_write_window(
-                            window,
-                            continuity_turn,
-                            document_time,
-                            prior,
-                            provisional_view,
-                        )
-                    )
                     responses.append(response_text)
                     write_context_trace[-1]["extracted_count"] = len(window_memories)
-                    local_to_session = {
-                        local_index: self._merge_provisional_memory(
-                            context.provisional_memories, memory
-                        )
-                        for local_index, memory in enumerate(window_memories)
-                    }
+                    
+                    # Instead of complex provisional merging, just append directly to our session memories
+                    local_to_session = {}
+                    for local_index, memory in enumerate(window_memories):
+                        session_idx = len(context.provisional_memories)
+                        context.provisional_memories.append(memory)
+                        local_to_session[local_index] = session_idx
+                        
                     for link in window_links:
                         cause = local_to_session.get(link["cause_index"])
                         effect = local_to_session.get(link["effect_index"])
                         if cause is None or effect is None or cause == effect:
                             continue
-                        causal_links.append(
-                            {**link, "cause_index": cause, "effect_index": effect}
-                        )
+                        causal_links.append({**link, "cause_index": cause, "effect_index": effect})
 
             old_counts = (
                 len(self._memories),

@@ -521,8 +521,6 @@ class CaptureMixin:
         focal_turns: List[Dict[str, Any]],
         previous_turn: Optional[Dict[str, Any]],
         document_time: str,
-        prior_beliefs: List[Dict[str, Any]],
-        provisional_memories: List[Dict[str, Any]],
     ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         focal_ids = {turn["turn_idx"] for turn in focal_turns}
         local_context = (
@@ -539,10 +537,6 @@ class CaptureMixin:
                     "role": "user",
                     "content": MEMORY_WRITE_PROMPT.format(
                         document_time=document_time,
-                        prior_beliefs=self._write_memory_payload(prior_beliefs),
-                        provisional_memories=self._write_memory_payload(
-                            provisional_memories
-                        ),
                         local_context=local_context,
                         focal_turns="\n".join(
                             self._format_turn(turn) for turn in focal_turns
@@ -560,11 +554,7 @@ class CaptureMixin:
             ) + int(parse_stats.get(source_key, 0))
         accepted, raw_to_accepted = [], {}
         focal_by_id = {turn["turn_idx"]: turn for turn in focal_turns}
-        prior_by_id = {
-            str(memory.get("id")): memory
-            for memory in prior_beliefs
-            if memory.get("id")
-        }
+        # prior_by_id removed
         for raw_index, raw in enumerate(
             (parsed.get("memories") or [])[: self.MAX_NEW_MEMORIES]
         ):
@@ -579,25 +569,11 @@ class CaptureMixin:
             source_text = "\n".join(
                 focal_by_id[index]["raw_text"] for index in sorted(source_turns)
             )
-            origin = prior_by_id.get(normalized.get("origin_memory_id", ""))
-            if origin is None and (
-                normalized["assertion_mode"] == "RECAP"
-                or self._contains_recap_reference(source_text)
-            ):
-                origin = self._best_prior_origin(normalized, prior_beliefs)
-            recap_signal = normalized[
-                "assertion_mode"
-            ] == "RECAP" or self._contains_recap_reference(source_text)
-            if (
-                origin is not None
-                and recap_signal
-                and not self._has_explicit_value_change(normalized, origin)
-            ):
+            if normalized["assertion_mode"] == "RECAP" or self._contains_recap_reference(source_text):
                 normalized["assertion_mode"] = "RECAP"
-                normalized["origin_memory_id"] = origin["id"]
-            elif normalized["assertion_mode"] == "RECAP" or origin is not None:
+            else:
                 normalized["assertion_mode"] = "DIRECT"
-                normalized["origin_memory_id"] = ""
+            normalized["origin_memory_id"] = ""
             raw_to_accepted[raw_index] = len(accepted)
             accepted.append(normalized)
 
@@ -609,7 +585,7 @@ class CaptureMixin:
             self._recover_unrepresented_quantified_evidence(
                 focal_turns,
                 accepted,
-                prior_beliefs,
+                [],  # no prior beliefs in V2 during extraction
             )
         )
 

@@ -339,16 +339,12 @@ class RetrievalOperationsMixin:
                 "TRAJECTORY",
                 "RISK",
                 "CONSTRAINT",
-                "PLAN",
-                "PREFERENCE",
             ),
             "SHARED_OPTIONS": (
                 "STATE",
                 "ACTION_RULE",
                 "RISK",
                 "CONSTRAINT",
-                "PLAN",
-                "PREFERENCE",
                 "RESOURCE",
                 "TRAJECTORY",
             ),
@@ -361,7 +357,7 @@ class RetrievalOperationsMixin:
                         for memory in ranked
                         if tag in memory.get("planning_tags", [])
                         or (tag == "STATE" and self._is_state_head(memory))
-                        or (tag == "ACTION_RULE" and memory.get("kind") == "PLAN")
+                        
                     ),
                     None,
                 )

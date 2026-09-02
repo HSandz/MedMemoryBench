@@ -26,10 +26,10 @@ agent_params:
   # A full session is useful as continuity context, but one large extraction
   # call compresses away low-salience atomic facts. Two bounded turn windows
   # preserve those facts while keeping write cost bounded.
-  write_window_max_tokens: 3000
+  write_window_max_tokens: 8000
   # full = bounded cross-session beliefs + within-session continuity.
   # window = continuity only; none = clean ablation without write context.
-  write_context_mode: full
+  write_context_mode: none
   write_prior_belief_limit: 8
   write_provisional_limit: 4
 
@@ -39,11 +39,11 @@ agent_params:
   enable_planner: true
   # Gate first; invoke the planner only when the gate cannot answer from one
   # seed. This is the optional-planner route used by the locked architecture.
-  enable_unified_controller: false
+  enable_unified_controller: true
   # Keep semantic sufficiency validation for inference, decisions, options,
   # comparisons, transitions, and multi-slot plans. Simple one-slot plans use
   # the deterministic typed validator and avoid a redundant LLM call.
-  enable_slot_support_validation: true
+  enable_slot_support_validation: false
   enable_replan: false
   enable_zero_result_recovery: true
   enable_planner_repair: false

@@ -63,30 +63,30 @@ class ExecutionMixin:
         tags = {str(tag).upper() for tag in memory.get("planning_tags", [])}
         kind = str(memory.get("kind") or "").upper()
         role_tags = {
-            "EXPOSURE": {"EXPOSURE", "STATE", "PLAN"},
+            "EXPOSURE": {"EXPOSURE", "STATE"},
             "RESPONSE": {"RESPONSE", "TRAJECTORY", "RISK", "STATE"},
             "TRAJECTORY": {"TRAJECTORY", "RESPONSE", "EXPOSURE", "RISK"},
             "LONGITUDINAL_CONTEXT": {
                 "TRAJECTORY", "RESPONSE", "EXPOSURE", "RISK", "STATE"
             },
             "RISK": {"RISK", "CONSTRAINT", "RESPONSE"},
-            "CONSTRAINT": {"CONSTRAINT", "RISK", "PLAN"},
-            "ACTION_RULE": {"ACTION_RULE", "PLAN", "CONSTRAINT"},
-            "ALTERNATIVE": {"ALTERNATIVE", "PREFERENCE", "RESOURCE", "PLAN"},
+            "CONSTRAINT": {"CONSTRAINT", "RISK"},
+            "ACTION_RULE": {"ACTION_RULE", "CONSTRAINT"},
+            "ALTERNATIVE": {"ALTERNATIVE", "RESOURCE"},
             # Capture models commonly tag an observed current measurement as
             # TRAJECTORY/RISK rather than STATE/EXPOSURE. Those tags are still
             # explicit write-time metadata, so accepting them here is a stable
             # compatibility rule, not query-intent inference.
             "FOCAL_STATE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "DECISION": {"DECISION", "ACTION_RULE", "PLAN", "CONSTRAINT"},
+            "DECISION": {"DECISION", "ACTION_RULE", "CONSTRAINT"},
             "TEMPORAL": {"TEMPORAL", "TRAJECTORY", "RESPONSE", "EXPOSURE", "STATE"},
             "CAUSE": {"CAUSE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "COMPARAND": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "PLAN"},
+            "COMPARAND": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY"},
         }.get(role)
         if role_tags is None:
             return True
         return bool(tags.intersection(role_tags)) or (
-            role in {"ACTION_RULE", "DECISION"} and kind == "PLAN"
+            role in {"ACTION_RULE", "DECISION"} 
         )
 
     def _slot_covered(

@@ -1,35 +1,32 @@
 """LLM contracts used by SmartMem0 write and read paths."""
 
 MEMORY_WRITE_PROMPT = """You write durable memory for a long-lived conversational agent.
-Extract at most 36 compact, faithful memories from FOCAL TURNS. Preserve names,
-numbers, units, negation, decisions, preferences, state changes, and explicit
-times inside each claim. Merge details describing the same event or state.
-Never invent information. Point each memory to its smallest supporting focal turn set.
+Extract at most 12 compact, faithful atomic claims from the EPISODE. Preserve names,
+numbers, units, negation, decisions, state changes, and explicit times inside each claim.
+Merge details describing the same event or state. Never invent information.
+Point each memory to its smallest supporting focal turn set.
+
+Extract only propositions whose value could plausibly affect a future answer. DO NOT extract
+general assistant recommendations, generic advice, or potential plans unless the patient
+explicitly agreed to or started them. Do not extract transient states.
 
 DOCUMENT TIME: {document_time}
-
-COMMITTED PRIOR BELIEFS (interpretation context only; never use as new evidence):
-{prior_beliefs}
-
-PROVISIONAL MEMORIES FROM EARLIER WINDOWS
-(continuity and deduplication context only; never use as new evidence):
-{provisional_memories}
 
 LOCAL CONTEXT TURN (pronoun/topic context only; never cite as source):
 {local_context}
 
-FOCAL TURNS (the only allowed source evidence):
+EPISODE (the only allowed source evidence):
 {focal_turns}
 
 Return JSON only:
 {{
   "memories": [{{
     "claim": "self-contained atomic claim",
-    "kind": "FACT|EVENT|STATE|PREFERENCE|PLAN",
+    "kind": "FACT|EVENT|STATE",
     "entities": ["canonical entity"],
     "subject": "canonical owner of the memory, usually a person",
     "scope": "stable semantic scope such as medication, symptom, test, or general",
-    "state_key": "short subject-free stable attribute name, or empty",
+    "state_key": "canonical predicate describing the state (e.g. experiences_thirst), or empty",
     "object_anchor": "canonical object owning an object-specific state, or empty",
     "scope_entities": ["retrieval metadata only"],
     "value": "compact normalized atomic value, or empty",
@@ -38,11 +35,9 @@ Return JSON only:
     "event_time": "YYYY-MM-DD, YYYY-MM, or UNKNOWN",
     "time_expression": "source time phrase, or empty",
     "assertion_mode": "DIRECT|RECAP|INFERRED",
-    "origin_memory_id": "matching committed prior belief id for RECAP, or empty",
-    "planning_tags": [],
-    "decision_salience": 0.0,
     "source_turns": [0],
-    "confidence": 0.0
+    "confidence": 0.0,
+    "qualifiers": {{"severity": "severe", "timing": "nighttime"}} 
   }}],
   "causal_links": [
     {{"cause_index": 0, "effect_index": 1, "source_turns": [0], "confidence": 0.0}}
@@ -50,97 +45,14 @@ Return JSON only:
 }}
 
 Rules:
-- source_turns may contain only TURN ids shown under FOCAL TURNS.
-- Never extract a memory supported only by prior beliefs, provisional memories,
-  or the local context turn.
-- Do not repeat an earlier memory unless a focal turn restates, refines, changes,
-  contradicts, or causally connects it.
+- source_turns may contain only TURN ids shown under EPISODE.
+- Never extract a memory supported only by the local context turn.
 - DIRECT means a focal speaker directly states, confirms, or updates the claim.
-- RECAP means a focal turn only recalls or paraphrases an already committed belief
-  (for example, "you mentioned", "I remember", or "previously"). For RECAP,
-  set origin_memory_id to the matching committed belief id. A sentence that recalls
-  an old value and then states a new value must extract the new value as DIRECT.
-- If a recap explicitly preserves an observed date, frequency, numeric range,
-  measurement, or before/after change, emit one compact RECAP memory for that
-  answer-bearing detail even when an equivalent origin already exists. It remains
-  linked to the origin and is not a new current state; it is retained so a later
-  document-time query can locate the actual record that stated the detail.
-- INFERRED is allowed only for an unavoidable implication directly supported by
-  focal turns; prefer DIRECT and use lower confidence for INFERRED.
-- For each focal speaker, preserve unique named entities, exact results, explicit
-  changes, durable concerns, preferences, decisions, and commitments.
-- Preserve participant-specific conditional safety instructions as one atomic PLAN
-  with both sides in value: "when/if <trigger>, <action>". Do not split away or omit
-  the trigger, including named symptoms, medicines, risks, tests, and stop/seek-help
-  conditions. A recalled clinician instruction is still durable evidence when the
-  focal speaker explicitly reports it; mark it RECAP when an origin exists.
-- Each memory must describe one focal event or one versioned state. When a turn
-  mentions an episode on one date and recovery, follow-up, or recurrence on another
-  date, emit separate memories with separate event_time values. Never assign the
-  recovery date to the original episode or combine two dated observations into one
-  value. document_time is supplied by the system and is not a substitute for an
-  unstated event_time.
-- Preserve the scope of restrictions exactly. When a focal turn states both a
-  named-item fact and a broader class-level restriction (for example, an allergy to
-  one medicine and avoidance of its whole drug class), retain both answer-bearing
-  scopes as separate atomic memories or in one value that explicitly names both.
-  Never silently narrow a class-wide instruction to the single example medicine.
-- Preserve meaning-changing response and trajectory qualifiers such as temporarily,
-  then, returns, again, no longer, still, only when, before/after, increased/decreased,
-  and approximate ranges. Never collapse "temporarily relieved, then returned" into
-  either "not relieved" or "resolved". When a compact value cannot retain the full
-  pattern, keep that pattern in value and copy its shortest exact phrase into
-  verbatim_value.
-- Use a short subject-free state_key of 2-5 stable attribute tokens. Never put
-  patient/doctor, current/recent/latest, dates, values, status, or update in it.
-  Emit state_key only for a versionable STATE, PREFERENCE, or PLAN. For FACT and
-  EVENT, state_key must be empty; a topical fact is not a state head.
-  Do not use generic topical keys such as symptom, emotional, condition,
-  clinical_profile, or state unless an object_anchor makes the owned attribute
-  unambiguous. Independent symptoms are separate FACT/EVENT cards, not versions
-  that supersede one another.
-  Reuse the exact state_key from prior beliefs when the attribute is the same.
-- subject, scope, state_key, and object_anchor identify a state. value, time,
-  and scope_entities never identify a state.
-- object_anchor is empty for a scope-wide state such as current medication. Use
-  one canonical object only for object-specific states such as a metformin dose.
-- scope must remain semantic and must never contain an entity or colon path.
-- value is the normalized answer-bearing value. verbatim_value preserves the
-  exact source phrase when exact spelling, number, unit, or name matters.
-- STATE can replace an older value for the same state_key.
-- A PLAN receives a state_key only when the participant's active plan itself can
-  be updated or superseded. A one-off recommendation remains an ordinary claim.
-- A stated start, stop, resume, replacement, or dose/value change is a DIRECT
-  state update. Reuse the prior subject, scope, state_key, and object_anchor so
-  the update remains the same state identity with a new value.
-- EVENT happened; FACT is a stable assertion.
-- Use UNKNOWN when event time is not stated. Document time is stored separately.
-- verbatim_value must be copied from a focal turn, not normalized or expanded.
-- planning_tags are routing metadata, not new facts. Use only this exact vocabulary
-  and choose every role explicitly supported by the focal turn: IDENTITY (patient
-  identity/diagnosis), STATE (current durable state), EXPOSURE (treatment or other
-  intervention actually used), RESPONSE (observed response to an exposure),
-  TRAJECTORY (change/persistence/recurrence across time), RISK (warning sign or
-  vulnerability), CONSTRAINT (contraindication/resource/safety limitation),
-  PREFERENCE (stable preference), RESOURCE (feasibility/resource), and PLAN
-  (accepted participant-specific action). TRAJECTORY requires change/persistence;
-  RESPONSE requires an observed response to an exposure; RISK/CONSTRAINT requires
-  a durable warning, contraindication, vulnerability, or decision-changing
-  limitation. Do not use a tag merely because it is relevant to the topic.
-- decision_salience is 0.0-1.0. Use high values only for durable information likely
-  to change future decisions: identity/diagnosis, treatment exposure and response,
-  objective progression, severe prior events, contraindications, stable preferences,
-  resource constraints, and accepted plans. Generic advice and transient small talk
-  must remain low.
-- A causal link must be explicit and directed cause -> effect. source_turns must
-  identify the focal turn(s) that explicitly state the causal relation. Temporal
-  order or topical association is never enough.
-- Do not store generic textbook explanations or hypothetical advice. Do preserve
-  participant-specific clinical reasoning: warning signs, interpreted trends,
-  suspected mechanisms, and reasons for a diagnosis, test, treatment decision,
-  or accepted plan. When a focal turn explicitly says participant fact A causes
-  participant outcome B, extract both endpoint memories and one causal_link.
-- Do not create aliases, likely questions, importance scores, or domain categories.
+- RECAP means a focal turn only recalls or paraphrases a past belief.
+- INFERRED is allowed only for an unavoidable implication directly supported by focal turns.
+- For each focal speaker, preserve unique named entities, exact results, explicit changes, durable concerns, and commitments.
+- Each memory must describe one focal event or one versioned state.
+- state_key should be a canonical predicate (subject + predicate). Put variations (e.g., nighttime, severity) into the qualifiers object.
 """
 
 CONSOLIDATION_PROMPT = """Compare NEW MEMORIES with nearby OLD MEMORIES.
@@ -155,35 +67,22 @@ OLD MEMORIES:
 Return JSON only:
 {{"relations": [{{
   "source_id": "new_0",
-    "target_id": "m_3",
-    "type": "SUPPORT|REFINE|SUPERSEDE|CONFLICT|RELATED|CAUSES",
-    "provenance_evidence_ids": ["ev_1_0"],
-    "confidence": 0.0
+  "target_id": "m_3",
+  "type": "REFINE|SUPERSEDE|CONFLICT|CAUSES",
+  "provenance_evidence_ids": ["ev_1_0"],
+  "confidence": 0.0
 }}]}}
 
 Semantics:
-- SUPPORT: same compatible belief.
-- REFINE: source is a more precise replacement for target.
-- SUPERSEDE: source is a newer state replacing target.
+- REFINE: source is a more precise replacement for target (e.g. adding missing details).
+- SUPERSEDE: source is a newer state replacing an older state.
 - CONFLICT: source and target cannot both hold for the same time/state.
-- RELATED: source has a clear, useful semantic connection to target, but none of
-  SUPPORT, REFINE, SUPERSEDE, CONFLICT, or CAUSES applies. RELATED is navigation
-  metadata only: it never changes state validity, identity, time, or causality.
-- CAUSES: source explicitly causes target. Never reverse it.
-- CAUSES requires non-empty evidence on both endpoints and non-empty
-  provenance_evidence_ids chosen from endpoint evidence. Temporal order is not causality.
-- A RECAP of the same value is SUPPORT, never SUPERSEDE or REFINE.
-- State-key wording is metadata, not proof that two memories describe different
-  states. When subject, semantic scope, object anchor, and durable attribute meaning
-  match but the state keys are synonymous, relate them as SUPPORT/REFINE/SUPERSEDE
-  according to their values and times so the older canonical identity can be reused.
-- SUPERSEDE requires an explicit changed value/state, not merely a later mention.
-- Each new memory's document_time is when it was stated. When event_time is UNKNOWN
-  on either side, you may use document_time as a weak recency signal, but prefer
-  no relation over guessing direction from a weak or absent temporal signal.
-- RELATED requires a concrete shared episode, object, decision, or participant-specific
-  context that could aid later retrieval. Mere lexical overlap or broad topic similarity
-  is not enough. Prefer no relation over a weak or speculative RELATED edge.
+- CAUSES: target directly and explicitly causes the source (or vice versa).
+
+Rules:
+- DO NOT use SUPPORT or RELATED.
+- If they are completely identical or one just supports the other without refining, do NOT emit a relation.
+- CAUSES must be explicit.
 """
 
 ANSWERABILITY_GATE_PROMPT = """Decide whether exactly one supplied seed directly and

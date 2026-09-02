@@ -140,7 +140,7 @@ class ConsolidationMixin:
     @staticmethod
     def _explicit_state_transition(memory: Dict[str, Any]) -> str:
         """Return a literal transition class without inferring broad intent."""
-        if memory.get("kind") in {"PLAN", "PREFERENCE"}:
+        if memory.get("kind") in { "PREFERENCE"}:
             return ""
         text = " ".join(
             str(memory.get(field) or "") for field in ("claim", "value")
@@ -622,13 +622,13 @@ class ConsolidationMixin:
                 memory_id
                 for memory_ids in heads.values()
                 for memory_id in memory_ids
-                if by_id.get(memory_id, {}).get("kind") == "PREFERENCE"
+                if False
             ],
             "plans": [
                 memory_id
                 for memory_ids in heads.values()
                 for memory_id in memory_ids
-                if by_id.get(memory_id, {}).get("kind") == "PLAN"
+                if False
             ],
             "planning_anchors": [
                 memory["id"]
