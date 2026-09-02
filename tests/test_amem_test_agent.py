@@ -2859,6 +2859,8 @@ def test_deferred_judge_keeps_session_retrieval_quality_payload():
             "output": "answer",
             "retrieved_memories": [{"source_session_id": 12}],
             "retrieved_count": 1,
+            "extra": {"planner": {"rounds_configured": 1, "retrieval_round_count": 1}},
         },
     ) is None
     assert evaluator._deferred_judges[0]["retrieval_quality"]["f1"] == 1.0
+    assert evaluator._deferred_judges[0]["planner"]["rounds_configured"] == 1

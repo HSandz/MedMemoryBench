@@ -3986,7 +3986,7 @@ class MedMemoryBenchEvaluator:
         if prepared_metric is not None and judge_client is not None:
             judge_payload = prepared_metric["prepared"]["judge_payload"]
             if "immediate" not in judge_payload:
-                self._deferred_judges.append({
+                deferred_judge = {
                     "query_id": query.query_id,
                     "persona_id": context_id,
                     "prepared_metric": prepared_metric,
@@ -4001,7 +4001,10 @@ class MedMemoryBenchEvaluator:
                     ),
                     "artifact_references": copy.deepcopy(artifact_references or {}),
                     "execution_usage": resolved_execution_usage,
-                })
+                }
+                if isinstance(response_extra, dict) and isinstance(response_extra.get("planner"), dict):
+                    deferred_judge["planner"] = copy.deepcopy(response_extra["planner"])
+                self._deferred_judges.append(deferred_judge)
                 return None
             result = self.metrics_calculator.finalize_batch(prepared_metric, "")
         else:
@@ -4175,6 +4178,8 @@ class MedMemoryBenchEvaluator:
                 response, transport="batch"
             )
             result.details["execution_usage"] = execution_usage
+            if isinstance(item.get("planner"), dict):
+                result.details["planner"] = copy.deepcopy(item["planner"])
             finalized.append({"persona_id": item["persona_id"], "result": result})
             self._advance_query_progress(
                 item["query_id"],

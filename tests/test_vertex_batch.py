@@ -9,12 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from metrics.llm_judge import LLMJudgeMCDMetric, LLMJudgeMetric
+from metrics.base import MetricResult
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
 from src.evaluator import Evaluator
 from utils.llm_client import LLMResponse, OpenRouterClient, get_usage_tracker
 from utils.openrouter_batch import OpenRouterBatchClient, OpenRouterBatchPending
 from utils.vertex_batch import (
     BatchChatRequest,
+    BatchChatResponse,
     PREPARED_QUERY_METADATA_KEY,
     VertexBatchClient,
     VertexBatchError,
@@ -632,6 +634,7 @@ def test_deferred_judge_work_is_persisted_for_resume(tmp_path):
         "memory_construction_time": 0.0,
         "retrieved_memories": [],
         "retrieved_count": 0,
+        "planner": {"rounds_configured": 1, "retrieval_round_count": 1},
     }]
     evaluator._log = lambda message: None
 
@@ -640,6 +643,7 @@ def test_deferred_judge_work_is_persisted_for_resume(tmp_path):
     evaluator._load_deferred_judges()
 
     assert evaluator._is_deferred_judge_query("q1")
+    assert evaluator._deferred_judges[0]["planner"]["rounds_configured"] == 1
     evaluator._clear_deferred_judges()
     assert evaluator._deferred_judges == []
     assert not list((tmp_path / "batch").glob("medmemorybench_deferred_judges-*.json"))
@@ -688,6 +692,50 @@ def test_single_deferred_judge_uses_batch_stage():
 
     assert captured["stage"] == "judge-final"
     assert len(captured["requests"]) == 1
+
+
+def test_completed_deferred_judge_restores_planner_artifact():
+    judge_client = SimpleNamespace(model="gemini-2.5-flash-lite")
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator._deferred_judges = [{
+        "query_id": "q1",
+        "persona_id": 1,
+        "prepared_metric": {"prepared": {
+            "query_id": "q1",
+            "query_type": "state_update",
+            "judge_payload": {"prompt": "judge", "max_tokens": 100},
+        }},
+        "query_time": 1.0,
+        "memory_construction_time": 2.0,
+        "retrieved_memories": [],
+        "retrieved_count": 0,
+        "planner": {"rounds_configured": 1, "retrieval_round_count": 1},
+    }]
+    evaluator.method_config = SimpleNamespace(method_name="event_state")
+    evaluator.metrics_calculator = SimpleNamespace(
+        get_batch_judge_client=lambda query_type: judge_client,
+        finalize_batch=lambda prepared, content: MetricResult("q1", "state_update", 1.0, True, "answer", "answer"),
+    )
+    evaluator._save_deferred_judges = lambda client: None
+    evaluator._get_judge_batch_client = lambda client: SimpleNamespace(
+        run_stage=lambda stage, requests: {
+            requests[0].request_id: BatchChatResponse(requests[0].request_id, content="{}")
+        }
+    )
+    evaluator._run_api_call = lambda operation, *args, **kwargs: operation(*args, **kwargs)
+    evaluator._batch_artifact_reference = lambda client, request_id: {}
+    evaluator._batch_response_usage = lambda response, transport: {}
+    evaluator._attach_session_retrieval_quality = lambda result, quality: None
+    evaluator._advance_query_progress = lambda *args, **kwargs: None
+    evaluator._clear_deferred_judges = lambda: None
+    evaluator._log = lambda *args, **kwargs: None
+
+    finalized = evaluator._complete_deferred_judges()
+
+    assert finalized[0]["result"].details["planner"] == {
+        "rounds_configured": 1,
+        "retrieval_round_count": 1,
+    }
 
 
 def test_judge_prepare_finalize_preserves_metric_schema():

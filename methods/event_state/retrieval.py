@@ -138,7 +138,23 @@ class EventStateRetriever:
         for channel_index, channel in enumerate(channels):
             for rank, item in enumerate(channel, 1):
                 identifier = item["id"]
-                merged = values.setdefault(identifier, deepcopy(item))
+                if identifier not in values:
+                    merged = deepcopy(item)
+                    # These fields describe a prior channel selection, not this
+                    # planner-level outer fusion and selection pass.
+                    for key in (
+                        "final_score",
+                        "selection_score",
+                        "selected_rank",
+                        "base_rank",
+                        "planner_request_indices",
+                        "planner_channel_support_count",
+                        "planner_fusion_score",
+                        "_planner_merged_final_score",
+                    ):
+                        merged.pop(key, None)
+                    values[identifier] = merged
+                merged = values[identifier]
                 if channel_index:
                     merged.setdefault("planner_request_indices", []).append(channel_index - 1)
                 merged["planner_request_indices"] = sorted(set(merged.get("planner_request_indices", [])))
@@ -156,7 +172,7 @@ class EventStateRetriever:
         if merge_mode == "sum_rrf":
             rows = list(values.values())
             rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["id"]))
-            return rows[:candidate_count]
+            return self._set_merged_final_scores(rows[:candidate_count])
         ordered: List[Dict[str, Any]] = []
         seen = set()
         max_depth = max((len(channel) for channel in channels), default=0)
@@ -169,8 +185,18 @@ class EventStateRetriever:
                     seen.add(identifier)
                     ordered.append(values[identifier])
                     if len(ordered) >= candidate_count:
-                        return ordered
-        return ordered
+                        return self._set_merged_final_scores(ordered)
+        return self._set_merged_final_scores(ordered)
+
+    @staticmethod
+    def _set_merged_final_scores(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize outer-fusion relevance once for the final planner pool."""
+        rows = list(candidates)
+        final_scores = normalize_scores([float(item.get("planner_fusion_score", item.get("score", 0.0))) for item in rows])
+        for item, final_score in zip(rows, final_scores):
+            item["final_score"] = final_score
+            item["_planner_merged_final_score"] = True
+        return rows
 
     def _claim_is_directly_visible(self, claim_id: str, temporal: TemporalQueryConstraint | None = None, state_view: str = "current") -> bool:
         claim = self.store.claims.get(claim_id)
@@ -310,7 +336,10 @@ class EventStateRetriever:
     def _select_impl(self, candidates: Sequence[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
         mode, selected = self.config.get("selector_mode", "state_mmr"), []
         remaining = list(candidates)
-        relevance = normalize_scores([float(item.get("final_score", item.get("score", 0.0))) for item in remaining])
+        if remaining and all(item.get("_planner_merged_final_score") for item in remaining):
+            relevance = [float(item["final_score"]) for item in remaining]
+        else:
+            relevance = normalize_scores([float(item.get("final_score", item.get("score", 0.0))) for item in remaining])
         relevance_by_id = {item["id"]: value for item, value in zip(remaining, relevance)}
         while remaining and len(selected) < count:
             if mode == "topk":

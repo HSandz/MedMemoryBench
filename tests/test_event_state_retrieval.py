@@ -63,6 +63,29 @@ def test_non_temporal_retrieval_does_not_activate_temporal_channel():
     assert extra_b["temporal_constraint_detected"] is False
 
 
+def test_planner_merge_recomputes_final_score_and_clears_stale_selection_metadata():
+    store = EventStateStore("ctx")
+    retriever = EventStateRetriever(
+        store,
+        Embedder(),
+        planner_merge_mode="coverage_interleave",
+        candidate_count=3,
+        evidence_count=1,
+        selector_mode="topk",
+    )
+    merged = retriever.merge_rank_channels([
+        [{"id": "A", "type": "episode", "final_score": 0.99, "selection_score": 0.99, "selected_rank": 7}],
+        [{"id": "C", "type": "episode", "final_score": 0.01, "selection_score": -3.0, "selected_rank": 8}],
+        [{"id": "B", "type": "episode", "final_score": 0.5}],
+    ])
+    by_id = {item["id"]: item for item in merged}
+    assert by_id["A"]["final_score"] == 1.0
+    assert by_id["C"]["final_score"] == 1.0
+    assert "selection_score" not in by_id["A"] and "selected_rank" not in by_id["A"]
+    selected, _ = retriever.select_candidates(merged)
+    assert selected[0]["id"] == "C"
+
+
 def test_ppr_is_bounded_and_conserves_personalized_mass():
     store = EventStateStore("ctx")
     store.episodes = {

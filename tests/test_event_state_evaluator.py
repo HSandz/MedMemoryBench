@@ -3,6 +3,9 @@
 from types import SimpleNamespace
 
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from methods.event_state.schemas import Episode
+from methods.event_state.store import EventStateStore
+from methods.event_state_agent import EventStateAgent
 
 
 def _answer_visible_quality(records, session_id):
@@ -17,6 +20,37 @@ def test_event_state_snapshot_messages_use_the_event_state_label():
     evaluator.method_config = SimpleNamespace(method_name="event_state")
 
     assert evaluator._memory_method_label() == "Event-State"
+
+
+def test_planner_budget_and_record_telemetry_are_unambiguous():
+    class LLM:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, **kwargs):
+            self.calls.append(messages)
+            return SimpleNamespace(content='{"action":"answer","answer":"ok","requests":[]}')
+
+    llm = LLM()
+    agent = EventStateAgent(llm_client=llm, memory_llm_client=llm, embedding_client=SimpleNamespace(embed_query=lambda _: [1.0, 0.0]), planner_rounds=1)
+    agent.set_context_id(1)
+    agent.query("What happened?")
+    prompt = llm.calls[0][-1]["content"]
+    assert "retrieval rounds available including this decision: 1" in prompt
+    assert "remaining retrieval rounds: 0" not in prompt
+
+    store = EventStateStore("ctx")
+    for identifier in ("A", "C", "D"):
+        store.add_episode(Episode(identifier, "ctx", identifier, 0, None, None, ["User"], "primary_user", identifier, identifier, []), [1.0, 0.0])
+    records = [
+        agent._record(store, {"id": "A", "type": "episode", "planner_request_indices": [0], "planner_added_to_final": False}),
+        agent._record(store, {"id": "C", "type": "episode", "planner_request_indices": [], "planner_added_to_final": False}),
+        agent._record(store, {"id": "D", "type": "episode", "planner_request_indices": [0], "planner_added_to_final": True}),
+    ]
+    assert records[0]["planner_channel_retrieval"] is True
+    assert records[0]["planner_added_to_final"] is False
+    assert records[0]["planner_retrieval"] is True
+    assert records[2]["planner_added_to_final"] is True
 
 
 def test_answer_visible_ignores_state_excluded_without_visible_provenance():

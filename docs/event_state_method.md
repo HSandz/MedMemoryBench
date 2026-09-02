@@ -156,15 +156,22 @@ interval, and knowledge-as-of (`state_view: as_of`). Invalid or duplicate
 requests are skipped and malformed planner output falls back to one ordinary
 final-answer call. Planner mode is realtime-only because dependent rounds cannot
 use the existing single-stage batch-answer transport; `planner_rounds: 0`
-retains batch support unchanged.
+retains batch support unchanged. Each planner prompt reports retrieval rounds
+available including the current decision, plus any additional rounds afterward,
+so a decision with one configured round is explicitly allowed to retrieve.
 
 Planner-enabled outer fusion uses `coverage_interleave` by default: relevance
 for a memory is the maximum reciprocal rank contributed by any channel, while
 channel support is diagnostic only. The bounded candidate pool is built by
 deterministically interleaving rank 1 from the base channel and each planner
 request, then rank 2 from each channel, and so on; the existing state-aware MMR
-selector remains the final evidence selector. `planner_merge_mode: sum_rrf`
-is available only to reproduce the historical agreement-weighted behavior.
+selector remains the final evidence selector and consumes the merged relevance
+normalized across that final pool. `planner_merge_mode: sum_rrf` is available
+only to reproduce the historical agreement-weighted behavior. Retrieval records
+expose `planner_channel_retrieval` when an item appeared in any planner request
+channel and `planner_added_to_final` when it was absent from the base selected
+evidence and newly selected after planner fusion; the legacy
+`planner_retrieval` field remains an alias for channel participation.
 Planner diagnostics are persisted per query in both the query-answer artifact
 and its retrieval-record sidecar. Query usage reports expose
 `event_state.plan_or_answer` as `planner_controller` and
