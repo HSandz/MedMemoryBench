@@ -920,18 +920,31 @@ class CoreMemoryMixin:
     ) -> Tuple[List[Dict[str, Any]], Dict[int, str]]:
         staged, mapping = [], {}
         for turn in turns:
-            evidence_id = f"ev_{session_idx}_{turn['turn_idx']}"
-            staged.append(
-                {
-                    "id": evidence_id,
-                    "session_idx": session_idx,
-                    "turn_idx": turn["turn_idx"],
-                    "speaker": turn["speaker"],
-                    "raw_text": turn["raw_text"],
-                    "document_time": document_time,
+            # Maintain backward-compatible ID format for evidence internally
+            evidence_id = f"ev_{session_idx}_{turn.get('local_turn_idx', turn.get('turn_idx', 0))}"
+            
+            evidence = {
+                "id": evidence_id,
+                "session_idx": session_idx,
+                "turn_idx": turn.get("local_turn_idx", turn.get("turn_idx", 0)),
+                "speaker": turn.get("speaker_name", turn.get("speaker", "unknown")).lower(),
+                "raw_text": turn.get("text", turn.get("raw_text", "")),
+                "document_time": document_time,
+                # Store full canonical provenance metadata
+                "canonical_metadata": {
+                    "source_session_id": turn.get("source_session_id"),
+                    "source_turn_id": turn.get("source_turn_id"),
+                    "source_event_id": turn.get("source_event_id"),
+                    "speaker_id": turn.get("speaker_id"),
+                    "speaker_name": turn.get("speaker_name"),
+                    "text": turn.get("text"),
+                    "image_caption": turn.get("image_caption"),
+                    "timestamp": turn.get("timestamp"),
+                    "local_turn_idx": turn.get("local_turn_idx")
                 }
-            )
-            mapping[turn["turn_idx"]] = evidence_id
+            }
+            staged.append(evidence)
+            mapping[evidence["turn_idx"]] = evidence_id
         return staged, mapping
 
     def _memory_text(self, memory: Dict[str, Any]) -> str:

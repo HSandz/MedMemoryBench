@@ -560,7 +560,7 @@ class AgentManager:
             self._agent.set_context_id(context_id)
 
         if memorizing:
-            return self._handle_memorize(message, is_last_session=is_last_session)
+            return self._handle_memorize(message, is_last_session=is_last_session, **kwargs)
         else:
             return self._handle_query(message, **kwargs)
 
@@ -626,11 +626,11 @@ class AgentManager:
         if self._context_id is not None:
             self._agent.set_context_id(self._context_id)
 
-    def _handle_memorize(self, message: str, is_last_session: bool = False) -> MemoryBuildResult:
+    def _handle_memorize(self, message: str, is_last_session: bool = False, **kwargs) -> MemoryBuildResult:
         get_usage_tracker().set_phase("memorize")
         start_time = time.time()
 
-        result = self._agent.memorize(message, is_last_session=is_last_session)
+        result = self._agent.memorize(message, is_last_session=is_last_session, **kwargs)
 
         memory_time = time.time() - start_time
 

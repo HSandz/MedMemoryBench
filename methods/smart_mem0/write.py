@@ -149,10 +149,60 @@ class WriteLifecycleMixin:
                     chunk_count=0,
                     extra={"frozen": True, "total_memories": len(self._memories)},
                 )
-        turns, parsed_time = self._parse_turns(session_content)
+        
+        memory_items = kwargs.get("memory_items")
+        if memory_items and isinstance(memory_items, list):
+            turns = []
+            for idx, item in enumerate(memory_items):
+                # Ensure minimal schema
+                canonical_turn = {
+                    "source_session_id": item.get("source_session_id", ""),
+                    "source_turn_id": item.get("source_turn_id", ""),
+                    "source_event_id": item.get("source_event_id", ""),
+                    "speaker_id": item.get("speaker_id", "unknown"),
+                    "speaker_name": item.get("speaker_name", "unknown"),
+                    "text": item.get("text", ""),
+                    "image_caption": item.get("image_caption", ""),
+                    "timestamp": item.get("timestamp", ""),
+                    "local_turn_idx": idx,
+                    # Backward compatibility fields for rest of pipeline
+                    "speaker": str(item.get("speaker_name", "unknown")).lower(),
+                    "raw_text": str(item.get("text", "")),
+                    "turn_idx": idx
+                }
+                turns.append(canonical_turn)
+            parsed_time = memory_items[0].get("timestamp", "") if memory_items else ""
+        else:
+            raw_turns, parsed_time = self._parse_turns(session_content)
+            turns = []
+            for idx, rt in enumerate(raw_turns):
+                turns.append({
+                    "source_session_id": f"s_{self._session_seq}",
+                    "source_turn_id": f"s_{self._session_seq}_t_{idx}",
+                    "source_event_id": "",
+                    "speaker_id": rt.get("speaker", "unknown"),
+                    "speaker_name": rt.get("speaker", "unknown"),
+                    "text": rt.get("raw_text", ""),
+                    "image_caption": "",
+                    "timestamp": parsed_time,
+                    "local_turn_idx": idx,
+                    "speaker": rt.get("speaker", "unknown"),
+                    "raw_text": rt.get("raw_text", ""),
+                    "turn_idx": idx
+                })
+            
         if not turns and session_content.strip():
             turns = [
                 {
+                    "source_session_id": f"s_{self._session_seq}",
+                    "source_turn_id": f"s_{self._session_seq}_t_0",
+                    "source_event_id": "",
+                    "speaker_id": "unknown",
+                    "speaker_name": "unknown",
+                    "text": session_content.strip(),
+                    "image_caption": "",
+                    "timestamp": parsed_time,
+                    "local_turn_idx": 0,
                     "speaker": "unknown",
                     "raw_text": session_content.strip(),
                     "turn_idx": 0,
