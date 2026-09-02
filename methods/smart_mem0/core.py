@@ -156,6 +156,8 @@ class CoreMemoryMixin:
         # Exactness Channel Postings
         self._entity_postings: Dict[str, set] = {}
         self._value_postings: Dict[str, set] = {}
+        self._subject_postings: Dict[str, set] = {}
+        self._object_postings: Dict[str, set] = {}
         self._unit_postings: Dict[str, set] = {}
         self._predicate_postings: Dict[str, set] = {}
         self._state_heads: Dict[str, List[str]] = {}
@@ -999,6 +1001,8 @@ class CoreMemoryMixin:
             self._rebuild_relations_and_status()
         self._entity_postings.clear()
         self._value_postings.clear()
+        self._subject_postings.clear()
+        self._object_postings.clear()
         self._unit_postings.clear()
         self._predicate_postings.clear()
         
@@ -1011,6 +1015,13 @@ class CoreMemoryMixin:
         for memory in self._memories:
             m_id = memory["id"]
             tier = memory.get("memory_tier", "COLD")
+            
+            sub = str(memory.get("subject_id") or "primary_user").strip().lower()
+            self._subject_postings.setdefault(sub, set()).add(m_id)
+            
+            obj = str(memory.get("object_anchor") or "").strip().lower()
+            if obj:
+                self._object_postings.setdefault(obj, set()).add(m_id)
             
             # Exact Indexing (HOT only for fast path)
             if tier == "HOT":

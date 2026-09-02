@@ -238,6 +238,22 @@ class QueryMixin:
     def prepare_batch_query(
         self, question: str, system_message: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
+        # P1A FAST PATH INTERCEPTION
+        try:
+            from methods.smart_mem0.p1a_execution import _prepare_p1a_query
+            fast_frame = _prepare_p1a_query(self, question)
+            if fast_frame:
+                if system_message:
+                    fast_frame["system_message"] = system_message
+                    if "messages" in fast_frame and fast_frame["messages"]:
+                        fast_frame["messages"][0]["content"] = system_message
+                return fast_frame
+        except Exception as e:
+            # P1A fail open
+            import traceback
+            traceback.print_exc()
+            pass
+
         started = time.time()
         retrieval_question = self._unwrap_question(question)
         question_options = self._question_options(retrieval_question)
