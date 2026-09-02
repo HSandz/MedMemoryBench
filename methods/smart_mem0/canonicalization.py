@@ -115,17 +115,11 @@ def measurement_identity(memory: dict) -> str:
 def has_exact_measurement_identity(memory: dict) -> bool:
     return bool(measurement_identity(memory))
 
-def is_state_projection_eligible(memory: dict) -> bool:
-    return bool(state_identity(memory))
-
 def state_identity(memory: dict) -> str:
     subject_id = memory.get("subject_id") or memory.get("subject") or "patient"
     
-    # 1. Measurement projection (role-gated & DIRECT-only)
+    # 1. Measurement identity (role-gated)
     if memory.get("semantic_role") == "MEASUREMENT":
-        if memory.get("assertion_mode", "DIRECT") != "DIRECT":
-            # RECAP measurements should never become a State Spine head
-            return ""
         meas_id = measurement_identity(memory)
         if meas_id:
             return f"{str(subject_id).lower().strip()}::{meas_id}::"
@@ -140,6 +134,22 @@ def state_identity(memory: dict) -> str:
         
     object_anchor = memory.get("object_anchor") or ""
     return build_state_identity(subject_id, state_key, object_anchor)
+
+def is_state_projection_eligible(memory: dict) -> bool:
+    identity = state_identity(memory)
+    if not identity:
+        return False
+        
+    if memory.get("semantic_role") == "MEASUREMENT":
+        return (
+            memory.get("memory_tier", "COLD") == "HOT"
+            and memory.get("assertion_mode", "DIRECT") == "DIRECT"
+        )
+        
+    return (
+        memory.get("kind") == "STATE"
+        and memory.get("memory_tier", "COLD") == "HOT"
+    )
 
 def canonicalize_state(memory: dict) -> dict:
     return memory

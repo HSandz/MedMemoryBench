@@ -103,7 +103,7 @@ class WriteLifecycleMixin:
                     "decision_salience": float(raw.get("decision_salience", 0.0) or 0.0),
                     "evidence_ids": list(raw.get("evidence_ids") or raw.get("source_turn_ids") or []),
                     "source_speakers": list(raw.get("source_speakers") or []),
-                    "confidence": float(raw.get("confidence", 0.8) or 0.8),
+                    "confidence": float(raw.get("confidence") if raw.get("confidence") is not None else 0.8),
                     "session_idx": int(raw.get("session_idx", 0)),
                 }
             )
