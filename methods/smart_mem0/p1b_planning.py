@@ -29,10 +29,22 @@ REQUIRED JSON OUTPUT FORMAT:
             "description": "Event that immediately preceded the delay",
             "required": true,
             "target_entities": ["project alpha", "blockers"],
-            "temporal_axis": "event_time"
+            "target_property": "status",
+            "temporal_axis": "event_time",
+            "temporal_relation": "MATCH",
+            "temporal_anchor": "2024-01-20",
+            "option_label": "A"
         }
     ]
 }
+
+TEMPORAL SCHEMA RULES:
+- `temporal_axis` MUST ONLY BE ONE OF: "event_time", "document_time", "effective_event_time", or "". Do NOT output ranges or prose here.
+- `temporal_relation` MUST BE: "MATCH", "BEFORE", "AFTER", "BETWEEN", or "".
+- `temporal_anchor` should contain the actual date/range string (e.g., "2024-01-20" or "recent").
+
+OPTION RULES:
+- If `role` is "OPTION_SUPPORT", you MUST provide the specific `option_label` (e.g., "A", "B") this gap supports or refutes.
 
 If the supplied seed evidence already completely answers the question, output an empty list for evidence_gaps.
 """
@@ -100,6 +112,10 @@ def _gap_planner(
             
         required = bool(g.get("required", True))
         
+        temp_axis = str(g.get("temporal_axis", ""))
+        if temp_axis not in {"event_time", "document_time", "effective_event_time", ""}:
+            temp_axis = ""
+
         gap = EvidenceGap(
             id=gid,
             role=role,
@@ -107,7 +123,10 @@ def _gap_planner(
             subject_id=getattr(frame, "speaker_role", "primary_user"),
             target_entities=g.get("target_entities", []),
             target_property=g.get("target_property", ""),
-            temporal_axis=g.get("temporal_axis", "")
+            temporal_axis=temp_axis,
+            temporal_relation=str(g.get("temporal_relation", "")),
+            temporal_anchor=str(g.get("temporal_anchor", "")),
+            option_label=str(g.get("option_label", ""))
         )
         # Store description via generic property for adapter
         gap.description = str(g.get("description", ""))

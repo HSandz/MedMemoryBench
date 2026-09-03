@@ -83,6 +83,14 @@ class ExecutionMixin:
             "TEMPORAL": {"TEMPORAL", "TRAJECTORY", "RESPONSE", "EXPOSURE", "STATE"},
             "CAUSE": {"CAUSE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
             "COMPARAND": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY"},
+            # P1B.1 New Roles
+            "FOCAL_TRIGGER": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CAUSE", "DECISION"},
+            "PRIOR_TRAJECTORY": {"TRAJECTORY", "RESPONSE", "EXPOSURE", "STATE", "RISK"},
+            "CAUSAL_BRIDGE": {"CAUSE", "RESPONSE", "TRAJECTORY", "RISK"},
+            "OUTCOME": {"RESPONSE", "TRAJECTORY", "STATE", "RISK"},
+            "OPTION_SUPPORT": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CONSTRAINT", "ACTION_RULE", "DECISION"},
+            "COMPARISON_SIDE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
+            "GENERIC_EVIDENCE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CONSTRAINT", "ACTION_RULE", "DECISION"}
         }.get(role)
         if role_tags is None:
             return True
@@ -939,6 +947,11 @@ class ExecutionMixin:
             "ALTERNATIVE",
             "CAUSE",
             "COMPARAND",
+            "OPTION_SUPPORT",
+            "FOCAL_TRIGGER",
+            "CAUSAL_BRIDGE",
+            "COMPARISON_SIDE",
+            "OUTCOME"
         }
 
     def _run_query_retrieval(
@@ -1058,11 +1071,30 @@ class ExecutionMixin:
                 query_latency["planner"] = round(float(usage.get("latency", 0.0) or 0.0), 3)
                 
                 if not evidence_gaps:
-                    fast_supports = planned_seed_set[:1] if planned_seed_set else None
-                    if fast_supports:
-                        plan["valid"] = True
-                        plan["required_slots"] = []
-                        self._seed_gate_telemetry["reason"] = "PLANNER_DECLARED_ZERO_GAP"
+                    # ZERO GAP FROM PLANNER
+                    # Wait, we only authorize top seed IF deterministic validation passes!
+                    top_seed_id = planned_seed_set[0]["id"] if planned_seed_set else None
+                    if top_seed_id:
+                        supports = self._validate_fast_support(top_seed_id, planned_seed_set, frame)
+                        if supports:
+                            fast_supports = supports
+                            plan["valid"] = True
+                            plan["required_slots"] = []
+                            self._seed_gate_telemetry["reason"] = "PLANNER_DECLARED_ZERO_GAP"
+                        else:
+                            # Planner said zero gaps, but validation failed.
+                            # Do NOT authorize seed0. We must fallback to deterministic recovery.
+                            fast_supports = None
+                            plan["need_evidence"] = True
+                            plan["required_slots"] = [] # Force empty recovery? Or let it be?
+                            # Actually, if there are no slots, recovery does nothing.
+                            # We should generate a generic gap.
+                            from methods.smart_mem0.p1b_execution import EvidenceGap
+                            fallback_gap = EvidenceGap(id="g_fallback", role="GENERIC_EVIDENCE", required=True)
+                            self._evidence_lattice.add_gap(fallback_gap)
+                            plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
+                            plan["valid"] = True
+                            
                 else:
                     fast_supports = None
                     for gap in evidence_gaps:
@@ -1071,6 +1103,7 @@ class ExecutionMixin:
                     plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
                     plan["need_evidence"] = True
                     plan["budget_tier"] = "SMALL" if len(evidence_gaps) <= 1 else "MEDIUM"
+                    plan["max_memories"] = max(3, len(evidence_gaps) + 2)  # At least 1 per gap + bounded context
                     
             controller = {
                 "called": False,

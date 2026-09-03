@@ -112,6 +112,9 @@ class EvidenceLattice:
                 "resolution_strategy": "RETRIEVE",
                 "subject": gap.subject_id,
                 "time_axis": gap.temporal_axis,
+                "time_relation": gap.temporal_relation,
+                "time_anchor": gap.temporal_anchor,
+                "option_label": gap.option_label,
             }
             if gap.role == "PRIOR_TRAJECTORY":
                 slot["history"] = True
@@ -144,13 +147,12 @@ def _evaluate_seed_gate(agent, question: str, frame: Any, seeds: List[Dict[str, 
     # Check for conflicts. If seeds[1] has same rank/score but different state value.
     if len(seeds) > 1:
         s2 = seeds[1]
-        score1 = top_seed.get("_score")
-        score2 = s2.get("_score")
-        # Strict conflict check: if scores are close/identical
-        if score1 is not None and score2 is not None and abs(float(score1) - float(score2)) < 0.01:
+        # Strict conflict check: only if canonical identities actually match but values contradict
+        if top_seed.get("semantic_role") == s2.get("semantic_role") and top_seed.get("object_anchor") == s2.get("object_anchor"):
             val1 = top_seed.get("value") or top_seed.get("state")
             val2 = s2.get("value") or s2.get("state")
             if val1 and val2 and val1 != val2:
+                # E.g. project_status = blocked vs project_status = completed
                 return False, None, "CONFLICTING_CANDIDATES"
 
     # Reuse existing deterministic structural validation
