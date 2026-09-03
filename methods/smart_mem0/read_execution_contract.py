@@ -199,6 +199,22 @@ class ReadExecutionContractMixin:
 
     def prepare_batch_query(self,question,system_message=None,**kwargs):
         prepared=super().prepare_batch_query(question,system_message=system_message,**kwargs)
+        # QueryMixin historically appended a second MC polarity paragraph after
+        # _multiple_choice_answer_instruction(). The shared-evidence instruction
+        # above already owns that rule, so strip the duplicate from the active prompt.
+        duplicate=(
+            " Before selecting labels, restate the stem's predicate internally: "
+            "if it asks which option is safe, recommended, or okay, exclude "
+            "options contradicted by an allergy or contraindication; if it asks "
+            "which is unsafe or contraindicated, select those contradicted "
+            "options. Never output the contraindicated labels for a safe/okay "
+            "stem just because those labels appear in the memory."
+        )
+        for message in prepared.get("messages",[]):
+            if isinstance(message,dict) and isinstance(message.get("content"),str):
+                message["content"]=message["content"].replace(duplicate,"")
+        # A caller-supplied system/output contract is not visible to controller
+        # generation, so do not bypass the final answerer in that case.
         if system_message and prepared.get("precomputed_answer"):
             prepared["precomputed_answer"]=""
         return prepared
