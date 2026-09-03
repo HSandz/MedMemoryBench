@@ -138,6 +138,7 @@ class ReadContractMixin:
 
     def _semantic_controller(self,question,seeds,frame,context_map=None):
         del context_map
+        self._evidence_lattice=EvidenceLattice()
         options=self._question_options(question) or {}; hints={"dates":list(getattr(frame,"dates",()) or ()),"source_speaker":getattr(frame,"speaker_role",""),"hard_entities":list(getattr(frame,"hard_entities",()) or ())}
         prompt=CONTROLLER_POLICY+"\n"+CONTROLLER_SCHEMA.format(question=question,options=json.dumps(options,ensure_ascii=False),hints=json.dumps(hints,ensure_ascii=False),seeds=json.dumps(self._rc_seed_payload(seeds),ensure_ascii=False))
         try:
