@@ -39,9 +39,6 @@ class ReadPlanContractMixin:
         explicit_anchor = req.get("temporal_anchor") or ""
         explicit_end = req.get("temporal_end") or ""
 
-        # A focal date scopes the state/event being discussed, but a
-        # PRIOR_TRAJECTORY gap intentionally reaches outside that date. Only an
-        # explicitly requirement-scoped temporal selector may constrain it.
         if role == "PRIOR_TRAJECTORY":
             axis, relation, anchor, end = explicit_axis, explicit_relation, explicit_anchor, explicit_end
         else:
@@ -56,10 +53,14 @@ class ReadPlanContractMixin:
                 except Exception:
                     local_dates = []
             frame_dates = list((getattr(frame, "dates", ()) or ())) if frame is not None else []
-            if not anchor and len(local_dates) == 1:
-                axis, relation, anchor = axis or "event_time", relation or "EXACT", local_dates[0]
-            elif not anchor and len(frame_dates) == 1 and decision["operator"] not in {"TEMPORAL", "COMPARISON"}:
-                axis, relation, anchor = axis or "event_time", relation or "EXACT", frame_dates[0]
+            # Never invent event_time/document_time merely because a date is
+            # present. If the controller supplied an axis, attach the date to
+            # that axis; otherwise QueryFrame will enforce a broad hard-date
+            # constraint over the existing write-time date fields.
+            if axis and not anchor and len(local_dates) == 1:
+                relation, anchor = relation or "EXACT", local_dates[0]
+            elif axis and not anchor and len(frame_dates) == 1 and decision["operator"] not in {"TEMPORAL", "COMPARISON"}:
+                relation, anchor = relation or "EXACT", frame_dates[0]
 
         return self._rc_gap(
             str(req.get("id") or fallback_id),
@@ -147,6 +148,13 @@ class ReadPlanContractMixin:
             decision = dict(decision)
             decision["operator"] = "DIRECT"
             decision["requires_inference"] = False
+            for gap in gaps:
+                gap.qrf_operator = "DIRECT"
+        # A dated STATE with no known temporal axis must not resolve the global
+        # current head. QueryFrame already knows the date and will constrain a
+        # bounded semantic search across event/document/origin dates.
+        if effective_operator == "STATE" and getattr(frame, "dates", ()) and not any(gap.temporal_axis for gap in gaps):
+            effective_operator = "DIRECT"
             for gap in gaps:
                 gap.qrf_operator = "DIRECT"
         for gap in gaps:
