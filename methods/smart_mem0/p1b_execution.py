@@ -103,9 +103,20 @@ class EvidenceLattice:
                 "GENERIC_EVIDENCE": "DIRECT"
             }
             
+            slot_type = role_to_type.get(gap.role, "DIRECT")
+            qrf_op = getattr(gap, "qrf_operator", "DIRECT")
+            
+            # Map deterministic QRF operators to execution primitives
+            if qrf_op == "STATE":
+                slot_type = "CURRENT_STATE"
+            elif gap.temporal_axis or gap.temporal_relation:
+                slot_type = "TEMPORAL"
+            elif gap.role == "CAUSAL_BRIDGE":
+                slot_type = "CAUSE_PATH"
+            
             slot = {
                 "id": gap.id,
-                "type": role_to_type.get(gap.role, "DIRECT"),
+                "type": slot_type,
                 "evidence_role": gap.role,
                 "description": getattr(gap, "description", f"Gap for {gap.role} concerning {' '.join(gap.target_entities)}"),
                 "required": gap.required,
@@ -115,6 +126,10 @@ class EvidenceLattice:
                 "time_relation": gap.temporal_relation,
                 "time_anchor": gap.temporal_anchor,
                 "option_label": gap.option_label,
+                "target_entities": gap.target_entities,
+                "target_property": gap.target_property,
+                "required_fields": gap.required_fields,
+                "temporal_relation": gap.temporal_relation, # preserve for legacy compat
             }
             if gap.role == "PRIOR_TRAJECTORY":
                 slot["history"] = True
@@ -147,16 +162,25 @@ def _evaluate_seed_gate(agent, question: str, frame: Any, seeds: List[Dict[str, 
     # Check for conflicts. If seeds[1] has same rank/score but different state value.
     if len(seeds) > 1:
         s2 = seeds[1]
-        # Strict conflict check: only if canonical identities actually match but values contradict
-        if top_seed.get("semantic_role") == s2.get("semantic_role") and top_seed.get("object_anchor") == s2.get("object_anchor"):
+        # Strict conflict check: only if canonical identities actually match but values contradict.
+        # Empty object anchors CANNOT cause conflicts.
+        role1 = top_seed.get("semantic_role")
+        obj1 = top_seed.get("object_anchor")
+        state1 = top_seed.get("state_key")
+        
+        if role1 and obj1 and role1 == s2.get("semantic_role") and obj1 == s2.get("object_anchor"):
             val1 = top_seed.get("value") or top_seed.get("state")
             val2 = s2.get("value") or s2.get("state")
             if val1 and val2 and val1 != val2:
-                # E.g. project_status = blocked vs project_status = completed
+                return False, None, "CONFLICTING_CANDIDATES"
+        # Or if state_identities explicitly match
+        elif state1 and state1 == s2.get("state_key"):
+            if top_seed.get("state") != s2.get("state"):
                 return False, None, "CONFLICTING_CANDIDATES"
 
     # Reuse existing deterministic structural validation
-    supports = agent._validate_fast_support(top_seed["id"], seeds, frame)
+    # Use $seed0 to match the expected prompt reference format in _validate_fast_support
+    supports = agent._validate_fast_support("$seed0", seeds, frame)
     if supports:
         return True, supports, "DIRECT_SEED_SUFFICIENT"
         

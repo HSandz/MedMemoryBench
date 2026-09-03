@@ -49,12 +49,41 @@ OPTION RULES:
 If the supplied seed evidence already completely answers the question, output an empty list for evidence_gaps.
 """
 
+def _build_qrf(question: str, frame: Any) -> Dict[str, Any]:
+    q = question.lower()
+    qrf = {
+        "operator": "DIRECT",
+        "temporal_axis": "",
+        "temporal_relation": "",
+        "temporal_anchor": "",
+        "comparison_sides": [],
+        "visible_options": []
+    }
+    
+    if hasattr(frame, "options") and frame.options:
+        qrf["operator"] = "MULTI_OPTION"
+        qrf["visible_options"] = list(frame.options.keys())
+    elif "compare" in q or "vs" in q or "versus" in q or "difference" in q or "compared with" in q:
+        qrf["operator"] = "COMPARISON"
+        # simple heuristic for side A / side B could go here if needed
+    elif "current" in q or "latest" in q or "now" in q or "present" in q:
+        qrf["operator"] = "STATE"
+    
+    if "document" in q or "record" in q or "note" in q or "file" in q:
+        qrf["temporal_axis"] = "document_time"
+    elif "when" in q or "date" in q or "year" in q or "time" in q:
+        qrf["temporal_axis"] = "event_time"
+        
+    return qrf
+
 def _gap_planner(
     agent,
     question: str,
     seeds: List[Dict[str, Any]],
     frame: Any
 ) -> Tuple[List[EvidenceGap], Dict[str, Any]]:
+    qrf = _build_qrf(question, frame)
+    
     # Format the seeds as compact representation
     compact_seeds = []
     for s in seeds[:3]:
@@ -115,7 +144,23 @@ def _gap_planner(
         temp_axis = str(g.get("temporal_axis", ""))
         if temp_axis not in {"event_time", "document_time", "effective_event_time", ""}:
             temp_axis = ""
+            
+        # Planner cannot invent a temporal axis if QRF has a strict requirement,
+        # nor can it drop a required QRF axis.
+        if qrf["temporal_axis"]:
+            temp_axis = qrf["temporal_axis"]
+        
+        # If the operator is STATE, force STATE temporal semantics
+        if qrf["operator"] == "STATE":
+            temp_axis = "" # State spine handles this
 
+        # Visible options deterministic parsing
+        opt_label = str(g.get("option_label", ""))
+        if qrf["operator"] == "MULTI_OPTION" and qrf["visible_options"]:
+            if opt_label not in qrf["visible_options"] and len(qrf["visible_options"]) > len(evidence_gaps):
+                # Force options mapping sequentially if planner failed to label them
+                opt_label = qrf["visible_options"][len(evidence_gaps) % len(qrf["visible_options"])]
+                
         gap = EvidenceGap(
             id=gid,
             role=role,
@@ -126,10 +171,47 @@ def _gap_planner(
             temporal_axis=temp_axis,
             temporal_relation=str(g.get("temporal_relation", "")),
             temporal_anchor=str(g.get("temporal_anchor", "")),
-            option_label=str(g.get("option_label", ""))
+            option_label=opt_label
         )
         # Store description via generic property for adapter
         gap.description = str(g.get("description", ""))
+        
+        # Keep track of QRF operator to map correctly in legacy slots
+        gap.qrf_operator = qrf["operator"]
+        
         evidence_gaps.append(gap)
+        
+    # Ensure options are exhaustively covered
+    if qrf["operator"] == "MULTI_OPTION" and qrf["visible_options"]:
+        covered_options = {g.option_label for g in evidence_gaps if g.option_label}
+        for opt in qrf["visible_options"]:
+            if opt not in covered_options and len(evidence_gaps) < 4:
+                gid = f"g_opt_{opt}"
+                gap = EvidenceGap(
+                    id=gid,
+                    role="OPTION_SUPPORT",
+                    required=True,
+                    subject_id=getattr(frame, "speaker_role", "primary_user"),
+                    option_label=opt
+                )
+                gap.qrf_operator = qrf["operator"]
+                gap.description = f"Evidence required to evaluate option {opt}"
+                evidence_gaps.append(gap)
+                
+    # Ensure comparisons have at least two sides
+    if qrf["operator"] == "COMPARISON":
+        sides = [g for g in evidence_gaps if g.role == "COMPARISON_SIDE"]
+        while len(sides) < 2 and len(evidence_gaps) < 4:
+            gid = f"g_comp_{len(sides)}"
+            gap = EvidenceGap(
+                id=gid,
+                role="COMPARISON_SIDE",
+                required=True,
+                subject_id=getattr(frame, "speaker_role", "primary_user")
+            )
+            gap.qrf_operator = qrf["operator"]
+            gap.description = f"Evidence required to evaluate comparison side"
+            evidence_gaps.append(gap)
+            sides.append(gap)
         
     return evidence_gaps, usage

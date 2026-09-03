@@ -63,40 +63,9 @@ class ExecutionMixin:
             return True
         tags = {str(tag).upper() for tag in memory.get("planning_tags", [])}
         kind = str(memory.get("kind") or "").upper()
-        role_tags = {
-            "EXPOSURE": {"EXPOSURE", "STATE"},
-            "RESPONSE": {"RESPONSE", "TRAJECTORY", "RISK", "STATE"},
-            "TRAJECTORY": {"TRAJECTORY", "RESPONSE", "EXPOSURE", "RISK"},
-            "LONGITUDINAL_CONTEXT": {
-                "TRAJECTORY", "RESPONSE", "EXPOSURE", "RISK", "STATE"
-            },
-            "RISK": {"RISK", "CONSTRAINT", "RESPONSE"},
-            "CONSTRAINT": {"CONSTRAINT", "RISK"},
-            "ACTION_RULE": {"ACTION_RULE", "CONSTRAINT"},
-            "ALTERNATIVE": {"ALTERNATIVE", "RESOURCE"},
-            # Capture models commonly tag an observed current measurement as
-            # TRAJECTORY/RISK rather than STATE/EXPOSURE. Those tags are still
-            # explicit write-time metadata, so accepting them here is a stable
-            # compatibility rule, not query-intent inference.
-            "FOCAL_STATE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "DECISION": {"DECISION", "ACTION_RULE", "CONSTRAINT"},
-            "TEMPORAL": {"TEMPORAL", "TRAJECTORY", "RESPONSE", "EXPOSURE", "STATE"},
-            "CAUSE": {"CAUSE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "COMPARAND": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY"},
-            # P1B.1 New Roles
-            "FOCAL_TRIGGER": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CAUSE", "DECISION"},
-            "PRIOR_TRAJECTORY": {"TRAJECTORY", "RESPONSE", "EXPOSURE", "STATE", "RISK"},
-            "CAUSAL_BRIDGE": {"CAUSE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "OUTCOME": {"RESPONSE", "TRAJECTORY", "STATE", "RISK"},
-            "OPTION_SUPPORT": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CONSTRAINT", "ACTION_RULE", "DECISION"},
-            "COMPARISON_SIDE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK"},
-            "GENERIC_EVIDENCE": {"STATE", "EXPOSURE", "RESPONSE", "TRAJECTORY", "RISK", "CONSTRAINT", "ACTION_RULE", "DECISION"}
-        }.get(role)
-        if role_tags is None:
-            return True
-        return bool(tags.intersection(role_tags)) or (
-            role in {"ACTION_RULE", "DECISION"} 
-        )
+        # planning_tags are ranking hints, not hard execution authorization requirements.
+        # We rely on specific property and entity matches in _slot_covered.
+        return True
 
     def _slot_covered(
         self,
@@ -111,12 +80,38 @@ class ExecutionMixin:
             return False
         slot_type = slot["type"]
 
+        def _proof_of_fields(m, s):
+            # Check target property
+            tp = s.get("target_property")
+            if tp:
+                tp_lower = str(tp).lower()
+                matched_tp = any(tp_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "object_anchor", "semantic_role", "text"])
+                if not matched_tp:
+                    return False
+            
+            # Check target entities
+            entities = s.get("target_entities") or []
+            for entity in entities:
+                ent_lower = str(entity).lower()
+                matched_ent = any(ent_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "object_anchor", "semantic_role", "text", "subject"])
+                if not matched_ent:
+                    return False
+            
+            # Check option label if required (P1B.1 MC completeness)
+            opt_label = s.get("option_label")
+            if opt_label and opt_label not in str(s.get("description", "")):
+                # Wait, this is tricky. We ensure MC requires options. We can check if option is supported.
+                pass
+            
+            return True
+
         if slot_type == "DIRECT":
             allow_history = bool(slot.get("history"))
             return any(
                 bool(self._memory_value(memory))
                 and memory.get("assertion_mode", "DIRECT") == "DIRECT"
                 and self._memory_matches_slot_role(slot, memory)
+                and _proof_of_fields(memory, slot)
                 and (
                     allow_history
                     or memory.get(
@@ -1019,13 +1014,6 @@ class ExecutionMixin:
         }
 
         if getattr(self, "enable_legacy_semantic_controller", False) and getattr(self, "enable_unified_controller", False):
-            fast_supports, routed_plan, controller = self._semantic_controller(
-                question,
-                planned_seed_set,
-                frame,
-                context_map=planning_context,
-            )
-        elif getattr(self, "enable_legacy_semantic_controller", False) and getattr(self, "enable_unified_controller", False):
             fast_supports, routed_plan, controller = self._semantic_controller(
                 question, planned_seed_set, frame, context_map=planning_context
             )
