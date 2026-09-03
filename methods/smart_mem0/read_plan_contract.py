@@ -50,7 +50,19 @@ class ReadPlanContractMixin:
         requirements = decision.get("requirements") or []
 
         if operator == "MULTI_OPTION":
-            shared = [req for req in requirements if req.get("role") != "COMPARAND"][:3]
+            # Options are probes, never required gaps. Drop any controller
+            # requirement that is merely one visible option proposition.
+            option_texts = {self._rc_text(text) for text in (decision.get("visible_options") or {}).values() if str(text).strip()}
+            shared_roles = {"FOCAL_STATE", "PRIOR_TRAJECTORY", "ACTION_RULE", "CONSTRAINT", "OPTION_CONTEXT", "GENERIC_EVIDENCE"}
+            shared = []
+            for req in requirements:
+                if req.get("role") not in shared_roles:
+                    continue
+                req_target = self._rc_text(req.get("target") or "")
+                if req_target and any(req_target == option or req_target in option or option in req_target for option in option_texts):
+                    continue
+                shared.append(req)
+            shared = shared[:3]
             if not shared:
                 shared = [{"id": "r_options", "role": "OPTION_CONTEXT", "target": decision.get("target") or ""}]
             return [self._rc_gap_from_req(decision, req, f"g_option_ctx_{i}") for i, req in enumerate(shared)]
