@@ -3,10 +3,59 @@
 from collections import defaultdict
 
 from .canonicalization import state_identity
-from .contracts import RETRIEVAL_BUDGETS, VALID_TEMPORAL_AXES
+from .contracts import QueryFrame, RETRIEVAL_BUDGETS, VALID_TEMPORAL_AXES
 
 
 class ReadExecutionContractMixin:
+    # ---------- option-aware retrieval ----------
+    def _semantic_operation_search(
+        self, query, top_k, strategy, frame=None, option_queries=None
+    ):
+        strategy = str(strategy or "FOCAL").upper()
+        if strategy != "SHARED_OPTIONS":
+            return super()._semantic_operation_search(
+                query, top_k, strategy,
+                frame=frame or QueryFrame(), option_queries=option_queries,
+            )
+        frame = frame or QueryFrame()
+        eligible_ids = {
+            memory["id"]
+            for memory in self._memories
+            if self._memory_satisfies_frame(
+                memory, frame, include_entities=bool(frame.hard_entities)
+            )
+            and self._query_visible_memory(memory)
+        }
+        if not eligible_ids:
+            return []
+        base = self._hybrid_search(
+            query, top_k=min(max(int(top_k) * 3, 12), len(eligible_ids)),
+            candidate_ids=eligible_ids,
+        )
+        representatives, option_hits, seen = [], [], set()
+        for option_query in option_queries or []:
+            text = str(option_query or "").strip()
+            if not text:
+                continue
+            hits = self._hybrid_search(
+                text, top_k=min(4, len(eligible_ids)), candidate_ids=eligible_ids
+            )
+            option_hits.extend(hits)
+            representative = next(
+                (memory for memory in hits if memory["id"] not in seen), None
+            )
+            if representative:
+                representatives.append(representative)
+                seen.add(representative["id"])
+        selected = []
+        for memory in (*representatives, *base, *option_hits):
+            if memory["id"] in {item["id"] for item in selected}:
+                continue
+            selected.append(self._snapshot(memory))
+            if len(selected) >= int(top_k):
+                break
+        return selected
+
     # ---------- deterministic typed operations / recovery ----------
     def _compile_gap_operations(self,slots,question,budget_tier="MEDIUM",plan=None):
         if not slots: return []
