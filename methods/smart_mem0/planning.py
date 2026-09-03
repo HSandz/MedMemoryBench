@@ -1358,6 +1358,8 @@ class PlanningMixin:
                                 "relation": relation,
                                 "axis": axis,
                                 "fallback_axis": fallback_axis,
+                                "anchor": str(slot.get("time_anchor") or ""),
+                                "end": str(slot.get("time_end") or ""),
                                 "candidate_refs": [f"${len(operations)}"],
                                 "produces": [slot_id],
                             },
@@ -1372,6 +1374,8 @@ class PlanningMixin:
                             "relation": relation,
                             "axis": axis,
                             "fallback_axis": fallback_axis,
+                            "anchor": str(slot.get("time_anchor") or ""),
+                            "end": str(slot.get("time_end") or ""),
                             "produces": [slot_id],
                         }
                     )
@@ -1384,6 +1388,7 @@ class PlanningMixin:
                     }
                 )
             elif slot_type == "CAUSE_PATH":
+                anchor_idx = len(operations)
                 operations.extend(
                     [
                         {
@@ -1393,8 +1398,10 @@ class PlanningMixin:
                         },
                         {
                             "op": "FOLLOW_CAUSES",
-                            "query": "cause",
-                            "candidate_refs": [f"${len(operations)}"],
+                            "start": [f"${anchor_idx}"],
+                            "direction": "OUT",
+                            "depth": 3,
+                            "goal": description,
                             "produces": [slot_id],
                         },
                     ]

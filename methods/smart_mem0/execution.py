@@ -93,9 +93,28 @@ class ExecutionMixin:
             # For now, we loosen target_entities and target_property so they don't cause false negatives.
             # We trust the semantic retrieval, and enforce `required_fields`, subject, and `option_label`.
             
-            # Target entities - loosen
-            # tp = s.get("target_property")
-            # entities = s.get("target_entities") or []
+            # Target property & entities MUST be enforced for FILLED proof
+            tp = s.get("target_property")
+            if tp and str(tp).strip():
+                tp_lower = str(tp).lower().strip()
+                # If target property is a long sentence (e.g. MCD wrapper leaked), we shouldn't fail everything, 
+                # but since MCD wrapper is fixed, tp should be clean.
+                matched_tp = any(tp_lower in str(m.get(k, "")).lower() for k in ["state_key", "claim", "value", "verbatim_value"])
+                if not matched_tp:
+                    # check subset in claim
+                    if not any(word in str(m.get("claim", "")).lower() for word in tp_lower.split() if len(word) > 4):
+                        return False
+            
+            entities = s.get("target_entities") or []
+            if entities:
+                mem_text = (str(m.get("claim","")) + " " + " ".join(m.get("entities", []))).lower()
+                matched_ent = False
+                for e in entities:
+                    if str(e).lower() in mem_text:
+                        matched_ent = True
+                        break
+                if not matched_ent:
+                    return False
                     
             # Required fields
             req_fields = s.get("required_fields") or []
@@ -104,13 +123,9 @@ class ExecutionMixin:
                     return False
             
             # Option label support
-            opt_label = s.get("option_label")
-            if opt_label:
-                # Option label must be supported by the memory text or value
-                opt_lower = str(opt_label).lower()
-                matched_opt = any(opt_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "text"])
-                if not matched_opt:
-                    return False
+            # Literal A/B/C/D mapping is invalid because memories do not contain letter labels.
+            # We defer proposition evaluation to the final answer phase which sees the SHARED_OPTIONS bundle.
+            pass
                     
             # Distinct comparison sides check. Just ensure it doesn't fail based on fake entities.
             if s.get("comparison_side_label"):
@@ -1087,8 +1102,9 @@ class ExecutionMixin:
                 
                 if not evidence_gaps:
                     # ZERO GAP FROM PLANNER
-                    # Wait, we only authorize top seed IF deterministic validation passes!
-                    if planned_seed_set:
+                    # Wait, we only authorize top seed IF deterministic validation passes AND QRF is DIRECT!
+                    # Structural requirements (STATE, CAUSAL, etc) cannot be bypassed.
+                    if planned_seed_set and qrf.get("operator", "DIRECT") == "DIRECT":
                         supports = self._validate_fast_support("$seed0", planned_seed_set, frame)
                         if supports:
                             fast_supports = supports
@@ -1104,7 +1120,12 @@ class ExecutionMixin:
                             # Actually, if there are no slots, recovery does nothing.
                             # We should generate a generic gap.
                             from methods.smart_mem0.p1b_execution import EvidenceGap
-                            fallback_gap = EvidenceGap(id="g_fallback", role="GENERIC_EVIDENCE", required=True)
+                            fallback_gap = EvidenceGap(
+                                id="g_fallback", 
+                                role="GENERIC_EVIDENCE", 
+                                required=True,
+                                subject_id=getattr(frame, "speaker_role", "primary_user")
+                            )
                             fallback_gap.qrf_operator = qrf.get("operator", "DIRECT")
                             self._evidence_lattice.add_gap(fallback_gap)
                             plan["required_slots"] = self._evidence_lattice.to_legacy_slots()

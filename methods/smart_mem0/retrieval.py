@@ -729,7 +729,13 @@ class RetrievalOperationsMixin:
             "",
         )
         if best_identity:
-            selected_ids.extend(self._state_heads.get(best_identity, []))
+            spine = self._state_spine.get(best_identity)
+            if spine:
+                latest = spine.latest()
+                if latest:
+                    selected_ids.append(latest["id"])
+            if not selected_ids:
+                selected_ids.extend(self._state_heads.get(best_identity, []))
         else:
             direct = next(
                 (

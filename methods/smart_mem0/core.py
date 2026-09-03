@@ -742,7 +742,14 @@ class CoreMemoryMixin:
             maxsplit=1,
         )[0]
         marker = re.search(r"(?is)answer the following question\s*:\s*", body)
-        return body[marker.end() :].strip() if marker else text
+        body = body[marker.end() :].strip() if marker else body
+        
+        # Remove MedMemoryBench MCD wrapper prefix
+        mcd_marker = re.search(r"(?is)based on the relevant information from the memory store, carefully review.*?multiple visits:\s*", body)
+        if mcd_marker:
+            body = body[mcd_marker.end() :].strip()
+            
+        return body
 
     @staticmethod
     def _normalise_memory(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
