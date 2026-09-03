@@ -30,15 +30,15 @@ Temporal relations: EXACT, EARLIEST, LATEST, BEFORE, AFTER, BETWEEN, or empty.
 Use explicit query dates as anchors/bounds. Gaps are semantic requirements only and contain no memory IDs or operations. Keep controller-declared covered+gaps to at most 4; runtime may deterministically expand visible options.
 
 Return JSON only:
-{
+{{
  "route":"ANSWER|PLAN|ABSTAIN", "operator":"DIRECT", "answer_slot":"TEXT",
  "answer":"", "support_refs":["$seed0"], "requires_inference":false,
  "target_entities":[],
- "temporal":{"axis":"","relation":"","anchor":"","end":""},
- "comparison_sides":[{"label":"left_side","temporal_anchor":""},{"label":"right_side","temporal_anchor":""}],
- "covered":[{"id":"c1","role":"ANSWER","description":"already present evidence","refs":["$seed0"],"target_entities":[],"target_property":"","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","option_label":""}],
- "gaps":[{"id":"g1","role":"GENERIC_EVIDENCE","description":"missing evidence","target_entities":[],"target_property":"","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","option_label":""}]
-}
+ "temporal":{{"axis":"","relation":"","anchor":"","end":""}},
+ "comparison_sides":[{{"label":"left_side","temporal_anchor":""}},{{"label":"right_side","temporal_anchor":""}}],
+ "covered":[{{"id":"c1","role":"ANSWER","description":"already present evidence","refs":["$seed0"],"target_entities":[],"target_property":"","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","option_label":""}}],
+ "gaps":[{{"id":"g1","role":"GENERIC_EVIDENCE","description":"missing evidence","target_entities":[],"target_property":"","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","option_label":""}}]
+}}
 
 QUESTION:\n{question}
 VISIBLE OPTIONS:\n{options}
@@ -56,28 +56,21 @@ class TwoStageControllerMixin:
     """One compact semantic LLM call followed by deterministic retrieval."""
 
     def _planning_context_map(self, question: str) -> List[Dict[str, Any]]:
-        # The old controller performed a second local recall pass for routing.
-        # Compact seeds + syntax hints are sufficient for the two-stage design.
         return []
 
     def _controller_seed_payload(self, seeds: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         from .canonicalization import state_identity
-
         out = []
         for index, memory in enumerate(seeds[:3]):
             identity = state_identity(memory) or ""
             out.append({
-                "ref": f"$seed{index}",
-                "kind": memory.get("kind"),
+                "ref": f"$seed{index}", "kind": memory.get("kind"),
                 "semantic_role": memory.get("semantic_role"),
                 "subject": memory.get("subject_id") or memory.get("subject"),
-                "object": memory.get("object_anchor"),
-                "value": self._memory_value(memory),
+                "object": memory.get("object_anchor"), "value": self._memory_value(memory),
                 "claim": str(memory.get("claim") or "")[:320],
-                "event_time": memory.get("event_time"),
-                "document_time": memory.get("document_time"),
-                "state_identity": identity,
-                "is_state_head": bool(identity and self._is_state_head(memory)),
+                "event_time": memory.get("event_time"), "document_time": memory.get("document_time"),
+                "state_identity": identity, "is_state_head": bool(identity and self._is_state_head(memory)),
                 "status": memory.get("_status", self._belief_status.get(memory.get("id"), "active")),
             })
         return out
@@ -107,9 +100,7 @@ class TwoStageControllerMixin:
         relation = relation if relation in VALID_RELATIONS else ""
         entities = parsed.get("target_entities") if isinstance(parsed.get("target_entities"), list) else []
         return {
-            "route": route,
-            "operator": operator,
-            "answer_slot": answer_slot,
+            "route": route, "operator": operator, "answer_slot": answer_slot,
             "answer": str(parsed.get("answer") or "").strip(),
             "support_refs": [str(v) for v in (parsed.get("support_refs") or []) if str(v).strip()][:3],
             "requires_inference": bool(parsed.get("requires_inference", False)),
@@ -139,7 +130,6 @@ class TwoStageControllerMixin:
             for memory in valid:
                 if all(item["id"] != memory["id"] for item in supports):
                     supports.append(memory)
-
         op, temporal = d["operator"], d["temporal"]
         if op == "STATE" and (len(supports) != 1 or not self._is_state_head(supports[0])):
             return None, "STATE_REQUIRES_CANONICAL_HEAD"
@@ -194,11 +184,9 @@ class TwoStageControllerMixin:
         return gap
 
     def _new_gap(self, gap_id: str, role: str, d: Dict[str, Any], frame: Any, description: str, **kwargs) -> EvidenceGap:
-        gap = EvidenceGap(
-            id=gap_id, role=role, required=True,
+        gap = EvidenceGap(id=gap_id, role=role, required=True,
             subject_id=getattr(frame, "speaker_role", "") or "primary_user",
-            target_entities=list(d["target_entities"]), **kwargs,
-        )
+            target_entities=list(d["target_entities"]), **kwargs)
         gap.qrf_operator = d["operator"]
         gap.description = description
         return gap
@@ -222,10 +210,8 @@ class TwoStageControllerMixin:
                 gap.id = f"g{i}"
             used.add(gap.id)
             missing.append(gap)
-
         op, options = d["operator"], d["visible_options"]
         all_gaps = lambda: [*(g for g, _ in covered), *missing]
-
         if op == "MULTI_OPTION":
             existing = {g.option_label: g for g in missing if g.option_label}
             covered, missing = [], []
@@ -236,156 +222,93 @@ class TwoStageControllerMixin:
                 gap.description = f"Evidence supporting or refuting option {label}: {proposition}"
                 missing.append(gap)
             return [], missing
-
         if op == "COMPARISON":
             sides = d["comparison_sides"]
             while sum(g.role == "COMPARISON_SIDE" for g in all_gaps()) < 2:
                 idx = sum(g.role == "COMPARISON_SIDE" for g in all_gaps())
                 spec = sides[idx] if idx < len(sides) and isinstance(sides[idx], dict) else {}
                 anchor = str(spec.get("temporal_anchor") or "")
-                gap = self._new_gap(
-                    f"g_comp_{idx}", "COMPARISON_SIDE", d, frame,
+                gap = self._new_gap(f"g_comp_{idx}", "COMPARISON_SIDE", d, frame,
                     f"Evidence for comparison {spec.get('label') or f'side_{idx}'}: {question}",
-                    temporal_axis="event_time" if anchor else "",
-                    temporal_relation="EXACT" if anchor else "",
-                    temporal_anchor=anchor,
-                    comparison_side_label=str(spec.get("label") or f"side_{idx}"),
-                )
+                    temporal_axis="event_time" if anchor else "", temporal_relation="EXACT" if anchor else "",
+                    temporal_anchor=anchor, comparison_side_label=str(spec.get("label") or f"side_{idx}"))
                 missing.append(gap)
-
         if op == "CAUSAL":
             roles = {g.role for g in all_gaps()}
-            for role, gid, text in (
-                ("FOCAL_TRIGGER", "g_trigger", "Grounded trigger or exposure"),
-                ("CAUSAL_BRIDGE", "g_bridge", "Stored causal connection between grounded endpoints"),
-                ("OUTCOME", "g_outcome", "Grounded outcome or resulting state"),
-            ):
+            for role, gid, text in (("FOCAL_TRIGGER","g_trigger","Grounded trigger or exposure"),("CAUSAL_BRIDGE","g_bridge","Stored causal connection between grounded endpoints"),("OUTCOME","g_outcome","Grounded outcome or resulting state")):
                 if role not in roles:
-                    missing.insert(0, self._new_gap(gid, role, d, frame, f"{text}: {question}"))
-                    roles.add(role)
-
+                    missing.insert(0, self._new_gap(gid, role, d, frame, f"{text}: {question}")); roles.add(role)
         if op == "DECISION":
             roles = {g.role for g in all_gaps()}
-            for role, gid, text in (
-                ("FOCAL_STATE", "g_focal", "Current focal evidence relevant to the decision"),
-                ("CONSTRAINT", "g_constraint", "Applicable participant-specific rule, policy, or constraint"),
-            ):
+            for role, gid, text in (("FOCAL_STATE","g_focal","Current focal evidence relevant to the decision"),("CONSTRAINT","g_constraint","Applicable participant-specific rule, policy, or constraint")):
                 if role not in roles:
-                    missing.insert(0, self._new_gap(gid, role, d, frame, f"{text}: {question}"))
-                    roles.add(role)
-
+                    missing.insert(0, self._new_gap(gid, role, d, frame, f"{text}: {question}")); roles.add(role)
         if op == "STATE" and not covered and not missing:
             missing.append(self._new_gap("g_state", "GENERIC_EVIDENCE", d, frame, f"Current/latest state required to answer: {question}"))
         if op == "TEMPORAL" and not covered and not missing:
             t = d["temporal"]
-            missing.append(self._new_gap(
-                "g_temporal", "GENERIC_EVIDENCE", d, frame,
-                f"Temporal evidence required to answer: {question}",
-                temporal_axis=t["axis"] or "event_time", temporal_relation=t["relation"] or "EXACT",
-                temporal_anchor=t["anchor"], temporal_end=t["end"],
-            ))
+            missing.append(self._new_gap("g_temporal", "GENERIC_EVIDENCE", d, frame,
+                f"Temporal evidence required to answer: {question}", temporal_axis=t["axis"] or "event_time",
+                temporal_relation=t["relation"] or "EXACT", temporal_anchor=t["anchor"], temporal_end=t["end"]))
         if not covered and not missing:
             missing.append(self._new_gap("g_direct", "GENERIC_EVIDENCE", d, frame, f"Missing answer-bearing evidence: {question}"))
-        role_order = {
-            "FOCAL_TRIGGER": 0, "CAUSAL_BRIDGE": 1, "OUTCOME": 2,
-            "FOCAL_STATE": 0, "CONSTRAINT": 1, "ACTION_RULE": 2,
-            "PRIOR_TRAJECTORY": 3, "COMPARISON_SIDE": 0,
-        }
+        role_order = {"FOCAL_TRIGGER":0,"CAUSAL_BRIDGE":1,"OUTCOME":2,"FOCAL_STATE":0,"CONSTRAINT":1,"ACTION_RULE":2,"PRIOR_TRAJECTORY":3,"COMPARISON_SIDE":0}
         missing.sort(key=lambda gap: role_order.get(gap.role, 10))
         return covered[:4], missing[:4]
 
     def _controller_plan(self, d: Dict[str, Any], question: str, frame: Any) -> Dict[str, Any]:
         covered, missing = self._normalize_requirements(d, question, frame)
         lattice = EvidenceLattice()
-        for gap, _ in covered:
-            lattice.add_gap(gap)
-        for gap in missing:
-            lattice.add_gap(gap)
+        for gap, _ in covered: lattice.add_gap(gap)
+        for gap in missing: lattice.add_gap(gap)
         slots = lattice.to_legacy_slots()
-        seed_coverage = [{"slot_id": gap.id, "refs": refs} for gap, refs in covered]
+        seed_coverage = [{"slot_id":gap.id,"refs":refs} for gap, refs in covered]
         missing_ids = {gap.id for gap in missing}
         missing_slots = [slot for slot in slots if slot["id"] in missing_ids]
-
         op = d["operator"]
         if op == "MULTI_OPTION" and missing:
-            operations = [{
-                "op": "SEMANTIC_SEARCH", "query": self._question_stem(question), "top_k": 8,
-                "strategy": "SHARED_OPTIONS", "option_queries": list(d["visible_options"].values()),
-                "produces": [gap.id for gap in missing],
-            }]
+            operations = [{"op":"SEMANTIC_SEARCH","query":self._question_stem(question),"top_k":8,
+                "strategy":"SHARED_OPTIONS","option_queries":list(d["visible_options"].values()),
+                "produces":[gap.id for gap in missing]}]
             tier = "LARGE"
         elif op == "DECISION" and missing:
             history = [g.id for g in missing if g.role == "PRIOR_TRAJECTORY"]
             focal = [g.id for g in missing if g.role != "PRIOR_TRAJECTORY"]
             operations = []
-            if focal:
-                operations.append({"op":"SEMANTIC_SEARCH","query":question,"top_k":5,"strategy":"DECISION_BUNDLE","produces":focal})
-            if history:
-                operations.append({"op":"SEMANTIC_SEARCH","query":question,"top_k":5,"strategy":"TRAJECTORY","produces":history})
+            if focal: operations.append({"op":"SEMANTIC_SEARCH","query":question,"top_k":5,"strategy":"DECISION_BUNDLE","produces":focal})
+            if history: operations.append({"op":"SEMANTIC_SEARCH","query":question,"top_k":5,"strategy":"TRAJECTORY","produces":history})
             tier = "MEDIUM"
         else:
             tier = "LARGE" if op == "CAUSAL" or len(slots) >= 3 else ("MEDIUM" if len(slots) >= 2 else "SMALL")
             operations = self._compile_gap_operations(missing_slots, question, tier)
-
         return {
-            "query_spec": {
-                "target_entities": d["target_entities"], "target_property": "",
-                "answer_type": d["answer_slot"],
-                "reasoning": "SYNTHESIS" if d["requires_inference"] else "NONE",
-                "requires_inference": d["requires_inference"], "temporal": dict(d["temporal"]),
-            },
-            "query_mode": op, "required_slots": slots, "seed_coverage": seed_coverage,
-            "operations": operations, "need_evidence": True, "budget_tier": tier,
-            "max_memories": RETRIEVAL_BUDGETS[tier]["max_memories"],
-            "planner_fallback": False, "fallback_reason": "", "valid": True, "option_coverage": [],
+            "query_spec":{"target_entities":d["target_entities"],"target_property":"","answer_type":d["answer_slot"],
+                "reasoning":"SYNTHESIS" if d["requires_inference"] else "NONE","requires_inference":d["requires_inference"],"temporal":dict(d["temporal"])},
+            "query_mode":op,"required_slots":slots,"seed_coverage":seed_coverage,"operations":operations,
+            "need_evidence":True,"budget_tier":tier,"max_memories":RETRIEVAL_BUDGETS[tier]["max_memories"],
+            "planner_fallback":False,"fallback_reason":"","valid":True,"option_coverage":[],
         }
 
-    def _semantic_controller(
-        self, question: str, seeds: List[Dict[str, Any]], frame: Any,
-        context_map: Optional[List[Dict[str, Any]]] = None,
-    ) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any], Dict[str, Any]]:
+    def _semantic_controller(self, question: str, seeds: List[Dict[str, Any]], frame: Any, context_map: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any], Dict[str, Any]]:
         options = self._question_options(question) or {}
-        hints = {
-            "dates": [str(v) for v in (getattr(frame, "dates", ()) or ()) if v],
-            "speaker_role": getattr(frame, "speaker_role", ""),
-            "hard_entities": list(getattr(frame, "hard_entities", ()) or ()),
-        }
-        prompt = CONTROLLER_PROMPT.format(
-            question=question, options=json.dumps(options, ensure_ascii=False),
-            syntax_hints=json.dumps(hints, ensure_ascii=False),
-            seeds=json.dumps(self._controller_seed_payload(seeds), ensure_ascii=False),
-        )
+        hints = {"dates":[str(v) for v in (getattr(frame,"dates",()) or ()) if v],"speaker_role":getattr(frame,"speaker_role",""),"hard_entities":list(getattr(frame,"hard_entities",()) or ())}
+        prompt = CONTROLLER_PROMPT.format(question=question, options=json.dumps(options, ensure_ascii=False), syntax_hints=json.dumps(hints, ensure_ascii=False), seeds=json.dumps(self._controller_seed_payload(seeds), ensure_ascii=False))
         try:
-            response = self._llm_client.chat(
-                [{"role":"user","content":prompt}], temperature=0.0, max_tokens=512,
-                response_format={"type":"json_object"},
-            )
+            response = self._llm_client.chat([{"role":"user","content":prompt}], temperature=0.0, max_tokens=512, response_format={"type":"json_object"})
             usage = self._response_usage(response, prompt)
             decision = self._normalize_controller_decision(self._parse_json(response.content), question, frame)
         except Exception as exc:
             decision = self._normalize_controller_decision({"route":"PLAN","operator":"MULTI_OPTION" if options else "DIRECT"}, question, frame)
             plan = self._controller_plan(decision, question, frame)
             return None, plan, {"called":True,"route":"PLAN","decision_route":"PLAN","answer":"","support_ref":"","support_refs":[],"fallback_reason":"controller_error","error":str(exc),"usage":{},"operator":decision["operator"]}
-
         fallback_reason = ""
         if decision["route"] == "ANSWER":
             supports, reason = self._authorize_controller_answer(decision, seeds, frame)
             if supports is not None:
                 refs = list(dict.fromkeys(decision["support_refs"]))
-                return supports, {}, {
-                    "called":True, "route":"DIRECT", "decision_route":"ANSWER",
-                    "answer":decision["answer"], "support_ref":refs[0] if refs else "",
-                    "support_refs":refs, "fallback_reason":"", "usage":usage,
-                    "operator":decision["operator"], "answer_slot":decision["answer_slot"],
-                }
+                return supports, {}, {"called":True,"route":"DIRECT","decision_route":"ANSWER","answer":decision["answer"],"support_ref":refs[0] if refs else "","support_refs":refs,"fallback_reason":"","usage":usage,"operator":decision["operator"],"answer_slot":decision["answer_slot"]}
             decision["route"], fallback_reason = "PLAN", reason
         elif decision["route"] == "ABSTAIN":
             decision["route"], fallback_reason = "PLAN", "ABSTAIN_REQUIRES_RETRIEVAL_CHECK"
-
         plan = self._controller_plan(decision, question, frame)
-        return None, plan, {
-            "called":True, "route":"PLAN", "decision_route":"PLAN", "answer":"",
-            "support_ref":"", "support_refs":[], "fallback_reason":fallback_reason,
-            "usage":usage, "operator":decision["operator"], "answer_slot":decision["answer_slot"],
-            "requires_inference":decision["requires_inference"],
-        }
+        return None, plan, {"called":True,"route":"PLAN","decision_route":"PLAN","answer":"","support_ref":"","support_refs":[],"fallback_reason":fallback_reason,"usage":usage,"operator":decision["operator"],"answer_slot":decision["answer_slot"],"requires_inference":decision["requires_inference"]}
