@@ -9,6 +9,7 @@ from .execution import ExecutionMixin
 from .planning import PlanningMixin
 from .query import QueryMixin
 from .read_controller import ReadContractMixin
+from .read_option_contract import ReadOptionContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
 from .read_plan_contract import ReadPlanContractMixin
 from .retrieval import RetrievalOperationsMixin
@@ -20,6 +21,7 @@ class SmartMem0Agent(
     # the legacy read helpers so the two-stage contract wins by normal Python MRO.
     ReadContractMixin,
     ReadPlanContractMixin,
+    ReadOptionContractMixin,
     ReadExecutionContractMixin,
     QueryMixin,
     ExecutionMixin,
