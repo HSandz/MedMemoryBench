@@ -84,24 +84,18 @@ class ExecutionMixin:
             # Subject check
             subj = s.get("subject")
             if subj and str(m.get("subject", "")) != str(subj) and str(subj) not in {"primary_user", ""}:
-                # Note: 'primary_user' is default in tests/mocks, let it pass if subject matches or is generic
-                pass
+                return False
 
-            # Target property
-            tp = s.get("target_property")
-            if tp:
-                tp_lower = str(tp).lower()
-                matched_tp = any(tp_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "object_anchor", "semantic_role", "text", "subject"])
-                if not matched_tp:
-                    return False
+            # Target property - loosen literal check, rely on semantic retrieval for concepts, but enforce if specified
+            # The planner might output abstractions, so we shouldn't strictly fail if it's not a literal substring.
+            # But the user said: "Use planner description/property to retrieve. Use canonical durable fields to authorize."
+            # The gaps created by QRF have specific required fields.
+            # For now, we loosen target_entities and target_property so they don't cause false negatives.
+            # We trust the semantic retrieval, and enforce `required_fields`, subject, and `option_label`.
             
-            # Target entities
-            entities = s.get("target_entities") or []
-            for entity in entities:
-                ent_lower = str(entity).lower()
-                matched_ent = any(ent_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "object_anchor", "semantic_role", "text", "subject", "planning_tags"])
-                if not matched_ent:
-                    return False
+            # Target entities - loosen
+            # tp = s.get("target_property")
+            # entities = s.get("target_entities") or []
                     
             # Required fields
             req_fields = s.get("required_fields") or []
@@ -112,10 +106,15 @@ class ExecutionMixin:
             # Option label support
             opt_label = s.get("option_label")
             if opt_label:
-                # Require that the memory at least mentions the option label or is semantically linked
-                # In a real system, we'd check text. For MedMemoryBench, ensure it's not randomly assigned.
-                # A basic check: memory string representation contains the label or it's a generic pass if too rigid.
-                pass # P1B.1 is not strictly checking option value mapping inside memory yet, but we enforce it exists.
+                # Option label must be supported by the memory text or value
+                opt_lower = str(opt_label).lower()
+                matched_opt = any(opt_lower in str(m.get(k, "")).lower() for k in ["value", "state", "claim", "text"])
+                if not matched_opt:
+                    return False
+                    
+            # Distinct comparison sides check. Just ensure it doesn't fail based on fake entities.
+            if s.get("comparison_side_label"):
+                pass
 
             return True
 
@@ -1041,17 +1040,25 @@ class ExecutionMixin:
                 planner_called = True
         elif getattr(self, "enable_unified_controller", False):
             from methods.smart_mem0.p1b_execution import _evaluate_seed_gate, EvidenceLattice
-            from methods.smart_mem0.p1b_planning import _gap_planner
+            from methods.smart_mem0.p1b_planning import _gap_planner, _build_qrf
             
-            is_accepted, fast_supports, reason = _evaluate_seed_gate(self, question, frame, planned_seed_set)
+            qrf = _build_qrf(self, question, frame)
+            self._qrf_telemetry = qrf
             
+            is_accepted, fast_supports, reason = _evaluate_seed_gate(self, qrf, planned_seed_set, frame)
+            
+            import os
+            git_sha = os.popen('git rev-parse HEAD').read().strip() if os.path.exists('.git') else "unknown"
             self._seed_gate_telemetry = {
                 "attempted": True,
                 "eligible": True,
                 "accepted": is_accepted,
                 "selected_memory_id": fast_supports[0]["id"] if fast_supports else None,
                 "reason": reason,
-                "conflict": (reason == "CONFLICTING_CANDIDATES")
+                "conflict": (reason == "CONFLICTING_CANDIDATES"),
+                "runtime_git_sha": git_sha,
+                "seed_gate_input": question,
+                "qrf": qrf
             }
             
             self._evidence_lattice = EvidenceLattice()
@@ -1093,8 +1100,15 @@ class ExecutionMixin:
                             # We should generate a generic gap.
                             from methods.smart_mem0.p1b_execution import EvidenceGap
                             fallback_gap = EvidenceGap(id="g_fallback", role="GENERIC_EVIDENCE", required=True)
+                            fallback_gap.qrf_operator = qrf.get("operator", "DIRECT")
                             self._evidence_lattice.add_gap(fallback_gap)
                             plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
+                            compiled_ops = []
+                            for slot in plan["required_slots"]:
+                                op_schema = self._make_deterministic_recovery_plan(slot, question)
+                                if op_schema:
+                                    compiled_ops.extend(op_schema)
+                            plan["operations"] = compiled_ops
                             plan["valid"] = True
                             
                 else:
@@ -1103,6 +1117,15 @@ class ExecutionMixin:
                         self._evidence_lattice.add_gap(gap)
                     
                     plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
+                    
+                    # Compile operations immediately to avoid pseudo-replan
+                    compiled_ops = []
+                    for slot in plan["required_slots"]:
+                        op_schema = self._make_deterministic_recovery_plan(slot, question)
+                        if op_schema:
+                            compiled_ops.extend(op_schema)
+                    plan["operations"] = compiled_ops
+                    
                     plan["need_evidence"] = True
                     plan["budget_tier"] = "SMALL" if len(evidence_gaps) <= 1 else "MEDIUM"
                     plan["max_memories"] = max(3, len(evidence_gaps) + 2)  # At least 1 per gap + bounded context

@@ -109,6 +109,8 @@ class EvidenceLattice:
             # Map deterministic QRF operators to execution primitives
             if qrf_op == "STATE":
                 slot_type = "CURRENT_STATE"
+            elif gap.role == "OPTION_SUPPORT":
+                slot_type = "DIRECT" # Option support must remain an evidence contract, not a temporal filter
             elif gap.temporal_axis or gap.temporal_relation:
                 slot_type = "TEMPORAL"
             elif gap.role == "CAUSAL_BRIDGE":
@@ -130,6 +132,7 @@ class EvidenceLattice:
                 "target_property": gap.target_property,
                 "required_fields": gap.required_fields,
                 "temporal_relation": gap.temporal_relation, # preserve for legacy compat
+                "comparison_side_label": getattr(gap, "comparison_side_label", None)
             }
             if gap.role == "PRIOR_TRAJECTORY":
                 slot["history"] = True
@@ -137,26 +140,19 @@ class EvidenceLattice:
         return slots
 
 
-def _evaluate_seed_gate(agent, question: str, frame: Any, seeds: List[Dict[str, Any]]) -> Tuple[bool, Optional[List[Dict[str, Any]]], str]:
+def _evaluate_seed_gate(agent, qrf: Dict[str, Any], seeds: List[Dict[str, Any]], frame: Any) -> Tuple[bool, Optional[List[Dict[str, Any]]], str]:
     if not seeds:
         return False, None, "NO_SEEDS"
 
-    # Whitelist approach: only allow simple lookup without structured reasoning keywords
-    import re
-    q_lower = question.lower()
-    reject_keywords = [
-        "why", "because", "compare", "vs", "versus", "option", "choice", 
-        "recommend", "should", "cause", "lead to", "result in", "between",
-        "difference", "explain", "reason"
-    ]
-    for k in reject_keywords:
-        # Match as whole word/phrase boundaries
-        if re.search(r'' + re.escape(k) + r'', q_lower):
-            return False, None, "STRUCTURED_REASONING_REQUIRED"
-    
-    if hasattr(frame, "options") and frame.options:
-         return False, None, "MULTI_OPTION_REQUIRED"
-
+    # Only DIRECT or STATE without inference can bypass the planner.
+    # QRF contains structural parsing.
+    op = qrf.get("operator", "DIRECT")
+    if op not in {"DIRECT", "STATE"}:
+        return False, None, f"{op}_REQUIRED"
+        
+    if qrf.get("requires_inference", False):
+        return False, None, "INFERENCE_REQUIRED"
+        
     top_seed = seeds[0]
     
     # Check for conflicts. If seeds[1] has same rank/score but different state value.

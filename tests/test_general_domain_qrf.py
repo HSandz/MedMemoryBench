@@ -75,7 +75,8 @@ class TestGeneralSeedGate(unittest.TestCase):
             {"id": "m1", "semantic_role": "state", "object_anchor": "project_alpha", "state": "blocked", "subject": "u1"},
             {"id": "m2", "semantic_role": "state", "object_anchor": "project_alpha", "state": "completed", "subject": "u1"}
         ]
-        is_accepted, _, reason = _evaluate_seed_gate(MockAgent(), "status?", MockFrame(), seeds)
+        qrf = {"operator": "DIRECT", "requires_inference": False}
+        is_accepted, _, reason = _evaluate_seed_gate(MockAgent(), qrf, seeds, MockFrame())
         self.assertEqual(reason, "CONFLICTING_CANDIDATES")
 
     def test_seed_gate_no_conflict_empty_anchor(self):
@@ -89,7 +90,8 @@ class TestGeneralSeedGate(unittest.TestCase):
             {"id": "m1", "semantic_role": "observation", "object_anchor": "", "value": "high", "subject": "u1"},
             {"id": "m2", "semantic_role": "observation", "object_anchor": "", "value": "low", "subject": "u1"}
         ]
-        is_accepted, _, reason = _evaluate_seed_gate(MockAgent(), "status?", MockFrame(), seeds)
+        qrf = {"operator": "DIRECT", "requires_inference": False}
+        is_accepted, _, reason = _evaluate_seed_gate(MockAgent(), qrf, seeds, MockFrame())
         self.assertTrue(is_accepted)
         self.assertEqual(reason, "DIRECT_SEED_SUFFICIENT")
 

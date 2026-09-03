@@ -31,7 +31,7 @@ REQUIRED JSON OUTPUT FORMAT:
             "target_entities": ["project alpha", "blockers"],
             "target_property": "status",
             "temporal_axis": "event_time",
-            "temporal_relation": "MATCH",
+            "temporal_relation": "EXACT",
             "temporal_anchor": "2024-01-20",
             "option_label": "A"
         }
@@ -64,7 +64,8 @@ def _build_qrf(agent, question: str, frame: Any) -> Dict[str, Any]:
         "temporal_relation": "",
         "temporal_anchor": "",
         "comparison_sides": [],
-        "visible_options": []
+        "visible_options": [],
+        "required_fields": []
     }
     
     # 1. Visible options
@@ -92,10 +93,24 @@ def _build_qrf(agent, question: str, frame: Any) -> Dict[str, Any]:
             qrf["temporal_relation"] = "EARLIEST"
         elif "recent" in q:
             qrf["temporal_relation"] = "LATEST"
-    # 4. Current/latest versioned property
+            
+        if qrf["temporal_axis"]:
+            qrf["required_fields"].append(qrf["temporal_axis"])
+            
+    # 4. Causal
+    elif "why" in q or "cause" in q or "lead to" in q or "result in" in q:
+        qrf["operator"] = "CAUSAL"
+    # 5. Decision
+    elif "should i" in q or "recommend" in q or "choice" in q:
+        qrf["operator"] = "DECISION"
+    # 6. Current/latest versioned property
     elif "current" in q or "latest" in q or "now" in q or "present" in q:
         qrf["operator"] = "STATE"
         qrf["answer_slot"] = "VALUE"
+        
+    # Check for required inference
+    if "suggest" in q or "imply" in q or "reason" in q or "explain" in q:
+        qrf["requires_inference"] = True
         
     return qrf
 
@@ -207,6 +222,8 @@ def _gap_planner(
             temporal_anchor=temp_anchor,
             option_label=opt_label
         )
+        if qrf.get("required_fields"):
+            gap.required_fields = qrf["required_fields"]
         # Store description via generic property for adapter
         gap.description = str(g.get("description", ""))
         
@@ -248,8 +265,9 @@ def _gap_planner(
             )
             gap.qrf_operator = qrf["operator"]
             gap.description = f"Evidence required to evaluate comparison {side_labels[i]}"
-            # Ensure properties are distinct by injecting them into target_entities/description
-            gap.target_entities = [side_labels[i]]
+            # Comparison sides are contextual. Planner should define distinct entities.
+            # But if it fails, we fall back to generic metadata
+            gap.comparison_side_label = side_labels[i]
             evidence_gaps.append(gap)
             sides.append(gap)
         
