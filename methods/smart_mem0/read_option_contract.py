@@ -1,0 +1,110 @@
+"""Multiple-choice retrieval invariants for the two-stage read path.
+
+Visible options are probes into one shared participant-evidence bundle. They are
+never required memory facts and their probe ordering must survive support
+packing; otherwise a broad stem such as "current condition" can replace useful
+option-specific candidates with topical noise.
+"""
+
+from typing import Any, Dict, List
+
+from .contracts import QueryFrame
+
+
+class ReadOptionContractMixin:
+    def _semantic_operation_search(self, query, top_k, strategy, frame=None, option_queries=None):
+        strategy = str(strategy or "FOCAL").upper()
+        if strategy != "SHARED_OPTIONS":
+            return super()._semantic_operation_search(
+                query, top_k, strategy, frame=frame, option_queries=option_queries
+            )
+
+        frame = frame or QueryFrame()
+        eligible_ids = {
+            memory["id"]
+            for memory in self._memories
+            if self._memory_satisfies_frame(
+                memory, frame, include_entities=bool(frame.hard_entities)
+            )
+            and self._query_visible_memory(memory)
+        }
+        if not eligible_ids:
+            self._last_option_probe_coverage = {
+                str(item.get("label") if isinstance(item, dict) else index): []
+                for index, item in enumerate(option_queries or [])
+            }
+            return []
+
+        base = self._hybrid_search(
+            query,
+            top_k=min(max(int(top_k) * 3, 12), len(eligible_ids)),
+            candidate_ids=eligible_ids,
+        )
+        representatives: List[Dict[str, Any]] = []
+        option_hits: List[Dict[str, Any]] = []
+        representative_ids = set()
+        coverage: Dict[str, List[str]] = {}
+
+        for index, item in enumerate(option_queries or []):
+            if isinstance(item, dict):
+                label = str(item.get("label") or index)
+                option_text = str(item.get("query") or item.get("text") or "").strip()
+            else:
+                label, option_text = str(index), str(item or "").strip()
+            if not option_text:
+                coverage[label] = []
+                continue
+
+            # Probe the proposition itself. A broad stem prefix causes different
+            # options to collapse onto the same generic memories.
+            hits = self._hybrid_search(
+                option_text,
+                top_k=min(4, len(eligible_ids)),
+                candidate_ids=eligible_ids,
+            )
+            coverage[label] = [memory["id"] for memory in hits[:3]]
+            option_hits.extend(hits)
+            representative = next(
+                (memory for memory in hits if memory["id"] not in representative_ids),
+                None,
+            )
+            if representative is not None:
+                representatives.append(representative)
+                representative_ids.add(representative["id"])
+
+        self._last_option_probe_coverage = coverage
+
+        # Preserve one distinct representative per option before the shared
+        # stem and redundant option hits. Do not sort by "number of options
+        # matched": generic noise often matches many probes and would be
+        # promoted by that heuristic.
+        selected: List[Dict[str, Any]] = []
+        selected_ids = set()
+        for memory in (*representatives, *base, *option_hits):
+            if memory["id"] in selected_ids:
+                continue
+            selected.append(self._snapshot(memory))
+            selected_ids.add(memory["id"])
+            if len(selected) >= int(top_k):
+                break
+        return selected
+
+    def _operation_slot_support(self, slot, result, relations):
+        role = str(slot.get("evidence_role") or "").upper()
+        if role != "OPTION_CONTEXT":
+            return super()._operation_slot_support(slot, result, relations)
+        if not result:
+            return []
+
+        # Preserve the SHARED_OPTIONS operation order. Re-ranking by a broad
+        # target such as "current condition" would undo per-option diversity.
+        ordered = []
+        seen = set()
+        for memory in result:
+            if memory["id"] in seen or not self._rc_owner_match(slot, memory):
+                continue
+            if not self._rc_option_probe_labels_for_memory(memory["id"]):
+                continue
+            ordered.append(memory)
+            seen.add(memory["id"])
+        return ordered[:6]
