@@ -8,7 +8,7 @@ from .read_controller import VALID_ROLES
 class ReadPlanContractMixin:
     # ---------- plan normalization ----------
     def _rc_gap(self,gid,role,d,description,**kw):
-        gap=EvidenceGap(id=gid,role=role,required=True,subject_id=d.get("subject_id") or "primary_user",target_entities=list(kw.pop("target_entities",None) or d.get("target_entities") or []),target_property=str(kw.pop("target_property","") or ""),temporal_axis=str(kw.pop("temporal_axis","") or ""),temporal_relation=str(kw.pop("temporal_relation","") or ""),temporal_anchor=str(kw.pop("temporal_anchor","") or ""),temporal_end=str(kw.pop("temporal_end","") or ""),comparison_side_label=str(kw.pop("comparison_side_label","") or "")); gap.qrf_operator=d["operator"]; gap.description=description; gap.required_fields=[gap.temporal_axis] if gap.temporal_axis else []; return gap
+        gap=EvidenceGap(id=gid,role=role,required=True,subject_id=d.get("subject_id") or "",target_entities=list(kw.pop("target_entities",None) or d.get("target_entities") or []),target_property=str(kw.pop("target_property","") or ""),temporal_axis=str(kw.pop("temporal_axis","") or ""),temporal_relation=str(kw.pop("temporal_relation","") or ""),temporal_anchor=str(kw.pop("temporal_anchor","") or ""),temporal_end=str(kw.pop("temporal_end","") or ""),comparison_side_label=str(kw.pop("comparison_side_label","") or "")); gap.qrf_operator=d["operator"]; gap.description=description; gap.required_fields=[gap.temporal_axis] if gap.temporal_axis else []; return gap
 
     def _controller_gaps(self,d,question,frame):
         op=d["operator"]; req=d.get("requirements") or []
