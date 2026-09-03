@@ -31,26 +31,39 @@ class ReadPlanContractMixin:
         return next((req for req in requirements if req.get("role") == role), None)
 
     def _rc_gap_from_req(self, decision, req, fallback_id, frame=None):
+        role = str(req.get("role") or "GENERIC_EVIDENCE")
         temporal = decision.get("temporal") or {}
         target_surface = req.get("target") or decision.get("target") or ""
-        local_dates = []
-        if target_surface:
-            try:
-                local_dates = list((self._query_frame(target_surface).dates or ()))
-            except Exception:
-                local_dates = []
-        frame_dates = list((getattr(frame, "dates", ()) or ())) if frame is not None else []
-        axis = req.get("temporal_axis") or temporal.get("axis") or ""
-        relation = req.get("temporal_relation") or temporal.get("relation") or ""
-        anchor = req.get("temporal_anchor") or temporal.get("anchor") or ""
-        end = req.get("temporal_end") or temporal.get("end") or ""
-        if not anchor and len(local_dates) == 1:
-            axis, relation, anchor = axis or "event_time", relation or "EXACT", local_dates[0]
-        elif not anchor and len(frame_dates) == 1 and decision["operator"] not in {"TEMPORAL", "COMPARISON"}:
-            axis, relation, anchor = axis or "event_time", relation or "EXACT", frame_dates[0]
+        explicit_axis = req.get("temporal_axis") or ""
+        explicit_relation = req.get("temporal_relation") or ""
+        explicit_anchor = req.get("temporal_anchor") or ""
+        explicit_end = req.get("temporal_end") or ""
+
+        # A focal date scopes the state/event being discussed, but a
+        # PRIOR_TRAJECTORY gap intentionally reaches outside that date. Only an
+        # explicitly requirement-scoped temporal selector may constrain it.
+        if role == "PRIOR_TRAJECTORY":
+            axis, relation, anchor, end = explicit_axis, explicit_relation, explicit_anchor, explicit_end
+        else:
+            axis = explicit_axis or temporal.get("axis") or ""
+            relation = explicit_relation or temporal.get("relation") or ""
+            anchor = explicit_anchor or temporal.get("anchor") or ""
+            end = explicit_end or temporal.get("end") or ""
+            local_dates = []
+            if target_surface:
+                try:
+                    local_dates = list((self._query_frame(target_surface).dates or ()))
+                except Exception:
+                    local_dates = []
+            frame_dates = list((getattr(frame, "dates", ()) or ())) if frame is not None else []
+            if not anchor and len(local_dates) == 1:
+                axis, relation, anchor = axis or "event_time", relation or "EXACT", local_dates[0]
+            elif not anchor and len(frame_dates) == 1 and decision["operator"] not in {"TEMPORAL", "COMPARISON"}:
+                axis, relation, anchor = axis or "event_time", relation or "EXACT", frame_dates[0]
+
         return self._rc_gap(
             str(req.get("id") or fallback_id),
-            str(req.get("role") or "GENERIC_EVIDENCE"),
+            role,
             decision,
             target_surface=target_surface,
             side_label=req.get("side") or "",
@@ -117,9 +130,6 @@ class ReadPlanContractMixin:
             return [self._rc_gap_from_req(decision, req, f"g_{i}", frame=frame) for i, req in enumerate(chosen)]
 
         if operator == "MULTI_HOP":
-            # MULTI_HOP may only express requirements the controller actually
-            # decomposed. Never invent a trajectory to make an atomic fallback
-            # look complex.
             chosen = requirements[:4]
             if len(chosen) < 2:
                 chosen = chosen or [{"id": "r1", "role": "ANSWER", "target": decision.get("target") or ""}]
@@ -131,8 +141,6 @@ class ReadPlanContractMixin:
     def _controller_plan(self, decision, question, frame):
         lattice = EvidenceLattice()
         gaps = self._controller_gaps(decision, question, frame)
-        # A model-labelled MULTI_HOP without two independent requirements is an
-        # atomic retrieval plan, not permission to synthesize fake hops.
         effective_operator = decision["operator"]
         if effective_operator == "MULTI_HOP" and len(gaps) < 2:
             effective_operator = "DIRECT"
