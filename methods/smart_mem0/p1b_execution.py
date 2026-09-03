@@ -127,10 +127,12 @@ class EvidenceLattice:
             }
             slot_type = role_to_type.get(gap.role, "DIRECT")
             qrf_op = getattr(gap, "qrf_operator", "DIRECT")
-            if qrf_op == "STATE":
-                slot_type = "CURRENT_STATE"
-            elif gap.temporal_axis or gap.temporal_relation:
+            # A historical/date-scoped state is not the current head. Temporal
+            # constraints therefore take precedence over STATE resolution.
+            if gap.temporal_axis or gap.temporal_relation:
                 slot_type = "TEMPORAL"
+            elif qrf_op == "STATE":
+                slot_type = "CURRENT_STATE"
             elif gap.role == "CAUSAL_BRIDGE":
                 slot_type = "CAUSE_PATH"
 
