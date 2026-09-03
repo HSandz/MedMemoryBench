@@ -173,6 +173,15 @@ def _evaluate_seed_gate(
         return False, None, "NO_SEEDS"
 
     op = qrf.get("operator", "DIRECT")
+
+    # Query-local validation policy. Complex evidence bundles get the existing
+    # semantic slot-support check; direct/state/temporal paths remain purely
+    # deterministic to preserve the fast path and latency budget.
+    agent.enable_slot_support_validation = bool(
+        op in {"DECISION", "MULTI_OPTION", "CAUSAL", "COMPARISON"}
+        or qrf.get("requires_inference", False)
+    )
+
     if op != "DIRECT":
         return False, None, f"{op}_REQUIRED"
 
