@@ -436,18 +436,37 @@ class RetrievalOperationsMixin:
             ),
         )
         focal_candidates = [focal[0]] if focal else []
-        if not lineages:
-            # Event/FACT memories may not have a state lineage. Keep a small
-            # semantic fallback in that case without displacing the anchor.
-            focal_candidates.extend(focal[1:3])
-        if lineages:
-            # Once a state lineage is identified, unrelated dated focal hits
-            # are not valid candidates for the same temporal question. Keep
-            # reranking inside the selected family; otherwise they re-enter
-            # through the ranked-fill path below.
-            pool_memories = family
-        else:
+        if not lineages and anchor:
+            # Event/FACT memories may not have a state lineage, but we MUST resolve
+            # the temporal family. Group by semantic_role and object_anchor if present.
+            role = anchor.get("semantic_role")
+            obj_anch = anchor.get("object_anchor")
+            subj = anchor.get("subject")
+            if role and (obj_anch or role != "observation"):
+                family = [
+                    m for m in self._memories 
+                    if m.get("semantic_role") == role 
+                    and m.get("object_anchor") == obj_anch
+                    and m.get("subject") == subj
+                ]
+                family_sorted = sorted(
+                    family,
+                    key=lambda memory: (
+                        self._recency_date(memory),
+                        memory.get("document_time", ""),
+                        memory["id"],
+                    ),
+                )
+                pool_memories = family
+                # We consider this a discovered lineage for extrema bounds
+                lineages = {"event_family"}
+            else:
+                focal_candidates.extend(focal[1:3])
+                pool_memories = focal
+        elif not lineages:
             pool_memories = focal
+        else:
+            pool_memories = family
         pool = {
             memory["id"]: memory for memory in (*focal_candidates, *pool_memories)
         }
@@ -462,16 +481,20 @@ class RetrievalOperationsMixin:
         # one endpoint merely because the opposite endpoint ranked higher.
         family_endpoints: List[Dict[str, Any]] = []
         for lineage in sorted(lineages):
-            versions = [
-                memory
-                for memory in family_sorted
-                if state_identity(memory) == lineage
-            ]
-            family_endpoints.extend((*versions[:2], *versions[-2:]))
+            if lineage == "event_family":
+                versions = family_sorted
+            else:
+                versions = [
+                    memory
+                    for memory in family_sorted
+                    if state_identity(memory) == lineage
+                ]
+            if versions:
+                family_endpoints.extend((*versions[:2], *versions[-2:]))
         for memory in (*focal_candidates, *family_endpoints, *ranked):
             if memory["id"] not in {item["id"] for item in selected}:
                 selected.append(self._snapshot(memory))
-            if len(selected) >= 8:
+            if len(selected) >= 16:  # P1B.1.3c: Provide larger candidate set for extrema
                 break
         return selected
 

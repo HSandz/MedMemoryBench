@@ -9,7 +9,7 @@ class RouteDecision:
     content_terms: list = None
     answer_slot: str = "VALUE"  # VALUE, DATE
     temporal_axis: str = "event_time"  # event_time, document_time
-    temporal_relation: str = "MATCH"  # EARLIEST, LATEST, MATCH
+    temporal_relation: str = "EXACT"  # EARLIEST, LATEST, MATCH
     temporal_anchor: str = ""
     temporal_precision: str = ""  # YEAR, MONTH, DAY
     temporal_year: Optional[int] = None
@@ -112,7 +112,7 @@ class DeterministicRouter:
             axis = "document_time" if self.RE_DOC_TIME.search(question) else "event_time"
             slot = "DATE" if temporal_date else "VALUE"
             
-            relation = "MATCH"
+            relation = "EXACT"
             if self.RE_EARLIEST.search(question):
                 relation = "EARLIEST"
             elif self.RE_LATEST_TEMP.search(question):

@@ -1291,22 +1291,14 @@ class PlanningMixin:
             "option_coverage": option_coverage,
         }, ""
 
-    def _make_deterministic_recovery_plan(
+    def _compile_gap_operations(
         self,
-        missing_slots: List[Dict[str, Any]],
+        slots: List[Dict[str, Any]],
         question: str,
-        existing_plan: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """Build a typed recovery plan without another LLM call.
-
-        Recovery preserves the missing slot's semantics. A generic semantic
-        search is appropriate for direct/option/comparison evidence, but it
-        cannot replace temporal filtering, state resolution, or causal walks.
-
-        Returns a valid plan dict, or None when nothing useful can be generated.
-        """
-        if not missing_slots:
-            return None
+        budget_tier: str = "MEDIUM",
+    ) -> List[Dict[str, Any]]:
+        if not slots:
+            return []
 
         # Extract keywords from the question stem (strip option choices).
         stem = self._question_stem(question)
@@ -1318,110 +1310,110 @@ class PlanningMixin:
         )
 
         operations = []
-        budget = existing_plan.get("budget_tier", "LARGE")
+        budget = budget_tier
         if budget == "SMALL" and any(
             str(slot.get("type") or "").upper() == "TEMPORAL"
             and str(slot.get("temporal_relation") or "").upper()
             in {"EARLIEST", "LATEST"}
-            for slot in missing_slots
+            for slot in slots
         ):
             budget = "MEDIUM"
         max_operations = RETRIEVAL_BUDGETS.get(budget, {}).get("max_operations", 4)
-        for slot in missing_slots:
+        for slot in slots:
             slot_id = slot.get("id", f"recovery_{len(operations)}")
             description = str(slot.get("description") or slot_id)
             query = f"{description} {stem_tokens}".strip()
             slot_type = str(slot.get("type") or "DIRECT").upper()
-            if slot_type == "TEMPORAL":
-                relation = str(slot.get("temporal_relation") or "EXACT").upper()
-                if relation in {"EARLIEST", "LATEST"}:
-                    # Anchor discovery and chronology are separate phases. The
-                    # executor knows that the first operation cannot satisfy a
-                    # temporal extremum by itself.
-                    operations.append(
-                        {
-                            "op": "LOCATE_ANCHOR",
-                            "query": query,
-                            "produces": [slot_id],
-                        }
-                    )
-                    if len(operations) < max_operations:
-                        operations.append(
-                            {
-                                "op": "TEMPORAL_FILTER",
-                                "relation": relation,
-                                "axis": str(
-                                    slot.get("time_axis") or "event_time"
-                                ).lower(),
-                                "fallback_axis": "",
-                                "candidate_refs": [f"${len(operations) - 1}"],
-                                "query": query,
-                                "produces": [slot_id],
-                            }
-                        )
-                else:
-                    operations.append(
-                        {
-                            "op": "TEMPORAL_FILTER",
-                            "relation": relation,
-                            "axis": str(slot.get("time_axis") or "event_time").lower(),
-                            "fallback_axis": "",
-                            "query": query,
-                            "produces": [slot_id],
-                        }
-                    )
-            elif slot_type == "CURRENT_STATE":
-                operations.append(
-                    {"op": "RESOLVE_STATE", "query": query, "produces": [slot_id]}
-                )
-            elif slot_type == "CAUSE_PATH":
-                anchor_index = len(operations)
+            
+            # P1B.1.3c: If we already tried temporal extremum and it failed, doing it again
+            # deterministically will just fail again. We should downgrade to broad semantic search
+            # to recover the episode/archive.
+            if slot.get("_failed_temporal_filter"):
                 operations.append(
                     {
                         "op": "SEMANTIC_SEARCH",
                         "query": query,
-                        "top_k": 3,
+                        "top_k": 8,
                         "produces": [slot_id],
                     }
                 )
-                if len(operations) < max_operations:
+                continue
+                
+            if slot_type == "TEMPORAL":
+                relation = str(slot.get("temporal_relation") or "EXACT").upper()
+                if relation in {"EARLIEST", "LATEST"}:
+                    axis = str(slot.get("fallback_axis") or slot.get("axis") or "event_time").lower()
+                    operations.extend(
+                        [
+                            {
+                                "op": "LOCATE_ANCHOR",
+                                "query": query,
+                                "produces": [slot_id],
+                            },
+                            {
+                                "op": "TEMPORAL_FILTER",
+                                "query": "event",
+                                "relation": relation,
+                                "axis": axis,
+                                "candidate_refs": [f"${len(operations)}"],
+                                "produces": [slot_id],
+                            },
+                        ]
+                    )
+                else:
                     operations.append(
                         {
-                            "op": "FOLLOW_CAUSES",
-                            "start": [f"${anchor_index}"],
-                            "direction": "OUT",
-                            "depth": 3,
-                            "goal": description,
+                            "op": "SEMANTIC_SEARCH",
+                            "query": query,
+                            "top_k": 8,
                             "produces": [slot_id],
                         }
                     )
-            else:
-                # Recovery must preserve the planner's shared-option contract.
-                # A normal FOCAL search can return the first remembered rule and
-                # starve the answer model of the participant facts needed to
-                # evaluate the remaining choices. This is still one bounded
-                # operation, not one search per option.
-                strategy = "SHARED_OPTIONS" if visible_options else "FOCAL"
-                recovery_query = " ".join(
-                    part for part in (query, option_text) if part
-                )
-                operation = {
-                    "op": "SEMANTIC_SEARCH",
-                    "query": recovery_query,
-                    "top_k": 8 if visible_options else 5,
-                    "strategy": strategy,
-                    "produces": [slot_id],
-                }
-                if visible_options:
-                    operation["option_queries"] = list(visible_options.values())
+            elif slot_type == "CAUSAL":
                 operations.append(
-                    operation
+                    {
+                        "op": "CAUSAL_PATH",
+                        "query": query,
+                        "top_k": 8,
+                        "produces": [slot_id],
+                    }
+                )
+            elif slot_type == "DECISION":
+                operations.append(
+                    {
+                        "op": "LOCATE_ANCHOR",
+                        "query": query,
+                        "produces": [slot_id],
+                    }
+                )
+            else:
+                operations.append(
+                    {
+                        "op": "SEMANTIC_SEARCH",
+                        "query": query,
+                        "top_k": 8,
+                        "produces": [slot_id],
+                    }
                 )
             if len(operations) >= max_operations:
                 break
+        return operations
 
-        if not operations:
+    def _make_deterministic_recovery_plan(
+        self,
+        missing_slots: List[Dict[str, Any]],
+        question: str,
+        existing_plan: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Build a typed recovery plan without another LLM call."""
+        if not missing_slots:
             return None
+        budget = existing_plan.get("budget_tier", "MEDIUM")
+        operations = self._compile_gap_operations(
+            missing_slots,
+            question,
+            budget,
+        )
 
         max_memories = RETRIEVAL_BUDGETS.get(budget, {}).get("max_memories", 8)
         return {

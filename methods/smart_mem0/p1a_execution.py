@@ -88,7 +88,7 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
                 return None
         elif decision.temporal_relation == "LATEST":
             selected = max(dated_pool, key=temp_key)
-        elif decision.temporal_relation == "MATCH":
+        elif decision.temporal_relation == "EXACT":
             if decision.temporal_anchor:
                 matched = []
                 for m in dated_pool:
@@ -109,12 +109,12 @@ def _prepare_p1a_query(agent, routing_question: str, answer_question: str, subje
                     matched.append(m)
                 
                 if not matched:
-                    telemetry_out["fallback_reason"] = "TEMPORAL_NO_MATCH_FOR_ANCHOR"
+                    telemetry_out["fallback_reason"] = "TEMPORAL_NO_EXACT_FOR_ANCHOR"
                     return None
                 selected = min(matched, key=temp_key)
             else:
                 # Unanchored MATCH fails HARD for now until focal-event relevance is implemented
-                telemetry_out["fallback_reason"] = "TEMPORAL_MATCH_AMBIGUOUS"
+                telemetry_out["fallback_reason"] = "TEMPORAL_EXACT_AMBIGUOUS"
                 return None
         else:
             telemetry_out["fallback_reason"] = "ROUTE_UNKNOWN"

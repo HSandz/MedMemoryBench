@@ -831,6 +831,11 @@ class ExecutionMixin:
                     for candidate in plan["required_slots"]
                     if candidate["id"] == slot_id
                 )
+                
+                # P1B.1.3c: LOCATE_ANCHOR cannot set TEMPORAL slot coverage.
+                if bounded_operation["op"] == "LOCATE_ANCHOR":
+                    continue
+                    
                 if bounded_operation["op"] == "TEMPORAL_FILTER":
                     # The fallback axis is part of the operation contract. Keep
                     # it attached to the typed slot so structural coverage uses

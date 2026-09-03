@@ -144,10 +144,12 @@ def _evaluate_seed_gate(agent, qrf: Dict[str, Any], seeds: List[Dict[str, Any]],
     if not seeds:
         return False, None, "NO_SEEDS"
 
-    # Only DIRECT or STATE without inference can bypass the planner.
+    # Only DIRECT without inference can bypass the planner.
     # QRF contains structural parsing.
     op = qrf.get("operator", "DIRECT")
-    if op not in {"DIRECT", "STATE"}:
+    
+    # P1B.1.3c: Do not treat STATE as one-seed DIRECT. Must go to typed execution.
+    if op not in {"DIRECT"}:
         return False, None, f"{op}_REQUIRED"
         
     if qrf.get("requires_inference", False):
