@@ -130,9 +130,6 @@ def _build_qrf(agent, question: str, frame: Any) -> Dict[str, Any]:
         qrf["operator"] = "CAUSAL"
 
     else:
-        # Interrogative temporal "when" can appear after a leading record/date
-        # clause. Subordinate forms such as "when I stand up, should I..." are
-        # intentionally excluded because they are not temporal questions.
         interrogative_when = bool(
             re.search(r"\bwhen\s+(?:did|does|do|was|were|is|are|will)\b", q)
         )
@@ -186,7 +183,6 @@ def _build_qrf(agent, question: str, frame: Any) -> Dict[str, Any]:
             elif "recent" in q and not dates:
                 qrf["temporal_relation"] = "LATEST"
 
-            # Explicit dates are deterministic query constraints, not planner facts.
             if dates:
                 qrf["temporal_anchor"] = dates[0]
                 if len(dates) > 1:
@@ -294,7 +290,6 @@ def _ensure_structural_gaps(
             gap.description = (
                 f"Evidence supporting or refuting option {label}: {proposition}"
             )
-            # Query-time proposition contract. This is ephemeral and never durable.
             gap.target_property = str(proposition)
             if not gap.target_entities:
                 gap.target_entities = entities
@@ -339,6 +334,59 @@ def _ensure_structural_gaps(
             rebuilt.append(gap)
         return rebuilt
 
+    if operator == "CAUSAL":
+        by_role = {gap.role: gap for gap in evidence_gaps}
+        required_roles = (
+            ("FOCAL_TRIGGER", "g_trigger", "Trigger/exposure relevant to"),
+            ("CAUSAL_BRIDGE", "g_bridge", "Stored causal bridge relevant to"),
+            ("OUTCOME", "g_outcome", "Outcome/state relevant to"),
+        )
+        rebuilt = []
+        for role, gap_id, prefix in required_roles:
+            gap = by_role.get(role)
+            if gap is None:
+                gap = _make_gap(
+                    gap_id=gap_id,
+                    role=role,
+                    frame=frame,
+                    qrf=qrf,
+                    description=f"{prefix}: {question}",
+                    target_entities=entities,
+                )
+            gap.role = role
+            gap.required = True
+            gap.qrf_operator = operator
+            if not gap.target_entities:
+                gap.target_entities = entities
+            rebuilt.append(gap)
+        return rebuilt
+
+    if operator == "DECISION" or qrf.get("requires_inference"):
+        by_role = {gap.role: gap for gap in evidence_gaps}
+        required_roles = (
+            ("FOCAL_TRIGGER", "g_focal", "Current focal evidence for decision/inference"),
+            ("PRIOR_TRAJECTORY", "g_history", "Relevant prior trajectory or constraint for"),
+        )
+        rebuilt = []
+        for role, gap_id, prefix in required_roles:
+            gap = by_role.get(role)
+            if gap is None:
+                gap = _make_gap(
+                    gap_id=gap_id,
+                    role=role,
+                    frame=frame,
+                    qrf=qrf,
+                    description=f"{prefix}: {question}",
+                    target_entities=entities,
+                )
+            gap.role = role
+            gap.required = True
+            gap.qrf_operator = operator
+            if not gap.target_entities:
+                gap.target_entities = entities
+            rebuilt.append(gap)
+        return rebuilt
+
     if evidence_gaps:
         return evidence_gaps[:4]
 
@@ -368,54 +416,6 @@ def _ensure_structural_gaps(
                 temporal_anchor=qrf["temporal_anchor"],
                 temporal_end=qrf["temporal_end"],
             )
-        ]
-
-    if operator == "CAUSAL":
-        return [
-            _make_gap(
-                gap_id="g_trigger",
-                role="FOCAL_TRIGGER",
-                frame=frame,
-                qrf=qrf,
-                description=f"Trigger/exposure relevant to: {question}",
-                target_entities=entities,
-            ),
-            _make_gap(
-                gap_id="g_bridge",
-                role="CAUSAL_BRIDGE",
-                frame=frame,
-                qrf=qrf,
-                description=f"Stored causal bridge relevant to: {question}",
-                target_entities=entities,
-            ),
-            _make_gap(
-                gap_id="g_outcome",
-                role="OUTCOME",
-                frame=frame,
-                qrf=qrf,
-                description=f"Outcome/state relevant to: {question}",
-                target_entities=entities,
-            ),
-        ]
-
-    if operator == "DECISION" or qrf.get("requires_inference"):
-        return [
-            _make_gap(
-                gap_id="g_focal",
-                role="FOCAL_TRIGGER",
-                frame=frame,
-                qrf=qrf,
-                description=f"Current focal evidence for decision/inference: {question}",
-                target_entities=entities,
-            ),
-            _make_gap(
-                gap_id="g_history",
-                role="PRIOR_TRAJECTORY",
-                frame=frame,
-                qrf=qrf,
-                description=f"Relevant prior trajectory or constraint for: {question}",
-                target_entities=entities,
-            ),
         ]
 
     return evidence_gaps
