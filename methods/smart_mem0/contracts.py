@@ -252,10 +252,12 @@ CLINICAL_SCOPES = frozenset(
 )
 
 # Planner chooses a coarse workload class; the executor owns the exact limits.
-# This avoids free-form numeric budgets drifting toward the prompt example.
+# MEDIUM permits four one-step gap operations so a four-option query cannot be
+# silently truncated after evaluating only two options. Multi-step temporal or
+# causal paths are still bounded by their explicit operation sequences.
 RETRIEVAL_BUDGETS = {
     "SMALL": {"max_memories": 3, "max_operations": 1},
-    "MEDIUM": {"max_memories": 5, "max_operations": 2},
+    "MEDIUM": {"max_memories": 5, "max_operations": 4},
     "LARGE": {"max_memories": 8, "max_operations": 4},
 }
 
