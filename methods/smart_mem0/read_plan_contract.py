@@ -30,28 +30,41 @@ class ReadPlanContractMixin:
     def _rc_req_by_role(requirements, role):
         return next((req for req in requirements if req.get("role") == role), None)
 
-    def _rc_gap_from_req(self, decision, req, fallback_id):
+    def _rc_gap_from_req(self, decision, req, fallback_id, frame=None):
         temporal = decision.get("temporal") or {}
+        target_surface = req.get("target") or decision.get("target") or ""
+        local_dates = []
+        if target_surface:
+            try:
+                local_dates = list((self._query_frame(target_surface).dates or ()))
+            except Exception:
+                local_dates = []
+        frame_dates = list((getattr(frame, "dates", ()) or ())) if frame is not None else []
+        axis = req.get("temporal_axis") or temporal.get("axis") or ""
+        relation = req.get("temporal_relation") or temporal.get("relation") or ""
+        anchor = req.get("temporal_anchor") or temporal.get("anchor") or ""
+        end = req.get("temporal_end") or temporal.get("end") or ""
+        if not anchor and len(local_dates) == 1:
+            axis, relation, anchor = axis or "event_time", relation or "EXACT", local_dates[0]
+        elif not anchor and len(frame_dates) == 1 and decision["operator"] not in {"TEMPORAL", "COMPARISON"}:
+            axis, relation, anchor = axis or "event_time", relation or "EXACT", frame_dates[0]
         return self._rc_gap(
             str(req.get("id") or fallback_id),
             str(req.get("role") or "GENERIC_EVIDENCE"),
             decision,
-            target_surface=req.get("target") or decision.get("target") or "",
+            target_surface=target_surface,
             side_label=req.get("side") or "",
-            temporal_axis=req.get("temporal_axis") or (temporal.get("axis") if decision["operator"] == "TEMPORAL" else "") or "",
-            temporal_relation=req.get("temporal_relation") or (temporal.get("relation") if decision["operator"] == "TEMPORAL" else "") or "",
-            temporal_anchor=req.get("temporal_anchor") or (temporal.get("anchor") if decision["operator"] == "TEMPORAL" else "") or "",
-            temporal_end=req.get("temporal_end") or (temporal.get("end") if decision["operator"] == "TEMPORAL" else "") or "",
+            temporal_axis=axis,
+            temporal_relation=relation,
+            temporal_anchor=anchor,
+            temporal_end=end,
         )
 
     def _controller_gaps(self, decision, question, frame):
-        del frame
         operator = decision["operator"]
         requirements = decision.get("requirements") or []
 
         if operator == "MULTI_OPTION":
-            # Options are probes, never required gaps. Drop any controller
-            # requirement that is merely one visible option proposition.
             option_texts = {self._rc_text(text) for text in (decision.get("visible_options") or {}).values() if str(text).strip()}
             shared_roles = {"FOCAL_STATE", "PRIOR_TRAJECTORY", "ACTION_RULE", "CONSTRAINT", "OPTION_CONTEXT", "GENERIC_EVIDENCE"}
             shared = []
@@ -65,11 +78,11 @@ class ReadPlanContractMixin:
             shared = shared[:3]
             if not shared:
                 shared = [{"id": "r_options", "role": "OPTION_CONTEXT", "target": decision.get("target") or ""}]
-            return [self._rc_gap_from_req(decision, req, f"g_option_ctx_{i}") for i, req in enumerate(shared)]
+            return [self._rc_gap_from_req(decision, req, f"g_option_ctx_{i}", frame=frame) for i, req in enumerate(shared)]
 
         if operator == "TEMPORAL":
             req = requirements[0] if requirements else {"id": "r_temporal", "role": "GENERIC_EVIDENCE", "target": decision.get("target") or ""}
-            gap = self._rc_gap_from_req(decision, req, "g_temporal")
+            gap = self._rc_gap_from_req(decision, req, "g_temporal", frame=frame)
             if not gap.temporal_relation:
                 gap.temporal_relation = decision["temporal"].get("relation") or "LOCATE"
             if not gap.temporal_axis:
@@ -81,9 +94,8 @@ class ReadPlanContractMixin:
             gaps = []
             for i, side in enumerate(("LEFT", "RIGHT")):
                 req = requirements[i] if i < len(requirements) else {"id": f"r_{side.lower()}", "role": "COMPARAND", "side": side, "target": decision.get("target") or ""}
-                gap = self._rc_gap_from_req(decision, req, f"g_{side.lower()}")
-                gap.role = "COMPARAND"
-                gap.side_label = side
+                gap = self._rc_gap_from_req(decision, req, f"g_{side.lower()}", frame=frame)
+                gap.role, gap.side_label = "COMPARAND", side
                 gaps.append(gap)
             return gaps
 
@@ -92,7 +104,7 @@ class ReadPlanContractMixin:
             gaps = []
             for i, role in enumerate(roles):
                 req = self._rc_req_by_role(requirements, role) or {"id": f"r_{i}", "role": role, "target": decision.get("target") or ""}
-                gaps.append(self._rc_gap_from_req(decision, req, f"g_{i}"))
+                gaps.append(self._rc_gap_from_req(decision, req, f"g_{i}", frame=frame))
             return gaps
 
         if operator == "DECISION":
@@ -102,30 +114,38 @@ class ReadPlanContractMixin:
                     {"id": "r_focal", "role": "FOCAL_STATE", "target": decision.get("target") or ""},
                     {"id": "r_constraint", "role": "CONSTRAINT", "target": decision.get("target") or ""},
                 ]
-            return [self._rc_gap_from_req(decision, req, f"g_{i}") for i, req in enumerate(chosen)]
+            return [self._rc_gap_from_req(decision, req, f"g_{i}", frame=frame) for i, req in enumerate(chosen)]
 
         if operator == "MULTI_HOP":
+            # MULTI_HOP may only express requirements the controller actually
+            # decomposed. Never invent a trajectory to make an atomic fallback
+            # look complex.
             chosen = requirements[:4]
-            if not chosen:
-                chosen = [
-                    {"id": "r1", "role": "GENERIC_EVIDENCE", "target": decision.get("target") or ""},
-                    {"id": "r2", "role": "PRIOR_TRAJECTORY", "target": decision.get("target") or ""},
-                ]
-            elif len(chosen) == 1:
-                chosen.append({"id": "r2", "role": "PRIOR_TRAJECTORY", "target": decision.get("target") or chosen[0].get("target") or ""})
-            return [self._rc_gap_from_req(decision, req, f"g_{i}") for i, req in enumerate(chosen)]
+            if len(chosen) < 2:
+                chosen = chosen or [{"id": "r1", "role": "ANSWER", "target": decision.get("target") or ""}]
+            return [self._rc_gap_from_req(decision, req, f"g_{i}", frame=frame) for i, req in enumerate(chosen)]
 
         req = requirements[0] if requirements else {"id": "r1", "role": "GENERIC_EVIDENCE" if operator == "STATE" else "ANSWER", "target": decision.get("target") or ""}
-        return [self._rc_gap_from_req(decision, req, "g_state" if operator == "STATE" else "g_direct")]
+        return [self._rc_gap_from_req(decision, req, "g_state" if operator == "STATE" else "g_direct", frame=frame)]
 
     def _controller_plan(self, decision, question, frame):
         lattice = EvidenceLattice()
         gaps = self._controller_gaps(decision, question, frame)
+        # A model-labelled MULTI_HOP without two independent requirements is an
+        # atomic retrieval plan, not permission to synthesize fake hops.
+        effective_operator = decision["operator"]
+        if effective_operator == "MULTI_HOP" and len(gaps) < 2:
+            effective_operator = "DIRECT"
+            decision = dict(decision)
+            decision["operator"] = "DIRECT"
+            decision["requires_inference"] = False
+            for gap in gaps:
+                gap.qrf_operator = "DIRECT"
         for gap in gaps:
             lattice.add_gap(gap)
         self._evidence_lattice = lattice
         slots = lattice.to_legacy_slots()
-        tier = "LARGE" if decision["operator"] in {"MULTI_OPTION", "CAUSAL", "MULTI_HOP"} or len(slots) >= 3 else ("MEDIUM" if decision["operator"] in {"DECISION", "COMPARISON"} or len(slots) >= 2 else "SMALL")
+        tier = "LARGE" if effective_operator in {"MULTI_OPTION", "CAUSAL", "MULTI_HOP"} or len(slots) >= 3 else ("MEDIUM" if effective_operator in {"DECISION", "COMPARISON"} or len(slots) >= 2 else "SMALL")
         top_target = decision.get("target") or ""
         plan = {
             "query_spec": {
@@ -139,7 +159,7 @@ class ReadPlanContractMixin:
                 "temporal": dict(decision["temporal"]),
                 "causal_mode": decision.get("causal_mode") or "",
             },
-            "query_mode": decision["operator"],
+            "query_mode": effective_operator,
             "required_slots": slots,
             "seed_coverage": [],
             "operations": [],
