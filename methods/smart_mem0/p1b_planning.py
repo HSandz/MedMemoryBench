@@ -49,10 +49,17 @@ OPTION RULES:
 If the supplied seed evidence already completely answers the question, output an empty list for evidence_gaps.
 """
 
-def _build_qrf(question: str, frame: Any) -> Dict[str, Any]:
+def _build_qrf(agent, question: str, frame: Any) -> Dict[str, Any]:
     q = question.lower()
+    
+    # Use agent's deterministic option parser
+    options = {}
+    if hasattr(agent, "_question_options"):
+        options = agent._question_options(question)
+        
     qrf = {
         "operator": "DIRECT",
+        "answer_slot": "TEXT",
         "temporal_axis": "",
         "temporal_relation": "",
         "temporal_anchor": "",
@@ -60,19 +67,35 @@ def _build_qrf(question: str, frame: Any) -> Dict[str, Any]:
         "visible_options": []
     }
     
-    if hasattr(frame, "options") and frame.options:
+    # 1. Visible options
+    if options:
         qrf["operator"] = "MULTI_OPTION"
-        qrf["visible_options"] = list(frame.options.keys())
-    elif "compare" in q or "vs" in q or "versus" in q or "difference" in q or "compared with" in q:
+        qrf["answer_slot"] = "OPTION_SET"
+        qrf["visible_options"] = list(options.keys())
+    # 2. Explicit comparison
+    elif "compare" in q or "vs " in q or "versus" in q or "difference" in q or "compared with" in q:
         qrf["operator"] = "COMPARISON"
-        # simple heuristic for side A / side B could go here if needed
+        qrf["comparison_sides"] = ["left_side", "right_side"]
+        qrf["answer_slot"] = "VALUE"
+    # 3. DATE requested
+    elif "when" in q or "what date" in q or "what year" in q:
+        qrf["operator"] = "TEMPORAL"
+        qrf["answer_slot"] = "DATE"
+        if "document" in q or "record" in q or "note" in q or "file" in q:
+            qrf["temporal_axis"] = "document_time"
+        else:
+            qrf["temporal_axis"] = "event_time"
+        
+        if "latest" in q or "most recent" in q or "last" in q:
+            qrf["temporal_relation"] = "LATEST"
+        elif "first" in q or "earliest" in q:
+            qrf["temporal_relation"] = "EARLIEST"
+        elif "recent" in q:
+            qrf["temporal_relation"] = "LATEST"
+    # 4. Current/latest versioned property
     elif "current" in q or "latest" in q or "now" in q or "present" in q:
         qrf["operator"] = "STATE"
-    
-    if "document" in q or "record" in q or "note" in q or "file" in q:
-        qrf["temporal_axis"] = "document_time"
-    elif "when" in q or "date" in q or "year" in q or "time" in q:
-        qrf["temporal_axis"] = "event_time"
+        qrf["answer_slot"] = "VALUE"
         
     return qrf
 
@@ -82,7 +105,7 @@ def _gap_planner(
     seeds: List[Dict[str, Any]],
     frame: Any
 ) -> Tuple[List[EvidenceGap], Dict[str, Any]]:
-    qrf = _build_qrf(question, frame)
+    qrf = _build_qrf(agent, question, frame)
     
     # Format the seeds as compact representation
     compact_seeds = []
@@ -149,10 +172,21 @@ def _gap_planner(
         # nor can it drop a required QRF axis.
         if qrf["temporal_axis"]:
             temp_axis = qrf["temporal_axis"]
+            
+        temp_relation = str(g.get("temporal_relation", ""))
+        temp_anchor = str(g.get("temporal_anchor", ""))
+        
+        if qrf["operator"] == "TEMPORAL":
+            if qrf["temporal_relation"]:
+                temp_relation = qrf["temporal_relation"]
+            if qrf["temporal_anchor"]:
+                temp_anchor = qrf["temporal_anchor"]
         
         # If the operator is STATE, force STATE temporal semantics
         if qrf["operator"] == "STATE":
             temp_axis = "" # State spine handles this
+            temp_relation = ""
+            temp_anchor = ""
 
         # Visible options deterministic parsing
         opt_label = str(g.get("option_label", ""))
@@ -169,8 +203,8 @@ def _gap_planner(
             target_entities=g.get("target_entities", []),
             target_property=g.get("target_property", ""),
             temporal_axis=temp_axis,
-            temporal_relation=str(g.get("temporal_relation", "")),
-            temporal_anchor=str(g.get("temporal_anchor", "")),
+            temporal_relation=temp_relation,
+            temporal_anchor=temp_anchor,
             option_label=opt_label
         )
         # Store description via generic property for adapter
@@ -201,8 +235,11 @@ def _gap_planner(
     # Ensure comparisons have at least two sides
     if qrf["operator"] == "COMPARISON":
         sides = [g for g in evidence_gaps if g.role == "COMPARISON_SIDE"]
-        while len(sides) < 2 and len(evidence_gaps) < 4:
-            gid = f"g_comp_{len(sides)}"
+        side_labels = ["left_side", "right_side"]
+        for i in range(len(sides), 2):
+            if len(evidence_gaps) >= 4:
+                break
+            gid = f"g_comp_{i}"
             gap = EvidenceGap(
                 id=gid,
                 role="COMPARISON_SIDE",
@@ -210,7 +247,9 @@ def _gap_planner(
                 subject_id=getattr(frame, "speaker_role", "primary_user")
             )
             gap.qrf_operator = qrf["operator"]
-            gap.description = f"Evidence required to evaluate comparison side"
+            gap.description = f"Evidence required to evaluate comparison {side_labels[i]}"
+            # Ensure properties are distinct by injecting them into target_entities/description
+            gap.target_entities = [side_labels[i]]
             evidence_gaps.append(gap)
             sides.append(gap)
         

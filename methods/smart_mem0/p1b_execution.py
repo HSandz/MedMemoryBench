@@ -163,19 +163,28 @@ def _evaluate_seed_gate(agent, question: str, frame: Any, seeds: List[Dict[str, 
     if len(seeds) > 1:
         s2 = seeds[1]
         # Strict conflict check: only if canonical identities actually match but values contradict.
-        # Empty object anchors CANNOT cause conflicts.
+        
+        def _state_id(m): 
+            return (m.get("subject"), m.get("scope"), m.get("state_key"))
+            
+        def _mem_val(m):
+            if hasattr(agent, "_memory_value"):
+                return agent._memory_value(m)
+            return m.get("value") or m.get("state")
+            
+        id1 = _state_id(top_seed)
+        id2 = _state_id(s2)
+        
+        # 1. Stateful canonical identity conflict
+        if id1 == id2 and id1[2]: # state_key must not be empty
+            if _mem_val(top_seed) != _mem_val(s2):
+                return False, None, "CONFLICTING_CANDIDATES"
+                
+        # 2. Non-state canonical identity conflict (predicate identity)
         role1 = top_seed.get("semantic_role")
         obj1 = top_seed.get("object_anchor")
-        state1 = top_seed.get("state_key")
-        
-        if role1 and obj1 and role1 == s2.get("semantic_role") and obj1 == s2.get("object_anchor"):
-            val1 = top_seed.get("value") or top_seed.get("state")
-            val2 = s2.get("value") or s2.get("state")
-            if val1 and val2 and val1 != val2:
-                return False, None, "CONFLICTING_CANDIDATES"
-        # Or if state_identities explicitly match
-        elif state1 and state1 == s2.get("state_key"):
-            if top_seed.get("state") != s2.get("state"):
+        if not id1[2] and role1 and obj1 and role1 == s2.get("semantic_role") and obj1 == s2.get("object_anchor") and top_seed.get("subject") == s2.get("subject"):
+            if _mem_val(top_seed) != _mem_val(s2):
                 return False, None, "CONFLICTING_CANDIDATES"
 
     # Reuse existing deterministic structural validation
