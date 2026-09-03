@@ -40,7 +40,7 @@ REQUIRED JSON OUTPUT FORMAT:
 
 TEMPORAL SCHEMA RULES:
 - `temporal_axis` MUST ONLY BE ONE OF: "event_time", "document_time", "effective_event_time", or "". Do NOT output ranges or prose here.
-- `temporal_relation` MUST BE: "MATCH", "BEFORE", "AFTER", "BETWEEN", or "".
+- `temporal_relation` MUST BE: "EXACT", "EARLIEST", "LATEST", "BEFORE", "AFTER", "BETWEEN", or "".
 - `temporal_anchor` should contain the actual date/range string (e.g., "2024-01-20" or "recent").
 
 OPTION RULES:

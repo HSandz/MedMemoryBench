@@ -679,7 +679,12 @@ class RetrievalOperationsMixin:
                     for item in relevant
                     if item.get("assertion_mode", "DIRECT") != "RECAP"
                 ]
-                pool = direct_relevant if direct_relevant else relevant
+                if relation == "EARLIEST":
+                    pool = direct_relevant
+                    if not pool:
+                        return []
+                else:
+                    pool = direct_relevant if direct_relevant else relevant
             pool.sort(
                 key=lambda memory: operation_date(memory) or "9999-99-99",
                 reverse=relation == "LATEST",

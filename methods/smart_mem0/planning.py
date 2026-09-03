@@ -1341,8 +1341,10 @@ class PlanningMixin:
                 
             if slot_type == "TEMPORAL":
                 relation = str(slot.get("temporal_relation") or "EXACT").upper()
+                axis = str(slot.get("time_axis") or "event_time").lower()
+                fallback_axis = str(slot.get("fallback_axis") or "").lower()
+                
                 if relation in {"EARLIEST", "LATEST"}:
-                    axis = str(slot.get("fallback_axis") or slot.get("axis") or "event_time").lower()
                     operations.extend(
                         [
                             {
@@ -1355,36 +1357,47 @@ class PlanningMixin:
                                 "query": "event",
                                 "relation": relation,
                                 "axis": axis,
+                                "fallback_axis": fallback_axis,
                                 "candidate_refs": [f"${len(operations)}"],
                                 "produces": [slot_id],
                             },
                         ]
                     )
                 else:
+                    # EXACT / BEFORE / AFTER / BETWEEN
                     operations.append(
                         {
-                            "op": "SEMANTIC_SEARCH",
+                            "op": "TEMPORAL_FILTER",
                             "query": query,
-                            "top_k": 8,
+                            "relation": relation,
+                            "axis": axis,
+                            "fallback_axis": fallback_axis,
                             "produces": [slot_id],
                         }
                     )
-            elif slot_type == "CAUSAL":
+            elif slot_type == "CURRENT_STATE":
                 operations.append(
                     {
-                        "op": "CAUSAL_PATH",
+                        "op": "RESOLVE_STATE",
                         "query": query,
-                        "top_k": 8,
                         "produces": [slot_id],
                     }
                 )
-            elif slot_type == "DECISION":
-                operations.append(
-                    {
-                        "op": "LOCATE_ANCHOR",
-                        "query": query,
-                        "produces": [slot_id],
-                    }
+            elif slot_type == "CAUSE_PATH":
+                operations.extend(
+                    [
+                        {
+                            "op": "LOCATE_ANCHOR",
+                            "query": query,
+                            "produces": [slot_id],
+                        },
+                        {
+                            "op": "FOLLOW_CAUSES",
+                            "query": "cause",
+                            "candidate_refs": [f"${len(operations)}"],
+                            "produces": [slot_id],
+                        },
+                    ]
                 )
             else:
                 operations.append(

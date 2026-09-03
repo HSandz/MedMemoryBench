@@ -1108,12 +1108,13 @@ class ExecutionMixin:
                             fallback_gap.qrf_operator = qrf.get("operator", "DIRECT")
                             self._evidence_lattice.add_gap(fallback_gap)
                             plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
-                            compiled_ops = []
-                            for slot in plan["required_slots"]:
-                                op_schema = self._make_deterministic_recovery_plan(slot, question)
-                                if op_schema:
-                                    compiled_ops.extend(op_schema)
-                            plan["operations"] = compiled_ops
+                            plan["budget_tier"] = "SMALL" if len(plan["required_slots"]) <= 1 else "MEDIUM"
+                            plan["max_memories"] = max(3, len(plan["required_slots"]) + 2)
+                            plan["operations"] = self._compile_gap_operations(
+                                plan["required_slots"],
+                                question,
+                                plan["budget_tier"],
+                            )
                             plan["valid"] = True
                             
                 else:
@@ -1123,17 +1124,16 @@ class ExecutionMixin:
                     
                     plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
                     
-                    # Compile operations immediately to avoid pseudo-replan
-                    compiled_ops = []
-                    for slot in plan["required_slots"]:
-                        op_schema = self._make_deterministic_recovery_plan(slot, question)
-                        if op_schema:
-                            compiled_ops.extend(op_schema)
-                    plan["operations"] = compiled_ops
-                    
                     plan["need_evidence"] = True
                     plan["budget_tier"] = "SMALL" if len(evidence_gaps) <= 1 else "MEDIUM"
                     plan["max_memories"] = max(3, len(evidence_gaps) + 2)  # At least 1 per gap + bounded context
+                    
+                    # Compile operations immediately to avoid pseudo-replan
+                    plan["operations"] = self._compile_gap_operations(
+                        plan["required_slots"],
+                        question,
+                        plan["budget_tier"],
+                    )
                     
             controller = {
                 "called": False,
