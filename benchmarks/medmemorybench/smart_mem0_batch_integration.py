@@ -1,8 +1,9 @@
-"""MedMemoryBench batch integration for prepared-query local answers.
+"""MedMemoryBench batch integration for SmartMem0 prepared-query answers.
 
 SmartMem0 can finish an atomic query during local preparation. Vertex batch must
 not submit an unused second generation for such a prepared query. This helper
-patches only evaluator transport/accounting; metric semantics remain unchanged.
+patches only SmartMem0 evaluator transport/accounting; every other method
+continues through the evaluator's original implementation unchanged.
 """
 
 from datetime import datetime
@@ -40,12 +41,30 @@ def _method_llm_usage(evaluator) -> Dict[str, Any]:
     }
 
 
+def _evaluation_llm_usage(global_usage: Dict[str, Any], method_usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose benchmark-side calls without pretending they belong to SmartMem0."""
+    query_usage = global_usage.get("query_phase") or {}
+    global_calls = int(query_usage.get("call_count", 0) or 0)
+    method_calls = int(method_usage.get("total_calls", 0) or 0)
+    return {
+        "call_count": max(0, global_calls - method_calls),
+        "includes_judges_and_other_benchmark_query_calls": True,
+        "derived_from_global_query_usage": True,
+    }
+
+
 def install_smart_mem0_batch_integration(evaluator_cls) -> None:
-    """Install resume-safe local-finalization and method-only usage reporting."""
+    """Install resume-safe SmartMem0 local-finalization and usage reporting."""
     if getattr(evaluator_cls, "_smart_mem0_batch_integration_installed", False):
         return
 
+    original_evaluate_batch_queries = evaluator_cls._evaluate_batch_queries
+    original_generate_report = evaluator_cls._generate_report
+
     def _evaluate_batch_queries(self, unit, memory_time_per_query):
+        if str(self.method_config.method_name) != "smart_mem0":
+            return original_evaluate_batch_queries(self, unit, memory_time_per_query)
+
         prepared_by_id = {}
         local_precomputed = set()
         requests: List[BatchChatRequest] = []
@@ -157,10 +176,14 @@ def install_smart_mem0_batch_integration(evaluator_cls) -> None:
         return results
 
     def _generate_report(self, start_time, end_time, duration):
+        if str(self.method_config.method_name) != "smart_mem0":
+            return original_generate_report(self, start_time, end_time, duration)
+
         summary = self.aggregator.get_summary()
         memory_build_summary = self._summarize_memory_builds()
         llm_usage = get_usage_tracker().get_stats()
         method_llm_usage = _method_llm_usage(self)
+        evaluation_llm_usage = _evaluation_llm_usage(llm_usage, method_llm_usage)
 
         report = EvaluationReport(
             method_name=self.method_config.method_name,
@@ -183,8 +206,10 @@ def install_smart_mem0_batch_integration(evaluator_cls) -> None:
                 "memory_build_summary": memory_build_summary,
                 # Global usage intentionally includes evaluator/judge calls.
                 "llm_usage": llm_usage,
-                # This field is the SmartMem0 method budget only.
+                # SmartMem0's semantic-generation budget only.
                 "method_llm_usage": method_llm_usage,
+                # Benchmark-side calls, derived from global minus method calls.
+                "evaluation_llm_usage": evaluation_llm_usage,
             },
         )
 
