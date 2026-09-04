@@ -8,6 +8,7 @@ month wildcards without changing the write schema.
 import re
 
 from .contracts import MONTH_NUMBERS, QueryFrame, VALID_TEMPORAL_AXES
+from .core import CoreMemoryMixin
 
 
 class ReadTemporalContractMixin:
@@ -29,8 +30,6 @@ class ReadTemporalContractMixin:
     def _rc_bare_months(cls, text):
         occupied = []
         source = str(text or "")
-        # Do not duplicate month names that are already part of an explicit
-        # Month DD[, YYYY] or Month YYYY expression handled by the base parser.
         explicit = re.compile(
             r"\b(?:" + "|".join(MONTH_NUMBERS) + r")\s+(?:\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{4})\b",
             re.IGNORECASE,
@@ -62,14 +61,16 @@ class ReadTemporalContractMixin:
 
     @staticmethod
     def _date_matches(date, constraint):
-        parsed = str(date or "")
         wanted = str(constraint or "")
+        parsed = CoreMemoryMixin._parse_date(str(date or ""))
+        if not parsed:
+            return False
         if re.fullmatch(r"\*-(?:0[1-9]|1[0-2])", wanted):
             return len(parsed) >= 7 and parsed[4:7] == wanted[1:]
         if re.fullmatch(r"\*-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])", wanted):
             return len(parsed) >= 10 and parsed[4:10] == wanted[1:]
-        # Keep the base exact/prefix semantics for ISO constraints.
-        return parsed == wanted or parsed.startswith(wanted)
+        normalized = CoreMemoryMixin._parse_date(wanted)
+        return bool(normalized and (parsed == normalized or parsed.startswith(normalized)))
 
     def _rc_gap_from_req(self, decision, req, fallback_id, frame=None):
         gap = super()._rc_gap_from_req(decision, req, fallback_id, frame=frame)
@@ -83,10 +84,6 @@ class ReadTemporalContractMixin:
             if len(months) == 1:
                 gap.temporal_anchor = months[0]
                 gap.temporal_relation = "EXACT"
-                # Unqualified "in March" may refer to an event or a documented
-                # state. effective_event_time is the existing read-time axis
-                # designed to use event time first and safely fall back to the
-                # source document date when event time is unavailable.
                 gap.temporal_axis = gap.temporal_axis or "effective_event_time"
 
         if gap.temporal_anchor and not gap.temporal_axis:
