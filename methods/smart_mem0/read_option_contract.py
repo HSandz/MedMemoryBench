@@ -29,6 +29,8 @@ class ReadOptionContractMixin:
             and self._query_visible_memory(memory)
         }
         if not eligible_ids:
+            # The probe was still executed for every visible option. Empty lists
+            # mean no personal-memory candidate, not an unprobed/false option.
             self._last_option_probe_coverage = {
                 str(item.get("label") if isinstance(item, dict) else index): []
                 for index, item in enumerate(option_queries or [])
@@ -88,6 +90,21 @@ class ReadOptionContractMixin:
             if len(selected) >= int(top_k):
                 break
         return selected
+
+    def _slot_covered(self, slot, support_ids, selected, relations):
+        role = str(slot.get("evidence_role") or "").upper()
+        if role != "OPTION_CONTEXT":
+            return super()._slot_covered(slot, support_ids, selected, relations)
+
+        # OPTION_CONTEXT proves exploration completeness, not proposition truth.
+        # Every visible label must have been probed; any individual probe may
+        # legitimately return an empty list without making the query incomplete.
+        expected = {str(label) for label in (slot.get("option_labels") or [])}
+        probed = {
+            str(label)
+            for label in (getattr(self, "_last_option_probe_coverage", {}) or {})
+        }
+        return bool(expected) and expected.issubset(probed)
 
     def _operation_slot_support(self, slot, result, relations):
         role = str(slot.get("evidence_role") or "").upper()
