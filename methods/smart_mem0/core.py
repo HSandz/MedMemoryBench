@@ -8,7 +8,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from utils.llm_client import create_llm_client
 
-from .canonicalization import StateSpine, canonicalize_state, state_identity, is_state_projection_eligible
+from .canonicalization import (
+    StateSpine,
+    canonicalize_state,
+    state_identity,
+    is_state_projection_eligible,
+)
 from .contracts import (
     GENERIC_OBJECT_ANCHORS,
     GENERIC_STATE_KEYS,
@@ -33,7 +38,6 @@ try:
     from sklearn.metrics.pairwise import cosine_similarity
 except ImportError as exc:
     raise ImportError(f"[SmartMem0] Missing dependency: {exc}")
-
 
 
 class CoreMemoryMixin:
@@ -97,9 +101,6 @@ class CoreMemoryMixin:
             )
         )
         self.enable_planner = bool(kwargs.get("enable_planner", True))
-        self.enable_unified_controller = bool(
-            kwargs.get("enable_unified_controller", True)
-        )
         self.enable_replan = bool(kwargs.get("enable_replan", False))
         self.enable_zero_result_recovery = bool(
             kwargs.get("enable_zero_result_recovery", True)
@@ -153,7 +154,7 @@ class CoreMemoryMixin:
         self._relations: List[Dict[str, Any]] = []
         self._capsules: List[Dict[str, Any]] = []
         self._belief_status: Dict[str, str] = {}
-        
+
         # Exactness Channel Postings
         self._entity_postings: Dict[str, set] = {}
         self._value_postings: Dict[str, set] = {}
@@ -163,7 +164,9 @@ class CoreMemoryMixin:
         self._predicate_postings: Dict[str, set] = {}
         self._state_heads: Dict[str, List[str]] = {}
         self._profile_pack: Dict[str, Any] = {}
-        self._memory_seq = self._evidence_seq = self._session_seq = self._capsule_seq = 0
+        self._memory_seq = self._evidence_seq = self._session_seq = (
+            self._capsule_seq
+        ) = 0
         self._loaded_frozen = False
         self._bm25 = None
         self._embedding_matrix = None
@@ -283,9 +286,10 @@ class CoreMemoryMixin:
         episode = {}
         try:
             import json
-            for line in raw.split('\n'):
+
+            for line in raw.split("\n"):
                 if '"abstraction"' in line:
-                    episode["abstraction"] = line.split(':', 1)[1].strip('," ') 
+                    episode["abstraction"] = line.split(":", 1)[1].strip('," ')
         except:
             pass
         valid_items = sum(item is not None for item in (*memories, *links))
@@ -303,7 +307,6 @@ class CoreMemoryMixin:
         return {
             "enable_memory_write": self.enable_memory_write,
             "enable_planner": self.enable_planner,
-            "enable_unified_controller": self.enable_unified_controller,
             "enable_slot_support_validation": self.enable_slot_support_validation,
             "enable_replan": self.enable_replan,
             "enable_zero_result_recovery": self.enable_zero_result_recovery,
@@ -538,6 +541,7 @@ class CoreMemoryMixin:
     @staticmethod
     def _memory_value(memory: Dict[str, Any]) -> str:
         import re
+
         return re.sub(
             r"\s+",
             " ",
@@ -743,12 +747,15 @@ class CoreMemoryMixin:
         )[0]
         marker = re.search(r"(?is)answer the following question\s*:\s*", body)
         body = body[marker.end() :].strip() if marker else body
-        
+
         # Remove MedMemoryBench MCD wrapper prefix
-        mcd_marker = re.search(r"(?is)based on the relevant information from the memory store, carefully review.*?multiple visits:\s*", body)
+        mcd_marker = re.search(
+            r"(?is)based on the relevant information from the memory store, carefully review.*?multiple visits:\s*",
+            body,
+        )
         if mcd_marker:
             body = body[mcd_marker.end() :].strip()
-            
+
         return body
 
     @staticmethod
@@ -851,7 +858,7 @@ class CoreMemoryMixin:
         subject_class = str(item.get("subject_class") or "PRIMARY_USER").strip().upper()
         if subject_class not in VALID_SUBJECT_CLASSES:
             subject_class = "PRIMARY_USER"
-            
+
         return {
             "claim": claim,
             "kind": kind,
@@ -940,12 +947,14 @@ class CoreMemoryMixin:
         for turn in turns:
             # Maintain backward-compatible ID format for evidence internally
             evidence_id = f"ev_{session_idx}_{turn.get('local_turn_idx', turn.get('turn_idx', 0))}"
-            
+
             evidence = {
                 "id": evidence_id,
                 "session_idx": session_idx,
                 "turn_idx": turn.get("local_turn_idx", turn.get("turn_idx", 0)),
-                "speaker": turn.get("speaker_name", turn.get("speaker", "unknown")).lower(),
+                "speaker": turn.get(
+                    "speaker_name", turn.get("speaker", "unknown")
+                ).lower(),
                 "raw_text": turn.get("text", turn.get("raw_text", "")),
                 "document_time": document_time,
                 # Store full canonical provenance metadata
@@ -958,8 +967,8 @@ class CoreMemoryMixin:
                     "text": turn.get("text"),
                     "image_caption": turn.get("image_caption"),
                     "timestamp": turn.get("timestamp"),
-                    "local_turn_idx": turn.get("local_turn_idx")
-                }
+                    "local_turn_idx": turn.get("local_turn_idx"),
+                },
             }
             staged.append(evidence)
             mapping[evidence["turn_idx"]] = evidence_id
@@ -1005,7 +1014,7 @@ class CoreMemoryMixin:
 
     def _rebuild_belief_view(self):
         """Build the State Spine view and inverted exactness indexes from the atomic ledger."""
-        if hasattr(self, '_rebuild_relations_and_status'):
+        if hasattr(self, "_rebuild_relations_and_status"):
             self._rebuild_relations_and_status()
         self._entity_postings.clear()
         self._value_postings.clear()
@@ -1013,49 +1022,50 @@ class CoreMemoryMixin:
         self._object_postings.clear()
         self._unit_postings.clear()
         self._predicate_postings.clear()
-        
+
         if not hasattr(self, "_state_spine"):
             self._state_spine = {}
         self._state_spine.clear()
 
-        
         import re
+
         for memory in self._memories:
             m_id = memory["id"]
             tier = memory.get("memory_tier", "COLD")
-            
+
             sub = str(memory.get("subject_id") or "primary_user").strip().lower()
             self._subject_postings.setdefault(sub, set()).add(m_id)
-            
+
             obj = str(memory.get("object_anchor") or "").strip().lower()
             if obj:
                 self._object_postings.setdefault(obj, set()).add(m_id)
-            
+
             # Exact Indexing (HOT only for fast path)
             if tier == "HOT":
                 for ent in memory.get("entities", []):
                     self._entity_postings.setdefault(str(ent).lower(), set()).add(m_id)
-                
-                val = str(memory.get("value") or memory.get("verbatim_value") or "").strip().lower()
+
+                val = (
+                    str(memory.get("value") or memory.get("verbatim_value") or "")
+                    .strip()
+                    .lower()
+                )
                 if val:
                     self._value_postings.setdefault(val, set()).add(m_id)
-                    match = re.search(r'([a-z/%]+)$', val)
+                    match = re.search(r"([a-z/%]+)$", val)
                     if match:
                         self._unit_postings.setdefault(match.group(1), set()).add(m_id)
-                
+
                 sk = str(memory.get("state_key") or "").strip().lower()
                 if sk:
                     self._predicate_postings.setdefault(sk, set()).add(m_id)
-                
+
             if tier == "HOT" and is_state_projection_eligible(memory):
                 ident = state_identity(memory)
                 if ident:
                     if ident not in self._state_spine:
                         self._state_spine[ident] = StateSpine(ident)
                     self._state_spine[ident].add_version(memory)
-                    
-
-
 
     def _refresh_index(self) -> None:
         self._rebuild_belief_view()
@@ -1165,8 +1175,7 @@ class CoreMemoryMixin:
         """
         if include_history:
             return True
-        status = memory.get("_status", self._belief_status.get(memory.get("id"), "active"))
-        return not (
-            status == "superseded"
-            and memory.get("kind") in STATE_LIKE_KINDS
+        status = memory.get(
+            "_status", self._belief_status.get(memory.get("id"), "active")
         )
+        return not (status == "superseded" and memory.get("kind") in STATE_LIKE_KINDS)

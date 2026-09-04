@@ -69,11 +69,7 @@ class ReadOptionContractMixin:
             coverage[label] = [memory["id"] for memory in hits[:3]]
             option_hits.extend(hits)
             representative = next(
-                (
-                    memory
-                    for memory in hits
-                    if memory["id"] not in representative_ids
-                ),
+                (memory for memory in hits if memory["id"] not in representative_ids),
                 None,
             )
             if representative is not None:
@@ -116,6 +112,20 @@ class ReadOptionContractMixin:
             return False
         support = set(support_ids or [])
         return any(memory.get("id") in support for memory in selected)
+
+    def _coverage_map(self, plan, slot_support, selected, relations):
+        coverage = super()._coverage_map(plan, slot_support, selected, relations)
+        options = plan.get("visible_options") or {}
+        if not options:
+            return coverage
+        expected = {str(label) for label in options}
+        probed = {
+            str(label)
+            for label in (getattr(self, "_last_option_probe_coverage", {}) or {})
+        }
+        if not expected.issubset(probed):
+            return {slot_id: False for slot_id in coverage}
+        return coverage
 
     def _operation_slot_support(self, slot, result, relations):
         role = str(slot.get("evidence_role") or "").upper()

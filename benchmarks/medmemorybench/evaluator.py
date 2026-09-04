@@ -986,7 +986,14 @@ class MedMemoryBenchEvaluator:
         if not isinstance(timing, dict):
             return
         stages = []
-        for name in ("fast_gate", "planner", "slot_validation", "replan", "answer"):
+        for name in (
+            "controller",
+            "fast_gate",
+            "planner",
+            "slot_validation",
+            "replan",
+            "answer",
+        ):
             value = timing.get(name)
             if value is not None and float(value or 0.0) > 0:
                 stages.append(f"{name}={float(value):.2f}s")

@@ -54,9 +54,7 @@ class ExecutionMixin:
         return support
 
     @staticmethod
-    def _memory_matches_slot_role(
-        slot: Dict[str, Any], memory: Dict[str, Any]
-    ) -> bool:
+    def _memory_matches_slot_role(slot: Dict[str, Any], memory: Dict[str, Any]) -> bool:
         """Honor an explicit planner role; never infer one from the question."""
         role = str(slot.get("evidence_role") or "").upper()
         if not role:
@@ -83,7 +81,11 @@ class ExecutionMixin:
         def _proves_slot_contract(m, s):
             # Subject check
             subj = s.get("subject")
-            if subj and str(m.get("subject", "")) != str(subj) and str(subj) not in {"primary_user", ""}:
+            if (
+                subj
+                and str(m.get("subject", "")) != str(subj)
+                and str(subj) not in {"primary_user", ""}
+            ):
                 return False
 
             # Target property - loosen literal check, rely on semantic retrieval for concepts, but enforce if specified
@@ -92,22 +94,31 @@ class ExecutionMixin:
             # The gaps created by QRF have specific required fields.
             # For now, we loosen target_entities and target_property so they don't cause false negatives.
             # We trust the semantic retrieval, and enforce `required_fields`, subject, and `option_label`.
-            
+
             # Target property & entities MUST be enforced for FILLED proof
             tp = s.get("target_property")
             if tp and str(tp).strip():
                 tp_lower = str(tp).lower().strip()
-                # If target property is a long sentence (e.g. MCD wrapper leaked), we shouldn't fail everything, 
+                # If target property is a long sentence (e.g. MCD wrapper leaked), we shouldn't fail everything,
                 # but since MCD wrapper is fixed, tp should be clean.
-                matched_tp = any(tp_lower in str(m.get(k, "")).lower() for k in ["state_key", "claim", "value", "verbatim_value"])
+                matched_tp = any(
+                    tp_lower in str(m.get(k, "")).lower()
+                    for k in ["state_key", "claim", "value", "verbatim_value"]
+                )
                 if not matched_tp:
                     # check subset in claim
-                    if not any(word in str(m.get("claim", "")).lower() for word in tp_lower.split() if len(word) > 4):
+                    if not any(
+                        word in str(m.get("claim", "")).lower()
+                        for word in tp_lower.split()
+                        if len(word) > 4
+                    ):
                         return False
-            
+
             entities = s.get("target_entities") or []
             if entities:
-                mem_text = (str(m.get("claim","")) + " " + " ".join(m.get("entities", []))).lower()
+                mem_text = (
+                    str(m.get("claim", "")) + " " + " ".join(m.get("entities", []))
+                ).lower()
                 matched_ent = False
                 for e in entities:
                     if str(e).lower() in mem_text:
@@ -115,18 +126,18 @@ class ExecutionMixin:
                         break
                 if not matched_ent:
                     return False
-                    
+
             # Required fields
             req_fields = s.get("required_fields") or []
             for field in req_fields:
                 if not m.get(field):
                     return False
-            
+
             # Option label support
             # Literal A/B/C/D mapping is invalid because memories do not contain letter labels.
             # We defer proposition evaluation to the final answer phase which sees the SHARED_OPTIONS bundle.
             pass
-                    
+
             # Distinct comparison sides check. Just ensure it doesn't fail based on fake entities.
             if s.get("comparison_side_label"):
                 pass
@@ -372,20 +383,34 @@ class ExecutionMixin:
                     and self._normalised_value(source) != self._normalised_value(target)
                 ):
                     endpoint_ids.update((source["id"], target["id"]))
-            return [memory for memory in ranked if memory["id"] in endpoint_ids and self._memory_matches_slot_role(slot, memory)]
+            return [
+                memory
+                for memory in ranked
+                if memory["id"] in endpoint_ids
+                and self._memory_matches_slot_role(slot, memory)
+            ]
 
         if slot_type == "CAUSE_PATH":
             endpoint_ids = set()
             for relation in relations:
                 if self._valid_causal_relation(relation, result_by_id):
                     endpoint_ids.update((relation["source_id"], relation["target_id"]))
-            return [memory for memory in ranked if memory["id"] in endpoint_ids and self._memory_matches_slot_role(slot, memory)]
+            return [
+                memory
+                for memory in ranked
+                if memory["id"] in endpoint_ids
+                and self._memory_matches_slot_role(slot, memory)
+            ]
 
         if slot_type == "COMPARISON":
             selected, values = [], set()
             for memory in ranked:
                 value = self._normalised_value(memory)
-                if value and value not in values and self._memory_matches_slot_role(slot, memory):
+                if (
+                    value
+                    and value not in values
+                    and self._memory_matches_slot_role(slot, memory)
+                ):
                     selected.append(memory)
                     values.add(value)
                 if len(selected) >= 4:
@@ -493,16 +518,16 @@ class ExecutionMixin:
             )
             usage = self._response_usage(response, prompt)
             parsed = self._parse_json(response.content)
-            if set(parsed) - {
-                "supports",
-                "query_sufficient",
-                "uncovered_option_labels",
-            } or not isinstance(
-                parsed.get("supports"), list
-            ) or not isinstance(
-                parsed.get("query_sufficient"), bool
-            ) or not isinstance(
-                parsed.get("uncovered_option_labels"), list
+            if (
+                set(parsed)
+                - {
+                    "supports",
+                    "query_sufficient",
+                    "uncovered_option_labels",
+                }
+                or not isinstance(parsed.get("supports"), list)
+                or not isinstance(parsed.get("query_sufficient"), bool)
+                or not isinstance(parsed.get("uncovered_option_labels"), list)
             ):
                 return {slot_id: [] for slot_id in slot_by_id}, {
                     **usage,
@@ -649,10 +674,9 @@ class ExecutionMixin:
             semantic_pass = structural
             # Zero operations means no more retrieval, not that proposed seed
             # coverage is exempt from semantic validation.
-            requires_validation = (
-                getattr(self, "enable_slot_support_validation", True)
-                and self._plan_requires_semantic_validation(plan)
-            )
+            requires_validation = getattr(
+                self, "enable_slot_support_validation", True
+            ) and self._plan_requires_semantic_validation(plan)
             if structural and requires_validation:
                 validation_key = tuple(
                     sorted(
@@ -693,7 +717,10 @@ class ExecutionMixin:
                     slot_support = {
                         slot_id: list(
                             dict.fromkeys(
-                                (*confirmed_slot_support.get(slot_id, []), *validated.get(slot_id, []))
+                                (
+                                    *confirmed_slot_support.get(slot_id, []),
+                                    *validated.get(slot_id, []),
+                                )
                             )
                         )
                         for slot_id in confirmed_slot_support
@@ -846,11 +873,11 @@ class ExecutionMixin:
                     for candidate in plan["required_slots"]
                     if candidate["id"] == slot_id
                 )
-                
-                # P1B.1.3c: LOCATE_ANCHOR cannot set TEMPORAL slot coverage.
+
+                # LOCATE_ANCHOR discovers candidates but cannot cover a temporal slot.
                 if bounded_operation["op"] == "LOCATE_ANCHOR":
                     continue
-                    
+
                 if bounded_operation["op"] == "TEMPORAL_FILTER":
                     # The fallback axis is part of the operation contract. Keep
                     # it attached to the typed slot so structural coverage uses
@@ -942,46 +969,9 @@ class ExecutionMixin:
 
     @staticmethod
     def _plan_requires_semantic_validation(plan: Dict[str, Any]) -> bool:
-        """Decide whether typed coverage needs an additional semantic check.
-
-        This is deliberately contract-based, not a query-text classifier. A
-        single non-inferential slot with one bounded operation is already
-        checked by the executor's typed validators. Plans that combine roles,
-        alternatives, history, relations, or declared inference still need
-        the LLM sufficiency check because boolean structural coverage can be
-        satisfied by a merely topical memory.
-        """
-        mode = str(plan.get("query_mode") or "DIRECT").upper()
-        if mode in {"DECISION", "CAUSAL", "COMPARISON", "MULTI_OPTION"}:
-            return True
-        query_spec = plan.get("query_spec")
-        # Hand-built/legacy plans do not carry enough semantic metadata to
-        # justify skipping the check. Treat them conservatively.
-        if not isinstance(query_spec, dict):
-            return True
-        if bool(query_spec.get("requires_inference")):
-            return True
-        slots = plan.get("required_slots") or []
-        if len(slots) != 1 or len(plan.get("operations") or []) > 1:
-            return True
-        slot = slots[0]
-        if slot.get("type") in {"TRANSITION", "COMPARISON", "CAUSE_PATH"}:
-            return True
-        if slot.get("history"):
-            return True
-        return str(slot.get("evidence_role") or "ANSWER").upper() in {
-            "LONGITUDINAL_CONTEXT",
-            "ACTION_RULE",
-            "CONSTRAINT",
-            "ALTERNATIVE",
-            "CAUSE",
-            "COMPARAND",
-            "OPTION_SUPPORT",
-            "FOCAL_TRIGGER",
-            "CAUSAL_BRIDGE",
-            "COMPARISON_SIDE",
-            "OUTCOME"
-        }
+        """The minimal-IR path has no middle LLM validator."""
+        del plan
+        return False
 
     def _run_query_retrieval(
         self,
@@ -995,6 +985,7 @@ class ExecutionMixin:
     ) -> Dict[str, Any]:
         """Run one semantic route and deterministic retrieval operations."""
         query_tokens = {
+            "controller": 0,
             "fast_gate": int(gate.get("usage", {}).get("total_tokens", 0)),
             "planner": 0,
             "slot_validation": 0,
@@ -1003,6 +994,7 @@ class ExecutionMixin:
             "total": 0,
         }
         query_latency = {
+            "controller": 0.0,
             "fast_gate": round(
                 float(gate.get("usage", {}).get("latency", 0.0) or 0.0), 3
             ),
@@ -1047,129 +1039,25 @@ class ExecutionMixin:
             "usage": {},
         }
 
-        if getattr(self, "enable_legacy_semantic_controller", False) and getattr(self, "enable_unified_controller", False):
+        if getattr(self, "enable_two_stage_controller", False):
             fast_supports, routed_plan, controller = self._semantic_controller(
                 question, planned_seed_set, frame, context_map=planning_context
             )
             usage = controller.get("usage", {})
-            controller_stage = "fast_gate" if controller.get("route") == "DIRECT" else "planner"
-            query_tokens[controller_stage] = int(usage.get("total_tokens", 0) or 0)
-            query_latency[controller_stage] = round(float(usage.get("latency", 0.0) or 0.0), 3)
+            query_tokens["controller"] = int(usage.get("total_tokens", 0) or 0)
+            query_latency["controller"] = round(
+                float(usage.get("latency", 0.0) or 0.0), 3
+            )
             if fast_supports is None:
                 plan = routed_plan
                 planner_called = True
-        elif getattr(self, "enable_unified_controller", False):
-            from methods.smart_mem0.p1b_execution import _evaluate_seed_gate, EvidenceLattice
-            from methods.smart_mem0.p1b_planning import _gap_planner, _build_qrf
-            
-            qrf = _build_qrf(self, question, frame)
-            self._qrf_telemetry = qrf
-            
-            is_accepted, fast_supports, reason = _evaluate_seed_gate(self, qrf, planned_seed_set, frame)
-            
-            import os
-            git_sha = os.popen('git rev-parse HEAD').read().strip() if os.path.exists('.git') else "unknown"
-            self._seed_gate_telemetry = {
-                "attempted": True,
-                "eligible": True,
-                "accepted": is_accepted,
-                "selected_memory_id": fast_supports[0]["id"] if fast_supports else None,
-                "reason": reason,
-                "conflict": (reason == "CONFLICTING_CANDIDATES"),
-                "runtime_git_sha": git_sha,
-                "seed_gate_input": question,
-                "qrf": qrf
-            }
-            
-            self._evidence_lattice = EvidenceLattice()
-            plan = {
-                "required_slots": [],
-                "seed_coverage": [],
-                "operations": [],
-                "need_evidence": False,
-                "budget_tier": "SMALL",
-                "max_memories": 3,
-                "planner_fallback": False,
-                "valid": True,
-            }
-            
-            usage = {}
-            if not is_accepted:
-                evidence_gaps, usage = _gap_planner(self, question, planned_seed_set, frame)
-                planner_called = True
-                query_tokens["planner"] = int(usage.get("total_tokens", 0) or 0)
-                query_latency["planner"] = round(float(usage.get("latency", 0.0) or 0.0), 3)
-                
-                if not evidence_gaps:
-                    # ZERO GAP FROM PLANNER
-                    # Wait, we only authorize top seed IF deterministic validation passes AND QRF is DIRECT!
-                    # Structural requirements (STATE, CAUSAL, etc) cannot be bypassed.
-                    if planned_seed_set and qrf.get("operator", "DIRECT") == "DIRECT":
-                        supports = self._validate_fast_support("$seed0", planned_seed_set, frame)
-                        if supports:
-                            fast_supports = supports
-                            plan["valid"] = True
-                            plan["required_slots"] = []
-                            self._seed_gate_telemetry["reason"] = "PLANNER_DECLARED_ZERO_GAP"
-                        else:
-                            # Planner said zero gaps, but validation failed.
-                            # Do NOT authorize seed0. We must fallback to deterministic recovery.
-                            fast_supports = None
-                            plan["need_evidence"] = True
-                            plan["required_slots"] = [] # Force empty recovery? Or let it be?
-                            # Actually, if there are no slots, recovery does nothing.
-                            # We should generate a generic gap.
-                            from methods.smart_mem0.p1b_execution import EvidenceGap
-                            fallback_gap = EvidenceGap(
-                                id="g_fallback", 
-                                role="GENERIC_EVIDENCE", 
-                                required=True,
-                                subject_id=getattr(frame, "speaker_role", "primary_user")
-                            )
-                            fallback_gap.qrf_operator = qrf.get("operator", "DIRECT")
-                            self._evidence_lattice.add_gap(fallback_gap)
-                            plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
-                            plan["budget_tier"] = "SMALL" if len(plan["required_slots"]) <= 1 else "MEDIUM"
-                            plan["max_memories"] = max(3, len(plan["required_slots"]) + 2)
-                            plan["operations"] = self._compile_gap_operations(
-                                plan["required_slots"],
-                                question,
-                                plan["budget_tier"],
-                            )
-                            plan["valid"] = True
-                            
-                else:
-                    fast_supports = None
-                    for gap in evidence_gaps:
-                        self._evidence_lattice.add_gap(gap)
-                    
-                    plan["required_slots"] = self._evidence_lattice.to_legacy_slots()
-                    
-                    plan["need_evidence"] = True
-                    plan["budget_tier"] = "SMALL" if len(evidence_gaps) <= 1 else "MEDIUM"
-                    plan["max_memories"] = max(3, len(evidence_gaps) + 2)  # At least 1 per gap + bounded context
-                    
-                    # Compile operations immediately to avoid pseudo-replan
-                    plan["operations"] = self._compile_gap_operations(
-                        plan["required_slots"],
-                        question,
-                        plan["budget_tier"],
-                    )
-                    
-            controller = {
-                "called": False,
-                "route": "DIRECT" if is_accepted else "PLAN",
-                "support_ref": fast_supports[0]["id"] if fast_supports else "",
-                "fallback_reason": reason,
-                "usage": usage, 
-            }
         if fast_supports is not None:
             beliefs, relations = self._reconstruct_beliefs(
                 fast_supports, min(3, len(fast_supports))
             )
             sufficient = bool(beliefs) and not self._has_unresolved_conflict(beliefs)
         else:
-            if not getattr(self, "enable_unified_controller", False):
+            if not getattr(self, "enable_two_stage_controller", False):
                 planner_called = True
                 plan, usage = self._plan_operations(
                     question,
@@ -1213,14 +1101,11 @@ class ExecutionMixin:
                 for slot in plan.get("required_slots", [])
                 if not slot_coverage.get(slot["id"], False)
             ]
-            unified = bool(getattr(self, "enable_unified_controller", False))
-            if getattr(self, "enable_legacy_semantic_controller", False) == False and unified:
-                # P1B.1 overrides
-                broad_replan = False
-                deterministic_recovery = True
-            else:
-                broad_replan = bool(getattr(self, "enable_replan", False)) and not unified
-                deterministic_recovery = bool(getattr(self, "enable_zero_result_recovery", False))
+            two_stage = bool(getattr(self, "enable_two_stage_controller", False))
+            broad_replan = bool(getattr(self, "enable_replan", False)) and not two_stage
+            deterministic_recovery = bool(
+                getattr(self, "enable_zero_result_recovery", False)
+            )
 
             replan = None
             if not sufficient and deterministic_recovery and missing_slots:
@@ -1233,7 +1118,7 @@ class ExecutionMixin:
                 if replan:
                     replan_called = True
             elif not sufficient and broad_replan and missing_slots:
-                # Legacy LLM-based replan (only when not in unified mode).
+                # Compatibility LLM replan, only outside the two-stage route.
                 replan_called = True
                 replan_seeds = []
                 for memory in (*beliefs, *planned_seed_set):
@@ -1250,7 +1135,9 @@ class ExecutionMixin:
                             "operation": item.get("operation"),
                             "produces": item.get("produces", []),
                             "output_ids": item.get("output_ids", []),
-                            "slot_coverage_before": item.get("slot_coverage_before", {}),
+                            "slot_coverage_before": item.get(
+                                "slot_coverage_before", {}
+                            ),
                             "slot_coverage_after": item.get("slot_coverage_after", {}),
                         }
                         for item in trace
@@ -1334,21 +1221,7 @@ class ExecutionMixin:
         query_latency["retrieval_wall"] = round(
             time.perf_counter() - retrieval_started, 3
         )
-        
-        lattice_telemetry = {}
-        if getattr(self, "_evidence_lattice", None):
-            # Update lattice with slot coverage
-            for slot_id, cov in slot_coverage.items():
-                if cov:
-                    self._evidence_lattice.update_gap(slot_id, "FILLED", slot_support.get(slot_id, []))
-            
-            lattice_telemetry = {
-                "required_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["gap"].required]),
-                "filled_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["status"] == "FILLED"]),
-                "missing_gaps": len([g for g in self._evidence_lattice.gaps.values() if g["status"] != "FILLED" and g["gap"].required]),
-                "recovery_used": replan_called
-            }
-            
+
         return {
             "query_tokens": query_tokens,
             "query_latency": query_latency,
@@ -1356,7 +1229,6 @@ class ExecutionMixin:
             "fast_supports": fast_supports,
             "precomputed_answer": str(controller.get("answer") or ""),
             "seed_gate": getattr(self, "_seed_gate_telemetry", {}),
-            "evidence_lattice": lattice_telemetry,
             "plan": plan,
             "replan": replan,
             "planner_called": planner_called,
@@ -1398,10 +1270,9 @@ class ExecutionMixin:
             if relation_type in {"REFINE", "SUPERSEDE", "CONFLICT"}:
                 source = selected[relation["source_id"]]
                 target = selected[relation["target_id"]]
-                if (
-                    not state_identity(source)
-                    or state_identity(source) != state_identity(target)
-                ):
+                if not state_identity(source) or state_identity(
+                    source
+                ) != state_identity(target):
                     continue
             relevant.append(self._snapshot(relation))
         output = list(selected.values())

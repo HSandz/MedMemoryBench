@@ -31,66 +31,63 @@ The implementation lives in this package and is split by runtime responsibility.
 | `capture.py` | Turn windows, MWC, and LLM memory extraction |
 | `consolidation.py` | ADD-only commit, state heads, and typed relations |
 | `write.py` | Session transaction, rollback, frozen-store lifecycle |
-| `planning.py` | One-seed answerability gate, bounded planning context map, and validated retrieval plans |
+| `planning.py` | Hard constraints, initial recall helpers, and structural seed authorization |
 | `retrieval.py` | Deterministic temporal, state, semantic, and causal operations |
 | `execution.py` | Deterministic typed coverage, stopping, and pure arbitration |
 | `query.py` | Final support boundary, context packing, telemetry, and answer request |
-| `read_controller.py` | One-call semantic requirement and seed-coverage contract |
-| `read_plan_contract.py` | Deterministic compilation of missing requirements into operations |
-| `read_execution_contract.py` | Structural proof of controller-authorized seed coverage |
+| `read_controller.py` | One-call seed-conditioned minimal semantic IR |
+| `read_plan_contract.py` | Deterministic requirement-graph compiler |
+| `read_execution_contract.py` | Requirement coverage and recovery rules |
+| `read_option_contract.py` | Shared physical retrieval for visible options |
+| `read_temporal_contract.py` | Explicit temporal parsing and axis-preserving filters |
+| `read_usage_contract.py` | Method-local two-call accounting |
 
 ## Runtime Paths
 
 ```text
 WRITE: capture -> consolidation -> transactional commit -> index refresh
 READ: Dense + BM25 -> RRF Top-8 -> Top-3 seeds -> semantic controller
-  ANSWER -> validate exactly one atomic seed -> return grounded value
-  PLAN   -> validate covered requirements -> retrieve only missing requirements
-         -> pure arbitration -> evidence on demand -> context -> answer
+  candidate authorized -> validate exactly one atomic seed -> return grounded value
+  otherwise -> compile requirement graph -> execute local operations
+            -> pure arbitration -> evidence on demand -> context -> answer
 ```
 
 The active semantic controller uses the same configured read client
 (`gemini-3.5-flash-lite` in `configs/method_config/smart_mem0.yaml`) for one compact
 JSON call. Its inputs are the original question, visible answer options, deterministic
-syntax hints, and the Top-3 seed payloads. It returns semantic fields only: route,
-operator, answer slot, temporal contract, immutable evidence requirements, each
-requirement's `COVERED|MISSING` state, seed references, raw-evidence need, and whether a
-general-domain reasoning bridge is authorized. It never emits store identities or
-retrieval operations.
+syntax hints, and the Top-3 seed payloads. It returns only `answer_type`, question-owned
+`focus_span` requirements, soft seed-conditioned `retrieval_hint` values, generic
+relations between requirements, and an optional atomic candidate. It never emits a
+route, query class, operator, budget, internal subject ID, store identity, evidence
+role, or retrieval operation.
 
-Code is the deterministic authority. It validates `$seed0..2`, subject and hard query
-constraints, active/current state, typed temporal axes, transition/causal relations,
-and conflicts. Only validated covered requirements enter `seed_coverage`; only missing
-requirements are compiled into local retrieval operations. A PLAN with complete seed
-coverage and `operations=[]` is valid. Dense/BM25 scores remain ranking telemetry and
-never prove sufficiency. The baseline calls no semantic slot validator, repair LLM, or
-LLM replan.
+The question owns what must be answered. Seeds may suggest where evidence lives through
+`retrieval_hint`, but that hint is never a hard filter or a fact. Code derives the route,
+typed slots, budget tier, inference permission, and physical operations. It resolves
+the participant identity, validates `$seed0..2`, hard query constraints, active/current
+state, temporal axes, stored causal paths, and conflicts. Dense/BM25 scores and lexical
+normalization are ranking aids only; they never prove sufficiency. The active baseline
+calls no planner LLM, semantic slot validator, repair LLM, or LLM replan.
 
-Raw source turns are dereferenced only when the controller explicitly requests exact
-evidence, an executed verification returns pointers, or a conflict remains unresolved.
-The final answer may use standard domain knowledge only when
-`world_knowledge_bridge=true`; that bridge can connect grounded participant facts but
-cannot create new participant history.
+Raw source turns are dereferenced only when `VERIFY_SOURCE` requests exact evidence, an
+executed verification returns pointers, or a conflict remains unresolved. The final
+answer may use a standard-domain bridge only when the requirement graph contains
+`POSSIBLE_CAUSE` or `INFER`; that bridge may connect grounded participant facts but
+cannot create participant history.
 
-The planning context map is built from compact write-time tags and salience metadata.
-It gives the planner a bounded view of durable identity, trajectory, risk, constraint,
-preference, resource, and plan anchors. Map entries are routing hints only: they have
-no valid `$` reference and cannot enter final answer context without an explicit
-retrieval operation.
+Visible options are detected deterministically and use one `SHARED_OPTIONS` physical
+operation with an independent probe per option. They are propositions, not semantic
+memory requirements. Stored `CAUSES` traversal remains strict and requires relation
+provenance; `POSSIBLE_CAUSE` instead retrieves grounded endpoints and explicitly
+authorizes only the final general-domain bridge.
 
-Decision plans retrieve only roles that can change the answer. Enumerated-option
-plans retrieve one shared evidence bundle of current facts, active guidance,
-constraints, contraindications, preferences, and alternatives; distractor text is
-never treated as a memory fact that must be retrieved. Causal plans retrieve grounded
-endpoints and use stored `CAUSES` only when an explicit participant-specific edge
-exists.
-
-The default read path separates semantic authority from execution authority inside one
-controller contract. `ANSWER` is the atomic fast path; `PLAN` is the optional retrieval
-path. Deterministic recovery may broaden an uncovered target through explicit traced
-operations without another LLM call. The normal upper bound is therefore two method
-LLM calls per query: controller plus answer, or just the controller when its atomic
-answer passes grounding validation.
+The default read path separates semantic authority from deterministic execution.
+An authorized `candidate` is the atomic fast path; otherwise the compiler turns the
+requirement graph directly into bounded operations. Deterministic recovery may remove
+only soft resolver hints and retry an explicit operation without changing the
+question-owned requirement. The normal upper bound is two method LLM calls per query:
+controller plus answer, or just the controller when its atomic candidate passes
+structural and grounding validation.
 
 The split follows the useful boundaries visible in the bundled implementations:
 Mem0 separates memory/index backends, MemoRAG separates prompts and retrieval, and

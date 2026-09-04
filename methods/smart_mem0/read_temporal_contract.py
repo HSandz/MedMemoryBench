@@ -31,7 +31,9 @@ class ReadTemporalContractMixin:
         occupied = []
         source = str(text or "")
         explicit = re.compile(
-            r"\b(?:" + "|".join(MONTH_NUMBERS) + r")\s+(?:\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{4})\b",
+            r"\b(?:"
+            + "|".join(MONTH_NUMBERS)
+            + r")\s+(?:\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{4})\b",
             re.IGNORECASE,
         )
         occupied.extend(match.span() for match in explicit.finditer(source))
@@ -47,7 +49,13 @@ class ReadTemporalContractMixin:
 
     def _query_frame(self, question):
         frame = super()._query_frame(question)
-        extras = self._rc_bare_months(self._question_stem(question))
+        # Core parsing deliberately keeps the most specific explicit dates.
+        # Bare months are useful only when no day/year constraint exists; adding
+        # them beside a focal day would turn comparison context into a hard OR
+        # filter on the answer target.
+        extras = (
+            [] if frame.dates else self._rc_bare_months(self._question_stem(question))
+        )
         dates = list(frame.dates)
         for value in extras:
             if value not in dates:
@@ -70,27 +78,9 @@ class ReadTemporalContractMixin:
         if re.fullmatch(r"\*-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])", wanted):
             return len(parsed) >= 10 and parsed[4:10] == wanted[1:]
         normalized = CoreMemoryMixin._parse_date(wanted)
-        return bool(normalized and (parsed == normalized or parsed.startswith(normalized)))
-
-    def _rc_gap_from_req(self, decision, req, fallback_id, frame=None):
-        gap = super()._rc_gap_from_req(decision, req, fallback_id, frame=frame)
-        month_anchor = self._rc_month_constraint(gap.temporal_anchor)
-        if month_anchor:
-            gap.temporal_anchor = month_anchor
-            gap.temporal_relation = gap.temporal_relation or "EXACT"
-
-        if gap.role == "COMPARAND" and not gap.temporal_anchor:
-            months = self._rc_bare_months(gap.target_surface)
-            if len(months) == 1:
-                gap.temporal_anchor = months[0]
-                gap.temporal_relation = "EXACT"
-                gap.temporal_axis = gap.temporal_axis or "effective_event_time"
-
-        if gap.temporal_anchor and not gap.temporal_axis:
-            gap.temporal_axis = "effective_event_time"
-        if gap.temporal_axis:
-            gap.required_fields = [gap.temporal_axis]
-        return gap
+        return bool(
+            normalized and (parsed == normalized or parsed.startswith(normalized))
+        )
 
     def _temporal_filter(self, operation, outputs, seeds, frame=QueryFrame()):
         relation = str(operation.get("relation") or "").upper()
@@ -103,7 +93,9 @@ class ReadTemporalContractMixin:
             return []
         candidate_refs = operation.get("candidate_refs")
         scoped = isinstance(candidate_refs, list) and bool(candidate_refs)
-        candidates = self._resolve_refs(candidate_refs, outputs, seeds) if scoped else []
+        candidates = (
+            self._resolve_refs(candidate_refs, outputs, seeds) if scoped else []
+        )
         scoped_ids = {memory["id"] for memory in candidates}
         if scoped and not scoped_ids:
             return []
@@ -128,7 +120,9 @@ class ReadTemporalContractMixin:
     def _slot_covered(self, slot, support_ids, selected, relations):
         if str(slot.get("type") or "").upper() != "TEMPORAL":
             return super()._slot_covered(slot, support_ids, selected, relations)
-        relation = str(slot.get("temporal_relation") or slot.get("time_relation") or "LOCATE").upper()
+        relation = str(
+            slot.get("temporal_relation") or slot.get("time_relation") or "LOCATE"
+        ).upper()
         anchor = self._rc_month_constraint(slot.get("time_anchor"))
         if relation != "EXACT" or not anchor:
             return super()._slot_covered(slot, support_ids, selected, relations)

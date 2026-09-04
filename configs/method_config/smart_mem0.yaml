@@ -36,16 +36,16 @@ agent_params:
   write_provisional_limit: 4
   max_new_memories: 12
 
-  # Compatibility switch retained by the benchmark facade. In the active
-  # two-stage path, planning is compiled deterministically from the semantic
-  # controller contract and does not make a second planner LLM call.
+  # Compatibility switch retained by the benchmark facade. The active path
+  # compiles retrieval deterministically from minimal semantic IR and never
+  # calls a separate planner LLM.
   enable_planner: true
-  # Active read route: one compact semantic-controller call returns ANSWER or
-  # PLAN after inspecting the question and Top-3 RRF seeds.
-  enable_unified_controller: true
-  # Keep semantic sufficiency validation for inference, decisions, options,
-  # comparisons, transitions, and multi-slot plans. Simple one-slot plans use
-  # the deterministic typed validator and avoid a redundant LLM call.
+  # Active read route: one compact controller emits requirements, relations,
+  # and an optional atomic candidate after inspecting question + Top-3 seeds.
+  # Route, budget, and physical operations are derived by code.
+  enable_two_stage_controller: true
+  # Frozen off: typed requirement coverage is deterministic, preserving the
+  # controller + answer two-call upper bound.
   enable_slot_support_validation: false
   enable_replan: false
   enable_zero_result_recovery: true

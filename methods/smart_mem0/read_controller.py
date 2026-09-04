@@ -1,7 +1,8 @@
-"""Minimal two-stage semantic controller for SmartMem0 reads.
+"""Minimal seed-conditioned semantic IR for SmartMem0 reads.
 
-The LLM owns natural-language intent only. Durable memory identity is resolved
-from fields that actually exist in the write-time ledger.
+The question owns evidence obligations. Seeds may suggest a candidate answer or
+soft retrieval neighborhood, but durable identities and physical operations are
+resolved deterministically after this layer.
 """
 
 import json
@@ -17,94 +18,144 @@ from .contracts import (
     STOPWORDS,
     VALID_TEMPORAL_AXES,
 )
-from .p1b_execution import EvidenceLattice
 
+SEMANTIC_IR_POLICY = """You produce the minimal semantic IR for an evidence-grounded memory system.
 
-CONTROLLER_POLICY = """You are the single semantic controller of an evidence-grounded memory system.
-Interpret QUESTION by meaning in any language. First derive immutable evidence requirements from QUESTION alone. Only after the requirements are fixed, assess whether SEEDS cover each requirement. SEEDS may justify an atomic answer or cover a planned requirement, but must never change the target requested by QUESTION.
+QUESTION defines what must be answered. First derive requirements from QUESTION. Then use SEEDS only to suggest where relevant evidence may live or to propose one directly supported atomic candidate. A seed must never redefine the question predicate, subject, comparison, causal request, or temporal constraint.
 
-Return only a small semantic contract. Never invent state_key, object_anchor, scope, entity IDs, memory IDs, retrieval operations, or other memory-store keys. Code resolves memory identity from the durable write-time schema.
+Return only answer_type, requirement nodes, relations between those nodes, and an optional candidate. Do not emit a route, query class, operator, difficulty score, budget, retrieval operation, evidence role, durable memory key, or internal subject ID.
 
-TARGET RULE: every non-empty target must be copied as one contiguous span from QUESTION. Never copy a target from SEEDS and never replace an unknown answer with a candidate seen in a seed.
+For every requirement:
+- focus_span is the shortest useful contiguous span copied from QUESTION. It is the immutable question-owned anchor.
+- retrieval_hint is a soft semantic description informed by QUESTION and, when useful, SEEDS. It may broaden the evidence neighborhood but is never a fact, hard filter, answer, or durable key.
+- time_constraint is optional. document_time is when something was documented or mentioned; event_time is when it happened; origin_document_time is the original source date; effective_event_time is the explicitly combined event/source chronology. LOCATE means the requested time is unknown. EXACT/BEFORE/AFTER/BETWEEN constrain a known time. EARLIEST/LATEST request an extremum.
 
-Routes: ANSWER or PLAN. ANSWER is allowed only for one atomic stored fact/current state fully supported by exactly one seed and with no temporal constraint. Otherwise PLAN.
-Operators: DIRECT, STATE, TEMPORAL, COMPARISON, CAUSAL, DECISION, MULTI_OPTION, MULTI_HOP.
-Answer slots: ENTITY, VALUE, DATE, RELATIVE_TIME, OPTION_SET, TEXT.
-Roles: ANSWER, FOCAL_STATE, PRIOR_TRAJECTORY, ACTION_RULE, CONSTRAINT, FOCAL_TRIGGER, CAUSAL_BRIDGE, OUTCOME, COMPARAND, OPTION_CONTEXT, GENERIC_EVIDENCE.
+Relations are generic requirement-graph edges:
+- COMPARE compares two requirement nodes.
+- CAUSES requests an explicit stored causal path.
+- POSSIBLE_CAUSE asks the answer model to connect grounded participant endpoints using general domain knowledge.
+- DEPENDS_ON declares evidence dependency without asserting causality.
+- INFER authorizes a general-domain bridge after all referenced participant requirements are grounded.
+- CURRENT marks one requirement as the current state.
+- VERIFY_SOURCE asks for exact linked source evidence.
 
-TEMPORAL IS ORTHOGONAL TO OPERATOR. Populate temporal fields whenever QUESTION supplies a time constraint even if operator is DIRECT, STATE, COMPARISON, CAUSAL, or DECISION. document_time means when something was documented/recorded/mentioned; event_time means when the underlying event happened. LOCATE means the requested date/time is unknown. EXACT means QUESTION supplies the date/time as a filter. EARLIEST/LATEST only when QUESTION requests an extremum. Use RELATIVE_TIME when the answer is timing relative to another event.
+Use to="ANSWER" for an INFER edge whose result is the answer rather than another requirement. Temporal order alone is not CAUSES.
 
-COMPARISON: emit exactly two COMPARAND requirements with side LEFT and RIGHT. Each side should carry its own temporal constraint when the compared sides refer to different times. Do not represent comparison as generic MULTI_HOP.
-MULTI_OPTION: visible options are retrieval probes, not required memory facts. Emit only shared participant-specific evidence requirements needed to evaluate the choices. An option may have no personal-memory match; absence is not evidence that it is false.
-CAUSAL: causal_mode=STORED only for an explicit remembered causal attribution/path. causal_mode=INFERRED retrieves grounded participant endpoints/trajectory and lets the final answer model explain a general-domain bridge.
-subject_id is who the memory is about; source speaker is only who said it.
+Visible answer options are propositions to evaluate, not memory facts. Requirements must describe shared participant-specific evidence needed to evaluate them. Do not create one requirement per option merely because the option is visible.
 
-SEED COVERAGE:
-- For every requirement, return coverage=COVERED only when its support_refs directly ground all participant-specific premises required by that requirement.
-- Otherwise return coverage=MISSING. Split independent participant-specific premises into separate requirements instead of calling a partial bundle covered.
-- world_knowledge_bridge=true only authorizes a general-domain connection after the participant-specific premises have been grounded by seeds or retrieval. It never changes MISSING to COVERED and must never create a new participant-specific fact.
-- Use world_knowledge_bridge=true for a DECISION, MULTI_OPTION, or INFERRED causal requirement only when the final reasoning genuinely needs standard domain knowledge beyond the participant evidence.
-- EARLIEST/LATEST and visible-option exploration are population operations and cannot be covered by the three seeds alone.
-
-RAW EVIDENCE:
-- need_raw_evidence=false by default. Set it true only when the answer needs exact original wording, source-turn verification, or resolution of an ambiguous/conflicting extracted claim.
-
-ROUTE ORDER:
-- If exactly one atomic requirement is covered by exactly one seed and the answer value is directly present, choose ANSWER and return that value plus its support ref.
-- Otherwise choose PLAN. PLAN may legitimately need zero operations when every requirement is already covered by seeds.
+candidate is optional and is allowed only when exactly one seed directly and atomically contains the answer to one requirement without comparison, temporal localization, source verification, or multi-step inference. The candidate may name only $seed0, $seed1, or $seed2. Code will independently authorize it.
 """
 
-CONTROLLER_SCHEMA = """Return JSON only:
-{{"route":"ANSWER|PLAN","operator":"DIRECT|STATE|TEMPORAL|COMPARISON|CAUSAL|DECISION|MULTI_OPTION|MULTI_HOP","answer_slot":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","answer":"","support_refs":["$seed0"],"requires_inference":false,"subject_id":"","target":"exact contiguous span copied from QUESTION or empty","causal_mode":"|STORED|INFERRED","need_raw_evidence":false,"temporal":{{"axis":"","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}},"requirements":[{{"id":"r1","role":"ANSWER","target":"exact contiguous span copied from QUESTION or empty","side":"|LEFT|RIGHT","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","coverage":"COVERED|MISSING","support_refs":["$seed0"],"world_knowledge_bridge":false}}]}}
-QUESTION:\n{question}\nVISIBLE OPTIONS:\n{options}\nSYNTAX HINTS (routing constraints only; never evidence):\n{hints}\nSEEDS:\n{seeds}"""
+SEMANTIC_IR_SCHEMA = """Return JSON only:
+{{"answer_type":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","subject_span":"exact contiguous subject span from QUESTION or empty","requirements":[{{"id":"r1","focus_span":"exact contiguous span from QUESTION","retrieval_hint":"soft semantic retrieval description","time_constraint":{{"axis":"event_time|document_time|origin_document_time|effective_event_time|","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}}}}],"relations":[{{"type":"COMPARE|CAUSES|POSSIBLE_CAUSE|DEPENDS_ON|INFER|CURRENT|VERIFY_SOURCE","from":"r1","to":"r2|ANSWER|"}}],"candidate":null}}
+When candidate exists use: {{"candidate":{{"answer":"exact answer value","support_ref":"$seed0"}}}}
+QUESTION:
+{question}
+VISIBLE OPTIONS:
+{options}
+STRUCTURAL HINTS (constraints only; never evidence):
+{hints}
+SEEDS:
+{seeds}"""
 
-VALID_OPERATORS = {"DIRECT", "STATE", "TEMPORAL", "COMPARISON", "CAUSAL", "DECISION", "MULTI_OPTION", "MULTI_HOP"}
-VALID_SLOTS = {"ENTITY", "VALUE", "DATE", "RELATIVE_TIME", "OPTION_SET", "TEXT"}
-VALID_ROLES = {"ANSWER", "FOCAL_STATE", "PRIOR_TRAJECTORY", "ACTION_RULE", "CONSTRAINT", "FOCAL_TRIGGER", "CAUSAL_BRIDGE", "OUTCOME", "COMPARAND", "OPTION_CONTEXT", "GENERIC_EVIDENCE"}
-VALID_RELATIONS = {"LOCATE", "EXACT", "EARLIEST", "LATEST", "BEFORE", "AFTER", "BETWEEN", ""}
-COMPLEX = {"TEMPORAL", "COMPARISON", "CAUSAL", "DECISION", "MULTI_OPTION", "MULTI_HOP"}
+VALID_ANSWER_TYPES = {
+    "ENTITY",
+    "VALUE",
+    "DATE",
+    "RELATIVE_TIME",
+    "OPTION_SET",
+    "TEXT",
+}
+VALID_IR_RELATIONS = {
+    "COMPARE",
+    "CAUSES",
+    "POSSIBLE_CAUSE",
+    "DEPENDS_ON",
+    "INFER",
+    "CURRENT",
+    "VERIFY_SOURCE",
+}
+VALID_TIME_RELATIONS = {
+    "LOCATE",
+    "EXACT",
+    "EARLIEST",
+    "LATEST",
+    "BEFORE",
+    "AFTER",
+    "BETWEEN",
+    "",
+}
 
 
 class ReadContractMixin:
     @staticmethod
     def _rc_text(value: Any) -> str:
-        return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+        )
 
     @classmethod
     def _rc_terms(cls, value: Any) -> List[str]:
-        return [x for x in re.findall(r"\w+", cls._rc_text(value).replace("_", " ").replace("-", " "), flags=re.UNICODE) if len(x) > 1]
+        normalized = cls._rc_text(value).replace("_", " ").replace("-", " ")
+        return [
+            token
+            for token in re.findall(r"\w+", normalized, flags=re.UNICODE)
+            if len(token) > 1
+        ]
 
     @classmethod
     def _rc_content_terms(cls, value: Any) -> List[str]:
-        noise = set(STOPWORDS) | set(STATE_KEY_NOISE) | set(GENERIC_STATE_KEYS) | set(GENERIC_OBJECT_ANCHORS) | {"primary", "primary_user"}
+        # This vocabulary is a ranking aid only. Structural validity never
+        # depends on a stopword-normalized score.
+        noise = (
+            set(STOPWORDS)
+            | set(STATE_KEY_NOISE)
+            | set(GENERIC_STATE_KEYS)
+            | set(GENERIC_OBJECT_ANCHORS)
+            | {"primary", "primary_user"}
+        )
         return [term for term in cls._rc_terms(value) if term not in noise]
 
     def _rc_owner(self, value: Any) -> str:
         raw = "_".join(self._rc_terms(value))
-        aliases = {"_".join(self._rc_terms(k)): "_".join(self._rc_terms(v)) for k, v in (getattr(self, "subject_aliases", {}) or {}).items()}
+        aliases = {
+            "_".join(self._rc_terms(key)): "_".join(self._rc_terms(mapped))
+            for key, mapped in (getattr(self, "subject_aliases", {}) or {}).items()
+        }
         return aliases.get(raw, raw)
 
     def _rc_owner_match(self, slot: Dict[str, Any], memory: Dict[str, Any]) -> bool:
-        want = self._rc_owner(slot.get("subject_id") or slot.get("subject") or "")
-        have = self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
-        return not want or bool(have and have == want)
+        wanted = self._rc_owner(slot.get("subject_id") or slot.get("subject") or "")
+        actual = self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
+        return not wanted or bool(actual and actual == wanted)
 
     def _rc_known_subject(self, value: Any) -> str:
         candidate = self._rc_owner(value)
         if not candidate:
             return ""
-        known = {self._rc_owner(memory.get("subject_id") or memory.get("subject") or "") for memory in self._memories}
+        known = {
+            self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
+            for memory in getattr(self, "_memories", [])
+        }
         known.discard("")
         return candidate if candidate in known else ""
 
-    def _rc_target_from_question(self, target: Any, question: str) -> str:
-        raw = str(target or "").strip()
+    def _rc_question_span(self, value: Any, question: str) -> str:
+        raw = " ".join(str(value or "").strip().split())
         if not raw:
             return ""
         return raw if self._rc_text(raw) in self._rc_text(question) else ""
 
+    def _rc_target_from_question(self, target: Any, question: str) -> str:
+        """Compatibility alias for the question-owned target firewall."""
+        return self._rc_question_span(target, question)
+
     def _rc_memory_concept_keys(self, memory: Dict[str, Any]) -> List[str]:
-        values: List[Any] = [memory.get("scope"), memory.get("state_key"), memory.get("object_anchor")]
+        values: List[Any] = [
+            memory.get("scope"),
+            memory.get("state_key"),
+            memory.get("object_anchor"),
+        ]
         values.extend(memory.get("entities") or [])
         values.extend(memory.get("scope_entities") or [])
         output: List[str] = []
@@ -118,14 +169,17 @@ class ReadContractMixin:
         return output
 
     def _rc_resolve_target_keys(self, target: str, subject_id: str = "") -> List[str]:
-        """Resolve only whole-token durable keys; never substring fragments."""
+        """Resolve a question span to durable metadata as a ranking hint."""
         target_terms = set(self._rc_content_terms(target))
         if not target_terms:
             return []
         wanted_owner = self._rc_owner(subject_id)
         scores: Dict[str, float] = {}
         for memory in self._memories:
-            if wanted_owner and self._rc_owner(memory.get("subject_id") or memory.get("subject") or "") != wanted_owner:
+            owner = self._rc_owner(
+                memory.get("subject_id") or memory.get("subject") or ""
+            )
+            if wanted_owner and owner != wanted_owner:
                 continue
             for key in self._rc_memory_concept_keys(memory):
                 key_terms = set(self._rc_content_terms(key))
@@ -137,220 +191,363 @@ class ReadContractMixin:
                 precision = overlap / len(key_terms)
                 coverage = overlap / len(target_terms)
                 if key_terms.issubset(target_terms) or precision >= 0.67:
-                    scores[key] = max(scores.get(key, 0.0), 0.75 * precision + 0.25 * coverage)
-        return [key for key, _ in sorted(scores.items(), key=lambda item: (-item[1], -len(self._rc_content_terms(item[0])), item[0]))[:4]]
-
-    def _planning_context_map(self, question: str, *args, **kwargs) -> List[Dict[str, Any]]:
-        return []
+                    scores[key] = max(
+                        scores.get(key, 0.0), 0.75 * precision + 0.25 * coverage
+                    )
+        return [
+            key
+            for key, _ in sorted(
+                scores.items(),
+                key=lambda item: (
+                    -item[1],
+                    -len(self._rc_content_terms(item[0])),
+                    item[0],
+                ),
+            )[:4]
+        ]
 
     def _rc_seed_payload(self, seeds: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
-        for i, memory in enumerate(seeds[:3]):
+        output = []
+        for index, memory in enumerate(seeds[:3]):
             identity = state_identity(memory) or ""
-            out.append({"ref": f"$seed{i}", "kind": memory.get("kind"), "semantic_role": memory.get("semantic_role"), "subject_id": memory.get("subject_id") or memory.get("subject"), "source_speakers": list(memory.get("source_speakers", [])), "scope": memory.get("scope"), "object": memory.get("object_anchor"), "value": self._memory_value(memory), "claim": str(memory.get("claim") or "")[:320], "event_time": memory.get("event_time"), "document_time": memory.get("document_time"), "state_identity": identity, "is_state_head": bool(identity and self._is_state_head(memory)), "status": memory.get("_status", self._belief_status.get(memory.get("id"), "active"))})
-        return out
+            output.append(
+                {
+                    "ref": f"$seed{index}",
+                    "kind": memory.get("kind"),
+                    "subject": memory.get("subject_id") or memory.get("subject"),
+                    "scope": memory.get("scope"),
+                    "object": memory.get("object_anchor"),
+                    "value": self._memory_value(memory),
+                    "claim": str(memory.get("claim") or "")[:320],
+                    "event_time": memory.get("event_time"),
+                    "document_time": memory.get("document_time"),
+                    "origin_document_time": memory.get("origin_document_time"),
+                    "state_identity": identity,
+                    "is_state_head": bool(identity and self._is_state_head(memory)),
+                    "status": memory.get(
+                        "_status",
+                        self._belief_status.get(memory.get("id"), "active"),
+                    ),
+                }
+            )
+        return output
 
-    def _rc_normalize_requirement(self, raw: Dict[str, Any], index: int, question: str, fallback_target: str) -> Dict[str, Any]:
-        role = str(raw.get("role") or "GENERIC_EVIDENCE").upper()
-        role = role if role in VALID_ROLES else "GENERIC_EVIDENCE"
-        target = self._rc_target_from_question(raw.get("target"), question) or fallback_target
-        axis = str(raw.get("temporal_axis") or "").lower()
+    def _rc_normalize_time_constraint(
+        self, raw: Any, frame: Any, question: str
+    ) -> Dict[str, str]:
+        value = raw if isinstance(raw, dict) else {}
+        axis = str(value.get("axis") or "").lower()
         axis = axis if axis in VALID_TEMPORAL_AXES else ""
-        relation = str(raw.get("temporal_relation") or "").upper()
-        relation = relation if relation in VALID_RELATIONS else ""
-        side = str(raw.get("side") or "").upper()
-        side = side if role == "COMPARAND" and side in {"LEFT", "RIGHT"} else ""
-        refs = [
-            str(ref)
-            for ref in (raw.get("support_refs") or raw.get("refs") or [])
-            if re.fullmatch(r"\$seed[0-2]", str(ref))
-        ]
-        coverage = str(raw.get("coverage") or raw.get("status") or "MISSING").upper()
-        coverage = "COVERED" if coverage == "COVERED" and refs else "MISSING"
-        return {
-            "id": str(raw.get("id") or f"r{index + 1}"),
-            "role": role,
-            "target": target,
-            "side": side,
-            "temporal_axis": axis,
-            "temporal_relation": relation,
-            "temporal_anchor": str(raw.get("temporal_anchor") or "").strip(),
-            "temporal_end": str(raw.get("temporal_end") or "").strip(),
-            "coverage": coverage,
-            "support_refs": list(dict.fromkeys(refs)),
-            "world_knowledge_bridge": bool(raw.get("world_knowledge_bridge", False)),
-        }
-
-    def _rc_normalize_decision(self, parsed: Dict[str, Any], question: str, frame: Any) -> Dict[str, Any]:
-        options = self._question_options(question) or {}
-        raw_route = str(parsed.get("route") or "").upper()
-        route_valid = raw_route in {"ANSWER", "PLAN"}
-        route = raw_route if route_valid else "PLAN"
-        operator = str(parsed.get("operator") or ("MULTI_OPTION" if options else "DIRECT")).upper()
-        operator = operator if operator in VALID_OPERATORS else "DIRECT"
-        if options:
-            operator, route = "MULTI_OPTION", "PLAN"
-        answer_slot = str(parsed.get("answer_slot") or ("OPTION_SET" if options else "TEXT")).upper()
-        answer_slot = "OPTION_SET" if options else (answer_slot if answer_slot in VALID_SLOTS else "TEXT")
-        target = self._rc_target_from_question(parsed.get("target"), question)
-        target_rejected = bool(str(parsed.get("target") or "").strip() and not target)
-
-        temporal = parsed.get("temporal") if isinstance(parsed.get("temporal"), dict) else {}
-        axis = str(temporal.get("axis") or "").lower()
-        axis = axis if axis in VALID_TEMPORAL_AXES else ""
-        relation = str(temporal.get("relation") or "").upper()
-        relation = relation if relation in VALID_RELATIONS else ""
-        anchor, end = str(temporal.get("anchor") or "").strip(), str(temporal.get("end") or "").strip()
-        dates = [str(x) for x in (getattr(frame, "dates", ()) or ()) if x]
+        relation = str(value.get("relation") or "").upper()
+        relation = relation if relation in VALID_TIME_RELATIONS else ""
+        anchor = str(value.get("anchor") or "").strip()
+        end = str(value.get("end") or "").strip()
+        dates = [str(item) for item in (getattr(frame, "dates", ()) or ()) if item]
+        question_text = self._rc_text(question)
+        if (
+            anchor
+            and anchor not in dates
+            and self._rc_text(anchor) not in question_text
+        ):
+            anchor = ""
+        if end and end not in dates and self._rc_text(end) not in question_text:
+            end = ""
         if relation in {"EXACT", "BEFORE", "AFTER"} and not anchor and len(dates) == 1:
             anchor = dates[0]
-        if relation == "BETWEEN" and not anchor and len(dates) >= 2:
-            anchor, end = dates[0], dates[1]
+        if relation == "BETWEEN" and len(dates) >= 2:
+            anchor = anchor or dates[0]
+            end = end or dates[1]
         if relation == "EXACT" and not anchor:
-            relation = "LOCATE" if operator == "TEMPORAL" else ""
-        if operator == "TEMPORAL":
-            axis, relation, route = axis or "event_time", relation or "LOCATE", "PLAN"
+            relation = "LOCATE"
+        if relation == "BETWEEN" and (not anchor or not end):
+            relation = "LOCATE"
+        if relation in {"BEFORE", "AFTER"} and not anchor:
+            relation = "LOCATE"
+        # A relation without an explicit axis is not executable. Silently
+        # choosing event_time would turn a malformed semantic request into a
+        # different one, so retain neither the relation nor its anchors.
+        if not axis:
+            relation = ""
+            anchor = ""
+            end = ""
+        return {
+            "axis": axis,
+            "relation": relation,
+            "anchor": anchor,
+            "end": end,
+        }
 
-        raw_requirements = parsed.get("requirements") if isinstance(parsed.get("requirements"), list) else []
-        requirements = [self._rc_normalize_requirement(raw, i, question, target) for i, raw in enumerate(raw_requirements[:4]) if isinstance(raw, dict)]
+    def _rc_normalize_requirement(
+        self, raw: Dict[str, Any], index: int, question: str, frame: Any
+    ) -> Dict[str, Any]:
+        focus = self._rc_question_span(raw.get("focus_span"), question)
+        if not focus:
+            focus = self._question_stem(question).strip()
+        return {
+            "id": str(raw.get("id") or f"r{index + 1}"),
+            "focus_span": focus,
+            "retrieval_hint": " ".join(str(raw.get("retrieval_hint") or "").split())[
+                :320
+            ],
+            "time_constraint": self._rc_normalize_time_constraint(
+                raw.get("time_constraint"), frame, question
+            ),
+        }
 
-        if operator == "COMPARISON":
-            route = "PLAN"
-            source = requirements[:2]
-            while len(source) < 2:
-                source.append({"id": f"r{len(source)+1}", "role": "COMPARAND", "target": target, "side": "", "temporal_axis": "", "temporal_relation": "", "temporal_anchor": "", "temporal_end": ""})
-            normalized = []
-            for i, req in enumerate(source[:2]):
-                req = dict(req)
-                req["role"], req["side"] = "COMPARAND", "LEFT" if i == 0 else "RIGHT"
-                req["target"] = req.get("target") or target
-                if len(dates) >= 2 and not req.get("temporal_anchor"):
-                    req["temporal_axis"], req["temporal_relation"], req["temporal_anchor"] = req.get("temporal_axis") or axis or "event_time", "EXACT", dates[i]
-                normalized.append(req)
-            requirements = normalized
-        else:
-            for req in requirements:
-                req["side"] = ""
+    def _rc_normalize_ir(
+        self, parsed: Dict[str, Any], question: str, frame: Any
+    ) -> Dict[str, Any]:
+        options = self._question_options(question) or {}
+        answer_type = str(parsed.get("answer_type") or "TEXT").upper()
+        answer_type = (
+            "OPTION_SET"
+            if options
+            else answer_type if answer_type in VALID_ANSWER_TYPES else "TEXT"
+        )
+        subject_span = self._rc_question_span(parsed.get("subject_span"), question)
+        raw_requirements = (
+            parsed.get("requirements")
+            if isinstance(parsed.get("requirements"), list)
+            else []
+        )
+        requirements = [
+            self._rc_normalize_requirement(raw, index, question, frame)
+            for index, raw in enumerate(raw_requirements[:4])
+            if isinstance(raw, dict)
+        ]
+        if not requirements:
+            stem = self._question_stem(question).strip()
+            requirements = [
+                {
+                    "id": "r1",
+                    "focus_span": stem,
+                    "retrieval_hint": stem,
+                    "time_constraint": {
+                        "axis": "",
+                        "relation": "",
+                        "anchor": "",
+                        "end": "",
+                    },
+                }
+            ]
 
-        if operator == "MULTI_OPTION":
-            requirements = [req for req in requirements if req["role"] != "COMPARAND"][:3]
-            if not requirements:
-                requirements = [{"id": "r_options", "role": "OPTION_CONTEXT", "target": target, "side": "", "temporal_axis": "", "temporal_relation": "", "temporal_anchor": "", "temporal_end": ""}]
+        seen = set()
+        for index, requirement in enumerate(requirements):
+            candidate_id = requirement["id"]
+            if not re.fullmatch(r"r[\w-]{0,31}", candidate_id) or candidate_id in seen:
+                candidate_id = f"r{index + 1}"
+            while candidate_id in seen:
+                candidate_id += "x"
+            requirement["id"] = candidate_id
+            seen.add(candidate_id)
 
-        inference = bool(parsed.get("requires_inference", False))
-        if operator in COMPLEX:
-            route = "PLAN"
-        if operator in {"CAUSAL", "DECISION", "MULTI_OPTION", "MULTI_HOP", "COMPARISON"}:
-            inference = True
+        valid_nodes = {requirement["id"] for requirement in requirements}
+        relations = []
+        raw_relations = (
+            parsed.get("relations") if isinstance(parsed.get("relations"), list) else []
+        )
+        for raw in raw_relations[:6]:
+            if not isinstance(raw, dict):
+                continue
+            relation_type = str(raw.get("type") or "").upper()
+            source = str(raw.get("from") or "")
+            target = str(raw.get("to") or "")
+            if relation_type not in VALID_IR_RELATIONS or source not in valid_nodes:
+                continue
+            if relation_type in {"CURRENT", "VERIFY_SOURCE"}:
+                target = ""
+            elif target != "ANSWER" and target not in valid_nodes:
+                continue
+            if (
+                relation_type in {"COMPARE", "CAUSES", "POSSIBLE_CAUSE", "DEPENDS_ON"}
+                and target not in valid_nodes
+            ):
+                continue
+            relation = {"type": relation_type, "from": source, "to": target}
+            if relation not in relations:
+                relations.append(relation)
 
-        roles = {req["role"] for req in requirements}
-        if operator == "DIRECT" and "COMPARAND" in roles:
-            return self._rc_normalize_decision({**parsed, "operator": "COMPARISON", "requirements": raw_requirements}, question, frame)
-        if operator == "DIRECT" and ("CAUSAL_BRIDGE" in roles or (inference and {"FOCAL_TRIGGER", "OUTCOME"}.issubset(roles))):
-            operator, route = "CAUSAL", "PLAN"
-        elif operator == "DIRECT" and len(requirements) > 1:
-            operator, route, inference = "MULTI_HOP", "PLAN", True
+        candidate = parsed.get("candidate")
+        if not isinstance(candidate, dict):
+            candidate = None
+        if candidate is not None:
+            answer = str(candidate.get("answer") or "").strip()
+            support_ref = str(candidate.get("support_ref") or "")
+            if not answer or not re.fullmatch(r"\$seed[0-2]", support_ref):
+                candidate = None
+            else:
+                candidate = {"answer": answer, "support_ref": support_ref}
 
-        causal_mode = str(parsed.get("causal_mode") or "").upper()
-        causal_mode = causal_mode if operator == "CAUSAL" and causal_mode in {"STORED", "INFERRED"} else ("INFERRED" if operator == "CAUSAL" else "")
-        support_refs = [str(ref) for ref in (parsed.get("support_refs") or []) if re.fullmatch(r"\$seed[0-2]", str(ref))][:1]
-        subject_id = self._rc_known_subject(parsed.get("subject_id") or "")
-        if route == "ANSWER" and not requirements:
-            requirements = [{"id": "r1", "role": "ANSWER", "target": target, "side": "", "temporal_axis": "", "temporal_relation": "", "temporal_anchor": "", "temporal_end": ""}]
-        if route == "ANSWER" and (operator not in {"DIRECT", "STATE"} or inference or len(requirements) != 1 or len(support_refs) != 1 or relation or anchor):
-            route = "PLAN"
+        owners = {
+            self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
+            for memory in getattr(self, "_active_controller_seeds", [])[:3]
+            if memory.get("subject_id") or memory.get("subject")
+        }
+        owners.discard("")
+        subject_id = self._rc_known_subject(subject_span)
+        if not subject_id and len(owners) == 1:
+            subject_id = next(iter(owners))
 
         return {
-            "route": route,
-            "route_valid": route_valid,
-            "operator": operator,
-            "answer_slot": answer_slot,
-            "answer": str(parsed.get("answer") or "").strip(),
-            "support_refs": support_refs,
-            "requires_inference": inference,
-            "subject_id": subject_id,
-            "target": target,
-            "target_rejected": target_rejected,
-            "causal_mode": causal_mode,
-            "need_raw_evidence": bool(parsed.get("need_raw_evidence", False)),
-            "temporal": {"axis": axis, "relation": relation, "anchor": anchor, "end": end},
+            "answer_type": answer_type,
+            "subject_span": subject_span,
+            "_resolved_subject_id": subject_id,
             "requirements": requirements,
+            "relations": relations,
+            "candidate": candidate,
             "visible_options": dict(options),
         }
 
-    def _rc_answer_grounded(self, answer: str, memories: Sequence[Dict[str, Any]]) -> bool:
+    def _rc_answer_grounded(
+        self, answer: str, memories: Sequence[Dict[str, Any]]
+    ) -> bool:
         answer_norm = self._rc_text(answer)
-        evidence = self._rc_text(" ".join(str(value or "") for memory in memories for value in (memory.get("claim"), self._memory_value(memory), memory.get("verbatim_value"), memory.get("object_anchor"), " ".join(memory.get("entities", [])))))
+        evidence = self._rc_text(
+            " ".join(
+                str(value or "")
+                for memory in memories
+                for value in (
+                    memory.get("claim"),
+                    self._memory_value(memory),
+                    memory.get("verbatim_value"),
+                    memory.get("object_anchor"),
+                    " ".join(memory.get("entities", [])),
+                )
+            )
+        )
         if not answer_norm:
             return False
         if answer_norm in evidence:
             return True
-        nums, evidence_nums = set(re.findall(r"\d+(?:\.\d+)?", answer_norm)), set(re.findall(r"\d+(?:\.\d+)?", evidence))
-        if nums and not nums.issubset(evidence_nums):
+        numbers = set(re.findall(r"\d+(?:\.\d+)?", answer_norm))
+        evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", evidence))
+        if numbers and not numbers.issubset(evidence_numbers):
             return False
-        answer_terms, evidence_terms = self._rc_content_terms(answer_norm), set(self._rc_content_terms(evidence))
-        return bool(answer_terms and len(answer_terms) <= 12 and sum(term in evidence_terms for term in answer_terms) / len(answer_terms) >= 0.8)
+        answer_terms = self._rc_content_terms(answer_norm)
+        evidence_terms = set(self._rc_content_terms(evidence))
+        return bool(
+            answer_terms
+            and len(answer_terms) <= 12
+            and sum(term in evidence_terms for term in answer_terms) / len(answer_terms)
+            >= 0.8
+        )
 
-    def _rc_requirement_match(self, req: Dict[str, Any], memory: Dict[str, Any], subject_id: str) -> bool:
-        target = req.get("target") or ""
-        slot = {"subject_id": subject_id, "target_surface": target, "resolved_keys": self._rc_resolve_target_keys(target, subject_id), "required_fields": [], "evidence_role": req.get("role") or "ANSWER"}
-        return self._slot_contract_match(slot, memory, strict_targets=True)
-
-    def _authorize_controller_answer(self, decision, seeds, frame):
-        if decision.get("operator") not in {"DIRECT", "STATE"} or decision.get("requires_inference") or decision.get("visible_options"):
-            return None, "NON_ATOMIC_ROUTE"
-        if (decision.get("temporal") or {}).get("relation") or (decision.get("temporal") or {}).get("anchor"):
-            return None, "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
-        refs = decision.get("support_refs") or []
-        if len(refs) != 1 or not decision.get("answer"):
-            return None, "ATOMIC_SUPPORT_REQUIRED"
-        match = re.fullmatch(r"\$seed(\d+)", refs[0])
+    def _authorize_controller_candidate(self, ir, seeds, frame):
+        candidate = ir.get("candidate")
+        if not candidate or len(ir.get("requirements") or []) != 1:
+            return None, "NO_ATOMIC_CANDIDATE"
+        relations = ir.get("relations") or []
+        if ir.get("visible_options") or any(
+            relation.get("type") != "CURRENT" for relation in relations
+        ):
+            return None, "RELATIONAL_QUERY_REQUIRES_RETRIEVAL"
+        requirement = ir["requirements"][0]
+        time_constraint = requirement.get("time_constraint") or {}
+        if time_constraint.get("axis") or time_constraint.get("relation"):
+            return None, "TEMPORAL_QUERY_REQUIRES_RETRIEVAL"
+        reference = candidate["support_ref"]
+        match = re.fullmatch(r"\$seed(\d+)", reference)
         if not match or int(match.group(1)) >= min(3, len(seeds)):
             return None, "INVALID_SUPPORT_REF"
-        valid = self._validate_fast_support(refs[0], seeds, frame)
+        valid = self._validate_fast_support(reference, seeds, frame)
         if not valid:
             return None, "STRUCTURAL_SUPPORT_REJECTED"
-        req = (decision.get("requirements") or [{}])[0]
-        owner = decision.get("subject_id") or self._rc_owner(valid[0].get("subject_id") or valid[0].get("subject"))
-        if not self._rc_requirement_match(req, valid[0], owner):
-            return None, "TARGET_SUPPORT_REJECTED"
-        if decision["operator"] == "STATE" and not self._is_state_head(valid[0]):
-            return None, "STATE_REQUIRES_HEAD"
-        if not self._rc_answer_grounded(decision["answer"], valid):
+        # focus_span protects the semantic obligation in the IR. Candidate
+        # authorization itself is deliberately structural: requiring lexical
+        # overlap here would reject valid paraphrases and make English
+        # stopwords part of the correctness path.
+        if relations and not self._is_state_head(valid[0]):
+            return None, "CURRENT_CANDIDATE_IS_NOT_STATE_HEAD"
+        if not self._rc_answer_grounded(candidate["answer"], valid):
             return None, "ANSWER_NOT_GROUNDED"
         return valid, "AUTHORIZED"
 
+    def _authorize_controller_answer(self, ir, seeds, frame):
+        """Authorize only an atomic candidate with no explicit date constraint."""
+        if getattr(frame, "dates", ()):
+            return None, "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
+        return self._authorize_controller_candidate(ir, seeds, frame)
+
+    @staticmethod
+    def _rc_public_ir(ir):
+        return {
+            "answer_type": ir.get("answer_type") or "TEXT",
+            "subject_span": ir.get("subject_span") or "",
+            "requirements": [dict(item) for item in ir.get("requirements") or []],
+            "relations": [dict(item) for item in ir.get("relations") or []],
+            "candidate": dict(ir["candidate"]) if ir.get("candidate") else None,
+        }
+
     def _semantic_controller(self, question, seeds, frame, context_map=None):
         del context_map
-        self._evidence_lattice, self._last_option_probe_coverage = EvidenceLattice(), {}
+        self._last_option_probe_coverage = {}
+        self._active_controller_seeds = list(seeds[:3])
         options = self._question_options(question) or {}
-        hints = {"dates": list(getattr(frame, "dates", ()) or ()), "source_speaker": getattr(frame, "speaker_role", ""), "hard_entities": list(getattr(frame, "hard_entities", ()) or ())}
-        prompt = CONTROLLER_POLICY + "\n" + CONTROLLER_SCHEMA.format(question=question, options=json.dumps(options, ensure_ascii=False), hints=json.dumps(hints, ensure_ascii=False), seeds=json.dumps(self._rc_seed_payload(seeds), ensure_ascii=False))
+        hints = {
+            "dates": list(getattr(frame, "dates", ()) or ()),
+            "source_speaker": getattr(frame, "speaker_role", ""),
+            "explicit_entities": list(getattr(frame, "entities", ()) or ()),
+        }
+        prompt = (
+            SEMANTIC_IR_POLICY
+            + "\n"
+            + SEMANTIC_IR_SCHEMA.format(
+                question=question,
+                options=json.dumps(options, ensure_ascii=False),
+                hints=json.dumps(hints, ensure_ascii=False),
+                seeds=json.dumps(self._rc_seed_payload(seeds), ensure_ascii=False),
+            )
+        )
         try:
-            response = self._llm_client.chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=512, response_format={"type": "json_object"})
+            response = self._llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
             usage = self._response_usage(response, prompt)
-            decision = self._rc_normalize_decision(self._parse_json(response.content), question, frame)
-            if not decision["subject_id"]:
-                owners = {self._rc_owner(memory.get("subject_id") or memory.get("subject") or "") for memory in seeds[:3] if memory.get("subject_id") or memory.get("subject")}
-                owners.discard("")
-                if len(owners) == 1:
-                    decision["subject_id"] = next(iter(owners))
+            ir = self._rc_normalize_ir(
+                self._parse_json(response.content), question, frame
+            )
+            error = ""
         except Exception as exc:
-            decision = self._rc_normalize_decision({"route": "PLAN", "operator": "MULTI_OPTION" if options else "DIRECT"}, question, frame)
-            decision["_seed_candidates"] = list(seeds[:3])
-            plan = self._controller_plan(decision, question, frame)
-            return None, plan, {"called": True, "route": "PLAN", "decision_route": "PLAN", "answer": "", "support_ref": "", "support_refs": [], "fallback_reason": "controller_error", "error": str(exc), "usage": {}, "operator": decision["operator"], "answer_slot": decision["answer_slot"]}
+            usage = {}
+            ir = self._rc_normalize_ir({}, question, frame)
+            error = str(exc)
 
-        fallback_reason = "" if decision.get("route_valid", True) else "invalid_controller_route"
-        if decision["route"] == "ANSWER":
-            supports, fallback_reason = self._authorize_controller_answer(decision, seeds, frame)
-            if supports is not None:
-                return supports, {}, {"called": True, "route": "DIRECT", "decision_route": "ANSWER", "answer": decision["answer"], "support_ref": decision["support_refs"][0], "support_refs": decision["support_refs"], "fallback_reason": "", "usage": usage, "operator": decision["operator"], "answer_slot": decision["answer_slot"], "requirement_count": len(decision["requirements"]), "target_rejected": decision["target_rejected"]}
-            decision["route"] = "PLAN"
+        supports, authorization = self._authorize_controller_answer(ir, seeds, frame)
+        if supports is not None:
+            candidate = ir["candidate"]
+            telemetry = {
+                "called": True,
+                "route": "DIRECT",
+                "route_source": "derived_from_authorized_candidate",
+                "answer": candidate["answer"],
+                "support_ref": candidate["support_ref"],
+                "support_refs": [candidate["support_ref"]],
+                "fallback_reason": "",
+                "usage": usage,
+                "answer_type": ir["answer_type"],
+                "requirement_count": 1,
+                "relation_count": 0,
+                "semantic_ir": self._rc_public_ir(ir),
+            }
+            return supports, {}, telemetry
 
-        decision["_seed_candidates"] = list(seeds[:3])
-        plan = self._controller_plan(decision, question, frame)
-        if fallback_reason:
-            plan["planner_fallback"] = True
-            plan["fallback_reason"] = fallback_reason
-        return None, plan, {"called": True, "route": "PLAN", "decision_route": "PLAN", "answer": "", "support_ref": "", "support_refs": [], "fallback_reason": fallback_reason, "usage": usage, "operator": decision["operator"], "answer_slot": decision["answer_slot"], "requires_inference": decision["requires_inference"], "causal_mode": decision.get("causal_mode") or "", "requirement_count": len(decision["requirements"]), "target_rejected": decision["target_rejected"]}
+        plan = self._controller_plan(ir, question, frame)
+        telemetry = {
+            "called": True,
+            "route": "PLAN",
+            "route_source": "derived_from_candidate_authorization",
+            "answer": "",
+            "support_ref": "",
+            "support_refs": [],
+            "fallback_reason": error or (authorization if ir.get("candidate") else ""),
+            "error": error,
+            "usage": usage,
+            "answer_type": ir["answer_type"],
+            "requirement_count": len(ir["requirements"]),
+            "relation_count": len(ir["relations"]),
+            "semantic_ir": self._rc_public_ir(ir),
+        }
+        return None, plan, telemetry

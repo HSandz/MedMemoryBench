@@ -420,11 +420,13 @@ class RetrievalOperationsMixin:
         # matching is only a write-time repair mechanism, never read-time
         # evidence expansion.
         anchor_lineage = state_identity(anchor) if anchor else ""
+        anchor_scope = str((anchor or {}).get("scope") or "").strip().lower()
         lineages = {anchor_lineage} if anchor_lineage else set()
         family = [
             memory
             for memory in self._memories
             if state_identity(memory) in lineages
+            and str(memory.get("scope") or "").strip().lower() == anchor_scope
             and memory.get("assertion_mode", "DIRECT") == "DIRECT"
         ]
         family_sorted = sorted(

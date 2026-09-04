@@ -6,10 +6,16 @@ from typing import Any, Dict, Iterable, List, Optional
 from methods.base import AgentResponse
 from utils.llm_client import format_messages
 
-from .contracts import CLINICAL_SCOPES
 from .canonicalization import state_identity
 
-QUERY_TOKEN_STAGES = ("fast_gate", "planner", "slot_validation", "replan", "answer")
+QUERY_TOKEN_STAGES = (
+    "controller",
+    "fast_gate",
+    "planner",
+    "slot_validation",
+    "replan",
+    "answer",
+)
 
 
 class QueryMixin:
@@ -81,9 +87,7 @@ class QueryMixin:
                 )
             )
             date_label = ", ".join(dates) if dates else "UNKNOWN"
-            lines = [
-                self._format_answer_memory(memory) for memory in episode_memories
-            ]
+            lines = [self._format_answer_memory(memory) for memory in episode_memories]
             blocks.append(
                 f"[EPISODE session={session} document_date={date_label}]\n"
                 + "\n".join(lines)
@@ -111,7 +115,7 @@ class QueryMixin:
         candidate_order: List[str],
         limit: int,
     ) -> List[str]:
-        """Reserve context for every covered role before adding redundancy."""
+        """Reserve bounded context for every independent requirement."""
         bounded_limit = max(0, int(limit))
         if not bounded_limit:
             return []
@@ -134,50 +138,15 @@ class QueryMixin:
             ):
                 selected.append(memory_id)
 
-        # First preserve one answer-bearing memory for every independent role.
+        option_count = max(
+            (len(slot.get("option_labels") or []) for slot in unique_slots),
+            default=0,
+        )
         for slot in unique_slots:
-            for memory_id in slot_support.get(slot["id"], []):
+            reserve = min(6, max(2, option_count)) if option_count else 1
+            for memory_id in slot_support.get(slot["id"], [])[:reserve]:
                 if memory_id in allowed:
                     add(memory_id)
-                    break
-
-        # Rich reasoning roles need a second independent observation when the
-        # executor exposed one. A single state head can satisfy a boolean
-        # contract yet be insufficient for an inference or option decision;
-        # retain the bounded second support without admitting candidates that
-        # were not already authorized by the plan.
-        rich_roles = {
-            "FOCAL_STATE",
-            "LONGITUDINAL_CONTEXT",
-            "ACTION_RULE",
-            "CONSTRAINT",
-            "ALTERNATIVE",
-            "CAUSE",
-            "COMPARAND",
-        }
-        for slot in unique_slots:
-            if slot.get("evidence_role") not in rich_roles:
-                continue
-            count = 0
-            for memory_id in slot_support.get(slot["id"], []):
-                if memory_id in allowed:
-                    add(memory_id)
-                    count += 1
-                if count >= 2 or len(selected) >= bounded_limit:
-                    break
-
-        # Relational slots need at least two endpoints when available.
-        relational = {"TRANSITION", "CAUSE_PATH", "COMPARISON"}
-        for slot in unique_slots:
-            if slot.get("type") not in relational:
-                continue
-            count = 0
-            for memory_id in slot_support.get(slot["id"], []):
-                if memory_id in allowed:
-                    add(memory_id)
-                    count += 1
-                if count >= 2 or len(selected) >= bounded_limit:
-                    break
 
         supported = {
             memory_id
@@ -240,34 +209,7 @@ class QueryMixin:
     ) -> Dict[str, Any]:
         started = time.time()
         retrieval_question = self._unwrap_question(question)
-        
-        # P1A FAST PATH INTERCEPTION
-        try:
-            from methods.smart_mem0.p1a_execution import _prepare_p1a_query
-            p1a_telemetry = {}
-            # Use self.subject_aliases configured in agent init
-            fast_frame = _prepare_p1a_query(
-                self, 
-                routing_question=retrieval_question, 
-                answer_question=question,
-                subject_aliases=getattr(self, "subject_aliases", {}),
-                telemetry_out=p1a_telemetry
-            )
-            if fast_frame:
-                if system_message:
-                    fast_frame["system_message"] = system_message
-                    if "messages" in fast_frame and fast_frame["messages"]:
-                        existing = fast_frame["messages"][0]["content"]
-                        fast_frame["messages"][0]["content"] = f"{system_message}\n\n{existing}" 
-                # Add telemetry to fast_frame's extra
-                fast_frame.setdefault("extra", {})["p1a_attempt"] = p1a_telemetry
-                return fast_frame
-        except Exception as e:
-            # P1A fail open
-            import traceback
-            traceback.print_exc()
-            p1a_telemetry = {"attempted": True, "accepted": False, "fallback_reason": "EXCEPTION", "error": str(e)}
-            pass
+
         question_options = self._question_options(retrieval_question)
         frame = self._query_frame(retrieval_question)
 
@@ -275,20 +217,14 @@ class QueryMixin:
         seeds = self._constraint_first_search(retrieval_question, frame, top_k=8)[:8]
         initial_seeds = self._select_initial_seeds(seeds)
         planning_seeds = self._planning_seed_set(retrieval_question, seeds)
-        # The routing map is needed by the unified controller, but a validated
-        # legacy fast-path query never sends it to an LLM and does not need the
-        # extra local hybrid search. Planned legacy queries build it lazily in
-        # _plan_operations, so direct queries pay only the initial recall.
-        planning_context = (
-            self._planning_context_map(retrieval_question)
-            if getattr(self, "enable_unified_controller", False)
-            else None
-        )
+        # Minimal IR reads need only the question and Top-3 seeds. The legacy
+        # context map is intentionally absent from the active controller input.
+        planning_context = None
 
-        if getattr(self, "enable_unified_controller", False):
+        if getattr(self, "enable_two_stage_controller", False):
             fast_supports, gate = None, {
                 "called": False,
-                "skip_reason": "unified_controller",
+                "skip_reason": "semantic_controller",
                 "usage": {},
             }
         else:
@@ -315,7 +251,7 @@ class QueryMixin:
             planning_seeds=planning_seeds,
             planning_context=planning_context,
         )
-        # The unified controller owns the direct/planned route decision. Keep
+        # The semantic controller owns the direct/planned route decision. Keep
         # its validated single support on the fast path all the way to context
         # packing instead of treating it as an ordinary planned result.
         fast_supports = run.get("fast_supports")
@@ -387,9 +323,16 @@ class QueryMixin:
         # explicitly marked as supplementary context.
         supplementary_ids = set()
         route_spec = (plan or {}).get("query_spec") or {}
-        hard_reasoning = bool(route_spec.get("requires_inference")) or str(
-            (plan or {}).get("query_mode") or ""
-        ).upper() in {"DECISION", "CAUSAL", "COMPARISON", "MULTI_OPTION"}
+        semantic_relation_types = {
+            str(relation.get("type") or "").upper()
+            for candidate_plan in (plan, replan or {})
+            for relation in candidate_plan.get("semantic_relations", [])
+        }
+        hard_reasoning = (
+            bool(route_spec.get("requires_inference"))
+            or bool(question_options)
+            or bool(semantic_relation_types)
+        )
         if (
             fast_supports is None
             and not sufficient
@@ -401,17 +344,7 @@ class QueryMixin:
                 for item in trace
                 if str(item.get("operation_index", "")).lstrip("-").isdigit()
             }
-            rich_roles = {
-                "FOCAL_STATE",
-                "LONGITUDINAL_CONTEXT",
-                "ACTION_RULE",
-                "CONSTRAINT",
-                "ALTERNATIVE",
-                "CAUSE",
-                "COMPARAND",
-            }
-            if str((plan or {}).get("query_mode") or "").upper() == "MULTI_OPTION":
-                rich_roles.add("ANSWER")
+            rich_roles = {"REQUIREMENT"}
             candidate_by_id_for_supplement = {
                 memory["id"]: memory for memory in operation_candidates
             }
@@ -435,7 +368,9 @@ class QueryMixin:
                 )
                 added_for_role = 0
                 for operation_index in sorted(operation_ids):
-                    for memory_id in output_ids_by_operation.get(operation_index, set()):
+                    for memory_id in output_ids_by_operation.get(
+                        operation_index, set()
+                    ):
                         memory = candidate_by_id_for_supplement.get(memory_id)
                         if not memory or memory_id in support_ids:
                             continue
@@ -452,7 +387,7 @@ class QueryMixin:
                             break
                     if added_for_role >= 1:
                         break
-                    
+
         if supplementary_ids:
             remaining = max(0, context_memory_limit - len(support_ids))
             for memory_id in list(supplementary_ids):
@@ -608,11 +543,12 @@ class QueryMixin:
             needed_relation_types.update({"SUPERSEDE", "REFINE"})
         if "CAUSE_PATH" in slot_types:
             needed_relation_types.add("CAUSES")
-        active_query_modes = {
-            str(candidate_plan.get("query_mode") or "").upper()
+        semantic_relation_types = {
+            str(relation.get("type") or "").upper()
             for candidate_plan in (plan, replan or {})
+            for relation in candidate_plan.get("semantic_relations", [])
         }
-        if "CAUSAL" in active_query_modes:
+        if "CAUSES" in semantic_relation_types:
             needed_relation_types.add("CAUSES")
         if "COMPARISON" in slot_types:
             needed_relation_types.update({"SUPERSEDE", "REFINE", "SUPPORT", "CONFLICT"})
@@ -624,7 +560,11 @@ class QueryMixin:
 
         need_evidence = (
             bool(plan.get("need_raw_evidence", plan.get("need_evidence")))
-            or bool((replan or {}).get("need_raw_evidence", (replan or {}).get("need_evidence")))
+            or bool(
+                (replan or {}).get(
+                    "need_raw_evidence", (replan or {}).get("need_evidence")
+                )
+            )
             or bool(evidence_refs)
             or unresolved
         )
@@ -692,9 +632,7 @@ class QueryMixin:
         # Check arbitration purity explicitly using the pre-arbitration selected IDs.
         # Pure-arbitration violation is equivalent to a final-ID escaping the
         # already authorized seed/operation set because arbitration never retrieves.
-        arbitration_expansion_violation = not final_ids.issubset(
-            arbitration_input_ids
-        )
+        arbitration_expansion_violation = not final_ids.issubset(arbitration_input_ids)
 
         slot_descriptions = {
             slot["id"]: slot["description"]
@@ -749,11 +687,7 @@ class QueryMixin:
             if beliefs and final_ids.issubset(unverified_context_ids)
             else "=== RETRIEVED BELIEFS ==="
         )
-        blocks = [
-            belief_heading
-            + "\n"
-            + self._format_episode_context(beliefs)
-        ]
+        blocks = [belief_heading + "\n" + self._format_episode_context(beliefs)]
         if planner_called:
             # Build a slot-coverage summary the Answer LLM can use to self-verify.
             # Internal memory IDs remain telemetry-only.
@@ -761,14 +695,11 @@ class QueryMixin:
             slot_coverage_lines = []
             unique_slots = list(
                 {
-                    slot.get("id"): slot
-                    for slot in context_slots
-                    if slot.get("id")
+                    slot.get("id"): slot for slot in context_slots if slot.get("id")
                 }.values()
             )
             for slot in unique_slots:
                 sid = slot["id"]
-                role = slot.get("evidence_role", "ANSWER")
                 desc = slot.get("description", sid)
                 covered = slot_coverage.get(sid, False)
                 support = slot_support.get(sid, [])
@@ -779,18 +710,15 @@ class QueryMixin:
                         str(first.get("claim", ""))[:100] if first else support[0]
                     )
                     slot_axis = str(slot.get("time_axis") or "")
-                    slot_contract = (
-                        f" type={slot.get('type', 'DIRECT')}"
-                        + (f" time_axis={slot_axis}" if slot_axis else "")
+                    slot_contract = f" type={slot.get('type', 'DIRECT')}" + (
+                        f" time_axis={slot_axis}" if slot_axis else ""
                     )
                     slot_coverage_lines.append(
-                        f"- [{role}]{slot_contract} {desc}: "
-                        f"[FOUND] {claim_snippet}"
+                        f"- {slot_contract.strip()} {desc}: " f"[FOUND] {claim_snippet}"
                     )
             if slot_coverage_lines:
                 blocks.append(
-                    "=== SLOT COVERAGE REQUIRED ===\n"
-                    + "\n".join(slot_coverage_lines)
+                    "=== SLOT COVERAGE REQUIRED ===\n" + "\n".join(slot_coverage_lines)
                 )
 
         if all_relations:
@@ -799,13 +727,13 @@ class QueryMixin:
                 "=== DIRECTED RELATIONS ===\n"
                 + "\n".join(
                     "- "
-                    + str(
-                        relation_memory.get(r["source_id"], {}).get("claim", "")
-                    )[:120]
+                    + str(relation_memory.get(r["source_id"], {}).get("claim", ""))[
+                        :120
+                    ]
                     + f" -[{r['type']}]-> "
-                    + str(
-                        relation_memory.get(r["target_id"], {}).get("claim", "")
-                    )[:120]
+                    + str(relation_memory.get(r["target_id"], {}).get("claim", ""))[
+                        :120
+                    ]
                     for r in all_relations[:12]
                 )
             )
@@ -822,10 +750,7 @@ class QueryMixin:
         route_spec = route_plan.get("query_spec") or {}
         world_knowledge_bridge_allowed = bool(
             route_spec.get("world_knowledge_bridge_allowed")
-            or any(
-                bool(slot.get("world_knowledge_bridge"))
-                for slot in context_slots
-            )
+            or any(bool(slot.get("world_knowledge_bridge")) for slot in context_slots)
         )
         # A direct controller route has no planner budget. Keep it genuinely
         # cheap; otherwise a one-seed answer silently pays the MEDIUM budget.
@@ -839,7 +764,10 @@ class QueryMixin:
             "SMALL": self.SMALL_CONTEXT_TOKENS,
             "MEDIUM": self.MEDIUM_CONTEXT_TOKENS,
             "LARGE": self.HARD_CONTEXT_TOKENS,
-        }.get(tier, self.HARD_CONTEXT_TOKENS if planner_called else self.EASY_CONTEXT_TOKENS)
+        }.get(
+            tier,
+            self.HARD_CONTEXT_TOKENS if planner_called else self.EASY_CONTEXT_TOKENS,
+        )
         # Keep the context proportional to the plan.  The previous code gave
         # every planned query the LARGE budget, so even a small direct lookup
         # paid the latency/token cost of a full evidence bundle.
@@ -854,6 +782,7 @@ class QueryMixin:
             "never substitute one temporal axis for another. Answer only the comparison "
             "or temporal scope requested, without adding a different baseline. "
             "If conflicts remain, state uncertainty. Pointer evidence supports only its linked memory. "
+            "For a decision, synthesize every grounded requirement that can change the answer instead of repeating one memory. "
             "For a multi-step reasoning question, preserve exact measurements and chronology and present a "
             "complete cause-to-effect chain rather than merely restating retrieved facts. Follow the requested "
             "output format and answer directly."
@@ -875,46 +804,7 @@ class QueryMixin:
             core_instruction += self._multiple_choice_answer_instruction(
                 question_options.keys()
             )
-            # Make the polarity check visible at the answer boundary. Retrieval
-            # supplies shared participant evidence; it must not turn an unsafe
-            # option into the answer merely because the memory mentions its
-            # contraindication.
-            core_instruction += (
-                " Before selecting labels, restate the stem's predicate internally: "
-                "if it asks which option is safe, recommended, or okay, exclude "
-                "options contradicted by an allergy or contraindication; if it asks "
-                "which is unsafe or contraindicated, select those contradicted "
-                "options. Never output the contraindicated labels for a safe/okay "
-                "stem just because those labels appear in the memory."
-            )
-        # Add clinical guidance only when the selected context is medical.
-        is_medical = any(
-            str(memory.get("scope") or "").lower() in CLINICAL_SCOPES
-            for memory in beliefs
-        )
-        if is_medical:
-            medical_extension = (
-                " For a clinical decision, synthesize all covered roles instead of repeating one clinician interpretation: "
-                "weigh exposure, objective trajectory, warning signs, contraindications, and feasible alternatives shown "
-                "in context. Persistent objective worsening must not be reduced to routine monitoring merely because a "
-                "reassuring assessment is also present. When asked whether to use a medicine, directly address medication "
-                "eligibility and safety; lifestyle measures alone are not a complete answer when the context also supports "
-                "a permitted backup or a contraindicated class."
-            )
-            if world_knowledge_bridge_allowed:
-                medical_extension += (
-                    " You may name a generally known option only when its safety properties "
-                    "satisfy the participant-specific constraints supplied in memory."
-                    " For causal clinical reasoning, connect the grounded exposure and outcome "
-                    "through a concrete physiological chain: trigger, regulatory or hormonal "
-                    "response, measured trajectory, and resulting symptom. Include exact patient "
-                    "values and timing from memory; supply standard mechanisms such as sympathetic "
-                    "or HPA-axis activation only when clinically relevant, and label them as "
-                    "inference rather than remembered history."
-                )
-            instruction = core_instruction + medical_extension
-        else:
-            instruction = core_instruction
+        instruction = core_instruction
         full_system = f"{instruction}\n\n{context}"
         if system_message:
             full_system = f"{system_message}\n\n{full_system}"
@@ -940,13 +830,15 @@ class QueryMixin:
                 "method": "smart_mem0",
                 "effective_runtime_config": self._effective_runtime_config(),
                 "planner_called": planner_called,
-                "planner": {"called": planner_called, "gap_count": len(plan.get("required_slots", [])) if plan else 0},
+                "planner": {
+                    "called": planner_called,
+                    "gap_count": len(plan.get("required_slots", [])) if plan else 0,
+                },
                 "plan": plan,
                 "replan_called": replan_called,
                 "replan": replan,
                 "fast_gate": gate,
                 "semantic_controller": controller,
-                "controller_coverage": plan.get("controller_coverage", {}),
                 "world_knowledge_bridge_allowed": world_knowledge_bridge_allowed,
                 "raw_evidence_requested": need_evidence,
                 "fast_gate_skipped": bool(gate.get("skip_reason")),
@@ -965,9 +857,7 @@ class QueryMixin:
                 "raw_evidence_injected": bool(evidence),
                 "memory_tokens": len(self._tokenizer.encode(context)),
                 "context_temporal_axis": context_time_axis or "mixed",
-                "p1a_attempt": p1a_telemetry if "p1a_telemetry" in locals() else {},
                 "seed_gate": run.get("seed_gate", {}),
-                "evidence_lattice": run.get("evidence_lattice", {}),
                 "retrieval_question": retrieval_question,
                 "query_dates": list(frame.dates),
                 "query_speaker_role": frame.speaker_role,
@@ -1016,9 +906,9 @@ class QueryMixin:
             result = self.finalize_batch_query(
                 prepared, str(prepared["precomputed_answer"])
             )
-            result.query_time = prepared["extra"].get(
-                "retrieval_elapsed_ms", 0
-            ) / 1000.0
+            result.query_time = (
+                prepared["extra"].get("retrieval_elapsed_ms", 0) / 1000.0
+            )
             latency = prepared["extra"].setdefault("query_latency", {})
             latency["total_wall"] = round(result.query_time, 3)
             return result

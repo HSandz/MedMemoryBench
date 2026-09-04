@@ -51,17 +51,12 @@ class ReadUsageContractMixin:
         # At this point all output-contract handling has already run. A
         # surviving precomputed answer therefore really skips the final model;
         # otherwise one final answer generation is required.
-        answer_calls = (
-            0 if str(prepared.get("precomputed_answer") or "").strip() else 1
-        )
+        answer_calls = 0 if str(prepared.get("precomputed_answer") or "").strip() else 1
         total_calls = controller_calls + middle_calls + answer_calls
         two_stage_active = bool(controller_calls)
         budget_violation = bool(
             two_stage_active
-            and (
-                middle_calls > 0
-                or total_calls > self.TWO_STAGE_MAX_LLM_CALLS
-            )
+            and (middle_calls > 0 or total_calls > self.TWO_STAGE_MAX_LLM_CALLS)
         )
 
         # planner_called is retained for historical telemetry compatibility: in
