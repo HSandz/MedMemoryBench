@@ -53,8 +53,22 @@ def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, A
     if not batch_stages:
         return efficiency
     efficiency["query_time_kind"] = "per_request_latency_unavailable_for_batch"
+
+    def stage_wall_time(stage: Dict[str, Any]) -> Any:
+        if not isinstance(stage, dict):
+            return None
+        for field in (
+            "end_to_end_wall_time_seconds",
+            "batch_wall_time_seconds",
+            "wall_time_seconds",
+        ):
+            if stage.get(field) is not None:
+                return stage[field]
+        usage = stage.get("usage", {})
+        return usage.get("wall_time") if isinstance(usage, dict) else None
+
     efficiency["stage_wall_time_seconds"] = {
-        name: (stage_usage.get(name, {}).get("usage", {}).get("wall_time"))
+        name: stage_wall_time(stage_usage.get(name, {}))
         for name in ("retrieval_preparation", "answer_generation", "judge")
     }
     efficiency["batch_stage_count"] = len(batch_stages)
@@ -220,6 +234,9 @@ class ResultCollector:
                 "dataset_config": report.config.get("dataset_config", {}),
             },
         }
+        for key in ("dataset_coverage", "input_modality"):
+            if key in report.metadata:
+                result_data[key] = report.metadata[key]
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(result_data, f, ensure_ascii=False, indent=2)
@@ -555,7 +572,7 @@ class ResultCollector:
                     if report.dataset_name == "locomo"
                     else "medmemorybench.query_retrieval_records"
                 ),
-                "version": 2 if report.dataset_name == "locomo" else 1,
+                "version": 3 if report.dataset_name == "locomo" else 1,
                 "method_name": report.method_name,
                 "model_name": report.model_name,
                 "dataset_name": report.dataset_name,
@@ -610,8 +627,8 @@ class ResultCollector:
                 if report.dataset_name == "locomo"
                 else "medmemorybench.query_answers"
             ),
-            # Version 4 adds neutral naming and LoCoMo diagnostic fields.
-            "version": 4 if report.dataset_name == "locomo" else 3,
+            # Version 5 adds explicit LoCoMo stage timing semantics.
+            "version": 5 if report.dataset_name == "locomo" else 3,
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,

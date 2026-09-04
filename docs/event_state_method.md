@@ -229,14 +229,16 @@ classifier prompt budget requires fewer current-state candidates.
 Temporal retrieval is query-only and is enabled by `temporal_retrieval_enabled`
 (`true` by default), with a neutral `temporal_retrieval_weight` of `1.0`.
 The deterministic parser recognizes explicit `YYYY-MM-DD` and `YYYY/MM/DD`
-dates with `as of`/`by` (state as-of), `before`, `after`, `between ... and ...`
-or `from ... to ...` (record-time bounds), and record cues such as `record
+dates, plus complete unambiguous English calendar dates such as `October 13,
+2023`, `Oct 13, 2023`, and `13 October 2023`. It supports `as of`/`by` (state
+as-of), `before`, `after`, `between ... and ...` or `from ... to ...`
+(record-time bounds), and record cues such as `record
 dated DATE` (exact record time). Planner valid-time constraints consume claim
 `valid_from`/`valid_to` metadata and never reinterpret an episode's
 `recorded_at` as event time. Episodes remain available through the ordinary
 dense channel when valid-time metadata is absent. A date without a clear axis uses a hybrid
-record/valid-time candidate channel; incomplete expressions such as "around the
-5th" are ignored and use ordinary retrieval.
+record/valid-time candidate channel; incomplete expressions such as "October",
+"October 13", or "around the 5th" are ignored and use ordinary retrieval.
 
 Episode temporal candidates require a parseable `recorded_at` satisfying the
 bound (for as-of, recorded on or before the target). Claims use actual EvidenceRefs to matching episodes and, for as-of

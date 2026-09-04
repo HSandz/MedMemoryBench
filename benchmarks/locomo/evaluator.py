@@ -1243,14 +1243,17 @@ class LoCoMoEvaluator:
 
     @staticmethod
     def _gold_evidence_turns(evidence: List[str]) -> List[str]:
-        """Keep only canonical LoCoMo evidence IDs (for evaluator-only use)."""
+        """Extract canonical LoCoMo evidence IDs for evaluator-only diagnostics."""
         values, seen = [], set()
         for value in evidence or []:
-            normalized = str(value).strip()
-            if not re.fullmatch(r"D\d+:[^\s:]+", normalized) or normalized in seen:
-                continue
-            values.append(normalized)
-            seen.add(normalized)
+            # An annotation can pack multiple IDs into one field (for example,
+            # ``D8:6; D9:17``). Only standalone canonical tokens are accepted.
+            for match in re.finditer(r"(?<![^\s;])(D\d+:[^\s:;]+)(?=$|[\s;])", str(value)):
+                normalized = match.group(1)
+                if normalized in seen:
+                    continue
+                values.append(normalized)
+                seen.add(normalized)
         return values
 
     @staticmethod
@@ -1439,13 +1442,17 @@ class LoCoMoEvaluator:
             },
             metadata={
                 "run_metadata": self._git_metadata(),
-                "total_samples": len(self.dataset.get_sample_ids()),
-                "evaluated_sample_count": len(self.dataset.get_sample_ids()),
-                "configured_max_samples": self.dataset.max_samples,
-                "sample_ids": self.dataset.get_sample_ids(),
+                "dataset_coverage": {
+                    "available_sample_count": self.dataset.get_available_sample_count(),
+                    "evaluated_sample_count": len(self.dataset.get_sample_ids()),
+                    "configured_max_samples": self.dataset.max_samples,
+                    "sample_ids": self.dataset.get_sample_ids(),
+                },
                 "category_distribution": self.dataset.get_category_distribution(),
-                "image_input_mode": "caption_only" if self.dataset.include_images else "disabled",
-                "image_caption_field": "blip_caption" if self.dataset.include_images else None,
+                "input_modality": {
+                    "image_input_mode": "caption_only" if self.dataset.include_images else "disabled",
+                    "image_caption_field": "blip_caption" if self.dataset.include_images else None,
+                },
                 "memory_build_summary": memory_build_summary,
                 "build_metrics": build_metrics,
                 "memory_chunk_size": self.memory_chunk_size,
@@ -1530,7 +1537,53 @@ class LoCoMoEvaluator:
             stats["mean_f1"] = stats.get("avg_score", 0.0)
             stats["queries_f1_ge_0_5"] = stats.pop("correct", 0)
             stats["fraction_f1_ge_0_5"] = stats.pop("accuracy", 0.0)
+        locomo_f1 = summary.get("by_metric", {}).get("locomo_f1")
+        if isinstance(locomo_f1, dict):
+            locomo_f1["mean_f1"] = locomo_f1.pop("avg_score", 0.0)
+            locomo_f1["queries_f1_ge_0_5"] = locomo_f1.pop("correct", 0)
+            locomo_f1["fraction_f1_ge_0_5"] = locomo_f1.pop("accuracy", 0.0)
         summary["retrieval_quality"] = self._aggregate_locomo_retrieval(results)
+
+    @staticmethod
+    def _batch_wall_time_seconds(stage: Dict[str, Any]) -> Optional[float]:
+        """Return batch job elapsed time only when its manifest timestamps agree."""
+        submitted_at = stage.get("submitted_at")
+        completed_at = stage.get("completed_at")
+        if not isinstance(submitted_at, str) or not isinstance(completed_at, str):
+            return None
+        try:
+            elapsed = (
+                datetime.fromisoformat(completed_at)
+                - datetime.fromisoformat(submitted_at)
+            ).total_seconds()
+        except (TypeError, ValueError):
+            return None
+        return elapsed if elapsed >= 0 else None
+
+    @staticmethod
+    def _aggregate_batch_answer_usage(results: List[MetricResult]) -> Dict[str, Any]:
+        """Aggregate per-result batch usage without re-counting global trackers."""
+        input_tokens = output_tokens = request_count = 0
+        for result in results:
+            details = result.details if isinstance(result.details, dict) else {}
+            execution_usage = details.get("execution_usage", {})
+            answer_usage = (
+                execution_usage.get("answer", {})
+                if isinstance(execution_usage, dict) else {}
+            )
+            if not isinstance(answer_usage, dict) or answer_usage.get("transport") != "batch":
+                continue
+            input_tokens += int(answer_usage.get("input_tokens", 0) or 0)
+            output_tokens += int(answer_usage.get("output_tokens", 0) or 0)
+            request_count += 1
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "request_count": request_count,
+            "successful_requests": request_count,
+            "transport": "batch",
+        }
 
     def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
         """Expose local phase accounting and batch lifecycle without fake latency."""
@@ -1542,26 +1595,54 @@ class LoCoMoEvaluator:
             try:
                 manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
                 for name, stage in (manifest.get("jobs") or {}).items():
+                    if not isinstance(stage, dict):
+                        continue
                     batch_stages.append({
                         "stage": name, "state": stage.get("state"),
                         "request_count": len(stage.get("requests") or []),
                         "submitted_at": stage.get("submitted_at"),
                         "completed_at": stage.get("completed_at"),
+                        "wall_time_seconds": self._batch_wall_time_seconds(stage),
                     })
             except (OSError, json.JSONDecodeError):
                 pass
+        retrieval_usage = query_operations.get("query.retrieval_preparation", {})
+        retrieval_end_to_end = getattr(
+            self, "_batch_retrieval_preparation_wall_time", 0.0
+        )
+        batch_usage = self._aggregate_batch_answer_usage(
+            getattr(getattr(self, "aggregator", None), "results", [])
+        )
+        realtime_usage = query_operations.get("query.answer_realtime", {})
+        answer_batch_stages = [
+            stage for stage in batch_stages if stage.get("stage") == "query-final"
+        ]
+        has_batch_usage = batch_usage["request_count"] > 0
+        has_realtime_usage = bool(realtime_usage.get("call_count", 0))
+        if answer_batch_stages and has_realtime_usage:
+            answer_generation = {
+                "transport": "mixed",
+                "usage": {"batch": batch_usage, "realtime": realtime_usage},
+                "batch_usage": batch_usage,
+                "realtime_usage": realtime_usage,
+            }
+        elif answer_batch_stages or has_batch_usage:
+            answer_generation = {"transport": "batch", "usage": batch_usage}
+        else:
+            answer_generation = {"transport": "realtime", "usage": realtime_usage}
+        if answer_batch_stages:
+            answer_generation["batch_wall_time_seconds"] = answer_batch_stages[-1][
+                "wall_time_seconds"
+            ]
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "memory": {"usage": llm_usage.get("memorize_phase", {})},
             "retrieval_preparation": {
-                "usage": query_operations.get("query.retrieval_preparation", {}),
-                "wall_time_seconds": getattr(
-                    self, "_batch_retrieval_preparation_wall_time", 0.0
-                ),
+                "usage": retrieval_usage,
+                "operation_wall_time_seconds": retrieval_usage.get("wall_time"),
+                "end_to_end_wall_time_seconds": retrieval_end_to_end,
             },
-            "answer_generation": {
-                "usage": query_operations.get("query.answer_realtime", {}),
-            },
+            "answer_generation": answer_generation,
             "judge": {"usage": llm_usage.get("judge_phase", {})},
             "batch_stages": batch_stages,
         }

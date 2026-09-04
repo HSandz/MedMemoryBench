@@ -294,13 +294,28 @@ When LoCoMo evidence annotations are present, query artifacts include
 evaluator-only diagnostics for selected-memory source sessions and exact source
 turns rendered into final answer context. Gold evidence is not sent to the
 memory method or answer model. Batch runs mark per-request answer latency as
-unavailable and report stage and batch wall times instead.
+unavailable and report stage and batch wall times instead. Packed annotations
+such as `D8:6; D9:17` are expanded only by the evaluator. `stage_usage` records
+batch answer tokens from completed query results, batch-job wall time, and
+separate retrieval-preparation operation versus end-to-end wall times; it never
+treats batch wall time as a per-request latency.
 
 LoCoMo session timestamps are normalized by the dataset adapter before they
 enter generic Event-State temporal handling; the raw timestamp is retained for
 audit. With `include_images: true`, LoCoMo provides `blip_caption` text only:
 Event-State does not consume image pixels. A run configured with
 `max_samples: 1` is a one-conversation development run, not a full benchmark.
+Its `result.json` records `dataset_coverage` and `input_modality` so this scope
+and caption-only input cannot be mistaken for a full raw-image run.
+
+For final or publication benchmark runs, prefer artifacts whose `run_metadata`
+has a non-null `git_commit_sha` and `git_dirty: false`. Dirty working trees are
+allowed for development; their results simply may not exactly correspond to the
+recorded commit.
+
+New LoCoMo query-answer artifacts use version 5 and retrieval-record sidecars
+use version 3. Older artifacts remain historical records and are not rewritten
+or reinterpreted.
 
 When `-d` is omitted, query stage restores the exact stored dataset config. To
 apply a revised query selection from the same named config (for example,

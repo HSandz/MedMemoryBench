@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from .schemas import Claim, Episode
 
 
 _DATE_PATTERN = r"(?<!\d)\d{4}[-/]\d{2}[-/]\d{2}(?!\d)"
+_MONTH_NAMES = (
+    "january|february|march|april|may|june|july|august|september|"
+    "october|november|december"
+)
+_MONTH_ABBREVIATIONS = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
+_MONTH_PATTERN = rf"(?:{_MONTH_NAMES}|{_MONTH_ABBREVIATIONS})"
+_MONTH_NAME_DATE_PATTERN = rf"\b(?:{_MONTH_PATTERN})\s+\d{{1,2}},\s*\d{{4}}\b"
+_DAY_MONTH_DATE_PATTERN = rf"\b\d{{1,2}}\s+(?:{_MONTH_PATTERN})\s+\d{{4}}\b"
+_QUERY_DATE_PATTERN = (
+    rf"(?:{_DATE_PATTERN}|{_MONTH_NAME_DATE_PATTERN}|{_DAY_MONTH_DATE_PATTERN})"
+)
 
 
 @dataclass(frozen=True)
@@ -47,23 +58,34 @@ def parse_stored_date(value: object) -> Optional[date]:
 
 def _query_dates(question: str) -> list[date]:
     dates = []
-    for match in re.finditer(_DATE_PATTERN, question):
+    for match in re.finditer(_QUERY_DATE_PATTERN, question, re.IGNORECASE):
+        value = match.group(0)
         try:
-            dates.append(date.fromisoformat(match.group(0).replace("/", "-")))
+            if re.fullmatch(_DATE_PATTERN, value):
+                dates.append(date.fromisoformat(value.replace("/", "-")))
+                continue
+            for pattern in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+                try:
+                    dates.append(datetime.strptime(value, pattern).date())
+                    break
+                except ValueError:
+                    continue
+            else:
+                return []
         except ValueError:
             return []
     return dates
 
 
 def parse_temporal_query(question: str) -> Optional[TemporalQueryConstraint]:
-    """Recognize only explicit ISO-like query dates and bounded cue phrases."""
+    """Recognize explicit complete calendar dates and bounded cue phrases."""
     normalized = " ".join(question.casefold().split())
     dates = _query_dates(normalized)
     if not dates:
         return None
 
     interval = re.search(
-        rf"\b(?:between|from)\s+{_DATE_PATTERN}\s+(?:and|to)\s+{_DATE_PATTERN}\b",
+        rf"\b(?:between|from)\s+{_QUERY_DATE_PATTERN}\s+(?:and|to)\s+{_QUERY_DATE_PATTERN}\b",
         normalized,
     )
     if interval:
@@ -74,13 +96,13 @@ def parse_temporal_query(question: str) -> Optional[TemporalQueryConstraint]:
     if len(dates) != 1:
         return None
     target = dates[0]
-    if re.search(rf"\b(?:as of|by)\s+{_DATE_PATTERN}\b", normalized):
+    if re.search(rf"\b(?:as of|by)\s+{_QUERY_DATE_PATTERN}\b", normalized):
         return TemporalQueryConstraint("as_of", target_date=target, intent="valid_time")
-    if re.search(rf"\bbefore\s+{_DATE_PATTERN}\b", normalized):
+    if re.search(rf"\bbefore\s+{_QUERY_DATE_PATTERN}\b", normalized):
         return TemporalQueryConstraint("before", target_date=target, intent="hybrid")
-    if re.search(rf"\bafter\s+{_DATE_PATTERN}\b", normalized):
+    if re.search(rf"\bafter\s+{_QUERY_DATE_PATTERN}\b", normalized):
         return TemporalQueryConstraint("after", target_date=target, intent="hybrid")
-    if re.search(rf"\b(?:record dated|record on|discuss(?:ed)? on)\s+{_DATE_PATTERN}\b", normalized):
+    if re.search(rf"\b(?:record dated|record on|discuss(?:ed)? on)\s+{_QUERY_DATE_PATTERN}\b", normalized):
         return TemporalQueryConstraint("exact_record_time", target_date=target, intent="record_time")
     # A bare date or "on DATE" has no reliable axis; use both candidate kinds.
     return TemporalQueryConstraint("exact_record_time", target_date=target, intent="hybrid")

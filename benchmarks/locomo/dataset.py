@@ -81,6 +81,7 @@ class LoCoMoDataset(BaseDataset):
         self.include_images = config.get("include_images", True)
 
         self._samples: Dict[str, Dict[str, Any]] = {}
+        self._available_sample_count = 0
 
     def load(self) -> None:
         if self._is_loaded:
@@ -89,6 +90,7 @@ class LoCoMoDataset(BaseDataset):
         data_path = self.data_dir / self.data_file
         with open(data_path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
+        self._available_sample_count = len(raw_data)
 
         for idx, sample in enumerate(raw_data):
             sample_id = sample.get("sample_id", f"sample_{idx}")
@@ -249,6 +251,10 @@ class LoCoMoDataset(BaseDataset):
 
     def get_sample_ids(self) -> List[str]:
         return list(self._samples.keys())
+
+    def get_available_sample_count(self) -> int:
+        """Return source samples before evaluation selection is applied."""
+        return self._available_sample_count
 
     def get_sample_info(self, sample_id: str) -> Dict[str, Any]:
         if sample_id in self._samples:
