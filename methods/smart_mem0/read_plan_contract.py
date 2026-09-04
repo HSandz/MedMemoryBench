@@ -174,12 +174,17 @@ class ReadPlanContractMixin:
                 "requires_inference": decision["requires_inference"],
                 "temporal": dict(decision["temporal"]),
                 "causal_mode": decision.get("causal_mode") or "",
+                "world_knowledge_bridge_allowed": any(
+                    bool(requirement.get("world_knowledge_bridge"))
+                    for requirement in decision.get("requirements") or []
+                ),
             },
             "query_mode": effective_operator,
             "required_slots": slots,
             "seed_coverage": [],
             "operations": [],
-            "need_evidence": True,
+            "need_evidence": bool(decision.get("need_raw_evidence", False)),
+            "need_raw_evidence": bool(decision.get("need_raw_evidence", False)),
             "budget_tier": tier,
             "max_memories": RETRIEVAL_BUDGETS[tier]["max_memories"],
             "planner_fallback": False,
@@ -188,5 +193,61 @@ class ReadPlanContractMixin:
             "option_coverage": [],
             "visible_options": dict(decision["visible_options"]),
         }
-        plan["operations"] = self._compile_gap_operations(slots, question, tier, plan=plan)
+        seeds = list(decision.get("_seed_candidates") or [])[:3]
+        requirements = {
+            str(requirement.get("id") or ""): requirement
+            for requirement in decision.get("requirements") or []
+        }
+        seed_by_ref = {f"$seed{index}": memory for index, memory in enumerate(seeds)}
+        seed_by_id = {memory["id"]: memory for memory in seeds}
+        seed_ids = set(seed_by_id)
+        seed_relations = [
+            relation
+            for relation in self._relations
+            if relation.get("source_id") in seed_ids
+            and relation.get("target_id") in seed_ids
+        ]
+
+        missing_slots = []
+        for slot in slots:
+            requirement = requirements.get(str(slot.get("id") or ""), {})
+            slot["world_knowledge_bridge"] = bool(
+                requirement.get("world_knowledge_bridge", False)
+            )
+            refs = list(requirement.get("support_refs") or [])
+            if requirement.get("coverage") != "COVERED":
+                missing_slots.append(slot)
+                continue
+            if effective_operator == "MULTI_OPTION" or str(slot.get("time_relation") or "").upper() in {"EARLIEST", "LATEST"}:
+                missing_slots.append(slot)
+                continue
+            memories = [seed_by_ref[ref] for ref in refs if ref in seed_by_ref]
+            if len(memories) != len(refs) or not memories:
+                missing_slots.append(slot)
+                continue
+            if any(not self._memory_satisfies_frame(memory, frame) for memory in memories):
+                missing_slots.append(slot)
+                continue
+
+            memory_ids = list(dict.fromkeys(memory["id"] for memory in memories))
+            slot["controller_seed_ids"] = memory_ids
+            if not self._slot_covered(slot, memory_ids, memories, seed_relations):
+                slot.pop("controller_seed_ids", None)
+                missing_slots.append(slot)
+                continue
+            plan["seed_coverage"].append(
+                {"slot_id": slot["id"], "refs": list(dict.fromkeys(refs))}
+            )
+
+        plan["operations"] = self._compile_gap_operations(
+            missing_slots, question, tier, plan=plan
+        )
+        plan["controller_coverage"] = {
+            "covered_requirement_ids": [
+                item["slot_id"] for item in plan["seed_coverage"]
+            ],
+            "missing_requirement_ids": [slot["id"] for slot in missing_slots],
+            "covered_count": len(plan["seed_coverage"]),
+            "missing_count": len(missing_slots),
+        }
         return plan

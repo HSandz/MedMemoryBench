@@ -390,7 +390,12 @@ class QueryMixin:
         hard_reasoning = bool(route_spec.get("requires_inference")) or str(
             (plan or {}).get("query_mode") or ""
         ).upper() in {"DECISION", "CAUSAL", "COMPARISON", "MULTI_OPTION"}
-        if fast_supports is None and hard_reasoning and operation_candidates:
+        if (
+            fast_supports is None
+            and not sufficient
+            and hard_reasoning
+            and operation_candidates
+        ):
             output_ids_by_operation = {
                 int(item.get("operation_index")): set(item.get("output_ids") or [])
                 for item in trace
@@ -443,9 +448,9 @@ class QueryMixin:
                             continue
                         supplementary_ids.add(memory_id)
                         added_for_role += 1
-                        if added_for_role >= (3 if role == "LONGITUDINAL_CONTEXT" else 2):
+                        if added_for_role >= 1:
                             break
-                    if added_for_role >= (3 if role == "LONGITUDINAL_CONTEXT" else 2):
+                    if added_for_role >= 1:
                         break
                     
         if supplementary_ids:
@@ -489,21 +494,34 @@ class QueryMixin:
                         and memory["id"] not in ordered_best_effort
                     ):
                         ordered_best_effort.append(memory["id"])
-                support_ids = set(ordered_best_effort[:context_memory_limit])
+                support_ids = set(ordered_best_effort[: min(2, context_memory_limit)])
             unverified_context_ids = set(support_ids)
-        elif not sufficient and len(support_ids) < context_memory_limit:
-            # Keep validated partial progress, then add bounded best-effort
-            # candidates for roles that remained uncovered after the one replan.
-            for memory in (*operation_candidates, *authorized_seeds):
-                if len(support_ids) >= context_memory_limit:
+        elif not sufficient:
+            # Keep validated progress and add at most one explicit-operation
+            # candidate for each still-missing role. Do not fill the context cap
+            # with merely topical outputs.
+            missing = [
+                slot
+                for slot in context_slots
+                if not slot_coverage.get(str(slot.get("id") or ""), False)
+            ]
+            added = 0
+            for slot in missing:
+                for memory in operation_candidates:
+                    if added >= 2:
+                        break
+                    if (
+                        memory["id"] not in support_ids
+                        and memory["id"] in operation_output_ids
+                        and eligible_best_effort(memory)
+                        and self._memory_matches_slot_role(slot, memory)
+                    ):
+                        support_ids.add(memory["id"])
+                        unverified_context_ids.add(memory["id"])
+                        added += 1
+                        break
+                if added >= 2:
                     break
-                if (
-                    memory["id"] not in support_ids
-                    and memory["id"] in operation_output_ids
-                    and eligible_best_effort(memory)
-                ):
-                    support_ids.add(memory["id"])
-                    unverified_context_ids.add(memory["id"])
 
         candidate_by_id = {
             memory["id"]: memory
@@ -605,9 +623,10 @@ class QueryMixin:
         ]
 
         need_evidence = (
-            bool(plan.get("need_evidence"))
-            or bool((replan or {}).get("need_evidence"))
+            bool(plan.get("need_raw_evidence", plan.get("need_evidence")))
+            or bool((replan or {}).get("need_raw_evidence", (replan or {}).get("need_evidence")))
             or bool(evidence_refs)
+            or unresolved
         )
         linked_evidence_refs = [
             memory_id for memory_id in evidence_refs if memory_id in final_ids
@@ -800,6 +819,14 @@ class QueryMixin:
             )
 
         route_plan = replan or plan or {}
+        route_spec = route_plan.get("query_spec") or {}
+        world_knowledge_bridge_allowed = bool(
+            route_spec.get("world_knowledge_bridge_allowed")
+            or any(
+                bool(slot.get("world_knowledge_bridge"))
+                for slot in context_slots
+            )
+        )
         # A direct controller route has no planner budget. Keep it genuinely
         # cheap; otherwise a one-seed answer silently pays the MEDIUM budget.
         tier = (
@@ -821,9 +848,7 @@ class QueryMixin:
 
         core_instruction = (
             "Ground every subject-specific claim in the supplied memory context. "
-            "For inference or reasoning questions, use general domain knowledge to connect grounded "
-            "endpoints and make the intermediate mechanism explicit; clearly distinguish that inferred "
-            "bridge from remembered subject history. Never invent subject history, events, measurements, states, decisions, preferences, or actions. "
+            "Never invent subject history, events, measurements, states, decisions, preferences, or actions. "
             "Preserve exact names, values, units, qualifiers, and dates. For each TEMPORAL slot, answer from its "
             "declared time_axis, not from another date displayed on the same memory. Respect relation direction; "
             "never substitute one temporal axis for another. Answer only the comparison "
@@ -833,6 +858,19 @@ class QueryMixin:
             "complete cause-to-effect chain rather than merely restating retrieved facts. Follow the requested "
             "output format and answer directly."
         )
+        if world_knowledge_bridge_allowed:
+            core_instruction += (
+                " GENERAL-DOMAIN BRIDGE IS AUTHORIZED: connect only the grounded "
+                "participant-specific endpoints using standard domain knowledge, make the "
+                "intermediate mechanism explicit, and label it as inference rather than "
+                "remembered history."
+            )
+        else:
+            core_instruction += (
+                " GENERAL-DOMAIN BRIDGE IS NOT AUTHORIZED: answer only from the supplied "
+                "participant-specific memories and their linked evidence; do not add an "
+                "unstored mechanism or recommendation."
+            )
         if question_options:
             core_instruction += self._multiple_choice_answer_instruction(
                 question_options.keys()
@@ -861,13 +899,19 @@ class QueryMixin:
                 "in context. Persistent objective worsening must not be reduced to routine monitoring merely because a "
                 "reassuring assessment is also present. When asked whether to use a medicine, directly address medication "
                 "eligibility and safety; lifestyle measures alone are not a complete answer when the context also supports "
-                "a permitted backup or a contraindicated class. You may name a generally known option only when its safety "
-                "properties satisfy the participant-specific constraints supplied in memory. For causal clinical reasoning, "
-                "connect the grounded exposure and outcome through a concrete physiological chain: trigger, regulatory or "
-                "hormonal response, measured trajectory, and resulting symptom. Include exact patient values and timing from "
-                "memory; supply standard mechanisms such as sympathetic or HPA-axis activation only when clinically relevant, "
-                "and label them as inference rather than remembered history."
+                "a permitted backup or a contraindicated class."
             )
+            if world_knowledge_bridge_allowed:
+                medical_extension += (
+                    " You may name a generally known option only when its safety properties "
+                    "satisfy the participant-specific constraints supplied in memory."
+                    " For causal clinical reasoning, connect the grounded exposure and outcome "
+                    "through a concrete physiological chain: trigger, regulatory or hormonal "
+                    "response, measured trajectory, and resulting symptom. Include exact patient "
+                    "values and timing from memory; supply standard mechanisms such as sympathetic "
+                    "or HPA-axis activation only when clinically relevant, and label them as "
+                    "inference rather than remembered history."
+                )
             instruction = core_instruction + medical_extension
         else:
             instruction = core_instruction
@@ -902,6 +946,9 @@ class QueryMixin:
                 "replan": replan,
                 "fast_gate": gate,
                 "semantic_controller": controller,
+                "controller_coverage": plan.get("controller_coverage", {}),
+                "world_knowledge_bridge_allowed": world_knowledge_bridge_allowed,
+                "raw_evidence_requested": need_evidence,
                 "fast_gate_skipped": bool(gate.get("skip_reason")),
                 "fast_gate_skip_reason": gate.get("skip_reason", ""),
                 "initial_seeds": len(initial_seeds),

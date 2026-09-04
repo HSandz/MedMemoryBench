@@ -21,7 +21,7 @@ from .p1b_execution import EvidenceLattice
 
 
 CONTROLLER_POLICY = """You are the single semantic controller of an evidence-grounded memory system.
-Interpret QUESTION by meaning in any language. Derive what evidence QUESTION requires before looking at SEEDS. SEEDS may justify an atomic answer, but must never change the target requested by QUESTION.
+Interpret QUESTION by meaning in any language. First derive immutable evidence requirements from QUESTION alone. Only after the requirements are fixed, assess whether SEEDS cover each requirement. SEEDS may justify an atomic answer or cover a planned requirement, but must never change the target requested by QUESTION.
 
 Return only a small semantic contract. Never invent state_key, object_anchor, scope, entity IDs, memory IDs, retrieval operations, or other memory-store keys. Code resolves memory identity from the durable write-time schema.
 
@@ -38,10 +38,24 @@ COMPARISON: emit exactly two COMPARAND requirements with side LEFT and RIGHT. Ea
 MULTI_OPTION: visible options are retrieval probes, not required memory facts. Emit only shared participant-specific evidence requirements needed to evaluate the choices. An option may have no personal-memory match; absence is not evidence that it is false.
 CAUSAL: causal_mode=STORED only for an explicit remembered causal attribution/path. causal_mode=INFERRED retrieves grounded participant endpoints/trajectory and lets the final answer model explain a general-domain bridge.
 subject_id is who the memory is about; source speaker is only who said it.
+
+SEED COVERAGE:
+- For every requirement, return coverage=COVERED only when its support_refs directly ground all participant-specific premises required by that requirement.
+- Otherwise return coverage=MISSING. Split independent participant-specific premises into separate requirements instead of calling a partial bundle covered.
+- world_knowledge_bridge=true only authorizes a general-domain connection after the participant-specific premises have been grounded by seeds or retrieval. It never changes MISSING to COVERED and must never create a new participant-specific fact.
+- Use world_knowledge_bridge=true for a DECISION, MULTI_OPTION, or INFERRED causal requirement only when the final reasoning genuinely needs standard domain knowledge beyond the participant evidence.
+- EARLIEST/LATEST and visible-option exploration are population operations and cannot be covered by the three seeds alone.
+
+RAW EVIDENCE:
+- need_raw_evidence=false by default. Set it true only when the answer needs exact original wording, source-turn verification, or resolution of an ambiguous/conflicting extracted claim.
+
+ROUTE ORDER:
+- If exactly one atomic requirement is covered by exactly one seed and the answer value is directly present, choose ANSWER and return that value plus its support ref.
+- Otherwise choose PLAN. PLAN may legitimately need zero operations when every requirement is already covered by seeds.
 """
 
 CONTROLLER_SCHEMA = """Return JSON only:
-{{"route":"ANSWER|PLAN","operator":"DIRECT|STATE|TEMPORAL|COMPARISON|CAUSAL|DECISION|MULTI_OPTION|MULTI_HOP","answer_slot":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","answer":"","support_refs":["$seed0"],"requires_inference":false,"subject_id":"","target":"exact contiguous span copied from QUESTION or empty","causal_mode":"|STORED|INFERRED","temporal":{{"axis":"","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}},"requirements":[{{"id":"r1","role":"ANSWER","target":"exact contiguous span copied from QUESTION or empty","side":"|LEFT|RIGHT","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":""}}]}}
+{{"route":"ANSWER|PLAN","operator":"DIRECT|STATE|TEMPORAL|COMPARISON|CAUSAL|DECISION|MULTI_OPTION|MULTI_HOP","answer_slot":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","answer":"","support_refs":["$seed0"],"requires_inference":false,"subject_id":"","target":"exact contiguous span copied from QUESTION or empty","causal_mode":"|STORED|INFERRED","need_raw_evidence":false,"temporal":{{"axis":"","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}},"requirements":[{{"id":"r1","role":"ANSWER","target":"exact contiguous span copied from QUESTION or empty","side":"|LEFT|RIGHT","temporal_axis":"","temporal_relation":"","temporal_anchor":"","temporal_end":"","coverage":"COVERED|MISSING","support_refs":["$seed0"],"world_knowledge_bridge":false}}]}}
 QUESTION:\n{question}\nVISIBLE OPTIONS:\n{options}\nSYNTAX HINTS (routing constraints only; never evidence):\n{hints}\nSEEDS:\n{seeds}"""
 
 VALID_OPERATORS = {"DIRECT", "STATE", "TEMPORAL", "COMPARISON", "CAUSAL", "DECISION", "MULTI_OPTION", "MULTI_HOP"}
@@ -146,12 +160,32 @@ class ReadContractMixin:
         relation = relation if relation in VALID_RELATIONS else ""
         side = str(raw.get("side") or "").upper()
         side = side if role == "COMPARAND" and side in {"LEFT", "RIGHT"} else ""
-        return {"id": str(raw.get("id") or f"r{index + 1}"), "role": role, "target": target, "side": side, "temporal_axis": axis, "temporal_relation": relation, "temporal_anchor": str(raw.get("temporal_anchor") or "").strip(), "temporal_end": str(raw.get("temporal_end") or "").strip()}
+        refs = [
+            str(ref)
+            for ref in (raw.get("support_refs") or raw.get("refs") or [])
+            if re.fullmatch(r"\$seed[0-2]", str(ref))
+        ]
+        coverage = str(raw.get("coverage") or raw.get("status") or "MISSING").upper()
+        coverage = "COVERED" if coverage == "COVERED" and refs else "MISSING"
+        return {
+            "id": str(raw.get("id") or f"r{index + 1}"),
+            "role": role,
+            "target": target,
+            "side": side,
+            "temporal_axis": axis,
+            "temporal_relation": relation,
+            "temporal_anchor": str(raw.get("temporal_anchor") or "").strip(),
+            "temporal_end": str(raw.get("temporal_end") or "").strip(),
+            "coverage": coverage,
+            "support_refs": list(dict.fromkeys(refs)),
+            "world_knowledge_bridge": bool(raw.get("world_knowledge_bridge", False)),
+        }
 
     def _rc_normalize_decision(self, parsed: Dict[str, Any], question: str, frame: Any) -> Dict[str, Any]:
         options = self._question_options(question) or {}
-        route = str(parsed.get("route") or "PLAN").upper()
-        route = route if route in {"ANSWER", "PLAN"} else "PLAN"
+        raw_route = str(parsed.get("route") or "").upper()
+        route_valid = raw_route in {"ANSWER", "PLAN"}
+        route = raw_route if route_valid else "PLAN"
         operator = str(parsed.get("operator") or ("MULTI_OPTION" if options else "DIRECT")).upper()
         operator = operator if operator in VALID_OPERATORS else "DIRECT"
         if options:
@@ -226,7 +260,23 @@ class ReadContractMixin:
         if route == "ANSWER" and (operator not in {"DIRECT", "STATE"} or inference or len(requirements) != 1 or len(support_refs) != 1 or relation or anchor):
             route = "PLAN"
 
-        return {"route": route, "operator": operator, "answer_slot": answer_slot, "answer": str(parsed.get("answer") or "").strip(), "support_refs": support_refs, "requires_inference": inference, "subject_id": subject_id, "target": target, "target_rejected": target_rejected, "causal_mode": causal_mode, "temporal": {"axis": axis, "relation": relation, "anchor": anchor, "end": end}, "requirements": requirements, "visible_options": dict(options)}
+        return {
+            "route": route,
+            "route_valid": route_valid,
+            "operator": operator,
+            "answer_slot": answer_slot,
+            "answer": str(parsed.get("answer") or "").strip(),
+            "support_refs": support_refs,
+            "requires_inference": inference,
+            "subject_id": subject_id,
+            "target": target,
+            "target_rejected": target_rejected,
+            "causal_mode": causal_mode,
+            "need_raw_evidence": bool(parsed.get("need_raw_evidence", False)),
+            "temporal": {"axis": axis, "relation": relation, "anchor": anchor, "end": end},
+            "requirements": requirements,
+            "visible_options": dict(options),
+        }
 
     def _rc_answer_grounded(self, answer: str, memories: Sequence[Dict[str, Any]]) -> bool:
         answer_norm = self._rc_text(answer)
@@ -287,15 +337,20 @@ class ReadContractMixin:
                     decision["subject_id"] = next(iter(owners))
         except Exception as exc:
             decision = self._rc_normalize_decision({"route": "PLAN", "operator": "MULTI_OPTION" if options else "DIRECT"}, question, frame)
+            decision["_seed_candidates"] = list(seeds[:3])
             plan = self._controller_plan(decision, question, frame)
             return None, plan, {"called": True, "route": "PLAN", "decision_route": "PLAN", "answer": "", "support_ref": "", "support_refs": [], "fallback_reason": "controller_error", "error": str(exc), "usage": {}, "operator": decision["operator"], "answer_slot": decision["answer_slot"]}
 
-        fallback_reason = ""
+        fallback_reason = "" if decision.get("route_valid", True) else "invalid_controller_route"
         if decision["route"] == "ANSWER":
             supports, fallback_reason = self._authorize_controller_answer(decision, seeds, frame)
             if supports is not None:
                 return supports, {}, {"called": True, "route": "DIRECT", "decision_route": "ANSWER", "answer": decision["answer"], "support_ref": decision["support_refs"][0], "support_refs": decision["support_refs"], "fallback_reason": "", "usage": usage, "operator": decision["operator"], "answer_slot": decision["answer_slot"], "requirement_count": len(decision["requirements"]), "target_rejected": decision["target_rejected"]}
             decision["route"] = "PLAN"
 
+        decision["_seed_candidates"] = list(seeds[:3])
         plan = self._controller_plan(decision, question, frame)
+        if fallback_reason:
+            plan["planner_fallback"] = True
+            plan["fallback_reason"] = fallback_reason
         return None, plan, {"called": True, "route": "PLAN", "decision_route": "PLAN", "answer": "", "support_ref": "", "support_refs": [], "fallback_reason": fallback_reason, "usage": usage, "operator": decision["operator"], "answer_slot": decision["answer_slot"], "requires_inference": decision["requires_inference"], "causal_mode": decision.get("causal_mode") or "", "requirement_count": len(decision["requirements"]), "target_rejected": decision["target_rejected"]}

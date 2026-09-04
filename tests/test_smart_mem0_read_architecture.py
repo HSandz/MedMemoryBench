@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 from methods.smart_mem0.contracts import QueryFrame
 from methods.smart_mem0.read_architecture_contract import ReadArchitectureContractMixin
+from methods.smart_mem0.read_controller import ReadContractMixin
 from methods.smart_mem0.read_option_contract import ReadOptionContractMixin
+from methods.smart_mem0.read_plan_contract import ReadPlanContractMixin
 from methods.smart_mem0.read_route_contract import ReadRouteContractMixin
 from methods.smart_mem0.read_usage_contract import ReadUsageContractMixin
 
@@ -69,6 +71,33 @@ class _UsageBase:
 
 
 class _UsageHarness(ReadUsageContractMixin, _UsageBase):
+    pass
+
+
+class _PlanBase:
+    _relations = []
+
+    @staticmethod
+    def _rc_resolve_target_keys(target, subject_id=""):
+        return []
+
+    @staticmethod
+    def _memory_satisfies_frame(memory, frame):
+        return True
+
+    @staticmethod
+    def _slot_covered(slot, support_ids, selected, relations):
+        return set(slot.get("controller_seed_ids") or []).issubset(support_ids)
+
+    @staticmethod
+    def _compile_gap_operations(slots, question, budget_tier="MEDIUM", plan=None):
+        return [
+            {"op": "SEMANTIC_SEARCH", "produces": [slot["id"]]}
+            for slot in slots
+        ]
+
+
+class _PlanHarness(ReadPlanContractMixin, _PlanBase):
     pass
 
 
@@ -199,3 +228,68 @@ def test_two_stage_usage_has_hard_two_call_budget_and_flags_middle_call():
     assert calls["total"] == 3
     assert calls["middle"] == 1
     assert calls["two_stage_budget_violation"] is True
+
+
+def test_controller_requirement_coverage_accepts_only_valid_seed_refs():
+    h = ReadContractMixin()
+    requirement = h._rc_normalize_requirement(
+        {
+            "id": "r1",
+            "role": "FOCAL_STATE",
+            "target": "blood glucose",
+            "coverage": "COVERED",
+            "support_refs": ["$seed0", "$seed9", "m_12"],
+            "world_knowledge_bridge": True,
+        },
+        0,
+        "What happened to blood glucose?",
+        "",
+    )
+    assert requirement["coverage"] == "COVERED"
+    assert requirement["support_refs"] == ["$seed0"]
+    assert requirement["world_knowledge_bridge"] is True
+
+
+def test_controller_requirement_without_valid_support_is_missing():
+    h = ReadContractMixin()
+    requirement = h._rc_normalize_requirement(
+        {
+            "coverage": "COVERED",
+            "support_refs": ["$0", "m_1"],
+        },
+        0,
+        "question",
+        "",
+    )
+    assert requirement["coverage"] == "MISSING"
+    assert requirement["support_refs"] == []
+
+
+def test_covered_controller_requirement_compiles_zero_operation_plan():
+    h = _PlanHarness()
+    decision = {
+        "operator": "DIRECT",
+        "answer_slot": "VALUE",
+        "requires_inference": True,
+        "subject_id": "",
+        "target": "",
+        "causal_mode": "",
+        "need_raw_evidence": False,
+        "temporal": {},
+        "visible_options": {},
+        "requirements": [
+            {
+                "id": "r1",
+                "role": "ANSWER",
+                "coverage": "COVERED",
+                "support_refs": ["$seed0"],
+                "world_knowledge_bridge": True,
+            }
+        ],
+        "_seed_candidates": [{"id": "m1", "value": "supported value"}],
+    }
+    plan = h._controller_plan(decision, "question", QueryFrame())
+    assert plan["operations"] == []
+    assert plan["seed_coverage"] == [{"slot_id": "r1", "refs": ["$seed0"]}]
+    assert plan["controller_coverage"]["missing_count"] == 0
+    assert plan["query_spec"]["world_knowledge_bridge_allowed"] is True

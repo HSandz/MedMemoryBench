@@ -8,6 +8,88 @@ from .contracts import QueryFrame, RETRIEVAL_BUDGETS, VALID_TEMPORAL_AXES
 
 
 class ReadExecutionContractMixin:
+    def _controller_seed_slot_covered(self, slot, support_ids, selected, relations):
+        """Validate controller-authorized semantics using structural facts only."""
+        declared = set(slot.get("controller_seed_ids") or [])
+        support = declared.intersection(support_ids or [])
+        memories = [memory for memory in selected if memory.get("id") in support]
+        if not memories:
+            return False
+
+        role = str(slot.get("evidence_role") or "").upper()
+        slot_type = str(slot.get("type") or "DIRECT").upper()
+        structurally_valid = [
+            memory
+            for memory in memories
+            if self._memory_value(memory)
+            and str(memory.get("assertion_mode") or "DIRECT").upper()
+            in {"DIRECT", "RECAP"}
+            and self._rc_owner_match(slot, memory)
+            and self._slot_contract_match(slot, memory, False)
+            and (
+                slot.get("history")
+                or memory.get(
+                    "_status", self._belief_status.get(memory.get("id"), "active")
+                )
+                not in {"superseded", "conflicting"}
+            )
+        ]
+
+        if slot_type == "DIRECT":
+            required_count = 2 if role == "PRIOR_TRAJECTORY" else 1
+            return len({memory["id"] for memory in structurally_valid}) >= required_count
+        if slot_type == "CURRENT_STATE":
+            heads = [
+                memory
+                for memory in structurally_valid
+                if self._is_state_head(memory)
+                and not self._has_competing_active_value(memory)
+            ]
+            identities = {state_identity(memory) for memory in heads if state_identity(memory)}
+            return bool(heads and len(identities) == 1)
+        if slot_type == "TEMPORAL":
+            axis = str(slot.get("time_axis") or "").lower()
+            relation = str(
+                slot.get("temporal_relation") or slot.get("time_relation") or "LOCATE"
+            ).upper()
+            if axis not in VALID_TEMPORAL_AXES or relation in {"EARLIEST", "LATEST"}:
+                return False
+            raw_anchor, raw_end = str(slot.get("time_anchor") or ""), str(
+                slot.get("time_end") or ""
+            )
+            anchor, end = self._parse_date(raw_anchor), self._parse_date(raw_end)
+            for memory in structurally_valid:
+                date = self._date_for(memory, axis)
+                if not date:
+                    continue
+                if relation == "LOCATE":
+                    return True
+                if relation == "EXACT" and raw_anchor and self._date_matches(date, raw_anchor):
+                    return True
+                if relation == "BEFORE" and anchor and date < anchor:
+                    return True
+                if relation == "AFTER" and anchor and date > anchor:
+                    return True
+                if relation == "BETWEEN" and anchor and end and anchor <= date <= end:
+                    return True
+            return False
+        if slot_type == "CAUSE_PATH":
+            by_id = {memory["id"]: memory for memory in structurally_valid}
+            adjacency = defaultdict(list)
+            for relation in relations:
+                if self._valid_causal_relation(relation, by_id):
+                    adjacency[relation["source_id"]].append(relation["target_id"])
+            return bool(len(by_id) >= 2 and any(adjacency.values()))
+        if slot_type == "TRANSITION":
+            ids = {memory["id"] for memory in structurally_valid}
+            return any(
+                relation.get("type") in {"SUPERSEDE", "REFINE"}
+                and relation.get("source_id") in ids
+                and relation.get("target_id") in ids
+                for relation in relations
+            )
+        return False
+
     def _rc_memory_target_text(self, memory: Dict[str, Any]) -> str:
         return " ".join(str(value or "") for value in (
             memory.get("claim"), self._memory_value(memory), memory.get("verbatim_value"),
@@ -270,6 +352,10 @@ class ReadExecutionContractMixin:
         }
 
     def _slot_covered(self, slot, support_ids, selected, relations):
+        if slot.get("controller_seed_ids") and self._controller_seed_slot_covered(
+            slot, support_ids, selected, relations
+        ):
+            return True
         support_set = set(support_ids)
         memories = [memory for memory in selected if memory.get("id") in support_set]
         if not memories:
