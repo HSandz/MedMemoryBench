@@ -854,6 +854,11 @@ class CoreMemoryMixin:
         semantic_role = str(item.get("semantic_role") or "OBSERVATION").strip().upper()
         if semantic_role not in VALID_SEMANTIC_ROLES:
             semantic_role = "OBSERVATION"
+        if semantic_role == "MEASUREMENT":
+            # The measured object/predicate distinguishes measurement families.
+            # Normalizing the container prevents extractor wording such as
+            # test/lab/vital from splitting one longitudinal measurement spine.
+            scope = "measurement"
         subject_id = str(item.get("subject_id") or "primary_user").strip().lower()
         subject_class = str(item.get("subject_class") or "PRIMARY_USER").strip().upper()
         if subject_class not in VALID_SUBJECT_CLASSES:

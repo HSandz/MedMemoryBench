@@ -63,13 +63,16 @@ def canonical_predicate_key(state_key: str) -> str:
 def canonical_object_key(object_anchor: str) -> str:
     return str(object_anchor or "").lower().strip()
     
-def build_state_identity(subject_id: str, state_key: str, object_anchor: str) -> str:
+def build_state_identity(
+    subject_id: str, scope: str, state_key: str, object_anchor: str
+) -> str:
     pred_key = canonical_predicate_key(state_key)
     if not pred_key:
         return ""
     obj_key = canonical_object_key(object_anchor)
+    scope_key = str(scope or "general").lower().strip()
     subject = str(subject_id or "").lower().strip()
-    return f"{subject}::{pred_key}::{obj_key}"
+    return f"{subject}::{scope_key}::{pred_key}::{obj_key}"
 
 
 MEASUREMENT_ALIASES = {
@@ -109,6 +112,18 @@ def measurement_identity(memory: dict) -> str:
         return "lab.c_peptide"
     if "uacr" in claim or "albumin" in claim and "creatinine" in claim:
         return "lab.uacr"
+
+    # Generic fallback for measurements outside the small alias table. Prefer
+    # the measured object, then the predicate, and remove representation-only
+    # suffixes so "blood_glucose" and "blood_glucose_level" share a family.
+    for raw in (memory.get("object_anchor"), memory.get("state_key")):
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(raw or "").lower()).strip("_")
+        normalized = re.sub(
+            r"_(?:level|value|result|reading|measurement|concentration)$", "", normalized
+        )
+        normalized = re.sub(r"^(?:patient|current|latest)_", "", normalized)
+        if normalized and normalized not in {"measurement", "value", "result", "level"}:
+            return f"measurement.{normalized}"
         
     return ""
 
@@ -122,7 +137,8 @@ def state_identity(memory: dict) -> str:
     if memory.get("semantic_role") == "MEASUREMENT":
         meas_id = measurement_identity(memory)
         if meas_id:
-            return f"{str(subject_id).lower().strip()}::{meas_id}::"
+            scope = str(memory.get("scope") or "measurement").lower().strip()
+            return f"{str(subject_id).lower().strip()}::{scope}::{meas_id}::"
             
     # 2. Ordinary STATE processing
     if memory.get("kind") != "STATE":
@@ -133,7 +149,8 @@ def state_identity(memory: dict) -> str:
         return ""
         
     object_anchor = memory.get("object_anchor") or ""
-    return build_state_identity(subject_id, state_key, object_anchor)
+    scope = memory.get("scope") or "general"
+    return build_state_identity(subject_id, scope, state_key, object_anchor)
 
 def is_state_projection_eligible(memory: dict) -> bool:
     identity = state_identity(memory)
@@ -149,6 +166,7 @@ def is_state_projection_eligible(memory: dict) -> bool:
     return (
         memory.get("kind") == "STATE"
         and memory.get("memory_tier", "COLD") == "HOT"
+        and memory.get("assertion_mode", "DIRECT") == "DIRECT"
     )
 
 def canonicalize_state(memory: dict) -> dict:

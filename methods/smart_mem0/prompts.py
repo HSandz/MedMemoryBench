@@ -3,6 +3,13 @@
 MEMORY_WRITE_PROMPT = """You write durable memory for a long-lived conversational agent.
 Extract one coherent Event Capsule summarizing the EPISODE, and at most {max_new_memories} compact, faithful atomic claims from the EPISODE. Preserve names,
 numbers, units, negation, decisions, state changes, and explicit times inside each claim.
+Preserve qualifiers that change truth conditions, especially partial response,
+temporary relief, recurrence, uncertainty, severity, frequency, and observed versus prescribed action.
+Never collapse "temporarily improved but returned" into "did not improve", or a proposed
+action into an action that actually occurred.
+Preserve trajectories such as "temporarily relieved, then returned" as one faithful state
+transition. Preserve conditional safety instructions in the form "when/if <trigger>, <action>",
+including a broader class-level restriction when the source states one.
 Merge details describing the same event or state. Never invent information.
 Point each memory to its smallest supporting focal turn set.
 
@@ -75,7 +82,8 @@ Return JSON only:
 {{"relations": [{{
   "source_id": "new_0",
   "target_id": "m_3",
-  "type": "REFINE|SUPERSEDE|CONFLICT|CAUSES",
+  "type": "SUPPORT|REFINE|SUPERSEDE|CONFLICT|RELATED|CAUSES",
+  "direction": "SOURCE_TO_TARGET|TARGET_TO_SOURCE",
   "provenance_evidence_ids": ["ev_1_0"],
   "confidence": 0.0
 }}]}}
@@ -84,11 +92,17 @@ Semantics:
 - REFINE: source is a more precise replacement for target (e.g. adding missing details).
 - SUPERSEDE: source is a newer state replacing an older state.
 - CONFLICT: source and target cannot both hold for the same time/state.
-- CAUSES: target directly and explicitly causes the source (or vice versa).
+- SUPPORT: source confirms target without replacing it.
+- RELATED is navigation only: source and target are topically related, but no stronger
+  relation applies. It never changes state heads or validity.
+- CAUSES: an explicit causal statement. source_id is the new-memory reference and
+  target_id is the old-memory reference, so storage order alone does not imply causality.
+  SOURCE_TO_TARGET means new memory causes old memory; TARGET_TO_SOURCE means old memory
+  causes new memory. The committed edge is always normalized to cause -> effect.
 
 Rules:
-- DO NOT use SUPPORT or RELATED.
-- If they are completely identical or one just supports the other without refining, do NOT emit a relation.
+- Do not use RELATED when a stronger typed relation applies.
+- Completely identical duplicates need no relation. Use SUPPORT only for a distinct confirmation.
 - CAUSES must be explicit.
 """
 
@@ -216,60 +230,9 @@ PLAN shape:
 }}
 """
 
-SLOT_SUPPORT_GATE_PROMPT = """Validate whether proposed memories directly support
-each exact retrieval slot. This is a sufficiency check, not a search or answer task.
-Use only the supplied candidates. A topical, chronologically nearby, or merely
-plausible memory is not support. For a temporal slot, select the candidate describing
-the exact focal event, not a later recurrence or broader recap just because it is more
-recent. The effective_event_time field is a valid explicit temporal value when present.
-For an observation, result, response, or trajectory slot, a plan or instruction to
-measure something is not evidence that the measurement or trajectory occurred. For a
-response or trajectory under treatment, accept direct patient observations, measured
-results, or explicit changes over time; reject a clinician's reassurance, conclusion,
-or causal interpretation when the underlying observations are not in that candidate.
-A trajectory requires an explicit trend or at least two compatible observations that
-establish change/persistence across time; one isolated reading is only a point result.
-For an intervention-use slot, a lifestyle or monitoring plan does not establish that
-the intervention is permitted, contraindicated, or needed unless it states that
-decision directly.
-For an entity-bearing DIRECT slot, the candidate must explicitly contain the requested
-answer category: symptoms or abnormal measurements cannot fill a diagnosis slot, and
-a named-item restriction cannot establish a broader class-wide restriction. For a
-conditional rule, the memory must preserve both the trigger and the action. For a
-comparison, keep distinct support for both named sides. Return no reference for an
-unsupported slot.
-For a CAUSE_PATH slot, the selected memories and supplied CAUSES relations must form a
-directed path that answers the exact start-to-goal mechanism in the slot description.
-An unrelated causal edge or a RELATED/SUPPORT edge is not causal-path support.
-
-Respect evidence_role exactly. FOCAL_STATE is the present observation being acted on;
-LONGITUDINAL_CONTEXT must contain prior response, progression, recurrence, or a
-decision-changing history rather than another paraphrase of the focal state;
-ACTION_RULE must directly preserve participant-specific guidance, a contraindication,
-a warning threshold, or a trigger-action policy for the requested action. One broad
-clinician interpretation must not fill all three roles unless it explicitly contains
-all three distinct pieces. For visible choices, validate the shared factual roles that
-the answer model will use to evaluate every option. Options are propositions, never
-memory slots, and option_coverage must remain empty. Set query_sufficient=false when
-the shared evidence still lacks a participant-specific state, constraint, rule, or
-alternative needed to distinguish the choices.
-
-ORIGINAL QUESTION:
-{question}
-
-OPTION COVERAGE:
-{option_coverage}
-
-SLOTS AND ALLOWED CANDIDATES:
-{slot_candidates}
-
-Return JSON only:
-{{
-  "supports": [{{"slot_id":"s1", "refs":["$candidate0"]}}],
-  "query_sufficient": true,
-  "uncovered_option_labels": []
-}}
-"""
+# Import compatibility only. The active two-stage architecture has no middle
+# semantic support gate; retrieval status is computed deterministically.
+SLOT_SUPPORT_GATE_PROMPT = ""
 
 MEDICAL_PLANNER_GUIDANCE = """CLINICAL DECISION GUIDANCE:
 - For treatment escalation or dose change, retrieve the smallest shared evidence bundle

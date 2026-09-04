@@ -268,8 +268,15 @@ class QueryMixin:
         evidence_refs = run["evidence_refs"]
         slot_support = run["slot_support"]
         slot_coverage = run["slot_coverage"]
+        requirement_status = run.get("requirement_status") or {
+            slot_id: "FOUND" if covered else "EMPTY"
+            for slot_id, covered in slot_coverage.items()
+        }
+        relation_status = run.get("relation_status", {})
+        retrieval_complete = bool(
+            run.get("retrieval_complete", run.get("sufficient", False))
+        )
         all_relations = run["relations"]
-        sufficient = run["sufficient"]
         beliefs = run["beliefs"]
         query_latency = dict(run.get("query_latency", {}))
         controller = run.get("controller", {})
@@ -314,13 +321,9 @@ class QueryMixin:
         # selected as the validator's answer-bearing supports.
         unverified_context_ids = set()
 
-        # Structural/semantic support proves slot sufficiency; it is not a
-        # license to discard every other candidate returned by the same
-        # authorized operation. Inference needs a small amount of independent
-        # longitudinal or decision evidence even after each typed slot has one
-        # accepted support. Add only candidates from operations already in the
-        # trace, match them against the planner-declared role, and keep them
-        # explicitly marked as supplementary context.
+        # FOUND means retrieval produced structurally usable support; semantic
+        # answerability remains the final LLM's job. Preserve a small amount of
+        # independent reasoning context from already-authorized operations.
         supplementary_ids = set()
         route_spec = (plan or {}).get("query_spec") or {}
         semantic_relation_types = {
@@ -335,16 +338,15 @@ class QueryMixin:
         )
         if (
             fast_supports is None
-            and not sufficient
             and hard_reasoning
             and operation_candidates
         ):
-            output_ids_by_operation = {
-                int(item.get("operation_index")): set(item.get("output_ids") or [])
-                for item in trace
-                if str(item.get("operation_index", "")).lstrip("-").isdigit()
+            rich_roles = {
+                "REQUIREMENT",
+                "COMPARAND",
+                "FOCAL_TRIGGER",
+                "OUTCOME",
             }
-            rich_roles = {"REQUIREMENT"}
             candidate_by_id_for_supplement = {
                 memory["id"]: memory for memory in operation_candidates
             }
@@ -352,39 +354,19 @@ class QueryMixin:
                 role = str(slot.get("evidence_role") or "ANSWER").upper()
                 if role not in rich_roles:
                     continue
-                operation_ids = {
-                    operation_index
-                    for operation_index, operation in enumerate(
-                        (plan or {}).get("operations") or []
-                    )
-                    if slot.get("id") in (operation.get("produces") or [])
-                }
-                operation_ids.update(
-                    operation_index
-                    for operation_index, operation in enumerate(
-                        (replan or {}).get("operations") or []
-                    )
-                    if slot.get("id") in (operation.get("produces") or [])
-                )
                 added_for_role = 0
-                for operation_index in sorted(operation_ids):
-                    for memory_id in output_ids_by_operation.get(
-                        operation_index, set()
-                    ):
-                        memory = candidate_by_id_for_supplement.get(memory_id)
-                        if not memory or memory_id in support_ids:
-                            continue
-                        if not self._memory_matches_slot_role(slot, memory):
-                            continue
-                        status = memory.get(
-                            "_status", self._belief_status.get(memory_id, "active")
-                        )
-                        if status == "superseded" and not slot.get("history"):
-                            continue
-                        supplementary_ids.add(memory_id)
-                        added_for_role += 1
-                        if added_for_role >= 1:
-                            break
+                for memory_id, memory in candidate_by_id_for_supplement.items():
+                    if memory_id in support_ids:
+                        continue
+                    if not self._memory_matches_slot_role(slot, memory):
+                        continue
+                    status = memory.get(
+                        "_status", self._belief_status.get(memory_id, "active")
+                    )
+                    if status == "superseded" and not slot.get("history"):
+                        continue
+                    supplementary_ids.add(memory_id)
+                    added_for_role += 1
                     if added_for_role >= 1:
                         break
 
@@ -431,14 +413,16 @@ class QueryMixin:
                         ordered_best_effort.append(memory["id"])
                 support_ids = set(ordered_best_effort[: min(2, context_memory_limit)])
             unverified_context_ids = set(support_ids)
-        elif not sufficient:
+        elif any(status == "EMPTY" for status in requirement_status.values()) or any(
+            status == "UNPROVEN" for status in relation_status.values()
+        ):
             # Keep validated progress and add at most one explicit-operation
             # candidate for each still-missing role. Do not fill the context cap
             # with merely topical outputs.
             missing = [
                 slot
                 for slot in context_slots
-                if not slot_coverage.get(str(slot.get("id") or ""), False)
+                if requirement_status.get(str(slot.get("id") or "")) == "EMPTY"
             ]
             added = 0
             for slot in missing:
@@ -689,7 +673,8 @@ class QueryMixin:
         )
         blocks = [belief_heading + "\n" + self._format_episode_context(beliefs)]
         if planner_called:
-            # Build a slot-coverage summary the Answer LLM can use to self-verify.
+            # Report retrieval availability only. Semantic answerability belongs
+            # to the final Answer LLM, not to the retrieval controller.
             # Internal memory IDs remain telemetry-only.
             belief_by_id = {m["id"]: m for m in beliefs}
             slot_coverage_lines = []
@@ -701,9 +686,9 @@ class QueryMixin:
             for slot in unique_slots:
                 sid = slot["id"]
                 desc = slot.get("description", sid)
-                covered = slot_coverage.get(sid, False)
+                found = requirement_status.get(sid) == "FOUND"
                 support = slot_support.get(sid, [])
-                if covered and support:
+                if found and support:
                     # Show the first supporting memory's claim snippet.
                     first = belief_by_id.get(support[0])
                     claim_snippet = (
@@ -716,9 +701,21 @@ class QueryMixin:
                     slot_coverage_lines.append(
                         f"- {slot_contract.strip()} {desc}: " f"[FOUND] {claim_snippet}"
                     )
+                else:
+                    slot_coverage_lines.append(
+                        f"- type={slot.get('type', 'DIRECT')} {desc}: [EMPTY]"
+                    )
             if slot_coverage_lines:
                 blocks.append(
-                    "=== SLOT COVERAGE REQUIRED ===\n" + "\n".join(slot_coverage_lines)
+                    "=== RETRIEVAL REQUIREMENTS ===\n" + "\n".join(slot_coverage_lines)
+                )
+            if relation_status:
+                blocks.append(
+                    "=== STRUCTURAL RELATION STATUS ===\n"
+                    + "\n".join(
+                        f"- {key}: [{status}]"
+                        for key, status in relation_status.items()
+                    )
                 )
 
         if all_relations:
@@ -785,7 +782,9 @@ class QueryMixin:
             "For a decision, synthesize every grounded requirement that can change the answer instead of repeating one memory. "
             "For a multi-step reasoning question, preserve exact measurements and chronology and present a "
             "complete cause-to-effect chain rather than merely restating retrieved facts. Follow the requested "
-            "output format and answer directly."
+            "output format and answer directly. For an entity answer, if a retrieved claim explicitly gives an "
+            "abbreviation together with its expanded canonical name, return the complete label rather than the "
+            "abbreviation alone."
         )
         if world_knowledge_bridge_allowed:
             core_instruction += (
@@ -867,8 +866,12 @@ class QueryMixin:
                     frame.dates or frame.speaker_role or frame.hard_entities
                 ),
                 "slot_coverage": slot_coverage,
+                "requirement_status": requirement_status,
+                "relation_status": relation_status,
+                "retrieval_complete": retrieval_complete,
                 "slot_validation": slot_validation_events,
-                "sufficient": sufficient,
+                # Deprecated compatibility alias for existing analysis scripts.
+                "sufficient": retrieval_complete,
                 "retrieval_trace": trace,
                 "retrieval_provenance": provenance,
                 "unverified_context_ids": sorted(unverified_context_ids & final_ids),
@@ -878,14 +881,18 @@ class QueryMixin:
                 "boundary_violation": boundary_violation,
                 "evidence_boundary_violation": evidence_boundary_violation,
                 "arbitration_expansion_violation": arbitration_expansion_violation,
-                "elapsed_ms_until_sufficient": elapsed_ms if sufficient else None,
-                "tokens_until_sufficient": (
-                    query_tokens["total"] if sufficient else None
+                "elapsed_ms_until_retrieval_complete": (
+                    elapsed_ms if retrieval_complete else None
                 ),
-                "unique_memories_until_sufficient": (
-                    len(retrieval_ids) if sufficient else None
+                "tokens_until_retrieval_complete": (
+                    query_tokens["total"] if retrieval_complete else None
                 ),
-                "retrieval_rounds_until_sufficient": len(trace) if sufficient else None,
+                "unique_memories_until_retrieval_complete": (
+                    len(retrieval_ids) if retrieval_complete else None
+                ),
+                "retrieval_rounds_until_retrieval_complete": (
+                    len(trace) if retrieval_complete else None
+                ),
                 "retrieval_expansion_ratio": round(rer, 4),
                 "zero_operation_plan": bool(
                     planner_called and plan.get("valid") and not plan.get("operations")

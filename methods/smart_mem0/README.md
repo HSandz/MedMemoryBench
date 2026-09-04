@@ -33,7 +33,7 @@ The implementation lives in this package and is split by runtime responsibility.
 | `write.py` | Session transaction, rollback, frozen-store lifecycle |
 | `planning.py` | Hard constraints, initial recall helpers, and structural seed authorization |
 | `retrieval.py` | Deterministic temporal, state, semantic, and causal operations |
-| `execution.py` | Deterministic typed coverage, stopping, and pure arbitration |
+| `execution.py` | Bounded operation execution, retrieval status, and pure arbitration |
 | `query.py` | Final support boundary, context packing, telemetry, and answer request |
 | `read_controller.py` | One-call seed-conditioned minimal semantic IR |
 | `read_plan_contract.py` | Deterministic requirement-graph compiler |
@@ -48,7 +48,8 @@ The implementation lives in this package and is split by runtime responsibility.
 WRITE: capture -> consolidation -> transactional commit -> index refresh
 READ: Dense + BM25 -> RRF Top-8 -> Top-3 seeds -> semantic controller
   candidate authorized -> validate exactly one atomic seed -> return grounded value
-  otherwise -> compile requirement graph -> execute local operations
+  otherwise -> compile requirement graph -> execute all bounded operations
+            -> FOUND/EMPTY + PROVEN/UNPROVEN status
             -> pure arbitration -> evidence on demand -> context -> answer
 ```
 
@@ -71,8 +72,16 @@ The question owns what must be answered. Seeds may suggest where evidence lives 
 typed slots, budget tier, inference permission, and physical operations. It resolves
 the participant identity, validates `$seed0..2`, hard query constraints, active/current
 state, temporal axes, stored causal paths, and conflicts. Dense/BM25 scores and lexical
-normalization are ranking aids only; they never prove sufficiency. The active baseline
+normalization are ranking aids only; they never prove semantic answerability. The active baseline
 calls no planner LLM, semantic slot validator, repair LLM, or LLM replan.
+
+Planned queries execute every operation in their bounded plan. Semantic requirements report
+only `FOUND` or `EMPTY`; structurally decidable relations (`CAUSES`, `COMPARE`, and
+`TEMPORAL_ORDER`) report `PROVEN` or `UNPROVEN`. `retrieval_complete` means every
+requirement was found and every required structural relation was proven. It does not claim
+that the final answer is correct. The final answer model remains the semantic authority.
+`sufficient` is emitted only as a deprecated compatibility alias for
+`retrieval_complete` and never controls execution or context enrichment.
 
 Raw source turns are dereferenced only when `VERIFY_SOURCE` requests exact evidence, an
 executed verification returns pointers, or a conflict remains unresolved. The final
@@ -88,9 +97,10 @@ authorizes only the final general-domain bridge.
 
 The default read path separates semantic authority from deterministic execution.
 An authorized `candidate` is the atomic fast path; otherwise the compiler turns the
-requirement graph directly into bounded operations. Deterministic recovery may remove
-only soft resolver hints and retry an explicit operation without changing the
-question-owned requirement. The normal upper bound is two method LLM calls per query:
+requirement graph directly into bounded operations. Deterministic recovery is allowed only
+for `EMPTY` requirements or `UNPROVEN` structural relations; it removes soft resolver hints,
+excludes already returned candidates, and never changes the question-owned requirement.
+The normal upper bound is two method LLM calls per query:
 controller plus answer, or just the controller when its atomic candidate passes
 structural and grounding validation. Candidate grounding requires the answer to occur
 in an atomic `value`, `verbatim_value`, or `object_anchor`; an entity appearing only

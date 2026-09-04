@@ -61,14 +61,16 @@ class ReadPlanContractMixin:
             None,
         )
         slot_type = "DIRECT"
-        if axis:
+        if "CURRENT" in relation_types and relation in {"", "LOCATE"}:
+            slot_type = "CURRENT_STATE"
+            axis = ""
+            relation = ""
+        elif axis:
             slot_type = "TEMPORAL"
         elif relative_order:
             slot_type = "TEMPORAL"
             axis = "event_time"
             relation = str(relative_order.get("relation") or "")
-        elif "CURRENT" in relation_types:
-            slot_type = "CURRENT_STATE"
 
         side_label = None
         comparison = next(
@@ -83,13 +85,35 @@ class ReadPlanContractMixin:
         if comparison:
             side_label = "LEFT" if comparison.get("from") == requirement_id else "RIGHT"
 
+        evidence_role = "REQUIREMENT"
+        if ir.get("visible_options"):
+            evidence_role = "OPTION_CONTEXT"
+        elif comparison:
+            evidence_role = "COMPARAND"
+        else:
+            causal = next(
+                (
+                    item
+                    for item in ir.get("relations") or []
+                    if item.get("type") in {"CAUSES", "POSSIBLE_CAUSE"}
+                    and requirement_id in {item.get("from"), item.get("to")}
+                ),
+                None,
+            )
+            if causal:
+                evidence_role = (
+                    "FOCAL_TRIGGER"
+                    if causal.get("from") == requirement_id
+                    else "OUTCOME"
+                )
+
         focus = str(requirement.get("focus_span") or "").strip()
         hint = str(requirement.get("retrieval_hint") or "").strip()
         subject_id = str(ir.get("_resolved_subject_id") or "")
         return {
             "id": requirement_id,
             "type": slot_type,
-            "evidence_role": "REQUIREMENT",
+            "evidence_role": evidence_role,
             "description": hint or focus or "question evidence",
             "required": True,
             "resolution_strategy": "RETRIEVE",
@@ -114,6 +138,17 @@ class ReadPlanContractMixin:
 
     def _controller_plan(self, ir, question, frame):
         del frame
+        ir = {
+            **ir,
+            "relations": [dict(item) for item in ir.get("relations") or []],
+        }
+        for requirement in ir.get("requirements") or []:
+            constraint = requirement.get("time_constraint") or {}
+            if constraint.get("axis") != "document_time":
+                continue
+            marker = {"type": "VERIFY_SOURCE", "from": requirement["id"], "to": ""}
+            if marker not in ir["relations"]:
+                ir["relations"].append(marker)
         compiled_mode = self._derive_compiled_mode(ir)
         answer_type = (
             "OPTION_SET"

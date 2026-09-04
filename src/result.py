@@ -103,6 +103,10 @@ class ResultCollector:
             "efficiency": report.summary.get("efficiency", {}),
             "memory_build_summary": report.metadata.get("memory_build_summary", {}),
             "llm_usage": report.metadata.get("llm_usage", {}),
+            "method_llm_usage": report.metadata.get("method_llm_usage", {}),
+            "evaluation_llm_usage": report.metadata.get(
+                "evaluation_llm_usage", {}
+            ),
             "config": {
                 "evaluation_mode": report.metadata.get("evaluation_mode", ""),
                 "evaluation_interval": report.metadata.get("evaluation_interval", 0),

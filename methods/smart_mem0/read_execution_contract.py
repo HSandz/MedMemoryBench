@@ -1,6 +1,9 @@
 """Deterministic compiler and proof rules for minimal-IR SmartMem0 reads."""
 
+import calendar
+import re
 from collections import defaultdict
+from datetime import date
 from typing import Any, Dict, List
 
 from .canonicalization import state_identity
@@ -8,6 +11,7 @@ from .contracts import QueryFrame, RETRIEVAL_BUDGETS, VALID_TEMPORAL_AXES
 
 
 class ReadExecutionContractMixin:
+    STRUCTURAL_RELATIONS = frozenset({"CAUSES", "COMPARE", "TEMPORAL_ORDER"})
 
     def _rc_memory_target_text(self, memory: Dict[str, Any]) -> str:
         return " ".join(
@@ -186,6 +190,7 @@ class ReadExecutionContractMixin:
                         "axis": "event_time",
                         "fallback_axis": "",
                         "anchor": f"${anchor_index}",
+                        "anchor_requirement": target_id,
                         "produces": [source_id],
                     }
                 )
@@ -295,6 +300,33 @@ class ReadExecutionContractMixin:
                     "produces": [slot_id],
                 }
             )
+
+        verify_slots = {
+            str(relation.get("from") or "")
+            for relation in plan.get("semantic_relations") or []
+            if relation.get("type") == "VERIFY_SOURCE"
+        }
+        for slot_id in verify_slots:
+            if len(operations) >= max_ops:
+                break
+            producer_index = next(
+                (
+                    index
+                    for index, operation in enumerate(operations)
+                    if operation.get("op") != "VERIFY_EVIDENCE"
+                    and slot_id in (operation.get("produces") or [])
+                ),
+                None,
+            )
+            if producer_index is None:
+                continue
+            operations.append(
+                {
+                    "op": "VERIFY_EVIDENCE",
+                    "memory_refs": [f"${producer_index}"],
+                    "produces": [slot_id],
+                }
+            )
         return operations[:max_ops]
 
     @staticmethod
@@ -316,18 +348,13 @@ class ReadExecutionContractMixin:
         # deterministic broadening step is to remove optional resolver hints and
         # search from the question-owned target again.
         broadened = []
-        changed = False
         for slot in missing_slots:
             copy = dict(slot)
             if copy.get("resolved_keys"):
                 copy["resolved_keys"] = []
-                changed = True
-            elif copy.get("retrieval_hint"):
+            if copy.get("retrieval_hint"):
                 copy["retrieval_hint"] = ""
-                changed = True
             broadened.append(copy)
-        if not changed:
-            return None
         budget = existing_plan.get("budget_tier", "MEDIUM")
         shell = {
             "query_mode": existing_plan.get("query_mode", "DIRECT"),
@@ -335,7 +362,10 @@ class ReadExecutionContractMixin:
             "semantic_relations": existing_plan.get("semantic_relations", []),
         }
         operations = self._compile_gap_operations(
-            broadened, question, budget, plan=shell
+            # The first pass already searched hint + focus + full question.
+            # Recovery searches the immutable focus only and excludes prior
+            # output IDs at execution time, so it cannot replay the same pool.
+            broadened, "", budget, plan=shell
         )
         previous = {
             self._rc_operation_signature(op)
@@ -361,7 +391,7 @@ class ReadExecutionContractMixin:
                 "max_memories"
             ],
             "planner_fallback": True,
-            "fallback_reason": "deterministic_broaden_without_resolved_keys",
+            "fallback_reason": "deterministic_focus_only_novelty_recovery",
             "valid": True,
         }
 
@@ -443,13 +473,22 @@ class ReadExecutionContractMixin:
                 if relation == "EXACT":
                     return bool(raw_anchor and self._date_matches(date, raw_anchor))
                 if relation == "BEFORE":
-                    return bool(anchor and date < anchor)
+                    return bool(
+                        raw_anchor
+                        and self._temporal_relation_holds(date, raw_anchor, "BEFORE")
+                    )
                 if relation == "AFTER":
-                    return bool(anchor and date > anchor)
+                    return bool(
+                        raw_anchor
+                        and self._temporal_relation_holds(date, raw_anchor, "AFTER")
+                    )
                 if relation == "BETWEEN":
                     return bool(anchor and end and anchor <= date <= end)
                 if relation == "OVERLAPS":
-                    return bool(anchor and date == anchor)
+                    return bool(
+                        raw_anchor
+                        and self._temporal_relation_holds(date, raw_anchor, "OVERLAPS")
+                    )
                 return relation in {"EARLIEST", "LATEST"}
 
             return any(good(memory) for memory in memories)
@@ -500,20 +539,24 @@ class ReadExecutionContractMixin:
                     coverage[requirement_id] = False
 
         def has_causal_path(source_ids, target_ids):
+            starts = set(source_ids) - set(target_ids)
+            goals = set(target_ids) - set(source_ids)
+            if not starts or not goals:
+                return False
             adjacency = defaultdict(set)
             for relation in relations:
                 if self._valid_causal_relation(relation, selected_by_id):
                     adjacency[relation["source_id"]].add(relation["target_id"])
-            frontier = list(source_ids)
-            seen = set(frontier)
+            frontier = [(memory_id, 0) for memory_id in starts]
+            seen = set(starts)
             while frontier:
-                node = frontier.pop(0)
-                if node in target_ids:
+                node, depth = frontier.pop(0)
+                if depth >= 1 and node in goals:
                     return True
                 for target in adjacency.get(node, set()):
                     if target not in seen:
                         seen.add(target)
-                        frontier.append(target)
+                        frontier.append((target, depth + 1))
             return False
 
         for relation in plan.get("semantic_relations") or []:
@@ -527,13 +570,150 @@ class ReadExecutionContractMixin:
             if target and target != "ANSWER" and not target_ids:
                 invalidate(target)
                 continue
-            if relation_type == "COMPARE" and source_ids == target_ids:
+            if relation_type == "COMPARE" and not (
+                source_ids - target_ids and target_ids - source_ids
+            ):
                 invalidate(source, target)
             elif relation_type == "CAUSES" and not has_causal_path(
                 source_ids, target_ids
             ):
                 invalidate(source, target)
         return coverage
+
+    @staticmethod
+    def _status_relation_key(relation: Dict[str, Any]) -> str:
+        return ":".join(
+            str(value or "")
+            for value in (
+                relation.get("type"),
+                relation.get("from"),
+                relation.get("to"),
+            )
+        )
+
+    @staticmethod
+    def _temporal_interval(value: Any):
+        raw = str(value or "").strip()
+        try:
+            if re.fullmatch(r"\d{4}", raw):
+                year = int(raw)
+                return date(year, 1, 1), date(year, 12, 31)
+            if re.fullmatch(r"\d{4}-\d{2}", raw):
+                year, month = (int(part) for part in raw.split("-"))
+                return date(year, month, 1), date(
+                    year, month, calendar.monthrange(year, month)[1]
+                )
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                point = date.fromisoformat(raw)
+                return point, point
+        except ValueError:
+            return None
+        return None
+
+    @classmethod
+    def _temporal_relation_holds(cls, source: Any, target: Any, relation: str) -> bool:
+        source_interval = cls._temporal_interval(source)
+        target_interval = cls._temporal_interval(target)
+        if not source_interval or not target_interval:
+            return False
+        source_start, source_end = source_interval
+        target_start, target_end = target_interval
+        order = str(relation or "").upper()
+        if order == "BEFORE":
+            return source_end < target_start
+        if order == "AFTER":
+            return source_start > target_end
+        if order == "OVERLAPS":
+            return max(source_start, target_start) <= min(source_end, target_end)
+        return False
+
+    def _relation_status_map(self, plan, slot_support, selected, relations):
+        """Prove only relations whose semantics are structurally decidable."""
+        support_sets = {
+            str(slot_id): set(memory_ids or [])
+            for slot_id, memory_ids in (slot_support or {}).items()
+        }
+        by_id = {memory["id"]: memory for memory in selected}
+        statuses = {}
+
+        def causal_path(source_ids, target_ids):
+            # The same memory cannot prove a non-empty causal path to itself.
+            starts = set(source_ids) - set(target_ids)
+            goals = set(target_ids) - set(source_ids)
+            if not starts or not goals:
+                return False
+            adjacency = defaultdict(set)
+            for edge in relations:
+                if self._valid_causal_relation(edge, by_id):
+                    adjacency[edge["source_id"]].add(edge["target_id"])
+            frontier = [(memory_id, 0) for memory_id in starts]
+            seen = set(starts)
+            while frontier:
+                node, depth = frontier.pop(0)
+                if depth >= 1 and node in goals:
+                    return True
+                for target in adjacency.get(node, set()):
+                    if target not in seen:
+                        seen.add(target)
+                        frontier.append((target, depth + 1))
+            return False
+
+        for relation in plan.get("semantic_relations") or []:
+            relation_type = str(relation.get("type") or "").upper()
+            if relation_type not in self.STRUCTURAL_RELATIONS:
+                continue
+            key = self._status_relation_key(relation)
+            source_ids = support_sets.get(str(relation.get("from") or ""), set())
+            target_ids = support_sets.get(str(relation.get("to") or ""), set())
+            proven = False
+            if relation_type == "CAUSES":
+                proven = causal_path(source_ids, target_ids)
+            elif relation_type == "COMPARE":
+                proven = bool(
+                    source_ids
+                    and target_ids
+                    and source_ids - target_ids
+                    and target_ids - source_ids
+                )
+            elif relation_type == "TEMPORAL_ORDER":
+                order = str(relation.get("relation") or "").upper()
+                proven = any(
+                    source_id != target_id
+                    and source_id in by_id
+                    and target_id in by_id
+                    and self._temporal_relation_holds(
+                        self._date_for(by_id[source_id], "event_time"),
+                        self._date_for(by_id[target_id], "event_time"),
+                        order,
+                    )
+                    for source_id in source_ids
+                    for target_id in target_ids
+                )
+            statuses[key] = "PROVEN" if proven else "UNPROVEN"
+        return statuses
+
+    def _retrieval_status(self, plan, slot_support, selected, relations):
+        """Report bounded retrieval completion without claiming semantic truth."""
+        requirement_status = {}
+        for slot in plan.get("required_slots") or []:
+            slot_id = str(slot.get("id") or "")
+            support_ids = list((slot_support or {}).get(slot_id) or [])
+            requirement_status[slot_id] = (
+                "FOUND"
+                if support_ids
+                and self._slot_covered(slot, support_ids, selected, relations)
+                else "EMPTY"
+            )
+        relation_status = self._relation_status_map(
+            plan, slot_support, selected, relations
+        )
+        retrieval_complete = bool(requirement_status) and all(
+            status == "FOUND" for status in requirement_status.values()
+        )
+        retrieval_complete = retrieval_complete and all(
+            status == "PROVEN" for status in relation_status.values()
+        )
+        return requirement_status, relation_status, retrieval_complete
 
     def _operation_slot_support(self, slot, result, relations):
         if not result:

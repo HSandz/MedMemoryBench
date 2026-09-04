@@ -81,7 +81,7 @@ VALID_MEMORY_TIERS = {"HOT", "COLD"}
 
 # Bump this whenever capture, normalization, identity, or consolidation changes
 # can alter the durable ledger. It is included in the snapshot fingerprint.
-MEMORY_WRITE_SCHEMA_VERSION = 7
+MEMORY_WRITE_SCHEMA_VERSION = 8
 
 # These are topical labels, not versionable attributes. If a capture model emits
 # one without an object owner, treating every later symptom/emotion as a new
@@ -129,7 +129,14 @@ STATE_LIKE_KINDS = frozenset({"STATE"})
 
 VALID_ASSERTION_MODES = {"DIRECT", "RECAP", "INFERRED"}
 
-VALID_RELATIONS = {"REFINE", "SUPERSEDE", "CONFLICT", "CAUSES"}
+VALID_RELATIONS = {
+    "SUPPORT",
+    "REFINE",
+    "SUPERSEDE",
+    "CONFLICT",
+    "RELATED",
+    "CAUSES",
+}
 
 VALID_OPERATIONS = {
     "SEMANTIC_SEARCH",

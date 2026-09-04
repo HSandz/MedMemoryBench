@@ -7,6 +7,8 @@ continues through the evaluator's original implementation unchanged.
 """
 
 from datetime import datetime
+from math import ceil
+from statistics import mean, median
 from typing import Any, Dict, List
 
 from src.result import EvaluationReport
@@ -22,6 +24,8 @@ from utils.vertex_batch import (
 
 def _method_llm_usage(evaluator) -> Dict[str, Any]:
     controller = answer = total = covered = 0
+    token_totals: List[int] = []
+    token_stages: Dict[str, int] = {}
     for result in evaluator.aggregator.results:
         details = getattr(result, "details", {}) or {}
         telemetry = details.get("agent_telemetry") or {}
@@ -32,11 +36,38 @@ def _method_llm_usage(evaluator) -> Dict[str, Any]:
         controller += int(calls.get("controller", 0) or 0)
         answer += int(calls.get("answer", 0) or 0)
         total += int(calls.get("total", 0) or 0)
+        query_tokens = telemetry.get("query_tokens") or {}
+        if isinstance(query_tokens, dict):
+            value = int(query_tokens.get("total", 0) or 0)
+            token_totals.append(value)
+            for stage, stage_tokens in query_tokens.items():
+                if stage == "total":
+                    continue
+                token_stages[stage] = token_stages.get(stage, 0) + int(
+                    stage_tokens or 0
+                )
+
+    ordered = sorted(token_totals)
+
+    def percentile(p: float) -> int:
+        if not ordered:
+            return 0
+        return ordered[max(0, ceil(p * len(ordered)) - 1)]
+
     return {
         "controller_calls": controller,
         "answer_calls": answer,
         "total_calls": total,
         "queries_with_telemetry": covered,
+        "total_tokens": sum(token_totals),
+        "tokens_by_stage": token_stages,
+        "tokens_per_query": {
+            "mean": round(mean(token_totals), 3) if token_totals else 0,
+            "median": round(median(token_totals), 3) if token_totals else 0,
+            "p90": percentile(0.90),
+            "p95": percentile(0.95),
+            "max": max(token_totals, default=0),
+        },
         "excludes_evaluator_judges": True,
     }
 
@@ -45,9 +76,12 @@ def _evaluation_llm_usage(global_usage: Dict[str, Any], method_usage: Dict[str, 
     """Expose benchmark-side calls without pretending they belong to SmartMem0."""
     query_usage = global_usage.get("query_phase") or {}
     global_calls = int(query_usage.get("call_count", 0) or 0)
+    global_tokens = int(query_usage.get("total_tokens", 0) or 0)
     method_calls = int(method_usage.get("total_calls", 0) or 0)
+    method_tokens = int(method_usage.get("total_tokens", 0) or 0)
     return {
         "call_count": max(0, global_calls - method_calls),
+        "total_tokens": max(0, global_tokens - method_tokens),
         "includes_judges_and_other_benchmark_query_calls": True,
         "derived_from_global_query_usage": True,
     }

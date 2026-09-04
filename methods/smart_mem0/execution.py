@@ -1,17 +1,15 @@
 """Typed slot coverage, progressive execution, and pure arbitration."""
 
-import json
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .contracts import VALID_TEMPORAL_AXES, QueryFrame
 from .canonicalization import state_identity
-from .prompts import SLOT_SUPPORT_GATE_PROMPT
 
 
 class ExecutionMixin:
-    """Stops retrieval on typed sufficiency while enforcing strict boundaries."""
+    """Executes bounded retrieval plans and enforces strict boundaries."""
 
     def _is_state_head(self, memory: Dict[str, Any]) -> bool:
         """Return whether a state-like memory is in its resolved head set."""
@@ -418,167 +416,6 @@ class ExecutionMixin:
             return selected if len(values) >= 2 else []
         return []
 
-    def _semantic_slot_support(
-        self,
-        plan: Dict[str, Any],
-        slot_support: Dict[str, List[str]],
-        selected: Sequence[Dict[str, Any]],
-        relations: Sequence[Dict[str, Any]],
-        question: str = "",
-    ) -> Tuple[Dict[str, List[str]], Dict[str, Any]]:
-        """Validate exact slot answerability after structural coverage succeeds."""
-        by_id = {memory["id"]: memory for memory in selected}
-        candidate_ids = list(
-            dict.fromkeys(
-                memory_id
-                for ids in slot_support.values()
-                for memory_id in ids
-                if memory_id in by_id
-            )
-        )
-        candidate_refs = {
-            memory_id: f"$candidate{index}"
-            for index, memory_id in enumerate(candidate_ids)
-        }
-        ref_ids = {
-            reference: memory_id for memory_id, reference in candidate_refs.items()
-        }
-        slot_by_id = {slot["id"]: slot for slot in plan["required_slots"]}
-        allowed_refs: Dict[str, set] = {}
-        payload = []
-        for slot in plan["required_slots"]:
-            refs = [
-                candidate_refs[memory_id]
-                for memory_id in slot_support.get(slot["id"], [])
-                if memory_id in candidate_refs
-            ]
-            allowed_refs[slot["id"]] = set(refs)
-            payload.append(
-                {
-                    "slot": slot,
-                    "candidates": [
-                        {
-                            "ref": candidate_refs[memory_id],
-                            "id": memory_id,
-                            "claim": by_id[memory_id].get("claim", ""),
-                            "kind": by_id[memory_id].get("kind", ""),
-                            "value": self._memory_value(by_id[memory_id]),
-                            "assertion_mode": by_id[memory_id].get(
-                                "assertion_mode", "DIRECT"
-                            ),
-                            "origin_memory_id": by_id[memory_id].get(
-                                "origin_memory_id", ""
-                            ),
-                            "state_identity": state_identity(by_id[memory_id]),
-                            "event_time": by_id[memory_id].get("event_time", "UNKNOWN"),
-                            "document_time": by_id[memory_id].get("document_time", ""),
-                            "origin_document_time": by_id[memory_id].get(
-                                "origin_document_time", ""
-                            ),
-                            "effective_event_time": self._date_for(
-                                by_id[memory_id], "effective_event_time"
-                            ),
-                            "status": by_id[memory_id].get(
-                                "_status",
-                                self._belief_status.get(memory_id, "active"),
-                            ),
-                        }
-                        for memory_id in slot_support.get(slot["id"], [])
-                        if memory_id in by_id
-                    ],
-                }
-            )
-        payload.append(
-            {
-                "relations": [
-                    {
-                        "source_id": relation.get("source_id"),
-                        "target_id": relation.get("target_id"),
-                        "type": relation.get("type"),
-                    }
-                    for relation in relations
-                    if relation.get("source_id") in candidate_refs
-                    and relation.get("target_id") in candidate_refs
-                ],
-            }
-        )
-        prompt = SLOT_SUPPORT_GATE_PROMPT.format(
-            slot_candidates=json.dumps(payload, ensure_ascii=False),
-            question=question,
-            option_coverage=json.dumps(
-                plan.get("option_coverage") or [], ensure_ascii=False
-            ),
-        )
-        try:
-            response = self._llm_client.chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.0,
-                # This validator emits only slot ids and authorized refs.
-                max_tokens=1024,
-            )
-            usage = self._response_usage(response, prompt)
-            parsed = self._parse_json(response.content)
-            if (
-                set(parsed)
-                - {
-                    "supports",
-                    "query_sufficient",
-                    "uncovered_option_labels",
-                }
-                or not isinstance(parsed.get("supports"), list)
-                or not isinstance(parsed.get("query_sufficient"), bool)
-                or not isinstance(parsed.get("uncovered_option_labels"), list)
-            ):
-                return {slot_id: [] for slot_id in slot_by_id}, {
-                    **usage,
-                    "called": True,
-                    "valid": False,
-                }
-        except Exception:
-            return {slot_id: [] for slot_id in slot_by_id}, {
-                "called": True,
-                "valid": False,
-            }
-
-        accepted: Dict[str, List[str]] = {slot_id: [] for slot_id in slot_by_id}
-        seen_slots = set()
-        for item in parsed["supports"]:
-            slot_id = str(item.get("slot_id") or "")
-            refs = item.get("refs") if isinstance(item.get("refs"), list) else []
-            if slot_id not in slot_by_id or slot_id in seen_slots:
-                return {candidate_id: [] for candidate_id in slot_by_id}, {
-                    **usage,
-                    "called": True,
-                    "valid": False,
-                }
-            if any(str(ref) not in allowed_refs[slot_id] for ref in refs):
-                return {candidate_id: [] for candidate_id in slot_by_id}, {
-                    **usage,
-                    "called": True,
-                    "valid": False,
-                }
-            accepted[slot_id] = list(dict.fromkeys(ref_ids[str(ref)] for ref in refs))
-            seen_slots.add(slot_id)
-        option_mode = bool(plan.get("option_coverage"))
-        query_sufficient = parsed.get("query_sufficient")
-        uncovered = parsed.get("uncovered_option_labels")
-        if option_mode and isinstance(uncovered, list):
-            uncovered_labels = {str(label).upper() for label in uncovered}
-            for coverage in plan.get("option_coverage", []):
-                if coverage.get("label") not in uncovered_labels:
-                    continue
-                for slot_id in coverage.get("slot_ids", []):
-                    slot = slot_by_id.get(slot_id, {})
-                    if slot.get("option_label") == coverage.get("label"):
-                        accepted[slot_id] = []
-        return accepted, {
-            **usage,
-            "called": True,
-            "valid": True,
-            "query_sufficient": bool(query_sufficient),
-            "uncovered_option_labels": uncovered if isinstance(uncovered, list) else [],
-        }
-
     def _execute_operation(
         self,
         operation: Dict[str, Any],
@@ -612,6 +449,17 @@ class ExecutionMixin:
         elif op == "VERIFY_EVIDENCE":
             result = self._resolve_refs(operation.get("memory_refs"), outputs, seeds)
             evidence_refs = [memory["id"] for memory in result]
+        excluded = {str(memory_id) for memory_id in operation.get("exclude_ids", [])}
+        if excluded:
+            result = [memory for memory in result if memory.get("id") not in excluded]
+            allowed = {memory["id"] for memory in result}
+            relations = [
+                relation
+                for relation in relations
+                if relation.get("source_id") in allowed
+                and relation.get("target_id") in allowed
+            ]
+            evidence_refs = [memory_id for memory_id in evidence_refs if memory_id in allowed]
         return result, relations, evidence_refs
 
     def _execute_plan(
@@ -628,13 +476,6 @@ class ExecutionMixin:
         slot_support = self._slot_seed_support(plan, seeds)
         selected: Dict[str, Dict[str, Any]] = {}
         slot_validation: List[Dict[str, Any]] = []
-        confirmed_slot_support: Dict[str, List[str]] = {
-            slot["id"]: [] for slot in plan["required_slots"]
-        }
-        validation_cache: Dict[
-            Tuple[Tuple[str, Tuple[str, ...]], ...],
-            Tuple[Dict[str, List[str]], Dict[str, Any]],
-        ] = {}
         memory_limit = max(1, int(plan["max_memories"]))
 
         # Only seed_coverage can authorize initial selected memories.
@@ -651,10 +492,13 @@ class ExecutionMixin:
         beliefs: List[Dict[str, Any]] = []
         current_relations: List[Dict[str, Any]] = []
         coverage: Dict[str, bool] = {}
-        sufficient = False
+        requirement_status: Dict[str, str] = {}
+        relation_status: Dict[str, str] = {}
+        retrieval_complete = False
 
-        def assess_sufficiency() -> None:
-            nonlocal beliefs, current_relations, coverage, sufficient, selected, slot_support, confirmed_slot_support
+        def assess_retrieval() -> None:
+            nonlocal beliefs, current_relations, coverage
+            nonlocal requirement_status, relation_status, retrieval_complete
             beliefs, belief_relations = self._reconstruct_beliefs(
                 list(selected.values()),
                 int(plan["max_memories"]),
@@ -663,135 +507,55 @@ class ExecutionMixin:
                 used_relations,
                 belief_relations,
             )
-            coverage = self._coverage_map(
-                plan, slot_support, beliefs, current_relations
-            )
-            structural = (
-                bool(coverage)
-                and all(coverage.values())
-                and not self._has_unresolved_conflict(beliefs)
-            )
-            semantic_pass = structural
-            # Zero operations means no more retrieval, not that proposed seed
-            # coverage is exempt from semantic validation.
-            requires_validation = getattr(
-                self, "enable_slot_support_validation", True
-            ) and self._plan_requires_semantic_validation(plan)
-            if structural and requires_validation:
-                validation_key = tuple(
-                    sorted(
-                        (slot_id, tuple(sorted(memory_ids)))
-                        for slot_id, memory_ids in slot_support.items()
-                    )
+            requirement_status, relation_status, retrieval_complete = (
+                self._retrieval_status(
+                    plan, slot_support, beliefs, current_relations
                 )
-                if validation_key in validation_cache:
-                    cached_support, cached_usage = validation_cache[validation_key]
-                    validated = self._snapshot(cached_support)
-                    validation_usage = {
-                        **cached_usage,
-                        "called": False,
-                        "cache_hit": True,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                        "latency": 0.0,
-                    }
-                else:
-                    validated, validation_usage = self._semantic_slot_support(
-                        plan,
-                        slot_support,
-                        beliefs,
-                        current_relations,
-                        question=question,
-                    )
-                    validation_cache[validation_key] = (
-                        self._snapshot(validated),
-                        self._snapshot(validation_usage),
-                    )
-                slot_validation.append(validation_usage)
-                semantic_pass = bool(validation_usage.get("valid"))
-                if validation_usage.get("valid"):
-                    # Semantic progress is monotonic within one retrieval
-                    # program. A later operation may add support, but a new
-                    # validator response cannot erase an earlier accepted ID.
-                    slot_support = {
-                        slot_id: list(
-                            dict.fromkeys(
-                                (
-                                    *confirmed_slot_support.get(slot_id, []),
-                                    *validated.get(slot_id, []),
-                                )
-                            )
-                        )
-                        for slot_id in confirmed_slot_support
-                    }
-                    confirmed_slot_support = self._snapshot(slot_support)
-                    accepted_ids = {
-                        memory_id for ids in slot_support.values() for memory_id in ids
-                    }
-                    selected = {
-                        memory_id: memory
-                        for memory_id, memory in selected.items()
-                        if memory_id in accepted_ids
-                    }
-                    beliefs, belief_relations = self._reconstruct_beliefs(
-                        list(selected.values()),
-                        int(plan["max_memories"]),
-                    )
-                    current_relations = self._merge_relations(
-                        used_relations,
-                        belief_relations,
-                        allowed_ids=accepted_ids,
-                    )
-                    coverage = self._coverage_map(
-                        plan, slot_support, beliefs, current_relations
-                    )
-                    semantic_pass = (
-                        bool(coverage)
-                        and all(coverage.values())
-                        and validation_usage.get("query_sufficient") is True
-                        and not self._has_unresolved_conflict(beliefs)
-                    )
-                else:
-                    # valid=False means the validator response itself violated the
-                    # schema or reference boundary, so none of it is trustworthy.
-                    # A schema-valid but incomplete judgment uses valid=True with
-                    # query_sufficient=False and retains its accepted slot supports
-                    # through the branch above.
-                    # Preserve structural candidates as best-effort context. A
-                    # malformed optional validator response must not erase the
-                    # evidence already authorized by the retrieval plan. It
-                    # still cannot establish coverage or sufficiency.
-                    beliefs, belief_relations = self._reconstruct_beliefs(
-                        list(selected.values()),
-                        int(plan["max_memories"]),
-                    )
-                    current_relations = self._merge_relations(
-                        used_relations,
-                        belief_relations,
-                    )
-                    coverage = self._coverage_map(
-                        plan, slot_support, beliefs, current_relations
-                    )
-                    semantic_pass = False
-            sufficient = (
-                semantic_pass
-                and bool(coverage)
-                and all(coverage.values())
-                and not self._has_unresolved_conflict(beliefs)
             )
+            coverage = {
+                slot_id: status == "FOUND"
+                for slot_id, status in requirement_status.items()
+            }
 
-        assess_sufficiency()
+        assess_retrieval()
         trace: List[Dict[str, Any]] = []
-        retrieved_ids = set(selected)
+        answer_operations = sum(
+            operation.get("op") not in {"LOCATE_ANCHOR", "VERIFY_EVIDENCE"}
+            for operation in plan["operations"]
+        )
 
         for index, operation in enumerate(plan["operations"]):
-            if sufficient:
-                break
             before = dict(coverage)
+            requirement_before = dict(requirement_status)
+            relation_before = dict(relation_status)
             previous_ids = set(selected)
             operation_started = time.perf_counter()
             bounded_operation = self._snapshot(operation)
+
+            # Relative temporal operations are anchored to the validated support
+            # of their target requirement. A raw operation output may contain
+            # several dates and is not itself a semantic anchor.
+            anchor_requirement = str(
+                bounded_operation.get("anchor_requirement") or ""
+            )
+            if (
+                bounded_operation.get("op") == "TEMPORAL_FILTER"
+                and anchor_requirement
+            ):
+                axis = str(bounded_operation.get("axis") or "event_time")
+                selected_by_id = {memory["id"]: memory for memory in beliefs}
+                anchor_value = next(
+                    (
+                        self._date_for(selected_by_id[memory_id], axis)
+                        for memory_id in slot_support.get(anchor_requirement, [])
+                        if memory_id in selected_by_id
+                        and self._date_for(selected_by_id[memory_id], axis)
+                    ),
+                    "",
+                )
+                bounded_operation["anchor"] = anchor_value
+                bounded_operation.pop("candidate_refs", None)
+
             if bounded_operation["op"] == "SEMANTIC_SEARCH":
                 remaining = max(0, memory_limit - len(selected))
                 try:
@@ -801,11 +565,6 @@ class ExecutionMixin:
                 except (TypeError, ValueError):
                     requested_top_k = max(1, remaining)
                 if bounded_operation.get("strategy") == "SHARED_OPTIONS":
-                    # A shared option operation must have room to expose the
-                    # facts that distinguish the choices. This is still one
-                    # bounded operation and never exceeds the plan's memory
-                    # budget; it only prevents a model-emitted top_k=3 from
-                    # starving a four-option evidence bundle.
                     option_count = len(bounded_operation.get("option_queries") or [])
                     requested_top_k = max(
                         requested_top_k,
@@ -815,17 +574,32 @@ class ExecutionMixin:
                     1,
                     min(max(1, remaining), requested_top_k),
                 )
-            result, relations, requested_evidence = self._execute_operation(
-                bounded_operation,
-                outputs,
-                seeds,
-                frame,
-            )
 
-            # Rejected candidates must not permanently consume the context
-            # budget. Bound this operation by currently accepted selections;
-            # all returned IDs remain in telemetry and retrieval provenance.
+            missing_anchor = bool(
+                bounded_operation.get("op") == "TEMPORAL_FILTER"
+                and anchor_requirement
+                and not bounded_operation.get("anchor")
+            )
+            if missing_anchor:
+                result, relations, requested_evidence = [], [], []
+            else:
+                result, relations, requested_evidence = self._execute_operation(
+                    bounded_operation,
+                    outputs,
+                    seeds,
+                    frame,
+                )
+
             remaining = max(0, memory_limit - len(selected))
+            if bounded_operation.get("strategy") == "SHARED_OPTIONS":
+                operation_cap = memory_limit
+            else:
+                operation_cap = max(
+                    1,
+                    (memory_limit // max(1, answer_operations))
+                    * max(1, len(operation.get("produces") or [])),
+                )
+            remaining = min(remaining, operation_cap)
             bounded_result: List[Dict[str, Any]] = []
             for memory in result:
                 memory_id = memory["id"]
@@ -834,13 +608,8 @@ class ExecutionMixin:
                 elif remaining > 0:
                     bounded_result.append(memory)
                     remaining -= 1
-                retrieved_ids.add(memory_id)
             result = bounded_result
             result_ids = {memory["id"] for memory in result}
-            # Typed transition/comparison validation may inspect only relations
-            # whose endpoints were returned by this operation. This preserves
-            # pure retrieval while allowing a semantic-search fallback to expose
-            # an already-stored relation between two returned versions.
             local_relations = [
                 self._snapshot(relation)
                 for relation in self._relations
@@ -861,7 +630,6 @@ class ExecutionMixin:
                 (time.perf_counter() - operation_started) * 1000.0, 3
             )
 
-            # An operation may only introduce its own returned memories.
             outputs.append([self._snapshot(memory) for memory in result])
             used_relations.extend(self._snapshot(relations))
             evidence_refs.extend(requested_evidence)
@@ -873,21 +641,16 @@ class ExecutionMixin:
                     for candidate in plan["required_slots"]
                     if candidate["id"] == slot_id
                 )
-
-                # LOCATE_ANCHOR discovers candidates but cannot cover a temporal slot.
                 if bounded_operation["op"] == "LOCATE_ANCHOR":
                     continue
-
                 if bounded_operation["op"] == "TEMPORAL_FILTER":
-                    # The fallback axis is part of the operation contract. Keep
-                    # it attached to the typed slot so structural coverage uses
-                    # exactly the same declared semantics as retrieval.
                     fallback_axis = str(
                         bounded_operation.get("fallback_axis") or ""
                     ).lower()
                     if fallback_axis in VALID_TEMPORAL_AXES:
                         slot["fallback_axis"] = fallback_axis
                     anchor_ref = bounded_operation.get("anchor")
+                    resolved_anchor = str(anchor_ref or "")
                     if isinstance(anchor_ref, str) and anchor_ref.startswith("$"):
                         resolved_anchor = self._operation_date(
                             anchor_ref,
@@ -895,8 +658,8 @@ class ExecutionMixin:
                             outputs,
                             seeds,
                         )
-                        if resolved_anchor:
-                            slot["resolved_time_anchor"] = resolved_anchor
+                    if resolved_anchor:
+                        slot["resolved_time_anchor"] = resolved_anchor
                 supported = self._operation_slot_support(slot, result, relations)
                 for memory in supported:
                     if memory["id"] not in selected and len(selected) >= memory_limit:
@@ -905,23 +668,7 @@ class ExecutionMixin:
                         slot_support[slot_id].append(memory["id"])
                     selected.setdefault(memory["id"], self._snapshot(memory))
 
-            assess_sufficiency()
-
-            # LOCATE_ANCHOR is candidate discovery only. When the next planned
-            # operation is TEMPORAL_FILTER for the same slot, do not stop on
-            # the anchor's first dated candidate.
-            if (
-                sufficient
-                and index + 1 < len(plan["operations"])
-                and bounded_operation["op"] == "LOCATE_ANCHOR"
-                and plan["operations"][index + 1]["op"] == "TEMPORAL_FILTER"
-                and any(
-                    slot_id in bounded_operation["produces"]
-                    for slot_id in plan["operations"][index + 1]["produces"]
-                )
-            ):
-                sufficient = False
-
+            assess_retrieval()
             trace.append(
                 {
                     "retrieval_round": round_offset + index + 1,
@@ -939,15 +686,14 @@ class ExecutionMixin:
                         for ref in (
                             operation.get(field)
                             if isinstance(operation.get(field), list)
-                            else (
-                                [operation.get(field)] if operation.get(field) else []
-                            )
+                            else ([operation.get(field)] if operation.get(field) else [])
                         )
                         if str(ref).startswith("$")
                     ],
                     "produces": list(operation["produces"]),
                     "output_ids": [memory["id"] for memory in result],
                     "operation_elapsed_ms": operation_elapsed_ms,
+                    "skipped_reason": "missing_anchor_support" if missing_anchor else "",
                     "new_memory_ids": [
                         memory["id"]
                         for memory in result
@@ -955,6 +701,10 @@ class ExecutionMixin:
                     ],
                     "slot_coverage_before": before,
                     "slot_coverage_after": dict(coverage),
+                    "requirement_status_before": requirement_before,
+                    "requirement_status_after": dict(requirement_status),
+                    "relation_status_before": relation_before,
+                    "relation_status_after": dict(relation_status),
                 }
             )
 
@@ -964,17 +714,16 @@ class ExecutionMixin:
             "evidence_refs": list(dict.fromkeys(evidence_refs)),
             "slot_support": slot_support,
             "slot_coverage": coverage,
-            "sufficient": sufficient,
+            "requirement_status": requirement_status,
+            "relation_status": relation_status,
+            "retrieval_complete": retrieval_complete,
+            # Deprecated compatibility alias. It no longer controls execution.
+            "sufficient": retrieval_complete,
             "trace": trace,
             "operation_outputs": outputs,
             "slot_validation": slot_validation,
-            "slot_validation_tokens": sum(
-                int(item.get("total_tokens", 0) or 0) for item in slot_validation
-            ),
-            "slot_validation_latency": round(
-                sum(float(item.get("latency", 0.0) or 0.0) for item in slot_validation),
-                3,
-            ),
+            "slot_validation_tokens": 0,
+            "slot_validation_latency": 0.0,
         }
 
     @staticmethod
@@ -1035,8 +784,10 @@ class ExecutionMixin:
         evidence_refs: List[str] = []
         slot_support: Dict[str, List[str]] = {}
         slot_coverage: Dict[str, bool] = {}
+        requirement_status: Dict[str, str] = {}
+        relation_status: Dict[str, str] = {}
         relations: List[Dict[str, Any]] = []
-        sufficient = False
+        retrieval_complete = False
         beliefs: List[Dict[str, Any]] = []
         operation_candidates: Dict[str, Dict[str, Any]] = {}
         planned_seed_set = planning_seeds or initial_seeds
@@ -1065,7 +816,12 @@ class ExecutionMixin:
             beliefs, relations = self._reconstruct_beliefs(
                 fast_supports, min(3, len(fast_supports))
             )
-            sufficient = bool(beliefs) and not self._has_unresolved_conflict(beliefs)
+            retrieval_complete = bool(beliefs) and not self._has_unresolved_conflict(
+                beliefs
+            )
+            requirement_status = {
+                "fast_atomic_answer": "FOUND" if retrieval_complete else "EMPTY"
+            }
         else:
             if not getattr(self, "enable_two_stage_controller", False):
                 planner_called = True
@@ -1086,7 +842,19 @@ class ExecutionMixin:
             evidence_refs.extend(execution["evidence_refs"])
             slot_support = self._snapshot(execution["slot_support"])
             slot_coverage = dict(execution["slot_coverage"])
-            sufficient = bool(execution["sufficient"])
+            requirement_status = dict(
+                execution.get("requirement_status")
+                or {
+                    slot_id: "FOUND" if covered else "EMPTY"
+                    for slot_id, covered in slot_coverage.items()
+                }
+            )
+            relation_status = dict(execution.get("relation_status") or {})
+            retrieval_complete = bool(
+                execution.get(
+                    "retrieval_complete", execution.get("sufficient", False)
+                )
+            )
             trace.extend(execution["trace"])
             slot_validation.extend(execution["slot_validation"])
             query_tokens["slot_validation"] += int(execution["slot_validation_tokens"])
@@ -1106,10 +874,22 @@ class ExecutionMixin:
                 }
             )
 
+            missing_slot_ids = {
+                slot_id
+                for slot_id, status in requirement_status.items()
+                if status == "EMPTY"
+            }
+            for relation in plan.get("semantic_relations") or []:
+                relation_key = self._status_relation_key(relation)
+                if relation_status.get(relation_key) != "UNPROVEN":
+                    continue
+                for endpoint in (relation.get("from"), relation.get("to")):
+                    if endpoint and endpoint != "ANSWER":
+                        missing_slot_ids.add(str(endpoint))
             missing_slots = [
                 slot
                 for slot in plan.get("required_slots", [])
-                if not slot_coverage.get(slot["id"], False)
+                if slot["id"] in missing_slot_ids
             ]
             two_stage = bool(getattr(self, "enable_two_stage_controller", False))
             broad_replan = bool(getattr(self, "enable_replan", False)) and not two_stage
@@ -1118,7 +898,7 @@ class ExecutionMixin:
             )
 
             replan = None
-            if not sufficient and deterministic_recovery and missing_slots:
+            if deterministic_recovery and missing_slots:
                 # Typed deterministic recovery is available on both controller
                 # variants. It never changes slot semantics or performs hidden
                 # retrieval; it only emits explicit operations for missing slots.
@@ -1127,7 +907,7 @@ class ExecutionMixin:
                 )
                 if replan:
                     replan_called = True
-            elif not sufficient and broad_replan and missing_slots:
+            elif broad_replan and missing_slots:
                 # Compatibility LLM replan, only outside the two-stage route.
                 replan_called = True
                 replan_seeds = []
@@ -1161,6 +941,17 @@ class ExecutionMixin:
                 )
 
             if replan_called and replan:
+                already_retrieved = set(operation_output_ids) | {
+                    memory["id"] for memory in beliefs
+                }
+                for operation in replan.get("operations") or []:
+                    if operation.get("op") in {
+                        "SEMANTIC_SEARCH",
+                        "LOCATE_ANCHOR",
+                        "RESOLVE_STATE",
+                        "TEMPORAL_FILTER",
+                    }:
+                        operation["exclude_ids"] = sorted(already_retrieved)
                 replan_seeds = []
                 for memory in (*beliefs, *planned_seed_set):
                     if all(item["id"] != memory["id"] for item in replan_seeds):
@@ -1213,19 +1004,18 @@ class ExecutionMixin:
                         for memory_id in memory_ids
                         if memory_id not in slot_support[slot_id]
                     )
-                initial_coverage = dict(slot_coverage)
-                second_coverage = dict(second["slot_coverage"])
-                slot_coverage = {
-                    slot["id"]: bool(initial_coverage.get(slot["id"]))
-                    or bool(second_coverage.get(slot["id"]))
-                    for slot in plan.get("required_slots", [])
-                }
-                sufficient = (
-                    bool(second.get("sufficient"))
-                    and bool(slot_coverage)
-                    and all(slot_coverage.values())
-                    and not self._has_unresolved_conflict(beliefs)
+                requirement_status, relation_status, retrieval_complete = (
+                    self._retrieval_status(
+                        plan,
+                        slot_support,
+                        beliefs,
+                        relations,
+                    )
                 )
+                slot_coverage = {
+                    slot_id: status == "FOUND"
+                    for slot_id, status in requirement_status.items()
+                }
 
         query_latency["slot_validation"] = round(query_latency["slot_validation"], 3)
         query_latency["retrieval_wall"] = round(
@@ -1251,8 +1041,12 @@ class ExecutionMixin:
             "evidence_refs": evidence_refs,
             "slot_support": slot_support,
             "slot_coverage": slot_coverage,
+            "requirement_status": requirement_status,
+            "relation_status": relation_status,
+            "retrieval_complete": retrieval_complete,
             "relations": relations,
-            "sufficient": sufficient,
+            # Deprecated compatibility alias for old result consumers.
+            "sufficient": retrieval_complete,
             "beliefs": beliefs,
         }
 

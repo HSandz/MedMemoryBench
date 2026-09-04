@@ -6,11 +6,17 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 from methods.smart_mem0.contracts import QueryFrame
+from methods.smart_mem0.canonicalization import (
+    is_state_projection_eligible,
+    state_identity,
+)
 from methods.smart_mem0.execution import ExecutionMixin
+from methods.smart_mem0.core import CoreMemoryMixin
 from methods.smart_mem0.read_controller import SEMANTIC_IR_POLICY, ReadContractMixin
 from methods.smart_mem0.read_execution_contract import ReadExecutionContractMixin
 from methods.smart_mem0.read_option_contract import ReadOptionContractMixin
 from methods.smart_mem0.read_plan_contract import ReadPlanContractMixin
+from methods.smart_mem0.read_temporal_contract import ReadTemporalContractMixin
 from methods.smart_mem0.read_usage_contract import ReadUsageContractMixin
 
 
@@ -26,6 +32,7 @@ class _JsonClient:
 
 class _MinimalHarness(
     ReadContractMixin,
+    ReadTemporalContractMixin,
     ReadPlanContractMixin,
     ReadExecutionContractMixin,
 ):
@@ -97,6 +104,24 @@ class _MinimalHarness(
         value = str(memory.get(axis) or "")
         return "" if value == "UNKNOWN" else value
 
+    @staticmethod
+    def _valid_causal_relation(relation, by_id):
+        source = by_id.get(relation.get("source_id"))
+        target = by_id.get(relation.get("target_id"))
+        provenance = set(relation.get("provenance_evidence_ids") or [])
+        return bool(
+            relation.get("type") == "CAUSES"
+            and source
+            and target
+            and source.get("evidence_ids")
+            and target.get("evidence_ids")
+            and provenance
+            and provenance.issubset(
+                set(source.get("evidence_ids") or [])
+                | set(target.get("evidence_ids") or [])
+            )
+        )
+
 
 class _OptionBase:
     @staticmethod
@@ -120,6 +145,49 @@ class _UsageBase:
 
 class _UsageHarness(ReadUsageContractMixin, _UsageBase):
     pass
+
+
+class _ExecutionHarness(ReadExecutionContractMixin, ExecutionMixin):
+    HARD_MEMORY_LIMIT = 8
+
+    def __init__(self):
+        self._relations = []
+        self._belief_status = {}
+        self._memories = []
+        self._operation_results = {}
+
+    @staticmethod
+    def _snapshot(value):
+        return deepcopy(value)
+
+    @staticmethod
+    def _slot_seed_support(plan, seeds):
+        del seeds
+        return {slot["id"]: [] for slot in plan["required_slots"]}
+
+    def _execute_operation(self, operation, outputs, seeds, frame):
+        del outputs, seeds, frame
+        return deepcopy(self._operation_results[operation["query"]]), [], []
+
+    @staticmethod
+    def _operation_slot_support(slot, result, relations):
+        del slot, relations
+        return result[:1]
+
+    @staticmethod
+    def _reconstruct_beliefs(memories, limit, prefer_active=True):
+        del prefer_active
+        return deepcopy(memories[:limit]), []
+
+    @staticmethod
+    def _merge_relations(*groups, **_kwargs):
+        return [relation for group in groups for relation in group]
+
+    @staticmethod
+    def _slot_covered(slot, support_ids, selected, relations):
+        del slot, relations
+        selected_ids = {memory["id"] for memory in selected}
+        return bool(set(support_ids) & selected_ids)
 
 
 def _memory(memory_id="m1", value="cefuroxime", **extra):
@@ -275,6 +343,31 @@ def test_explicit_date_blocks_atomic_candidate():
     assert reason == "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
 
 
+def test_exact_date_filter_can_authorize_matching_atomic_candidate():
+    seed = _memory(event_time="2024-01-01")
+    harness = _MinimalHarness([seed])
+    ir = _ir(
+        [
+            {
+                "id": "r1",
+                "focus_span": "which antibiotic",
+                "time_constraint": {
+                    "axis": "event_time",
+                    "relation": "EXACT",
+                    "anchor": "2024-01-01",
+                },
+            }
+        ],
+        candidate={"answer": "cefuroxime", "support_ref": "$seed0"},
+        answer_type="ENTITY",
+    )
+    supports, reason = harness._authorize_controller_answer(
+        ir, [seed], QueryFrame(dates=("2024-01-01",))
+    )
+    assert reason == "AUTHORIZED"
+    assert [memory["id"] for memory in supports] == ["m1"]
+
+
 def test_current_candidate_requires_a_real_state_head():
     seed = _memory(kind="STATE")
     harness = _MinimalHarness([seed])
@@ -359,7 +452,7 @@ def test_requirement_graph_derives_mode_budget_and_operations():
         "SEMANTIC_SEARCH",
         "SEMANTIC_SEARCH",
     ]
-    assert {slot["evidence_role"] for slot in plan["required_slots"]} == {"REQUIREMENT"}
+    assert {slot["evidence_role"] for slot in plan["required_slots"]} == {"COMPARAND"}
 
 
 def test_relative_temporal_order_compiles_anchor_then_filter():
@@ -397,6 +490,7 @@ def test_relative_temporal_order_compiles_anchor_then_filter():
         "TEMPORAL_FILTER",
     ]
     assert plan["operations"][1]["anchor"] == "$0"
+    assert plan["operations"][1]["anchor_requirement"] == "r1"
     assert plan["operations"][1]["relation"] == "AFTER"
     assert plan["operations"][1]["fallback_axis"] == ""
 
@@ -419,6 +513,12 @@ def test_relative_temporal_overlap_requires_the_resolved_anchor_date():
     assert not harness._slot_covered(slot, ["m1"], [memory], [])
 
 
+def test_temporal_overlap_accepts_month_and_day_intervals():
+    harness = _MinimalHarness()
+    assert harness._temporal_relation_holds("2024-04", "2024-04-03", "OVERLAPS")
+    assert not harness._temporal_relation_holds("2024-05", "2024-04-03", "OVERLAPS")
+
+
 def test_possible_cause_derives_general_knowledge_bridge():
     harness = _MinimalHarness()
     ir = _ir(
@@ -433,6 +533,9 @@ def test_possible_cause_derives_general_knowledge_bridge():
     )
     assert plan["query_spec"]["requires_inference"] is True
     assert plan["query_spec"]["world_knowledge_bridge_allowed"] is True
+    assert [
+        slot["evidence_role"] for slot in plan["required_slots"]
+    ] == ["FOCAL_TRIGGER", "OUTCOME"]
 
 
 def test_current_relation_compiles_state_resolution():
@@ -468,6 +571,8 @@ def test_temporal_axis_is_preserved_without_fallback():
     assert operation["op"] == "TEMPORAL_FILTER"
     assert operation["axis"] == "document_time"
     assert operation["fallback_axis"] == ""
+    assert plan["need_evidence"] is True
+    assert plan["operations"][-1]["op"] == "VERIFY_EVIDENCE"
 
 
 def test_visible_options_compile_one_shared_physical_operation():
@@ -487,6 +592,223 @@ def test_visible_options_compile_one_shared_physical_operation():
     assert operation["strategy"] == "SHARED_OPTIONS"
     assert operation["produces"] == ["r1"]
     assert [item["label"] for item in operation["option_queries"]] == ["A", "B"]
+    assert plan["required_slots"][0]["evidence_role"] == "OPTION_CONTEXT"
+
+
+def test_focus_months_bind_to_their_own_comparison_requirements():
+    harness = _MinimalHarness()
+    question = "How did the January dose compare with the March dose?"
+    ir = harness._rc_normalize_ir(
+        {
+            "answer_type": "VALUE",
+            "requirements": [
+                {"id": "r1", "focus_span": "January dose"},
+                {"id": "r2", "focus_span": "March dose"},
+            ],
+            "relations": [{"type": "COMPARE", "from": "r1", "to": "r2"}],
+        },
+        question,
+        QueryFrame(dates=("*-01", "*-03")),
+    )
+    assert ir["requirements"][0]["time_constraint"]["anchor"] == "*-01"
+    assert ir["requirements"][1]["time_constraint"]["anchor"] == "*-03"
+
+
+def test_non_temporal_answer_drops_meaningless_locate_and_keeps_current():
+    harness = _MinimalHarness()
+    question = "What medication am I currently taking?"
+    ir = harness._rc_normalize_ir(
+        {
+            "answer_type": "ENTITY",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "focus_span": "medication",
+                    "time_constraint": {
+                        "axis": "event_time",
+                        "relation": "LOCATE",
+                    },
+                }
+            ],
+            "relations": [{"type": "CURRENT", "from": "r1"}],
+        },
+        question,
+        QueryFrame(),
+    )
+    assert ir["requirements"][0]["time_constraint"]["axis"] == ""
+    plan = harness._controller_plan(ir, question, QueryFrame())
+    assert plan["required_slots"][0]["type"] == "CURRENT_STATE"
+    assert plan["operations"][0]["op"] == "RESOLVE_STATE"
+
+
+def test_atomic_candidate_removes_redundant_infer_and_overdecomposition():
+    harness = _MinimalHarness()
+    question = "What was the latest HbA1c result on the follow-up test?"
+    ir = harness._rc_normalize_ir(
+        {
+            "answer_type": "VALUE",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "focus_span": "latest HbA1c result",
+                    "time_constraint": {
+                        "axis": "event_time",
+                        "relation": "LATEST",
+                    },
+                },
+                {"id": "r2", "focus_span": "follow-up test"},
+            ],
+            "relations": [
+                {"type": "DEPENDS_ON", "from": "r1", "to": "r2"},
+                {"type": "INFER", "from": "r1", "to": "ANSWER"},
+            ],
+            "candidate": {"answer": "8.1%", "support_ref": "$seed0"},
+        },
+        question,
+        QueryFrame(),
+    )
+    assert len(ir["requirements"]) == 1
+    assert ir["requirements"][0]["time_constraint"]["relation"] == "LATEST"
+    assert ir["relations"] == []
+
+
+def test_retrieval_status_rejects_zero_hop_cause_and_accepts_real_edge():
+    first = _memory("m1", value="missed dose", claim="The participant missed a dose.")
+    second = _memory("m2", value="high glucose", claim="Glucose rose.", evidence_ids=["ev2"])
+    harness = _MinimalHarness([first, second])
+    plan = {
+        "required_slots": [
+            {"id": "r1", "type": "DIRECT", "evidence_role": "REQUIREMENT"},
+            {"id": "r2", "type": "DIRECT", "evidence_role": "REQUIREMENT"},
+        ],
+        "semantic_relations": [{"type": "CAUSES", "from": "r1", "to": "r2"}],
+    }
+    statuses = harness._relation_status_map(
+        plan, {"r1": ["m1"], "r2": ["m1"]}, [first], []
+    )
+    assert statuses["CAUSES:r1:r2"] == "UNPROVEN"
+    edge = {
+        "type": "CAUSES",
+        "source_id": "m1",
+        "target_id": "m2",
+        "provenance_evidence_ids": ["ev1"],
+    }
+    statuses = harness._relation_status_map(
+        plan, {"r1": ["m1"], "r2": ["m2"]}, [first, second], [edge]
+    )
+    assert statuses["CAUSES:r1:r2"] == "PROVEN"
+
+
+def test_requirement_status_is_found_empty_and_relation_aware():
+    first = _memory("m1", value="left")
+    second = _memory("m2", value="right", evidence_ids=["ev2"])
+    harness = _MinimalHarness([first, second])
+    plan = {
+        "required_slots": [
+            {"id": "r1", "type": "DIRECT", "evidence_role": "REQUIREMENT"},
+            {"id": "r2", "type": "DIRECT", "evidence_role": "REQUIREMENT"},
+        ],
+        "semantic_relations": [{"type": "COMPARE", "from": "r1", "to": "r2"}],
+    }
+    requirement, relations, complete = harness._retrieval_status(
+        plan,
+        {"r1": ["m1"], "r2": []},
+        [first],
+        [],
+    )
+    assert requirement == {"r1": "FOUND", "r2": "EMPTY"}
+    assert relations == {"COMPARE:r1:r2": "UNPROVEN"}
+    assert complete is False
+    requirement, relations, complete = harness._retrieval_status(
+        plan,
+        {"r1": ["m1"], "r2": ["m2"]},
+        [first, second],
+        [],
+    )
+    assert requirement == {"r1": "FOUND", "r2": "FOUND"}
+    assert relations == {"COMPARE:r1:r2": "PROVEN"}
+    assert complete is True
+
+
+def test_planned_execution_runs_every_bounded_operation_after_early_found():
+    harness = _ExecutionHarness()
+    harness._operation_results = {
+        "first": [_memory("m1", "first")],
+        "second": [_memory("m2", "second")],
+    }
+    plan = {
+        "required_slots": [
+            {"id": "r1", "type": "DIRECT"},
+            {"id": "r2", "type": "DIRECT"},
+        ],
+        "seed_coverage": [],
+        "semantic_relations": [],
+        "operations": [
+            {
+                "op": "SEMANTIC_SEARCH",
+                "query": "first",
+                "top_k": 1,
+                "produces": ["r1"],
+            },
+            {
+                "op": "SEMANTIC_SEARCH",
+                "query": "second",
+                "top_k": 1,
+                "produces": ["r2"],
+            },
+        ],
+        "max_memories": 2,
+    }
+    result = harness._execute_plan(plan, [], question="q")
+    assert [item["operation"] for item in result["trace"]] == [
+        "SEMANTIC_SEARCH",
+        "SEMANTIC_SEARCH",
+    ]
+    assert result["requirement_status"] == {"r1": "FOUND", "r2": "FOUND"}
+    assert result["retrieval_complete"] is True
+
+
+def test_state_identity_includes_scope_and_recap_cannot_become_head():
+    medication = _memory(
+        "m1",
+        "500 mg",
+        kind="STATE",
+        scope="medication",
+        state_key="dose",
+        object_anchor="metformin",
+        memory_tier="HOT",
+    )
+    nutrition = dict(medication, id="m2", scope="nutrition")
+    assert state_identity(medication) != state_identity(nutrition)
+    assert is_state_projection_eligible(medication)
+    assert not is_state_projection_eligible(
+        dict(medication, assertion_mode="RECAP")
+    )
+
+
+def test_measurement_container_is_canonical_across_lab_and_test_wording():
+    lab = CoreMemoryMixin._normalise_memory(
+        {
+            "claim": "HbA1c was 8.1%.",
+            "kind": "STATE",
+            "semantic_role": "MEASUREMENT",
+            "scope": "lab",
+            "state_key": "hba1c_level",
+            "value": "8.1%",
+        }
+    )
+    test = CoreMemoryMixin._normalise_memory(
+        {
+            "claim": "The HbA1c test result was 9.2%.",
+            "kind": "STATE",
+            "semantic_role": "MEASUREMENT",
+            "scope": "test",
+            "state_key": "hba1c",
+            "value": "9.2%",
+        }
+    )
+    assert lab["scope"] == test["scope"] == "measurement"
+    assert state_identity(lab) == state_identity(test)
 
 
 def test_option_coverage_requires_every_visible_option_to_be_probed():

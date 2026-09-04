@@ -30,9 +30,8 @@ class ConsolidationMixin:
             if (
                 existing.get("kind") == memory.get("kind") == "STATE"
                 and existing.get("stance") == memory.get("stance")
-                and CoreMemoryMixin._state_identity(existing)
-                and CoreMemoryMixin._state_identity(existing)
-                == CoreMemoryMixin._state_identity(memory)
+                and state_identity(existing)
+                and state_identity(existing) == state_identity(memory)
             ):
                 existing_numbers = set(
                     re.findall(r"\d+(?:\.\d+)?", existing.get("value", ""))
@@ -461,11 +460,17 @@ class ConsolidationMixin:
                     ]
                     if not provenance:
                         continue
+                direction = str(
+                    relation.get("direction") or "SOURCE_TO_TARGET"
+                ).upper()
+                if direction not in {"SOURCE_TO_TARGET", "TARGET_TO_SOURCE"}:
+                    direction = "SOURCE_TO_TARGET"
                 valid.append(
                     {
                         "source_id": source,
                         "target_id": target,
                         "type": relation_type,
+                        "direction": direction,
                         "confidence": confidence,
                         "provenance_evidence_ids": provenance,
                     }
@@ -494,7 +499,7 @@ class ConsolidationMixin:
             source = by_id.get(relation.get("source_id"))
             target = by_id.get(relation.get("target_id"))
             relation_type = str(relation.get("type") or "").upper()
-            if not source or not target:
+            if not source or not target or relation_type not in VALID_RELATIONS:
                 continue
             if relation_type in {"REFINE", "SUPERSEDE", "CONFLICT"}:
                 source_identity = state_identity(source)
@@ -534,7 +539,9 @@ class ConsolidationMixin:
                     or (not provenance.issubset(endpoint_evidence) and not focal_provenance)
                 ):
                     continue
-            clean_relations.append(relation)
+            normalized_relation = self._snapshot(relation)
+            normalized_relation["type"] = relation_type
+            clean_relations.append(normalized_relation)
         self._relations = clean_relations
         status = {memory["id"]: "active" for memory in self._memories}
         # Resolve replacement targets before applying weaker annotations. This
@@ -894,7 +901,7 @@ class ConsolidationMixin:
                 if source_ref in supersede_per_source:
                     continue
                 supersede_per_source.add(source_ref)
-            if relation_type not in {"REFINE", "SUPERSEDE", "CONFLICT", "CAUSES"}:
+            if relation_type not in VALID_RELATIONS:
                 continue
             normalized_relation = self._snapshot(relation)
             normalized_relation["type"] = relation_type
@@ -1159,16 +1166,21 @@ class ConsolidationMixin:
             }
             self._memories.append(card)
             added.append(card)
-        from methods.smart_mem0.contracts import VALID_RELATIONS
-        
         for relation in consolidation:
             if relation.get("type") not in VALID_RELATIONS:
                 continue
             source = local_ids.get(relation["source_id"])
             target = local_ids.get(relation["target_id"], relation["target_id"])
             if source and target and source != target:
+                relation_payload = dict(relation)
+                if (
+                    relation.get("type") == "CAUSES"
+                    and relation.get("direction") == "TARGET_TO_SOURCE"
+                ):
+                    source, target = target, source
+                relation_payload.pop("direction", None)
                 self._relations.append(
-                    {**relation, "source_id": source, "target_id": target}
+                    {**relation_payload, "source_id": source, "target_id": target}
                 )
         for link in causal_links:
             source = local_ids.get(f"new_{link.get('cause_index')}")

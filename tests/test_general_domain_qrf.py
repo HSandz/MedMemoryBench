@@ -61,7 +61,7 @@ class TestGeneralDomainQRF(unittest.TestCase):
         self.current_frame = MockFrame(options={"A": "MacBook", "B": "Dell"})
         qrf = _build_qrf(self.agent, "Which laptop did I decide to buy?", self.current_frame)
         self.assertEqual(qrf["operator"], "MULTI_OPTION")
-        self.assertEqual(qrf["visible_options"], ["A", "B"])
+        self.assertEqual(qrf["visible_options"], {"A": "MacBook", "B": "Dell"})
 
 class TestGeneralSeedGate(unittest.TestCase):
     def test_seed_gate_conflict(self):

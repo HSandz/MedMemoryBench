@@ -10,6 +10,10 @@ import pytest
 
 from metrics.llm_judge import LLMJudgeMCDMetric, LLMJudgeMetric
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from benchmarks.medmemorybench.smart_mem0_batch_integration import (
+    _evaluation_llm_usage,
+    _method_llm_usage,
+)
 from src.evaluator import Evaluator
 from utils.llm_client import get_usage_tracker
 from utils.vertex_batch import (
@@ -137,6 +141,48 @@ def _request(request_id: str, text: str = None) -> BatchChatRequest:
         response_format={"type": "json_object"},
         phase="query",
     )
+
+
+def test_smart_mem0_usage_separates_method_and_evaluator_calls():
+    evaluator = SimpleNamespace(
+        aggregator=SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    details={
+                        "agent_telemetry": {
+                            "method_llm_calls": {"controller": 1, "answer": 1, "total": 2},
+                            "query_tokens": {"controller": 20, "answer": 30, "total": 50},
+                        }
+                    }
+                ),
+                SimpleNamespace(
+                    details={
+                        "agent_telemetry": {
+                            "method_llm_calls": {"controller": 1, "answer": 0, "total": 1},
+                            "query_tokens": {"controller": 25, "answer": 0, "total": 25},
+                        }
+                    }
+                ),
+            ]
+        )
+    )
+
+    method = _method_llm_usage(evaluator)
+    benchmark = _evaluation_llm_usage(
+        {"query_phase": {"call_count": 5, "total_tokens": 100}}, method
+    )
+
+    assert method["total_calls"] == 3
+    assert method["total_tokens"] == 75
+    assert method["tokens_per_query"] == {
+        "mean": 37.5,
+        "median": 37.5,
+        "p90": 50,
+        "p95": 50,
+        "max": 50,
+    }
+    assert benchmark["call_count"] == 2
+    assert benchmark["total_tokens"] == 25
 
 
 def test_jsonl_mapping_and_output_parsing(tmp_path):

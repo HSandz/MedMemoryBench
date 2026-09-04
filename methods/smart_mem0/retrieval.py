@@ -557,9 +557,15 @@ class RetrievalOperationsMixin:
             if not date:
                 return False
             if relation == "AFTER":
-                return bool(anchor_date and date > anchor_date)
+                return bool(
+                    anchor_date
+                    and self._temporal_relation_holds(date, anchor_date, "AFTER")
+                )
             if relation == "BEFORE":
-                return bool(anchor_date and date < anchor_date)
+                return bool(
+                    anchor_date
+                    and self._temporal_relation_holds(date, anchor_date, "BEFORE")
+                )
             if relation == "BETWEEN":
                 return bool(
                     anchor_date and end_date and anchor_date <= date <= end_date
@@ -570,12 +576,12 @@ class RetrievalOperationsMixin:
                     # filter value. In that case semantic event matching owns
                     # candidate selection and the operation still enforces axis.
                     return True
+                return bool(anchor_date and self._date_matches(date, anchor_date))
+            if relation == "OVERLAPS":
                 return bool(
                     anchor_date
-                    and (date == anchor_date or date.startswith(anchor_date))
+                    and self._temporal_relation_holds(date, anchor_date, "OVERLAPS")
                 )
-            if relation == "OVERLAPS":
-                return bool(anchor_date and date == anchor_date)
             return True
 
         ids = [

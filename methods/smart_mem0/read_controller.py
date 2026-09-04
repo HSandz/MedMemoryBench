@@ -41,6 +41,11 @@ Relations are generic requirement-graph edges:
 - VERIFY_SOURCE asks for exact linked source evidence.
 
 Use to="ANSWER" for an INFER edge whose result is the answer rather than another requirement. Temporal order alone is not CAUSES.
+Use CAUSES only when the requested relation is explicitly stated in participant evidence. For "likely explains", clinical deduction, or mechanism questions where the endpoints may be observed but the connecting rule is not stored, use POSSIBLE_CAUSE or INFER instead; do not demand a nonexistent stored CAUSES edge.
+
+INFER is exceptional. Do not emit INFER for extraction, paraphrase, entity selection, ordinary synthesis, choosing a supported option, or when one retrieved participant memory can state the answer directly. Emit it only when grounded participant facts must be combined with a general-domain rule to produce an answer that is not explicit in memory.
+
+Keep requirements atomic but do not split one answer-bearing phrase into a noun and its qualifier when one memory can satisfy both. A single fact such as a medication with its dose, a symptom with its severity, or an event with its date is normally one requirement.
 
 Visible answer options are propositions to evaluate, not memory facts. Requirements must describe shared participant-specific evidence needed to evaluate them. Do not create one requirement per option merely because the option is visible.
 
@@ -146,7 +151,7 @@ class ReadContractMixin:
         raw = " ".join(str(value or "").strip().split())
         if not raw:
             return ""
-        return raw if self._rc_text(raw) in self._rc_text(question) else ""
+        return raw if self._rc_token_sequence_present(raw, question) else ""
 
     def _rc_target_from_question(self, target: Any, question: str) -> str:
         """Compatibility alias for the question-owned target firewall."""
@@ -285,15 +290,19 @@ class ReadContractMixin:
         focus = self._rc_question_span(raw.get("focus_span"), question)
         if not focus:
             focus = self._question_stem(question).strip()
+        time_constraint = self._rc_normalize_time_constraint(
+            raw.get("time_constraint"), frame, question
+        )
+        focus_binder = getattr(self, "_rc_bind_focus_time_constraint", None)
+        if callable(focus_binder):
+            time_constraint = focus_binder(focus, time_constraint)
         return {
             "id": str(raw.get("id") or f"r{index + 1}"),
             "focus_span": focus,
             "retrieval_hint": " ".join(str(raw.get("retrieval_hint") or "").split())[
                 :320
             ],
-            "time_constraint": self._rc_normalize_time_constraint(
-                raw.get("time_constraint"), frame, question
-            ),
+            "time_constraint": time_constraint,
         }
 
     def _rc_normalize_ir(
@@ -381,6 +390,29 @@ class ReadContractMixin:
             if relation not in relations:
                 relations.append(relation)
 
+        # LOCATE is meaningful only when time itself is the requested answer.
+        # Relative/current wording can guide retrieval, but it must not turn an
+        # ordinary value requirement into a temporal-answer contract.
+        if answer_type not in {"DATE", "RELATIVE_TIME"}:
+            for requirement in requirements:
+                constraint = requirement.get("time_constraint") or {}
+                if constraint.get("relation") == "LOCATE":
+                    requirement["time_constraint"] = {
+                        "axis": "",
+                        "relation": "",
+                        "anchor": "",
+                        "end": "",
+                    }
+
+        # A document-time obligation necessarily needs the linked source turn.
+        for requirement in requirements:
+            constraint = requirement.get("time_constraint") or {}
+            if constraint.get("axis") != "document_time":
+                continue
+            marker = {"type": "VERIFY_SOURCE", "from": requirement["id"], "to": ""}
+            if marker not in relations:
+                relations.append(marker)
+
         candidate = parsed.get("candidate")
         if not isinstance(candidate, dict):
             candidate = None
@@ -391,6 +423,66 @@ class ReadContractMixin:
                 candidate = None
             else:
                 candidate = {"answer": answer, "support_ref": support_ref}
+
+        # A one-requirement atomic candidate does not need an INFER edge merely
+        # to authorize extraction of a value already present in its seed.
+        if candidate and len(requirements) == 1 and relations and all(
+            relation.get("type") == "INFER"
+            and relation.get("from") == requirements[0]["id"]
+            and relation.get("to") == "ANSWER"
+            for relation in relations
+        ):
+            relations = []
+
+        # Repair only a narrow, observable over-decomposition pattern: an
+        # atomic candidate plus noun/qualifier requirements connected solely by
+        # dependency/inference edges. Keep any one compatible temporal selector
+        # on the merged evidence obligation; do not collapse real comparisons,
+        # causal endpoints, or independently answerable requirements.
+        relation_types = {relation.get("type") for relation in relations}
+        if (
+            candidate
+            and len(requirements) > 1
+            and answer_type in {"ENTITY", "VALUE", "DATE", "RELATIVE_TIME"}
+            and relation_types
+            and relation_types.issubset({"DEPENDS_ON", "INFER"})
+        ):
+            constraints = [
+                requirement.get("time_constraint") or {}
+                for requirement in requirements
+                if (requirement.get("time_constraint") or {}).get("axis")
+            ]
+            signatures = {
+                (
+                    item.get("axis", ""),
+                    item.get("relation", ""),
+                    item.get("anchor", ""),
+                    item.get("end", ""),
+                )
+                for item in constraints
+            }
+            if len(signatures) <= 1:
+                merged_constraint = constraints[0] if constraints else {
+                    "axis": "",
+                    "relation": "",
+                    "anchor": "",
+                    "end": "",
+                }
+                requirements = [
+                    {
+                        "id": "r1",
+                        "focus_span": self._question_stem(question).strip(),
+                        "retrieval_hint": " | ".join(
+                            dict.fromkeys(
+                                str(item.get("retrieval_hint") or "").strip()
+                                for item in requirements
+                                if str(item.get("retrieval_hint") or "").strip()
+                            )
+                        )[:320],
+                        "time_constraint": dict(merged_constraint),
+                    }
+                ]
+                relations = []
 
         owners = {
             self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
@@ -491,8 +583,10 @@ class ReadContractMixin:
             return None, "RELATIONAL_QUERY_REQUIRES_RETRIEVAL"
         requirement = ir["requirements"][0]
         time_constraint = requirement.get("time_constraint") or {}
-        if time_constraint.get("axis") or time_constraint.get("relation"):
-            return None, "TEMPORAL_QUERY_REQUIRES_RETRIEVAL"
+        if ir.get("answer_type") in {"DATE", "RELATIVE_TIME"}:
+            return None, "TEMPORAL_ANSWER_REQUIRES_RETRIEVAL"
+        if getattr(frame, "dates", ()) and not time_constraint.get("axis"):
+            return None, "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
         reference = candidate["support_ref"]
         match = re.fullmatch(r"\$seed(\d+)", reference)
         if not match or int(match.group(1)) >= min(3, len(seeds)):
@@ -500,6 +594,17 @@ class ReadContractMixin:
         valid = self._validate_fast_support(reference, seeds, frame)
         if not valid:
             return None, "STRUCTURAL_SUPPORT_REJECTED"
+        if time_constraint.get("axis") or time_constraint.get("relation"):
+            axis = str(time_constraint.get("axis") or "")
+            relation = str(time_constraint.get("relation") or "")
+            anchor = str(time_constraint.get("anchor") or "")
+            if (
+                relation != "EXACT"
+                or not axis
+                or not anchor
+                or not self._date_matches(self._date_for(valid[0], axis), anchor)
+            ):
+                return None, "TEMPORAL_QUERY_REQUIRES_RETRIEVAL"
         # focus_span protects the semantic obligation in the IR. Candidate
         # authorization itself is deliberately structural: requiring lexical
         # overlap here would reject valid paraphrases and make English
@@ -513,9 +618,7 @@ class ReadContractMixin:
         return valid, "AUTHORIZED"
 
     def _authorize_controller_answer(self, ir, seeds, frame):
-        """Authorize only an atomic candidate with no explicit date constraint."""
-        if getattr(frame, "dates", ()):
-            return None, "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
+        """Authorize an atomic candidate, including an exact-date filter match."""
         return self._authorize_controller_candidate(ir, seeds, frame)
 
     @staticmethod

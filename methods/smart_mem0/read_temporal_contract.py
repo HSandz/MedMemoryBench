@@ -12,6 +12,27 @@ from .core import CoreMemoryMixin
 
 
 class ReadTemporalContractMixin:
+    def _rc_bind_focus_time_constraint(self, focus, constraint):
+        """Bind a local month/date selector to its own comparison requirement."""
+        result = dict(constraint or {})
+        if result.get("relation") not in {"", "LOCATE", "EXACT"}:
+            return result
+        source = str(focus or "")
+        selectors = re.findall(r"\b\d{4}-\d{2}(?:-\d{2})?\b", source)
+        selectors.extend(self._rc_bare_months(source))
+        selectors = list(dict.fromkeys(selectors))
+        if len(selectors) != 1:
+            return result
+        result.update(
+            {
+                "axis": result.get("axis") or "event_time",
+                "relation": "EXACT",
+                "anchor": selectors[0],
+                "end": "",
+            }
+        )
+        return result
+
     @staticmethod
     def _rc_month_constraint(value):
         text = str(value or "").strip()
