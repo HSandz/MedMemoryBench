@@ -31,6 +31,15 @@ def test_stable_ids_and_snapshot_round_trip_preserve_vectors():
     assert restored.claim_slot_embeddings[c.claim_id] == [0.0, 1.0]
 
 
+def test_episode_store_rejects_reused_method_source_uid():
+    store = EventStateStore("patient")
+    episode = Episode("E1", "patient", "src_p1_r0", 0, None, None, [], "primary_user", "", "")
+    store.add_episode(episode, [1.0, 0.0])
+
+    with pytest.raises(ValueError, match="source identity collision"):
+        store.add_episode(episode, [1.0, 0.0])
+
+
 def test_history_claim_bypasses_state_compilation_and_slot_storage():
     store = EventStateStore("patient")
     store.add_claim(Claim("STATE", "Alice", "alice", "city", "Boston", evidence=[EvidenceRef("s1", "s1", [1])]), [1.0, 0.0], [1.0, 0.0])

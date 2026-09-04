@@ -563,7 +563,8 @@ class ResultCollector:
 
         query_answer_data = {
             "format": "medmemorybench.query_answers",
-            "version": 2,
+            # Version 3 distinguishes method-facing source UIDs from benchmark IDs.
+            "version": 3,
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,

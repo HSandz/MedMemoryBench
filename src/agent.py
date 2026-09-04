@@ -86,6 +86,39 @@ class AgentManager:
         return "long_context"
 
     @classmethod
+    def supports_configured_batch_queries(
+        cls,
+        method_config: MethodConfig,
+    ) -> bool:
+        """Check final-answer batching without constructing a mutable adapter.
+
+        This intentionally lives next to adapter dispatch so evaluators do not
+        maintain a second, drifting list of method names.
+        """
+        if not is_batch_provider(method_config.model.provider):
+            return False
+        method_key = cls._matched_method_key(method_config.method_name)
+        params = (
+            getattr(method_config, "build_config", None)
+            or getattr(method_config, "agent_params", None)
+            or getattr(method_config, "raw_config", {}).get("agent_params", {})
+        )
+        retrieval = getattr(method_config, "retrieval_config", None) or getattr(
+            method_config, "raw_config", {}
+        ).get("retrieval_config", {})
+        if method_key == "event_state":
+            # Planner rounds have dependent retrieval/answer calls and cannot
+            # be represented by the single final-answer batch request.
+            return int(retrieval.get("planner_rounds", params.get("planner_rounds", 0)) or 0) == 0
+        if method_key == "mirix":
+            return not params.get("use_native_query", True)
+        return method_key in {
+            "long_context", "embedding_rag", "bm25_rag", "lightmem",
+            "zep", "remem", "graph_rag", "amem", "mem0", "memos",
+            "memrl",
+        }
+
+    @classmethod
     def resolve_effective_init_params(
         cls,
         method_config: MethodConfig,
@@ -922,7 +955,9 @@ class AgentManager:
         self._agent.import_memory_state(state, context_id=context_id)
         resolved_context_id = state.get("context_id") if context_id is None else context_id
         if resolved_context_id is not None:
-            self._context_id = int(resolved_context_id)
+            # Dataset contexts are not universally numeric (LoCoMo sample IDs
+            # are strings), so preserve the adapter's opaque identity.
+            self._context_id = resolved_context_id
 
     def get_batch_llm_client(self):
         """Expose the managed client only for the evaluator's batch transport."""

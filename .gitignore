@@ -70,6 +70,8 @@ env/
 !/tests/test_modal_provider.py
 !/tests/test_query_workers.py
 !/tests/test_amem_workers.py
+!/tests/test_event_state_prompt_contracts.py
+!/tests/test_medmemorybench_source_identity.py
 /docker/
 /.serena/
 /.spec-workflow/

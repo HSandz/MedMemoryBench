@@ -123,9 +123,17 @@ def compute_session_retrieval_quality(
     retrieved_memories: Optional[Sequence[Dict[str, Any]]],
     source_key_points: Optional[Sequence[Dict[str, Any]]],
     metadata: Optional[Dict[str, Any]] = None,
+    source_uid_to_benchmark_session_id: Optional[Dict[Any, Optional[Any]]] = None,
 ) -> Dict[str, Any]:
-    """Compute set- and rank-based retrieval quality at session granularity."""
-    predicted_ids = retrieved_session_ids(retrieved_memories)
+    """Compute gold-session quality, optionally translating method source UIDs."""
+    retrieved_source_uids = retrieved_session_ids(retrieved_memories)
+    if source_uid_to_benchmark_session_id is None:
+        predicted_ids = retrieved_source_uids
+    else:
+        predicted_ids = _unique_session_ids(
+            source_uid_to_benchmark_session_id.get(source_uid)
+            for source_uid in retrieved_source_uids
+        )
     expected_ids = gold_session_ids(source_key_points, metadata)
     predicted_set = set(predicted_ids)
     expected_set = set(expected_ids)
@@ -143,6 +151,7 @@ def compute_session_retrieval_quality(
         "level": "session",
         "unit": "unique_session_id",
         "available": bool(expected_ids),
+        "retrieved_source_uids": retrieved_source_uids,
         "predicted_session_ids": predicted_ids,
         "gold_session_ids": expected_ids,
         "matched_session_ids": matched_ids,

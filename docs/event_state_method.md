@@ -285,8 +285,9 @@ python main.py -m event_state_gemini -d medmemorybench --dry-run
 python main.py -m event_state_gemini -d medmemorybench
 python main.py -m event_state_gemini -d locomo
 
-# Build a memory snapshot, then answer from it
+# Build a memory snapshot, then answer from it (MedMemoryBench or LoCoMo)
 python main.py -m event_state_gemini -d medmemorybench --stage memory
+python main.py -m event_state_gemini -d locomo --stage memory
 python main.py --stage query --memory-run <memory-run-directory>
 ```
 
@@ -304,8 +305,13 @@ mutation remain serial. `--workers 1` follows the same staged path without a
 pool, and workers greater than one are intended to be semantically equivalent.
 The evaluator shows a `Memory build` progress bar covering both preparation and
 ordered stateful commit steps; it reaches completion only after commits finish.
-LoCoMo multi-session chunks use the same ordered preparation/commit split, while
-query workers continue to use the evaluator's existing global query limit.
+For LoCoMo, Event-State bypasses character chunking: every chronological session
+in one sample is prepared as a source session, then committed in sample order.
+Its sample-global `source_session_index`, original timestamps, session IDs, and
+turn IDs are persisted. Event-State snapshots are written per LoCoMo sample;
+`--stage query` restores those exact stores without rebuilding memory. Query
+workers use isolated restored stores, and batch preparation likewise freezes
+each sample's retrieval result before the run-wide `query-final` batch stage.
 MedMemoryBench unit build telemetry reports wall-clock preparation plus ordered
 commit time (parallel worker durations are not summed).
 Worker count is an execution setting and is not included in snapshot or config
@@ -342,6 +348,33 @@ when their full block fits the final prompt. A state claim contributes its
 direct origin only when its compact state block fits; otherwise, it contributes
 only included provenance excerpts, and is excluded entirely when neither is
 visible.
+
+### MedMemoryBench mixed-source integrity
+
+MedMemoryBench assigns every loaded conversation a deterministic opaque source
+UID (for example, `src_p1_r17`). This is the only session identity passed to a
+memory method and is stored in Event-State episode and retrieval provenance.
+The dataset adapter also supplies only generic `conversation_scope` metadata:
+`primary_user`, `general_non_personal`, or `third_party:<visible identity>`.
+It does not pass a noise label, noise type, or benchmark gold ID to Event-State.
+
+Original clean benchmark session IDs remain evaluator-private. During retrieval
+scoring, the evaluator translates selected source UIDs through its private
+source-to-benchmark mapping; distractor UIDs map to null and therefore cannot
+be gold evidence. Query diagnostics report selected clean/distractor source
+counts and noise-intrusion rates without exposing that telemetry to the answer
+model. Mixed runs fail before memory construction on duplicate source UIDs or
+invalid clean/distractor provenance. Event-State also rejects duplicate source
+UIDs in its immutable episode archive and reports
+`duplicate_episode_source_id_count` (normally zero).
+
+Mixed artifacts with the former positional-ID collision are historical and
+must not be used for robustness comparisons. New snapshots include
+`source_identity_schema_version: 1`; their legacy-shaped `session_ids` field,
+where present, contains method-facing source UIDs rather than gold session IDs.
+New `medmemorybench.query_answers` artifacts use version 3; version-2 artifacts
+retain their historical, ambiguous source-session semantics and are not
+reinterpreted during loading.
 
 `SUPERSEDE` interval closure is conservative. Ordinary state changes use the
 new claim's normalized `valid_from` only when it is not earlier than the

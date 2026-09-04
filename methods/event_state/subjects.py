@@ -16,12 +16,6 @@ def normalize_scope(text: str = "", explicit: Optional[str] = None) -> str:
             return "general_non_personal"
         if lowered in {"primary", "primary_user", "user"}:
             return "primary_user"
-    match = re.search(r"\[\s*Health consultation record about\s+([^\]]+)\]", text or "", re.I)
-    if match:
-        target = re.sub(r"\([^)]*\)", "", match.group(1)).strip()
-        return "third_party:" + normalize_name(target)
-    if re.search(r"\[\s*Health consultation record\s*\]", text or "", re.I):
-        return "general_non_personal"
     return "primary_user"
 
 

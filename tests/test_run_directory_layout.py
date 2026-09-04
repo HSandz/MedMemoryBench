@@ -827,6 +827,33 @@ def test_main_uses_inferred_method_dataset_and_output_root(tmp_path: Path, monke
     assert captured["memory_source_run_dir"] == source_run
 
 
+def test_main_uses_explicit_dataset_config_for_query_selection(tmp_path: Path, monkeypatch):
+    source_run = _write_memory_run(tmp_path, "20260813_143538")
+    captured = {}
+
+    class FakeEvaluator:
+        output_dir = source_run / "query_runs" / "explicit-dataset-run"
+
+        @staticmethod
+        def run():
+            return SimpleNamespace(
+                summary={"correct": 0, "total": 0, "overall_accuracy": 0.0}
+            )
+
+    monkeypatch.setattr(cli, "create_evaluator", lambda **kwargs: captured.update(kwargs) or FakeEvaluator())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py", "--stage", "query", "-d", "medmemorybench",
+            "--memory-run", "20260813_143538", "-o", str(tmp_path),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured["dataset_config"] is None
+
+
 def test_query_stage_accepts_an_explicit_method_config_file(
     tmp_path: Path,
     monkeypatch,

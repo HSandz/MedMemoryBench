@@ -195,7 +195,10 @@ def infer_query_config_from_memory_run(
             rejected.append(f"{run_dir}: manifest and run config must be JSON objects")
             continue
         if (
-            manifest.get("format") != "medmemorybench.memory_manifest"
+            manifest.get("format") not in {
+                "medmemorybench.memory_manifest",
+                "locomo.event_state_memory_manifest",
+            }
             or manifest.get("version") != 1
         ):
             rejected.append(f"{run_dir}: unsupported memory manifest")
@@ -483,6 +486,7 @@ def main() -> int:
             )
             return 1
         supplied_query_method = bool(args.method)
+        supplied_query_dataset = bool(args.dataset)
         args.method = args.method or inferred["method_config_name"]
         args.dataset = args.dataset or inferred["dataset_config_name"]
         try:
@@ -490,9 +494,10 @@ def main() -> int:
                 snapshot_method_config = method_config_from_snapshot(
                     inferred["method_config_snapshot"]
                 )
-            snapshot_dataset_config = dataset_config_from_snapshot(
-                inferred["dataset_config_snapshot"]
-            )
+            if not supplied_query_dataset:
+                snapshot_dataset_config = dataset_config_from_snapshot(
+                    inferred["dataset_config_snapshot"]
+                )
         except (TypeError, ValueError) as exc:
             print(f"Memory run configuration failed: {truncate_error_message(exc)}")
             return 1

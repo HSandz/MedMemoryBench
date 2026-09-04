@@ -250,7 +250,7 @@ def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_pat
     )
 
     query_data = json.loads(query_path.read_text())
-    assert query_data["version"] == 2
+    assert query_data["version"] == 3
     assert query_data["summary"]["overall_accuracy"] == 0.5
     assert query_data["summary"]["evaluation_coverage"]["complete"] is True
     batch_query, realtime_query = query_data["queries"]

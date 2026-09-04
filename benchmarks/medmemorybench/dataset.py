@@ -11,6 +11,9 @@ from benchmarks.base import BaseDataset, Session, Query, EvaluationUnit
 @dataclass
 class MedSession(Session):
     """MedMemoryBench session with medical dialogue data."""
+    source_uid: str = ""
+    benchmark_session_id: Optional[int] = None
+    conversation_scope: str = "primary_user"
     timestamp: Optional[str] = None
     is_noise: bool = False
     noise_type: Optional[str] = None
@@ -24,16 +27,8 @@ class MedSession(Session):
         """Convert session to memory text format."""
         lines = []
 
-        if self.is_noise:
-            if self.noise_type == "family_health_consultation" and self.family_role:
-                role_name = self.family_role.get('name', 'Family member')
-                relationship = self.family_role.get('relationship', '')
-                lines.append(f"[Health consultation record about {role_name}({relationship})]")
-            else:
-                lines.append("[Health consultation record]")
-        else:
-            date_str = self.timestamp or self.event_info.get('date', 'N/A')
-            lines.append(f"[{date_str}]")
+        date_str = self.timestamp or self.event_info.get('date', 'N/A')
+        lines.append(f"[{date_str}]")
 
         lines.append("")
 
@@ -91,6 +86,66 @@ class MedMemoryBenchDataset(BaseDataset):
         self.query_types_filter = config.get("query_types")
 
         self._personas: Dict[int, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _source_uid(persona_id: int, record_index: int) -> str:
+        """Return a deterministic, method-facing identity for one source record."""
+        return f"src_p{persona_id}_r{record_index}"
+
+    @staticmethod
+    def _conversation_scope(
+        is_noise: bool,
+        noise_type: Optional[str],
+        family_role: Optional[Dict[str, Any]],
+    ) -> str:
+        """Translate dataset structure into method-neutral conversation semantics."""
+        if not is_noise:
+            return "primary_user"
+        if noise_type == "family_health_consultation" and family_role:
+            identity = str(family_role.get("name") or family_role.get("relationship") or "third_party")
+            normalized = "_".join(identity.casefold().split())
+            return f"third_party:{normalized}"
+        return "general_non_personal"
+
+    @staticmethod
+    def _benchmark_session_id(record: Dict[str, Any], is_noise: bool) -> Optional[int]:
+        """Keep gold provenance only for genuine benchmark conversations."""
+        if is_noise or record.get("session_id") is None:
+            return None
+        return record["session_id"]
+
+    def _validate_persona_source_integrity(
+        self,
+        persona_id: int,
+        sessions: List[MedSession],
+        queries: List[MedQuery],
+    ) -> None:
+        """Fail before evaluation when source and benchmark identities disagree."""
+        source_uids = [session.source_uid for session in sessions]
+        duplicates = sorted({uid for uid in source_uids if source_uids.count(uid) > 1})
+        if not all(source_uids) or duplicates:
+            raise ValueError(
+                f"MedMemoryBench persona {persona_id} has duplicate or missing source UIDs: {duplicates or source_uids}"
+            )
+        clean_ids = [session.benchmark_session_id for session in sessions if not session.is_noise]
+        if any(session_id is None for session_id in clean_ids):
+            raise ValueError(f"MedMemoryBench persona {persona_id} has a clean source without a benchmark session ID")
+        if any(session.benchmark_session_id is not None for session in sessions if session.is_noise):
+            raise ValueError(f"MedMemoryBench persona {persona_id} maps a distractor source to a benchmark session")
+        if len(clean_ids) != len(set(clean_ids)):
+            raise ValueError(f"MedMemoryBench persona {persona_id} maps multiple clean sources to one benchmark session")
+        known_clean_ids = set(clean_ids)
+        # Session limits deliberately omit later checkpoints, which are not
+        # evaluated. A complete persona must resolve every query checkpoint.
+        unresolved = [] if self.max_sessions_per_persona else sorted({
+            query.session_id
+            for query in queries
+            if query.session_id is not None and query.session_id not in known_clean_ids
+        })
+        if unresolved:
+            raise ValueError(
+                f"MedMemoryBench persona {persona_id} has queries with unresolved clean-session provenance: {unresolved}"
+            )
 
     def load(self) -> None:
         if self._is_loaded:
@@ -157,8 +212,11 @@ class MedMemoryBenchDataset(BaseDataset):
                     event_info = s.get("event_info", {})
                     timestamp = event_info.get("date") if event_info else None
 
+                    benchmark_session_id = self._benchmark_session_id(s, is_noise)
+                    source_uid = self._source_uid(persona_id, i)
                     session = MedSession(
-                        session_id=s.get("session_id", i),
+                        # Base Session identity is method-facing and is never a gold ID.
+                        session_id=source_uid,
                         content=content,
                         metadata={
                             "messages": messages,
@@ -167,6 +225,11 @@ class MedMemoryBenchDataset(BaseDataset):
                             "status": s.get("status", ""),
                         },
                         timestamp=timestamp,
+                        source_uid=source_uid,
+                        benchmark_session_id=benchmark_session_id,
+                        conversation_scope=self._conversation_scope(
+                            is_noise, noise_type, s.get("family_role")
+                        ),
                         is_noise=is_noise,
                         noise_type=noise_type,
                         original_index=i,
@@ -219,6 +282,8 @@ class MedMemoryBenchDataset(BaseDataset):
                             queries_by_session[query.session_id] = []
                         queries_by_session[query.session_id].append(query)
 
+        self._validate_persona_source_integrity(persona_id, sessions, queries)
+
         self._personas[persona_id] = {
             "persona_id": persona_id,
             "sessions": sessions,
@@ -250,7 +315,7 @@ class MedMemoryBenchDataset(BaseDataset):
                     regular_session_count += 1
 
                     if regular_session_count % self.evaluation_interval == 0:
-                        queries = queries_by_session.get(session.session_id, [])
+                        queries = queries_by_session.get(session.benchmark_session_id, [])
 
                         if queries:
                             yield EvaluationUnit(
@@ -260,7 +325,7 @@ class MedMemoryBenchDataset(BaseDataset):
                                 context_id=persona_id,
                                 metadata={
                                     "persona_id": persona_id,
-                                    "eval_session_id": session.session_id,
+                                    "eval_session_id": session.benchmark_session_id,
                                     "total_sessions_injected": len(pending_sessions),
                                     "noise_sessions_count": sum(1 for s in pending_sessions if isinstance(s, MedSession) and s.is_noise),
                                 }
@@ -286,7 +351,7 @@ class MedMemoryBenchDataset(BaseDataset):
                     total_session_count += 1
 
                     if total_session_count % self.evaluation_interval == 0:
-                        queries = queries_by_session.get(session.session_id, [])
+                        queries = queries_by_session.get(session.benchmark_session_id, [])
 
                         if queries:
                             yield EvaluationUnit(
@@ -296,7 +361,7 @@ class MedMemoryBenchDataset(BaseDataset):
                                 context_id=0,
                                 metadata={
                                     "persona_id": persona_id,
-                                    "eval_session_id": session.session_id,
+                                    "eval_session_id": session.benchmark_session_id,
                                 }
                             )
                             unit_id += 1
@@ -320,6 +385,21 @@ class MedMemoryBenchDataset(BaseDataset):
                 "total_queries": len(self._personas[persona_id]["queries"]),
             }
         return {}
+
+    def get_source_identity_mapping(self, persona_id: int) -> Dict[str, Optional[int]]:
+        """Return evaluator-only source UID to clean benchmark-session provenance."""
+        persona = self._personas.get(persona_id, {})
+        return {
+            session.source_uid: session.benchmark_session_id
+            for session in persona.get("sessions", [])
+        }
+
+    def get_all_source_identity_mappings(self) -> Dict[str, Optional[int]]:
+        """Return the global evaluator provenance map for merged contexts."""
+        mapping: Dict[str, Optional[int]] = {}
+        for persona_id in self._personas:
+            mapping.update(self.get_source_identity_mapping(persona_id))
+        return mapping
 
     def get_query_type_distribution(self) -> Dict[str, int]:
         distribution: Dict[str, int] = {}

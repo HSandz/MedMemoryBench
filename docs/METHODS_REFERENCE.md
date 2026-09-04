@@ -56,12 +56,15 @@ For a fair comparison, pin the complete YAML, answer model, judge provider/model
 - **Long context:** simplest control; retains history until its context policy removes older material.
 - **Embedding RAG:** bounded dense retrieval; good for paraphrases but can miss exact terms or negations.
 - **Event-State Hybrid:** preserves source episodes while compressing recurring/evolving claims; dense hybrid retrieval and optional query-only PPR.
+- **Mixed MedMemoryBench runs:** methods receive opaque source UIDs and generic conversation scope only. The evaluator privately maps clean source UIDs to gold benchmark sessions; distractor UIDs never count as retrieval gold.
 - **BM25 RAG:** deterministic lexical baseline; good for rare names, dates, and medications.
 - **Graph methods:** add extraction, linking, graph traversal, or PPR; expect higher setup cost and more failure points.
 - **Agentic memory:** rewrites or manages memory during ingestion and may use tools at query time.
 - **Managed services:** Zep depends on remote state, credentials, service version, cost, and privacy settings.
 
 Do not treat historical outputs as rankings. Inspect `retrieved_memories`, method logs, `run_config.json`, and judge configuration before attributing an error to retrieval or answer generation.
+Mixed artifacts created before source-identity schema version 1 may contain
+positional source-ID collisions and are not valid noise-robustness comparisons.
 
 ## Outputs and Evidence
 

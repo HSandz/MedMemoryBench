@@ -33,6 +33,21 @@ class EventStateStore:
         return f"{prefix}{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]}"
 
     def add_episode(self, episode: Episode, embedding: List[float]) -> None:
+        conflicting_episode = next(
+            (
+                existing.episode_id
+                for existing in self.episodes.values()
+                if episode.source_session_id is not None
+                and existing.source_session_id == episode.source_session_id
+            ),
+            None,
+        )
+        if conflicting_episode is not None:
+            raise ValueError(
+                "Event-State source identity collision: source UID "
+                f"{episode.source_session_id!r} already belongs to episode "
+                f"{conflicting_episode!r}"
+            )
         if episode.episode_id not in self.episodes:
             self.episodes[episode.episode_id] = episode
             self.episode_embeddings[episode.episode_id] = list(embedding)
@@ -156,6 +171,22 @@ class EventStateStore:
             "standalone_claim_count": sum(item.status == "standalone" for item in self.claims.values()),
             "total_claim_count": len(self.claims),
             "total_episode_count": len(self.episodes),
+            "distinct_episode_source_id_count": len(
+                {
+                    episode.source_session_id
+                    for episode in self.episodes.values()
+                    if episode.source_session_id is not None
+                }
+            ),
+            "duplicate_episode_source_id_count": sum(
+                episode.source_session_id is not None for episode in self.episodes.values()
+            ) - len(
+                {
+                    episode.source_session_id
+                    for episode in self.episodes.values()
+                    if episode.source_session_id is not None
+                }
+            ),
         }
 
     def export(self) -> Dict[str, Any]:

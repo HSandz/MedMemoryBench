@@ -28,6 +28,7 @@ from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.retrieval_quality import (
     RETRIEVAL_QUALITY_GROUP,
     compute_session_retrieval_quality,
+    retrieved_session_ids,
 )
 from utils.templates import get_prompt_manager
 from utils.logger import truncate_error_message
@@ -171,6 +172,8 @@ class MedMemoryBenchEvaluator:
         self._append_source_snapshot_keys: set[tuple[int, int]] = set()
         self._append_source_snapshot_records: Dict[tuple[int, int], Dict[str, Any]] = {}
         self._append_source_manifest: Optional[Dict[str, Any]] = None
+        # Evaluator-only provenance. Memory methods receive source UIDs, never gold IDs.
+        self._source_uid_to_benchmark_session_id: Dict[Any, Dict[str, Optional[Any]]] = {}
 
         if self._should_enable_checkpoint():
             self._init_checkpoint_manager()
@@ -361,10 +364,105 @@ class MedMemoryBenchEvaluator:
             return True
         return note_level.strip().lower() == "session"
 
+    @staticmethod
+    def _method_source_uid(session: MedSession) -> Any:
+        return session.source_uid or session.session_id
+
+    @staticmethod
+    def _benchmark_session_id(session: MedSession) -> Optional[Any]:
+        if session.is_noise:
+            return None
+        return (
+            session.benchmark_session_id
+            if session.benchmark_session_id is not None
+            else session.session_id
+        )
+
+    def _validate_unit_source_integrity(self, unit: EvaluationUnit) -> Dict[str, Any]:
+        """Validate source ingress and retain private source-to-gold provenance."""
+        sessions = [item for item in unit.sessions_to_inject if isinstance(item, MedSession)]
+        source_uids = [self._method_source_uid(session) for session in sessions]
+        duplicate_uids = sorted({uid for uid in source_uids if source_uids.count(uid) > 1})
+        if duplicate_uids or len(source_uids) != len(set(source_uids)):
+            raise ValueError(
+                f"MedMemoryBench source UID collision for persona {unit.context_id}, "
+                f"unit {unit.unit_id}: {duplicate_uids}"
+            )
+        mapping = {
+            self._method_source_uid(session): self._benchmark_session_id(session)
+            for session in sessions
+        }
+        if any(
+            session.is_noise and mapping[self._method_source_uid(session)] is not None
+            for session in sessions
+        ):
+            raise ValueError(
+                f"MedMemoryBench distractor has benchmark provenance for persona {unit.context_id}, unit {unit.unit_id}"
+            )
+        clean_ids = [value for value in mapping.values() if value is not None]
+        if len(clean_ids) != len(set(clean_ids)):
+            raise ValueError(
+                f"MedMemoryBench clean benchmark provenance is non-unique for persona {unit.context_id}, unit {unit.unit_id}"
+            )
+        source_mappings = getattr(self, "_source_uid_to_benchmark_session_id", None)
+        if source_mappings is None:
+            source_mappings = self._source_uid_to_benchmark_session_id = {}
+        context_mapping = source_mappings.setdefault(unit.context_id, {})
+        collisions = [uid for uid, value in mapping.items() if uid in context_mapping and context_mapping[uid] != value]
+        if collisions:
+            raise ValueError(
+                f"MedMemoryBench source provenance changed for persona {unit.context_id}: {collisions}"
+            )
+        context_mapping.update(mapping)
+        counts = {
+            "source_identity_schema_version": 1,
+            "input_source_record_count": len(sessions),
+            "unique_source_uid_count": len(set(source_uids)),
+            "clean_source_record_count": sum(value is not None for value in mapping.values()),
+            "noise_source_record_count": sum(value is None for value in mapping.values()),
+            "source_uid_collision_count": len(source_uids) - len(set(source_uids)),
+            "general_non_personal_source_count": sum(session.conversation_scope == "general_non_personal" for session in sessions),
+            "third_party_source_count": sum(session.conversation_scope.startswith("third_party:") for session in sessions),
+        }
+        if counts["input_source_record_count"] != counts["unique_source_uid_count"]:
+            raise ValueError(f"MedMemoryBench source UID invariant failed for persona {unit.context_id}, unit {unit.unit_id}")
+        return counts
+
+    def _noise_intrusion_diagnostics(
+        self,
+        retrieved_memories: List[Dict[str, Any]],
+        context_id: Optional[Any],
+    ) -> Dict[str, Any]:
+        mapping = getattr(self, "_source_uid_to_benchmark_session_id", {}).get(context_id)
+        source_uids = retrieved_session_ids(retrieved_memories)
+        if mapping is None:
+            return {
+                "source_mapping_schema_version": 1,
+                "selected_clean_source_count": len(source_uids),
+                "selected_noise_source_count": 0,
+                "item_level_noise_intrusion_rate": 0.0,
+                "clean_evidence_rate": 1.0 if source_uids else 0.0,
+            }
+        unknown = [uid for uid in source_uids if uid not in mapping]
+        if unknown:
+            raise ValueError(
+                f"MedMemoryBench retrieval references unknown source UIDs for persona {context_id}: {unknown}"
+            )
+        clean_count = sum(mapping[uid] is not None for uid in source_uids)
+        noise_count = len(source_uids) - clean_count
+        return {
+            "source_mapping_schema_version": 1,
+            "selected_clean_source_count": clean_count,
+            "selected_noise_source_count": noise_count,
+            "item_level_noise_intrusion_rate": noise_count / len(source_uids) if source_uids else 0.0,
+            "clean_evidence_rate": clean_count / len(source_uids) if source_uids else 0.0,
+        }
+
     def _session_retrieval_quality(
         self,
         query: Any,
         retrieved_memories: List[Dict[str, Any]],
+        context_id: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self._session_retrieval_quality_enabled():
             return None
@@ -372,6 +470,7 @@ class MedMemoryBenchEvaluator:
             retrieved_memories=retrieved_memories,
             source_key_points=getattr(query, "source_key_points", []),
             metadata=getattr(query, "metadata", {}),
+            source_uid_to_benchmark_session_id=getattr(self, "_source_uid_to_benchmark_session_id", {}).get(context_id),
         )
         if str(getattr(self.method_config, "method_name", "")).lower() != "event_state":
             return quality
@@ -405,15 +504,20 @@ class MedMemoryBenchEvaluator:
             retrieved_memories=lineage_records,
             source_key_points=getattr(query, "source_key_points", []),
             metadata=getattr(query, "metadata", {}),
+            source_uid_to_benchmark_session_id=getattr(self, "_source_uid_to_benchmark_session_id", {}).get(context_id),
         )
         quality["answer_visible"] = compute_session_retrieval_quality(
             retrieved_memories=visible_records,
             source_key_points=getattr(query, "source_key_points", []),
             metadata=getattr(query, "metadata", {}),
+            source_uid_to_benchmark_session_id=getattr(self, "_source_uid_to_benchmark_session_id", {}).get(context_id),
         )
         quality["retrieval_quality_claim_lineage"] = quality["claim_lineage"]
         quality["retrieval_quality_answer_visible"] = quality["answer_visible"]
         quality["provenance_semantics"] = "selected claim origin plus selected episodes; answer_visible uses included evidence only"
+        quality["noise_intrusion"] = self._noise_intrusion_diagnostics(
+            visible_records, context_id
+        )
         return quality
 
     @staticmethod
@@ -765,6 +869,14 @@ class MedMemoryBenchEvaluator:
             }
         )
         self.dataset.load()
+        self._source_uid_to_benchmark_session_id = {
+            persona_id: self.dataset.get_source_identity_mapping(persona_id)
+            for persona_id in self.dataset.get_persona_ids()
+        }
+        if self.dataset_config.evaluation_mode == "merged":
+            self._source_uid_to_benchmark_session_id[0] = (
+                self.dataset.get_all_source_identity_mappings()
+            )
         self._evaluation_units = list(self.dataset.get_evaluation_units())
         self._evaluation_total_sessions = sum(
             len(unit.sessions_to_inject) for unit in self._evaluation_units
@@ -2129,7 +2241,16 @@ class MedMemoryBenchEvaluator:
             "context_id": unit.context_id,
             "unit_id": unit.unit_id,
             "evaluation_session_id": unit.metadata.get("eval_session_id"),
-            "session_ids": [session.session_id for session in unit.sessions_to_inject],
+            "source_identity_schema_version": 1,
+            "source_uids": [
+                self._method_source_uid(session)
+                for session in unit.sessions_to_inject
+            ],
+            # Retained for readers of version-1 snapshots; values are source UIDs.
+            "session_ids": [
+                self._method_source_uid(session)
+                for session in unit.sessions_to_inject
+            ],
             "memory_build_time": memory_build_time,
             "memory_build_metrics": copy.deepcopy(memory_build_metrics or {}),
             "feature_configuration": self._amem_feature_configuration(),
@@ -2794,6 +2915,7 @@ class MedMemoryBenchEvaluator:
 
     def _evaluate_unit_with_checkpoint(self, unit: EvaluationUnit) -> List[MetricResult]:
         """Evaluate unit with checkpoint support."""
+        source_integrity = self._validate_unit_source_integrity(unit)
         self._log(
             f"\nUnit {unit.unit_id} | persona={unit.context_id} | "
             f"sessions={len(unit.sessions_to_inject)} | queries={len(unit.queries_to_evaluate)}"
@@ -2823,7 +2945,7 @@ class MedMemoryBenchEvaluator:
             if self._session_level_force_resume() and not self._supports_memory_snapshots() and self._checkpoint_manager:
                 pending_sessions = [
                     session for session in pending_sessions
-                    if not self._checkpoint_manager.is_session_injected(session.session_id, persona_id=unit.context_id)
+                    if not self._checkpoint_manager.is_session_injected(self._method_source_uid(session), persona_id=unit.context_id)
                 ]
             supports_staged_memory = getattr(self.agent_manager, "supports_staged_memory", None)
             staged_event_state = "event_state" in method_name and len(pending_sessions) > 1 and callable(supports_staged_memory) and supports_staged_memory()
@@ -2832,16 +2954,18 @@ class MedMemoryBenchEvaluator:
                 # Extraction and embedding are independent per source session;
                 # the returned preparations are committed below in source order.
                 staged_items = []
-                pending_ids = {session.session_id for session in pending_sessions}
+                pending_ids = {self._method_source_uid(session) for session in pending_sessions}
                 for idx, session in enumerate(unit.sessions_to_inject):
-                    if session.session_id not in pending_ids:
+                    source_uid = self._method_source_uid(session)
+                    if source_uid not in pending_ids:
                         continue
-                    session_ids.append(session.session_id)
-                    session_scope = normalize_scope(session.to_memory_text())
+                    session_ids.append(source_uid)
+                    session_scope = normalize_scope(explicit=session.conversation_scope)
                     source_messages = session.metadata.get("messages", []) or [{"speaker": "Unknown", "content": session.content, "source_turn_id": None}]
                     for turn_index, item in enumerate(source_messages):
                         staged_item = dict(item)
-                        staged_item.setdefault("source_session_id", session.session_id)
+                        staged_item.setdefault("source_session_id", source_uid)
+                        staged_item.setdefault("source_uid", source_uid)
                         staged_item.setdefault("source_session_index", idx)
                         staged_item.setdefault("source_turn_id", item.get("turn_id", item.get("dia_id", turn_index)))
                         staged_item.setdefault("source_event_id", session.metadata.get("event_id"))
@@ -2850,7 +2974,7 @@ class MedMemoryBenchEvaluator:
                         staged_items.append(staged_item)
                     marker = getattr(self._checkpoint_manager, "mark_session_started", None)
                     if callable(marker):
-                        marker(session.session_id, unit.unit_id)
+                        marker(source_uid, unit.unit_id)
                 staged_start = time.perf_counter()
                 staged_usage_before = get_usage_tracker().get_stats()
                 try:
@@ -2876,7 +3000,7 @@ class MedMemoryBenchEvaluator:
                         session_id = prepared_session.session.get("source_session_id")
                         session_index = prepared_session.session.get("source_session_index")
                         session_build_results.append({
-                            "session_id": session_id,
+                            "source_uid": session_id,
                             "session_index": session_index,
                             "build_result": memory_result.to_dict(),
                             "wall_time_seconds": time.perf_counter() - session_start,
@@ -2912,10 +3036,11 @@ class MedMemoryBenchEvaluator:
                     self._finish_memory_progress()
 
             for idx, session in enumerate(sessions_to_process):
-                session_ids.append(session.session_id)
+                source_uid = self._method_source_uid(session)
+                session_ids.append(source_uid)
                 if restored_completed_unit:
                     self._log(
-                        f"      [Resume] Session {session.session_id} restored from snapshot; skipping"
+                        f"      [Resume] Session {source_uid} restored from snapshot; skipping"
                     )
                     continue
                 if (
@@ -2923,19 +3048,19 @@ class MedMemoryBenchEvaluator:
                     and not self._supports_memory_snapshots()
                     and self._checkpoint_manager
                     and self._checkpoint_manager.is_session_injected(
-                        session.session_id,
+                        source_uid,
                         persona_id=unit.context_id,
                     )
                 ):
                     self._log(
-                        f"      [Resume] Session {session.session_id} already injected; skipping"
+                        f"      [Resume] Session {source_uid} already injected; skipping"
                     )
                     continue
                 session_succeeded = False
                 memory_text = session.to_memory_text()
 
                 # Show progress
-                self._log(f"      [Progress] Session {idx + 1}/{total_sessions} (ID: {session.session_id})")
+                self._log(f"      [Progress] Session {idx + 1}/{total_sessions} (source UID: {source_uid})")
 
                 formatted_text = self.prompt_manager.format_memorize(
                     context=memory_text,
@@ -2950,28 +3075,25 @@ class MedMemoryBenchEvaluator:
                     None,
                 )
                 if callable(mark_session_started):
-                    mark_session_started(session.session_id, unit.unit_id)
+                    mark_session_started(source_uid, unit.unit_id)
 
                 usage_tracker = get_usage_tracker()
                 usage_before = usage_tracker.get_stats()
                 session_started_at = time.perf_counter()
                 session_build_record: Dict[str, Any] = {
-                    "session_id": session.session_id,
+                    "source_uid": source_uid,
                     "session_index": idx,
                 }
                 try:
-                    experimental_source = {}
-                    method_name = getattr(
-                        getattr(self, "method_config", None),
-                        "method_name",
-                        "",
-                    )
-                    if method_name in {"amem_test", "event_state"}:
-                        experimental_source = {
-                            "source_session_id": session.session_id,
-                            "source_session_index": idx,
-                            "source_event_id": session.metadata.get("event_id"),
-                        }
+                    # Generic source semantics are available to every adapter;
+                    # benchmark gold IDs and distractor labels remain private.
+                    source_metadata = {
+                        "source_session_id": source_uid,
+                        "source_uid": source_uid,
+                        "source_session_index": idx,
+                        "source_event_id": session.metadata.get("event_id"),
+                        "conversation_scope": session.conversation_scope,
+                    }
                     memory_result = self._run_api_call(
                         self.agent_manager.send_message,
                         message=formatted_text,
@@ -2980,7 +3102,7 @@ class MedMemoryBenchEvaluator:
                         is_last_session=is_last_session,
                         timestamp=session.timestamp,
                         memory_items=session.metadata.get("messages", []),
-                        **experimental_source,
+                        **source_metadata,
                     )
 
                     if memory_result is not None and isinstance(memory_result, MemoryBuildResult):
@@ -2993,13 +3115,13 @@ class MedMemoryBenchEvaluator:
                                 failure,
                                 unit_id=unit.unit_id,
                                 context_id=unit.context_id,
-                                session_id=session.session_id,
+                                session_id=source_uid,
                                 session_index=idx,
                             )
 
                         passages_count = len(memory_result.all_passages) if memory_result.all_passages else memory_result.extra.get("inserted_count", 0)
                         self._log(
-                            f"  Session {session.session_id} complete | "
+                            f"  Session {source_uid} complete | "
                             f"passages={passages_count} | time={memory_result.time_cost:.2f}s"
                         )
 
@@ -3008,7 +3130,7 @@ class MedMemoryBenchEvaluator:
                 except LLMAPIError as e:
                     session_build_record["error"] = truncate_error_message(e)
                     self._log(
-                        f"        [API ERROR] Session {session.session_id} failed: {truncate_error_message(e)}",
+                        f"        [API ERROR] Session {source_uid} failed: {truncate_error_message(e)}",
                         level="ERROR"
                     )
                     memory_build_failed = True
@@ -3021,7 +3143,7 @@ class MedMemoryBenchEvaluator:
                             failure if failure else e,
                             unit_id=unit.unit_id,
                             context_id=unit.context_id,
-                            session_id=session.session_id,
+                            session_id=source_uid,
                             session_index=idx,
                             affected_query_ids=[
                                 query.query_id for query in unit.queries_to_evaluate
@@ -3046,7 +3168,7 @@ class MedMemoryBenchEvaluator:
                     session_build_results.append(session_build_record)
 
                 if self._checkpoint_manager and session_succeeded:
-                    self._checkpoint_manager.mark_session_injected(session.session_id)
+                    self._checkpoint_manager.mark_session_injected(source_uid)
                 if memory_build_failed:
                     break
 
@@ -3082,6 +3204,10 @@ class MedMemoryBenchEvaluator:
                 "unit_id": unit.unit_id,
                 "context_id": unit.context_id,
                 "session_ids": session_ids,
+                "mixed_source_integrity": {
+                    **source_integrity,
+                    "source_records_ingested_count": len(session_build_results),
+                },
                 "session_count": total_sessions,
                 "total_time": total_memory_time,
                 "total_passages": total_passages,
@@ -3510,17 +3636,15 @@ class MedMemoryBenchEvaluator:
                     context_id=unit.context_id,
                 )
                 continue
+            # This bar tracks final-answer completion, not asynchronous judge
+            # completion. A deferred judge already has its answer and belongs
+            # to the subsequent judge stage.
+            self._advance_query_progress(
+                query.query_id,
+                context_id=unit.context_id,
+            )
             if result is not None:
                 results.append(result)
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
-            elif not self._is_deferred_judge_query(query.query_id):
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=unit.context_id,
-                )
         return results
 
     def _prepare_combined_batch_queries(
@@ -3732,6 +3856,12 @@ class MedMemoryBenchEvaluator:
                     context_id=item["persona_id"],
                 )
                 continue
+            # The answer batch is complete even when metric scoring is queued
+            # for the next judge batch.
+            self._advance_query_progress(
+                query.query_id,
+                context_id=item["persona_id"],
+            )
             if result is not None:
                 status = "✓" if result.is_correct else "✗"
                 self._log(
@@ -3741,15 +3871,6 @@ class MedMemoryBenchEvaluator:
                     "persona_id": item["persona_id"],
                     "result": result,
                 })
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
-            elif not self._is_deferred_judge_query(query.query_id):
-                self._advance_query_progress(
-                    query.query_id,
-                    context_id=item["persona_id"],
-                )
 
         self._pending_batch_queries = []
         return finalized
@@ -4008,7 +4129,7 @@ class MedMemoryBenchEvaluator:
                     "retrieved_memories": retrieved_memories,
                     "retrieved_count": retrieved_count,
                     "retrieval_quality": self._session_retrieval_quality(
-                        query, retrieved_memories
+                        query, retrieved_memories, context_id
                     ),
                     "artifact_references": deferred_references,
                     "execution_usage": resolved_execution_usage,
@@ -4059,7 +4180,7 @@ class MedMemoryBenchEvaluator:
         references.setdefault("judge", {"transport": "realtime"})
         self._attach_session_retrieval_quality(
             result,
-            self._session_retrieval_quality(query, retrieved_memories),
+            self._session_retrieval_quality(query, retrieved_memories, context_id),
         )
         result.details["artifact_references"] = references
         result.details["execution_usage"] = resolved_execution_usage

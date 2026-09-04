@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 from benchmarks.base import EvaluationUnit
@@ -114,6 +115,36 @@ def test_medmemorybench_combines_units_after_freezing_each_memory_snapshot():
     assert stage == "query-final"
     assert [request.metadata["query_id"] for request in requests] == ["q0", "q1"]
     assert [item["persona_id"] for item in finalized] == [10, 20]
+
+
+def test_combined_batch_progress_completes_before_deferred_judging():
+    class Progress:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, count):
+            self.updates.append(count)
+
+    evaluator = _evaluator_state(MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator))
+    evaluator._checkpoint_manager = None
+    evaluator._deferred_judges = []
+    evaluator._record_batch_api_failure = lambda *args, **kwargs: None
+    def defer_judge(query, *args, **kwargs):
+        evaluator._deferred_judges.append({"query_id": query.query_id})
+        return None
+
+    evaluator._score_agent_response = defer_judge
+    progress = Progress()
+    evaluator._query_progress = progress
+    evaluator._query_progress_lock = threading.Lock()
+    evaluator._query_progress_completed = set()
+
+    evaluator._prepare_combined_batch_queries(
+        EvaluationUnit(0, [], [_query("q0"), _query("q1")], context_id=10),
+        memory_time_per_query=0.0,
+    )
+    assert evaluator._complete_combined_batch_queries() == []
+    assert progress.updates == [1, 1]
 
 
 def test_locomo_combines_samples_into_one_final_answer_stage():

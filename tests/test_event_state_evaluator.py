@@ -113,3 +113,23 @@ def test_answer_visible_ignores_selected_episode_excluded_by_context_budget():
     assert quality["available"] is True
     assert quality["retrieved_note_count"] == 0
     assert quality["predicted_session_ids"] == []
+
+
+def test_retrieval_quality_translates_source_uids_and_excludes_distractors():
+    evaluator = object.__new__(MedMemoryBenchEvaluator)
+    evaluator.method_config = SimpleNamespace(method_name="event_state", build_config={})
+    evaluator._source_uid_to_benchmark_session_id = {
+        1: {"src_p1_r0": None, "src_p1_r1": 3},
+    }
+    query = SimpleNamespace(source_key_points=[{"session_id": 3}], metadata={})
+    records = [
+        {"type": "episode", "source_session_id": "src_p1_r0", "included_in_context": True},
+        {"type": "episode", "source_session_id": "src_p1_r1", "included_in_context": True},
+    ]
+
+    quality = evaluator._session_retrieval_quality(query, records, context_id=1)
+    assert quality["retrieved_source_uids"] == ["src_p1_r0", "src_p1_r1"]
+    assert quality["predicted_session_ids"] == ["3"]
+    assert quality["matched_session_ids"] == ["3"]
+    assert quality["noise_intrusion"]["selected_noise_source_count"] == 1
+    assert quality["noise_intrusion"]["selected_clean_source_count"] == 1

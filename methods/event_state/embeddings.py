@@ -9,6 +9,11 @@ from typing import Any, List, Optional, Sequence
 class DenseEmbedder:
     """Normalizes vectors from the repository's supported embedding families."""
 
+    # Query workers use isolated Event-State stores, but local Transformer
+    # weights are immutable and can be shared within one process.
+    _local_clients: dict[tuple[str, str], Any] = {}
+    _local_clients_lock = threading.Lock()
+
     def __init__(self, provider: str = "local", model: str = "sentence-transformers/all-MiniLM-L6-v2", model_path: Optional[str] = None, api_key: Optional[str] = None, base_url: Optional[str] = None, client: Optional[Any] = None) -> None:
         self.provider, self.model, self.model_path = provider.lower(), model, model_path
         self.api_key, self.base_url, self._client = api_key, base_url, client
@@ -28,7 +33,13 @@ class DenseEmbedder:
                 return self._client
             if self.provider in {"local", "huggingface"}:
                 from sentence_transformers import SentenceTransformer
-                self._client = SentenceTransformer(self.model_path or self.model)
+                cache_key = (self.provider, self.model_path or self.model)
+                with self._local_clients_lock:
+                    client = self._local_clients.get(cache_key)
+                    if client is None:
+                        client = SentenceTransformer(self.model_path or self.model)
+                        self._local_clients[cache_key] = client
+                self._client = client
             elif self.provider == "openai":
                 from langchain_openai import OpenAIEmbeddings
                 options = {"model": self.model}

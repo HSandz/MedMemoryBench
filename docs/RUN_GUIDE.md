@@ -259,7 +259,7 @@ python main.py -m embedding_rag_gpt-5.1 -d medmemorybench --resume
 JUDGE_MODEL=gpt-5.1 python main.py --rejudge outputs/METHOD_MODEL/RUN_query_answer.json
 ```
 
-## Staged A-MEM Runs
+## Staged Memory Runs
 
 Build memory once, then answer queries from its snapshot:
 
@@ -269,6 +269,28 @@ python main.py --stage query --memory-run YYYYMMDD_HHMMSS
 ```
 
 The query stage reads the stored effective configuration and writes under the source run's `query_runs/` directory. Use `--resume` for an incomplete query child. Do not change snapshot-incompatible A-MEM flags between stages.
+
+Event-State supports the same staged workflow for LoCoMo, with a snapshot per
+complete conversation sample rather than a persona/evaluation unit:
+
+```bash
+python main.py -m event_state_gemini -d locomo --stage memory --workers 4
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS --workers 4
+```
+
+LoCoMo snapshots retain original session and turn provenance. Query-stage
+workers restore independent Event-State instances; `--resume` reuses completed
+sample snapshots, rebuilds only a sample without a valid snapshot, and skips
+answers recorded in the query checkpoint.
+
+When `-d` is omitted, query stage restores the exact stored dataset config. To
+apply a revised query selection from the same named config (for example,
+`locomo_1` with `evaluation.category_filter: [1, 2, 3, 4]`), pass it explicitly:
+
+```bash
+python main.py -m event_state_gemini -d locomo_1 --stage query \
+  --memory-run YYYYMMDD_HHMMSS --batch-api
+```
 
 ### Incremental A-MEM Append
 
@@ -354,7 +376,7 @@ execution. Event-State memory preparation also displays a per-unit
 both preparation and ordered stateful commit steps, so completion means the
 entire memory build is finished.
 
-When running `--stage query` against completed A-MEM snapshots, independent
+When running `--stage query` against completed A-MEM or LoCoMo Event-State snapshots, independent
 unit contexts can initialize without waiting for earlier units. Each unit uses
 an isolated agent/memory context, while `N` remains a single global cap across
 all real-time queries, not a per-unit cap. Result, batch, deferred-judge, and

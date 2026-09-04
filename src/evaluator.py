@@ -296,7 +296,10 @@ class Evaluator:
 
         compatible = (
             isinstance(manifest, dict)
-            and manifest.get("format") == "medmemorybench.memory_manifest"
+            and manifest.get("format") in {
+                "medmemorybench.memory_manifest",
+                "locomo.event_state_memory_manifest",
+            }
             and manifest.get("version") == 1
             and manifest.get("status") in ({"complete", "building"} if self.append else {"complete"})
             and manifest.get("method_name") == self.method_config.method_name
@@ -614,20 +617,10 @@ class Evaluator:
     def _validate_batch_eligibility(self) -> None:
         """Fail early when --batch-api cannot reach any supported stage."""
         provider = self.method_config.model.provider.lower()
-        method_name = self.method_config.method_name.lower()
-        eligible_methods = (
-            "long_context", "embedding_rag", "bm25_rag", "lightmem",
-            "zep", "remem", "graph_rag", "amem", "mem0", "memos",
-            "memrl", "mirix",
-        )
-        agent_params = getattr(self.method_config, "raw_config", {}).get("agent_params", {})
-        has_method_stage = (
-            is_batch_provider(provider)
-            and any(name in method_name for name in eligible_methods)
-            and not (
-                "mirix" in method_name
-                and agent_params.get("use_native_query", True)
-            )
+        from src.agent import AgentManager
+
+        has_method_stage = AgentManager.supports_configured_batch_queries(
+            self.method_config
         )
         has_medmemorybench_judge = (
             self.dataset_config.dataset_name.lower() == "medmemorybench"

@@ -192,6 +192,28 @@ def test_dense_embedder_initializes_backend_once_under_concurrent_first_use(monk
     assert count == 1
 
 
+def test_dense_embedder_shares_local_backend_between_isolated_instances(monkeypatch):
+    count = 0
+
+    class Backend:
+        def __init__(self, model):
+            nonlocal count
+            count += 1
+
+        def encode(self, texts, normalize_embeddings=True):
+            return [[1.0, 0.0] for _ in texts] if isinstance(texts, list) else [1.0, 0.0]
+
+    DenseEmbedder._local_clients.clear()
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Backend))
+
+    first = DenseEmbedder(provider="local", model="shared-test")
+    second = DenseEmbedder(provider="local", model="shared-test")
+    first.embed_query("one")
+    second.embed_query("two")
+
+    assert count == 1
+
+
 def test_medmemorybench_staged_unit_wall_time_includes_preparation_and_commit():
     class Manager:
         def supports_staged_memory(self):

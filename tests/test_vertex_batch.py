@@ -392,7 +392,7 @@ def test_small_batch_retry_uses_another_batch_job(tmp_path, monkeypatch):
     assert responses["request-5"].content == "answer-request-5"
 
 
-@pytest.mark.parametrize("method_name", ["amem", "mem0", "memos", "memrl", "mirix"])
+@pytest.mark.parametrize("method_name", ["amem", "mem0", "memos", "memrl", "mirix", "event_state"])
 def test_new_gemini_batch_methods_pass_eligibility_check(method_name):
     evaluator = Evaluator.__new__(Evaluator)
     evaluator.method_config = SimpleNamespace(
@@ -404,6 +404,20 @@ def test_new_gemini_batch_methods_pass_eligibility_check(method_name):
     evaluator.batch_gcs_uri = "gs://private-bucket/evaluation-batch"
 
     evaluator._validate_batch_eligibility()
+
+
+def test_event_state_planner_queries_are_not_batch_eligible():
+    evaluator = Evaluator.__new__(Evaluator)
+    evaluator.method_config = SimpleNamespace(
+        method_name="event_state",
+        model=SimpleNamespace(provider="gemini"),
+        raw_config={"retrieval_config": {"planner_rounds": 1}},
+    )
+    evaluator.dataset_config = SimpleNamespace(dataset_name="locomo")
+    evaluator.batch_gcs_uri = "gs://private-bucket/evaluation-batch"
+
+    with pytest.raises(ValueError, match="at least one eligible Gemini stage"):
+        evaluator._validate_batch_eligibility()
 
 
 def test_native_mirix_is_not_an_eligible_final_answer_batch_stage():

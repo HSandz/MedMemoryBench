@@ -27,6 +27,50 @@ def test_normalization_groups_locomo_sessions_and_preserves_turn_provenance():
     assert [item["source_session_index"] for item in sessions] == [42, 7]
 
 
+def test_generic_conversation_scope_keeps_mixed_sources_isolated():
+    class ScopeLLM:
+        def chat(self, messages, **kwargs):
+            if "Extract conversational memory" in messages[0]["content"]:
+                return SimpleNamespace(content=(
+                    '{"episode_summary":"fact","claims":[{"subject":"patient",'
+                    '"predicate":"condition","value":"recorded",'
+                    '"source_turn_ids":["t"]}]}'
+                ))
+            return SimpleNamespace(content='{"operation":"NEW","confidence":1}')
+
+    agent = EventStateAgent(
+        llm_client=ScopeLLM(),
+        memory_llm_client=ScopeLLM(),
+        embedding_client=FakeEmbedder(),
+        enable_state_compilation=False,
+    )
+    for source_uid, scope in (
+        ("src_p1_r0", "primary_user"),
+        ("src_p1_r1", "general_non_personal"),
+        ("src_p1_r2", "third_party:maya"),
+    ):
+        agent.memorize(
+            "conversation",
+            memory_items=[{
+                "source_session_id": source_uid,
+                "source_turn_id": "t",
+                "speaker": "Patient",
+                "content": "A medical fact.",
+                "conversation_scope": scope,
+            }],
+        )
+
+    state = agent.export_memory_state()
+    assert len(state["episodes"]) == 3
+    assert {item["source_session_id"] for item in state["episodes"]} == {
+        "src_p1_r0", "src_p1_r1", "src_p1_r2",
+    }
+    assert {item["subject_id"] for item in state["claims"]} == {
+        "primary_user", "general_non_personal", "third_party:maya",
+    }
+    assert agent._store().claim_counts()["duplicate_episode_source_id_count"] == 0
+
+
 def test_agent_build_query_snapshot_and_provenance(monkeypatch):
     monkeypatch.setattr(module, "create_llm_client", lambda **kwargs: FakeLLM())
     agent = EventStateAgent(model="query", memory_model="build", embedding_client=FakeEmbedder())
