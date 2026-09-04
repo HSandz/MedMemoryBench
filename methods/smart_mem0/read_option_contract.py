@@ -12,7 +12,9 @@ from .contracts import QueryFrame
 
 
 class ReadOptionContractMixin:
-    def _semantic_operation_search(self, query, top_k, strategy, frame=None, option_queries=None):
+    def _semantic_operation_search(
+        self, query, top_k, strategy, frame=None, option_queries=None
+    ):
         strategy = str(strategy or "FOCAL").upper()
         if strategy != "SHARED_OPTIONS":
             return super()._semantic_operation_search(
@@ -67,7 +69,11 @@ class ReadOptionContractMixin:
             coverage[label] = [memory["id"] for memory in hits[:3]]
             option_hits.extend(hits)
             representative = next(
-                (memory for memory in hits if memory["id"] not in representative_ids),
+                (
+                    memory
+                    for memory in hits
+                    if memory["id"] not in representative_ids
+                ),
                 None,
             )
             if representative is not None:
@@ -96,15 +102,20 @@ class ReadOptionContractMixin:
         if role != "OPTION_CONTEXT":
             return super()._slot_covered(slot, support_ids, selected, relations)
 
-        # OPTION_CONTEXT proves exploration completeness, not proposition truth.
-        # Every visible label must have been probed; any individual probe may
-        # legitimately return an empty list without making the query incomplete.
+        # Exploration completeness and evidence coverage are different facts.
+        # All visible labels must be probed, but probing alone cannot make the
+        # evidence contract sufficient. At least one participant-specific
+        # candidate returned by the shared operation must survive support
+        # packing. An individual option is still allowed to have zero hits.
         expected = {str(label) for label in (slot.get("option_labels") or [])}
         probed = {
             str(label)
             for label in (getattr(self, "_last_option_probe_coverage", {}) or {})
         }
-        return bool(expected) and expected.issubset(probed)
+        if not expected or not expected.issubset(probed):
+            return False
+        support = set(support_ids or [])
+        return any(memory.get("id") in support for memory in selected)
 
     def _operation_slot_support(self, slot, result, relations):
         role = str(slot.get("evidence_role") or "").upper()

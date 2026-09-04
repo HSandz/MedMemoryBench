@@ -7,8 +7,6 @@ falls back to neutral focal retrieval instead of staying locked to a fast-path
 label or being promoted to a fabricated MULTI_HOP plan.
 """
 
-from .contracts import RETRIEVAL_BUDGETS
-
 
 class ReadRouteContractMixin:
     def _controller_plan(self, decision, question, frame):
@@ -20,11 +18,15 @@ class ReadRouteContractMixin:
             for slot in plan.get("required_slots", [])
         }
 
-        # OPTION_CONTEXT is not a claim that every option needs a memory hit.
-        # It is a required *exploration* contract: every visible label must be
-        # probed once, while an individual probe is allowed to return zero hits.
+        # SHARED_OPTIONS must execute once for every visible label, but probe
+        # completeness is telemetry/exploration, not proof that an option is
+        # true. The OPTION_CONTEXT slot remains required so execution cannot
+        # short-circuit before probing; ReadOptionContractMixin separately
+        # requires actual participant evidence before marking it covered.
         if semantic_mode == "MULTI_OPTION":
-            expected_labels = sorted(str(label) for label in (plan.get("visible_options") or {}))
+            expected_labels = sorted(
+                str(label) for label in (plan.get("visible_options") or {})
+            )
             for slot in plan.get("required_slots", []):
                 if str(slot.get("evidence_role") or "").upper() == "OPTION_CONTEXT":
                     slot["required"] = True
@@ -32,17 +34,17 @@ class ReadRouteContractMixin:
 
         active_strategy = semantic_mode
         route_lock_released = False
-        if semantic_mode == "DIRECT" and str(decision.get("route") or "PLAN").upper() == "PLAN":
+        if (
+            semantic_mode == "DIRECT"
+            and str(decision.get("route") or "PLAN").upper() == "PLAN"
+        ):
             # DIRECT is only the cheap first attempt. Once planning is required,
             # typed requirements/constraints own execution. A temporal slot can
             # select its temporal primitive; otherwise use neutral focal recall.
+            # Keep the one-gap plan's original SMALL budget: failed authorization
+            # is not evidence that a larger evidence bundle is necessary.
             active_strategy = "TEMPORAL" if "TEMPORAL" in slot_types else "FOCAL"
             route_lock_released = True
-            # A neutral recovery from a failed fast path needs enough room to
-            # expose competing evidence, but it is still one bounded plan.
-            if plan.get("budget_tier") == "SMALL":
-                plan["budget_tier"] = "MEDIUM"
-                plan["max_memories"] = RETRIEVAL_BUDGETS["MEDIUM"]["max_memories"]
 
         plan["initial_route"] = initial_route
         plan["active_strategy"] = active_strategy
@@ -55,8 +57,7 @@ class ReadRouteContractMixin:
     def _coverage_map(self, plan, slot_support, selected, relations):
         coverage = super()._coverage_map(plan, slot_support, selected, relations)
         # Optional gaps may enrich answer context but can never block execution
-        # or trigger deterministic recovery. Active MC exploration is explicitly
-        # required above, so this does not skip SHARED_OPTIONS probing.
+        # or trigger deterministic recovery.
         for slot in plan.get("required_slots", []):
             if slot.get("required") is False:
                 coverage[slot["id"]] = True
