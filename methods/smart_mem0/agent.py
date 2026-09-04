@@ -10,6 +10,7 @@ from .planning import PlanningMixin
 from .query import QueryMixin
 from .read_controller import ReadContractMixin
 from .read_temporal_contract import ReadTemporalContractMixin
+from .read_route_contract import ReadRouteContractMixin
 from .read_option_contract import ReadOptionContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
 from .read_plan_contract import ReadPlanContractMixin
@@ -20,10 +21,11 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     # One semantic owner, then deterministic read-contract overrides. Temporal
-    # normalization precedes plan construction so side-specific month selectors
-    # are preserved before operations are compiled.
+    # normalization precedes route/plan construction; the route layer may only
+    # relax execution after the semantic decision is already PLAN.
     ReadContractMixin,
     ReadTemporalContractMixin,
+    ReadRouteContractMixin,
     ReadPlanContractMixin,
     ReadUsageContractMixin,
     ReadOptionContractMixin,
