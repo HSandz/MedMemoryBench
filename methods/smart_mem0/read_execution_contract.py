@@ -31,9 +31,8 @@ class ReadExecutionContractMixin:
         target = str(slot.get("target_surface") or "").strip()
         if not target:
             return False
-        text = self._rc_text(self._rc_memory_target_text(memory))
-        phrase = self._rc_text(target)
-        if phrase and phrase in text:
+        text = self._rc_memory_target_text(memory)
+        if self._rc_token_sequence_present(target, text):
             return True
         target_terms = self._rc_content_terms(target)
         if not target_terms:
@@ -160,6 +159,38 @@ class ReadExecutionContractMixin:
         operations = []
         slot_by_id = {slot["id"]: slot for slot in slots}
         handled = set()
+        for relation in plan.get("semantic_relations") or []:
+            if relation.get("type") != "TEMPORAL_ORDER" or len(operations) >= max_ops:
+                continue
+            source_id, target_id = relation.get("from"), relation.get("to")
+            source, target = slot_by_id.get(source_id), slot_by_id.get(target_id)
+            order = str(relation.get("relation") or "").upper()
+            if not source or not target or order not in {"BEFORE", "AFTER", "OVERLAPS"}:
+                continue
+            anchor_index = len(operations)
+            operations.append(
+                {
+                    "op": "SEMANTIC_SEARCH",
+                    "query": self._rc_search_query(target, question),
+                    "top_k": 4,
+                    "strategy": "FOCAL",
+                    "produces": [target_id],
+                }
+            )
+            if len(operations) < max_ops:
+                operations.append(
+                    {
+                        "op": "TEMPORAL_FILTER",
+                        "query": self._rc_search_query(source, question),
+                        "relation": order,
+                        "axis": "event_time",
+                        "fallback_axis": "",
+                        "anchor": f"${anchor_index}",
+                        "produces": [source_id],
+                    }
+                )
+                handled.update({source_id, target_id})
+
         for relation in plan.get("semantic_relations") or []:
             if relation.get("type") != "CAUSES" or len(operations) >= max_ops:
                 continue
@@ -393,9 +424,10 @@ class ReadExecutionContractMixin:
             relation = str(
                 slot.get("temporal_relation") or slot.get("time_relation") or "LOCATE"
             ).upper()
-            raw_anchor, raw_end = str(slot.get("time_anchor") or ""), str(
-                slot.get("time_end") or ""
+            raw_anchor = str(
+                slot.get("resolved_time_anchor") or slot.get("time_anchor") or ""
             )
+            raw_end = str(slot.get("time_end") or "")
             anchor, end = self._parse_date(raw_anchor), self._parse_date(raw_end)
             if axis not in VALID_TEMPORAL_AXES:
                 return False
@@ -416,6 +448,8 @@ class ReadExecutionContractMixin:
                     return bool(anchor and date > anchor)
                 if relation == "BETWEEN":
                     return bool(anchor and end and anchor <= date <= end)
+                if relation == "OVERLAPS":
+                    return bool(anchor and date == anchor)
                 return relation in {"EARLIEST", "LATEST"}
 
             return any(good(memory) for memory in memories)

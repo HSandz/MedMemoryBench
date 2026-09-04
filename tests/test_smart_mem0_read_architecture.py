@@ -87,6 +87,16 @@ class _MinimalHarness(
     def _is_state_head(memory):
         return bool(memory.get("is_state_head"))
 
+    @staticmethod
+    def _parse_date(value):
+        value = str(value or "")
+        return value if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else ""
+
+    @staticmethod
+    def _date_for(memory, axis="event_time"):
+        value = str(memory.get(axis) or "")
+        return "" if value == "UNKNOWN" else value
+
 
 class _OptionBase:
     @staticmethod
@@ -214,6 +224,43 @@ def test_atomic_candidate_authorization_is_structural_not_lexical():
     assert [memory["id"] for memory in supports] == ["m1"]
 
 
+def test_atomic_candidate_rejects_incidental_entity_in_rich_seed():
+    seed = _memory(
+        claim="Cefuroxime caused hives, while NSAIDs were contraindicated.",
+        value="contraindicated",
+        verbatim_value="NSAIDs were contraindicated",
+        object_anchor="NSAIDs",
+        entities=["cefuroxime", "NSAIDs"],
+    )
+    harness = _MinimalHarness([seed])
+    ir = _ir(
+        [
+            {
+                "id": "r1",
+                "focus_span": "which contraindicated medication",
+                "time_constraint": {},
+            }
+        ],
+        candidate={"answer": "cefuroxime", "support_ref": "$seed0"},
+        answer_type="ENTITY",
+    )
+    supports, reason = harness._authorize_controller_answer(ir, [seed], QueryFrame())
+    assert supports is None
+    assert reason == "ANSWER_NOT_IN_ATOMIC_SURFACE"
+
+
+def test_target_matching_uses_tokens_not_substrings():
+    harness = _MinimalHarness()
+    memory = _memory(value="current condition", claim="diagnosis is current")
+    assert not harness._rc_memory_matches_target({"target_surface": "rent"}, memory)
+    assert not harness._rc_memory_matches_target({"target_surface": "ia"}, memory)
+    assert not harness._rc_answer_grounded("rent", [memory])
+    assert not harness._rc_answer_grounded("ia", [memory])
+    assert harness._rc_memory_matches_target(
+        {"target_surface": "current condition"}, memory
+    )
+
+
 def test_explicit_date_blocks_atomic_candidate():
     seed = _memory()
     harness = _MinimalHarness([seed])
@@ -254,6 +301,35 @@ def test_time_relation_without_axis_is_not_implicitly_event_time():
     assert constraint == {"axis": "", "relation": "", "anchor": "", "end": ""}
 
 
+def test_temporal_order_parser_requires_an_explicit_supported_relation():
+    harness = _MinimalHarness()
+    question = "Which medication started after the blood pressure increase?"
+    base = {
+        "requirements": [
+            {"id": "r1", "focus_span": "blood pressure increase"},
+            {"id": "r2", "focus_span": "Which medication"},
+        ],
+        "relations": [
+            {
+                "type": "TEMPORAL_ORDER",
+                "from": "r2",
+                "to": "r1",
+                "relation": "AFTER",
+            },
+            {"type": "TEMPORAL_ORDER", "from": "r1", "to": "r2"},
+        ],
+    }
+    ir = harness._rc_normalize_ir(base, question, QueryFrame())
+    assert ir["relations"] == [
+        {
+            "type": "TEMPORAL_ORDER",
+            "from": "r2",
+            "to": "r1",
+            "relation": "AFTER",
+        }
+    ]
+
+
 def test_requirement_graph_derives_mode_budget_and_operations():
     harness = _MinimalHarness()
     ir = _ir(
@@ -284,6 +360,63 @@ def test_requirement_graph_derives_mode_budget_and_operations():
         "SEMANTIC_SEARCH",
     ]
     assert {slot["evidence_role"] for slot in plan["required_slots"]} == {"REQUIREMENT"}
+
+
+def test_relative_temporal_order_compiles_anchor_then_filter():
+    harness = _MinimalHarness()
+    ir = _ir(
+        [
+            {
+                "id": "r1",
+                "focus_span": "blood pressure began increasing",
+                "time_constraint": {},
+            },
+            {"id": "r2", "focus_span": "which medication", "time_constraint": {}},
+        ],
+        relations=[
+            {
+                "type": "TEMPORAL_ORDER",
+                "from": "r2",
+                "to": "r1",
+                "relation": "AFTER",
+            }
+        ],
+        answer_type="ENTITY",
+    )
+    plan = harness._controller_plan(
+        ir,
+        "Which medication did I start after my blood pressure began increasing?",
+        QueryFrame(),
+    )
+    assert plan["compiled_mode"] == "TEMPORAL"
+    assert plan["query_spec"]["requires_inference"] is True
+    assert plan["required_slots"][1]["time_axis"] == "event_time"
+    assert plan["required_slots"][1]["relative_to_requirement"] == "r1"
+    assert [operation["op"] for operation in plan["operations"]] == [
+        "SEMANTIC_SEARCH",
+        "TEMPORAL_FILTER",
+    ]
+    assert plan["operations"][1]["anchor"] == "$0"
+    assert plan["operations"][1]["relation"] == "AFTER"
+    assert plan["operations"][1]["fallback_axis"] == ""
+
+
+def test_relative_temporal_overlap_requires_the_resolved_anchor_date():
+    harness = _MinimalHarness()
+    memory = _memory(event_time="2024-04-03")
+    slot = {
+        "id": "r2",
+        "type": "TEMPORAL",
+        "evidence_role": "REQUIREMENT",
+        "subject_id": "primary_user",
+        "required_fields": ["event_time"],
+        "time_axis": "event_time",
+        "temporal_relation": "OVERLAPS",
+        "resolved_time_anchor": "2024-04-03",
+    }
+    assert harness._slot_covered(slot, ["m1"], [memory], [])
+    slot["resolved_time_anchor"] = "2024-04-04"
+    assert not harness._slot_covered(slot, ["m1"], [memory], [])
 
 
 def test_possible_cause_derives_general_knowledge_bridge():

@@ -35,6 +35,7 @@ Relations are generic requirement-graph edges:
 - CAUSES requests an explicit stored causal path.
 - POSSIBLE_CAUSE asks the answer model to connect grounded participant endpoints using general domain knowledge.
 - DEPENDS_ON declares evidence dependency without asserting causality.
+- TEMPORAL_ORDER orders two requirement nodes by event time. Its relation is BEFORE, AFTER, or OVERLAPS; temporal order never implies causality.
 - INFER authorizes a general-domain bridge after all referenced participant requirements are grounded.
 - CURRENT marks one requirement as the current state.
 - VERIFY_SOURCE asks for exact linked source evidence.
@@ -47,7 +48,7 @@ candidate is optional and is allowed only when exactly one seed directly and ato
 """
 
 SEMANTIC_IR_SCHEMA = """Return JSON only:
-{{"answer_type":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","subject_span":"exact contiguous subject span from QUESTION or empty","requirements":[{{"id":"r1","focus_span":"exact contiguous span from QUESTION","retrieval_hint":"soft semantic retrieval description","time_constraint":{{"axis":"event_time|document_time|origin_document_time|effective_event_time|","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}}}}],"relations":[{{"type":"COMPARE|CAUSES|POSSIBLE_CAUSE|DEPENDS_ON|INFER|CURRENT|VERIFY_SOURCE","from":"r1","to":"r2|ANSWER|"}}],"candidate":null}}
+{{"answer_type":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","subject_span":"exact contiguous subject span from QUESTION or empty","requirements":[{{"id":"r1","focus_span":"exact contiguous span from QUESTION","retrieval_hint":"soft semantic retrieval description","time_constraint":{{"axis":"event_time|document_time|origin_document_time|effective_event_time|","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}}}}],"relations":[{{"type":"COMPARE|CAUSES|POSSIBLE_CAUSE|DEPENDS_ON|TEMPORAL_ORDER|INFER|CURRENT|VERIFY_SOURCE","from":"r1","to":"r2|ANSWER|","relation":"BEFORE|AFTER|OVERLAPS|"}}],"candidate":null}}
 When candidate exists use: {{"candidate":{{"answer":"exact answer value","support_ref":"$seed0"}}}}
 QUESTION:
 {question}
@@ -71,6 +72,7 @@ VALID_IR_RELATIONS = {
     "CAUSES",
     "POSSIBLE_CAUSE",
     "DEPENDS_ON",
+    "TEMPORAL_ORDER",
     "INFER",
     "CURRENT",
     "VERIFY_SOURCE",
@@ -359,11 +361,23 @@ class ReadContractMixin:
             elif target != "ANSWER" and target not in valid_nodes:
                 continue
             if (
-                relation_type in {"COMPARE", "CAUSES", "POSSIBLE_CAUSE", "DEPENDS_ON"}
+                relation_type
+                in {
+                    "COMPARE",
+                    "CAUSES",
+                    "POSSIBLE_CAUSE",
+                    "DEPENDS_ON",
+                    "TEMPORAL_ORDER",
+                }
                 and target not in valid_nodes
             ):
                 continue
             relation = {"type": relation_type, "from": source, "to": target}
+            if relation_type == "TEMPORAL_ORDER":
+                order = str(raw.get("relation") or "").upper()
+                if order not in {"BEFORE", "AFTER", "OVERLAPS"}:
+                    continue
+                relation["relation"] = order
             if relation not in relations:
                 relations.append(relation)
 
@@ -417,7 +431,7 @@ class ReadContractMixin:
         )
         if not answer_norm:
             return False
-        if answer_norm in evidence:
+        if self._rc_token_sequence_present(answer_norm, evidence):
             return True
         numbers = set(re.findall(r"\d+(?:\.\d+)?", answer_norm))
         evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", evidence))
@@ -430,6 +444,40 @@ class ReadContractMixin:
             and len(answer_terms) <= 12
             and sum(term in evidence_terms for term in answer_terms) / len(answer_terms)
             >= 0.8
+        )
+
+    @classmethod
+    def _rc_token_sequence_present(cls, needle: Any, haystack: Any) -> bool:
+        """Match complete Unicode-aware tokens, never arbitrary substrings."""
+        wanted = cls._rc_terms(needle)
+        available = cls._rc_terms(haystack)
+        width = len(wanted)
+        return bool(
+            wanted
+            and any(
+                available[index : index + width] == wanted
+                for index in range(len(available) - width + 1)
+            )
+        )
+
+    @classmethod
+    def _rc_candidate_has_atomic_surface(
+        cls, answer: str, memory: Dict[str, Any]
+    ) -> bool:
+        """Require the answer in an atomic value field, not incidental seed text."""
+        surfaces = []
+        for value in (
+            memory.get("value"),
+            memory.get("verbatim_value"),
+            str(memory.get("object_anchor") or "").replace("_", " "),
+        ):
+            normalized = cls._rc_text(value)
+            if normalized and normalized not in surfaces:
+                surfaces.append(normalized)
+        return any(
+            cls._rc_token_sequence_present(answer, surface)
+            or cls._rc_token_sequence_present(surface, answer)
+            for surface in surfaces
         )
 
     def _authorize_controller_candidate(self, ir, seeds, frame):
@@ -458,6 +506,8 @@ class ReadContractMixin:
         # stopwords part of the correctness path.
         if relations and not self._is_state_head(valid[0]):
             return None, "CURRENT_CANDIDATE_IS_NOT_STATE_HEAD"
+        if not self._rc_candidate_has_atomic_surface(candidate["answer"], valid[0]):
+            return None, "ANSWER_NOT_IN_ATOMIC_SURFACE"
         if not self._rc_answer_grounded(candidate["answer"], valid):
             return None, "ANSWER_NOT_GROUNDED"
         return valid, "AUTHORIZED"

@@ -887,6 +887,16 @@ class ExecutionMixin:
                     ).lower()
                     if fallback_axis in VALID_TEMPORAL_AXES:
                         slot["fallback_axis"] = fallback_axis
+                    anchor_ref = bounded_operation.get("anchor")
+                    if isinstance(anchor_ref, str) and anchor_ref.startswith("$"):
+                        resolved_anchor = self._operation_date(
+                            anchor_ref,
+                            str(bounded_operation.get("axis") or "event_time"),
+                            outputs,
+                            seeds,
+                        )
+                        if resolved_anchor:
+                            slot["resolved_time_anchor"] = resolved_anchor
                 supported = self._operation_slot_support(slot, result, relations)
                 for memory in supported:
                     if memory["id"] not in selected and len(selected) >= memory_limit:

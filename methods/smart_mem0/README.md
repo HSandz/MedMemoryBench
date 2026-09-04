@@ -61,6 +61,11 @@ relations between requirements, and an optional atomic candidate. It never emits
 route, query class, operator, budget, internal subject ID, store identity, evidence
 role, or retrieval operation.
 
+Relative chronology is represented by one generic requirement edge:
+`TEMPORAL_ORDER(source, target, BEFORE|AFTER|OVERLAPS)`. The compiler resolves the
+target event first and filters the source on `event_time` without an implicit fallback
+axis. This edge expresses order only and can never create a `CAUSES` relation.
+
 The question owns what must be answered. Seeds may suggest where evidence lives through
 `retrieval_hint`, but that hint is never a hard filter or a fact. Code derives the route,
 typed slots, budget tier, inference permission, and physical operations. It resolves
@@ -87,7 +92,9 @@ requirement graph directly into bounded operations. Deterministic recovery may r
 only soft resolver hints and retry an explicit operation without changing the
 question-owned requirement. The normal upper bound is two method LLM calls per query:
 controller plus answer, or just the controller when its atomic candidate passes
-structural and grounding validation.
+structural and grounding validation. Candidate grounding requires the answer to occur
+in an atomic `value`, `verbatim_value`, or `object_anchor`; an entity appearing only
+incidentally elsewhere in a rich seed cannot authorize the fast path.
 
 The split follows the useful boundaries visible in the bundled implementations:
 Mem0 separates memory/index backends, MemoRAG separates prompts and retrieval, and

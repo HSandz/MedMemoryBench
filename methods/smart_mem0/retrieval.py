@@ -260,9 +260,7 @@ class RetrievalOperationsMixin:
             # including scope. The scope-tolerant lineage helper is reserved
             # for write-time reconciliation and must not mix distinct state
             # families in the final evidence set.
-            anchor_lineage = (
-                state_identity(focal_anchor) if focal_anchor else ""
-            )
+            anchor_lineage = state_identity(focal_anchor) if focal_anchor else ""
             focal_lineages = {anchor_lineage} if anchor_lineage else set()
         else:
             focal_lineages = {
@@ -358,14 +356,15 @@ class RetrievalOperationsMixin:
                         for memory in ranked
                         if tag in memory.get("planning_tags", [])
                         or (tag == "STATE" and self._is_state_head(memory))
-                        
                     ),
                     None,
                 )
             )
 
         seen_dates = {
-            memory.get("document_time") for memory in selected if memory.get("document_time")
+            memory.get("document_time")
+            for memory in selected
+            if memory.get("document_time")
         }
         for memory in ranked:
             date = memory.get("document_time")
@@ -446,8 +445,9 @@ class RetrievalOperationsMixin:
             subj = anchor.get("subject")
             if role and (obj_anch or role != "observation"):
                 family = [
-                    m for m in self._memories 
-                    if m.get("semantic_role") == role 
+                    m
+                    for m in self._memories
+                    if m.get("semantic_role") == role
                     and m.get("object_anchor") == obj_anch
                     and m.get("subject") == subj
                 ]
@@ -469,9 +469,7 @@ class RetrievalOperationsMixin:
             pool_memories = focal
         else:
             pool_memories = family
-        pool = {
-            memory["id"]: memory for memory in (*focal_candidates, *pool_memories)
-        }
+        pool = {memory["id"]: memory for memory in (*focal_candidates, *pool_memories)}
         ranked = self._hybrid_search(
             query,
             top_k=min(32, len(pool)),
@@ -496,7 +494,9 @@ class RetrievalOperationsMixin:
         for memory in (*focal_candidates, *family_endpoints, *ranked):
             if memory["id"] not in {item["id"] for item in selected}:
                 selected.append(self._snapshot(memory))
-            if len(selected) >= 16:  # P1B.1.3c: Provide larger candidate set for extrema
+            if (
+                len(selected) >= 16
+            ):  # P1B.1.3c: Provide larger candidate set for extrema
                 break
         return selected
 
@@ -574,6 +574,8 @@ class RetrievalOperationsMixin:
                     anchor_date
                     and (date == anchor_date or date.startswith(anchor_date))
                 )
+            if relation == "OVERLAPS":
+                return bool(anchor_date and date == anchor_date)
             return True
 
         ids = [
@@ -637,8 +639,7 @@ class RetrievalOperationsMixin:
                         token
                         for token in self._tokenize(self._memory_value(memory))
                         if len(token) > 3
-                        and token
-                        not in {"patient", "current", "recent", "state"}
+                        and token not in {"patient", "current", "recent", "state"}
                     }
                     for memory in relevant
                     if state_identity(memory)
