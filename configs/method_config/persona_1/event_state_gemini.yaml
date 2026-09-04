@@ -2,13 +2,13 @@ method_name: event_state
 method_type: agentic_memory
 description: Event-State Hybrid conversational memory with evidence-preserving state compilation
 model:
-  provider: openai
-  name: gemini/gemini-3.5-flash-lite
+  provider: vertex
+  name: gemini-3.5-flash-lite
   temperature: 0.0
   max_completion_tokens: 32000
 memorize_model:
   provider: openai
-  name: Gemini2/gemini-3.5-flash-lite
+  name: gemini3/gemini-3.5-flash-lite
   temperature: 0.0
   max_completion_tokens: 32000
 embedding:
@@ -32,7 +32,7 @@ build_config:
   enable_bitemporal_time: true
   preserve_turn_evidence: true
 retrieval_config:
-  planner_rounds: 1
+  planner_rounds: 0
   planner_max_requests: 3
   planner_temperature: 0.0
   planner_max_tokens: 1200
@@ -69,5 +69,5 @@ retrieval_config:
   max_source_excerpts_per_claim: 2
 dataset_overrides:
   persona_ids:
-  - 1
-  max_sessions_per_persona: null
+  - 2
+  max_sessions_per_persona: 50

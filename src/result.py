@@ -10,17 +10,58 @@ from metrics import MetricResult
 
 
 def _true_duration_seconds(report: "EvaluationReport") -> float:
-    """Return wall time with measured failed API operation time removed."""
-    failure_duration = report.metadata.get("api_failure_duration_seconds")
-    if failure_duration is None:
-        failure_duration = sum(
-            float(failure.get("duration_seconds", 0.0) or 0.0)
-            for failure in report.metadata.get("api_failures", [])
-        )
+    """Return wall time with one authoritative failed-operation duration removed."""
+    metadata = report.metadata
+    failure_duration = _failure_duration_from_metadata(metadata)
     return max(
         report.duration_seconds - max(float(failure_duration), 0.0),
         0.0,
     )
+
+
+def _nonnegative_duration(value: Any) -> Optional[float]:
+    """Parse a duration without allowing malformed or negative telemetry through."""
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration >= 0.0 else None
+
+
+def _failure_duration_from_metadata(metadata: Dict[str, Any]) -> float:
+    """Select one failure-duration source in explicit precedence order.
+
+    The aggregate scalar may already combine terminal failures with recovered
+    retries, so lower-priority sources are alternatives rather than additions.
+    """
+    explicit_duration = _nonnegative_duration(
+        metadata.get("api_failure_duration_seconds")
+    )
+    if explicit_duration is not None:
+        return explicit_duration
+
+    failures = metadata.get("api_failures")
+    if isinstance(failures, list) and failures:
+        failure_durations = []
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            duration = _nonnegative_duration(failure.get("duration_seconds"))
+            if duration is not None:
+                failure_durations.append(duration)
+        if failure_durations:
+            return sum(failure_durations)
+
+    llm_usage = metadata.get("llm_usage")
+    if isinstance(llm_usage, dict):
+        total_usage = llm_usage.get("total")
+        if isinstance(total_usage, dict):
+            usage_duration = _nonnegative_duration(
+                total_usage.get("failure_duration_seconds")
+            )
+            if usage_duration is not None:
+                return usage_duration
+    return 0.0
 
 
 def _failure_counts_from_usage(llm_usage: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,6 +236,7 @@ class ResultCollector:
                 "mean_f1": report.summary.get("mean_f1", 0.0),
                 "queries_f1_ge_0_5": report.summary.get("queries_f1_ge_0_5", 0),
                 "fraction_f1_ge_0_5": report.summary.get("fraction_f1_ge_0_5", 0.0),
+                "metric_variants": report.summary.get("metric_variants", {}),
                 "retrieval_quality": report.summary.get("retrieval_quality", {}),
             })
         else:
@@ -218,10 +260,6 @@ class ResultCollector:
             "efficiency": _efficiency_with_timing_semantics(report),
             "memory_build_summary": report.metadata.get("memory_build_summary", {}),
             "build_metrics": report.metadata.get("build_metrics", {}),
-            "memory_size": report.metadata.get("memory_size", {}),
-            "feature_configuration": report.metadata.get(
-                "feature_configuration", {}
-            ),
             "llm_usage": report.metadata.get("llm_usage", {}),
             "stage_usage": report.metadata.get("stage_usage", {}),
             "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
@@ -234,6 +272,7 @@ class ResultCollector:
                 "dataset_config": report.config.get("dataset_config", {}),
             },
         }
+        self._add_memory_reporting_fields(result_data, report)
         for key in ("dataset_coverage", "input_modality"):
             if key in report.metadata:
                 result_data[key] = report.metadata[key]
@@ -242,6 +281,22 @@ class ResultCollector:
             json.dump(result_data, f, ensure_ascii=False, indent=2)
 
         return filepath
+
+    @staticmethod
+    def _add_memory_reporting_fields(
+        artifact: Dict[str, Any],
+        report: EvaluationReport,
+    ) -> None:
+        """Avoid empty Event-State LoCoMo placeholders while preserving legacy output."""
+        is_event_state_locomo = (
+            report.dataset_name == "locomo"
+            and report.method_name.lower() == "event_state"
+        )
+        for field_name in ("memory_size", "feature_configuration"):
+            value = report.metadata.get(field_name, {})
+            if is_event_state_locomo and not value:
+                continue
+            artifact[field_name] = value
 
     def _save_api_failures_json(
         self,
@@ -282,8 +337,30 @@ class ResultCollector:
 
         processed_units = []
         for log in memory_build_logs:
+            # Event-State compilation produces records, not legacy memory chunks.
+            if log.get("reporting_kind") == "event_state":
+                raw_build_metrics = log.get("build_metrics", {})
+                if not isinstance(raw_build_metrics, dict):
+                    raw_build_metrics = {}
+                processed_unit = {
+                    "unit_id": log.get("unit_id"),
+                    "context_id": log.get("context_id"),
+                    "session_ids": log.get("session_ids", []),
+                    "session_count": log.get("session_count", 0),
+                    "total_time": log.get("total_time", 0.0),
+                    "inserted_record_count": log.get("inserted_record_count", 0),
+                    "final_store": log.get("final_store", {}),
+                    "build_metrics": {
+                        key: value
+                        for key, value in raw_build_metrics.items()
+                        if key != "chunk_count"
+                    },
+                    "staged_session_count": log.get("staged_session_count", 0),
+                    "restored_from_snapshot": log.get("restored_from_snapshot", False),
+                }
+
             # Check if this is the new per-session format (MedMemoryBench)
-            if "session_builds" in log:
+            elif "session_builds" in log:
                 # New format: per-session builds
                 processed_sessions = []
                 for sb in log.get("session_builds", []):
@@ -409,10 +486,6 @@ class ResultCollector:
             "dataset_name": report.dataset_name,
             "summary": report.metadata.get("memory_build_summary", {}),
             "build_metrics": report.metadata.get("build_metrics", {}),
-            "memory_size": report.metadata.get("memory_size", {}),
-            "feature_configuration": report.metadata.get(
-                "feature_configuration", {}
-            ),
             "llm_usage": report.metadata.get("llm_usage", {}),
             "stage_usage": report.metadata.get("stage_usage", {}),
             "memory_chunk_size": report.metadata.get("memory_chunk_size"),
@@ -420,6 +493,7 @@ class ResultCollector:
             "total_units": len(processed_units),
             "units": processed_units,
         }
+        self._add_memory_reporting_fields(memory_build_data, report)
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(memory_build_data, f, ensure_ascii=False, indent=2)
@@ -604,6 +678,7 @@ class ResultCollector:
                 "mean_f1": report.summary.get("mean_f1", 0.0),
                 "queries_f1_ge_0_5": report.summary.get("queries_f1_ge_0_5", 0),
                 "fraction_f1_ge_0_5": report.summary.get("fraction_f1_ge_0_5", 0.0),
+                "metric_variants": report.summary.get("metric_variants", {}),
                 "retrieval_quality": report.summary.get("retrieval_quality", {}),
             })
             if (report.metadata.get("stage_usage") or {}).get("batch_stages"):

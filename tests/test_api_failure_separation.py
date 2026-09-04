@@ -433,6 +433,60 @@ def test_true_duration_subtracts_recovered_retry_time():
 
     assert report.to_dict()["true_duration_seconds"] == 7.0
 
+def test_true_duration_prefers_explicit_failure_duration():
+    report = EvaluationReport(
+        method_name="method", model_name="model", dataset_name="medmemorybench",
+        start_time="start", end_time="end", duration_seconds=1000.0,
+        summary={}, metadata={"api_failure_duration_seconds": 100.0},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 900.0
+
+
+def test_true_duration_falls_back_to_explicit_failure_records():
+    report = EvaluationReport(
+        method_name="method", model_name="model", dataset_name="medmemorybench",
+        start_time="start", end_time="end", duration_seconds=1000.0,
+        summary={}, metadata={"api_failures": [
+            {"duration_seconds": 40.0}, {"duration_seconds": 60.0},
+        ]},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 900.0
+
+
+def test_true_duration_falls_back_to_usage_failure_duration():
+    report = EvaluationReport(
+        method_name="method", model_name="model", dataset_name="medmemorybench",
+        start_time="start", end_time="end", duration_seconds=1000.0,
+        summary={}, metadata={"llm_usage": {
+            "total": {"failure_duration_seconds": 100.0},
+        }},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 900.0
+
+
+def test_true_duration_without_failure_telemetry_preserves_wall_time():
+    report = EvaluationReport(
+        method_name="method", model_name="model", dataset_name="medmemorybench",
+        start_time="start", end_time="end", duration_seconds=1000.0,
+        summary={}, metadata={},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 1000.0
+
+
+def test_true_duration_clamps_excess_failure_duration_to_zero():
+    report = EvaluationReport(
+        method_name="method", model_name="model", dataset_name="medmemorybench",
+        start_time="start", end_time="end", duration_seconds=50.0,
+        summary={}, metadata={"api_failure_duration_seconds": 100.0},
+    )
+
+    assert report.to_dict()["true_duration_seconds"] == 0.0
+
+
 def test_report_failure_duration_combines_recovered_and_terminal_failures():
     evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
     evaluator._api_failure_duration_seconds = 2.5

@@ -6,7 +6,13 @@ from typing import Dict, List, Any, Type, Optional
 from .base import BaseMetric, MetricResult
 from .string_match import StringContainMetric, ExactMatchMetric, OptionMatchMetric, MQFixMetric
 from .llm_judge import LLMJudgeMetric, EEMJudgeMetric, LLMJudgeMCDMetric
-from .locomo_metrics import LoCoMoF1Metric, LoCoMoAdversarialMetric, LoCoMoTemporalMetric
+from .locomo_metrics import (
+    LoCoMoF1Metric,
+    LoCoMoOfficialF1Metric,
+    LoCoMoLegacyMedMemoryBenchMetric,
+    LoCoMoAdversarialMetric,
+    LoCoMoTemporalMetric,
+)
 from .retrieval_quality import (
     RETRIEVAL_QUALITY_GROUP,
     aggregate_session_retrieval_quality,
@@ -23,6 +29,8 @@ METRIC_REGISTRY: Dict[str, Type[BaseMetric]] = {
     "eem_judge": EEMJudgeMetric,
     "llm_judge_mcd": LLMJudgeMCDMetric,
     "locomo_f1": LoCoMoF1Metric,
+    "locomo_official_f1": LoCoMoOfficialF1Metric,
+    "locomo_legacy_medmemorybench_f1": LoCoMoLegacyMedMemoryBenchMetric,
     "locomo_adversarial": LoCoMoAdversarialMetric,
     "locomo_temporal": LoCoMoTemporalMetric,
 }
@@ -269,7 +277,15 @@ class MetricsAggregator:
         efficiency_stats = {
             "total_memory_construction_time": total_memory_time,
             "total_query_time": total_query_time,
+            "amortized_memory_construction_time_per_query": (
+                total_memory_time / total if total > 0 else 0.0
+            ),
+            # Compatibility alias: this is amortized over evaluated queries,
+            # not the duration of one memory build.
             "avg_memory_construction_time": total_memory_time / total if total > 0 else 0.0,
+            "avg_memory_construction_time_semantics": (
+                "legacy_alias_for_amortized_memory_construction_time_per_query"
+            ),
             "avg_query_time": total_query_time / total if total > 0 else 0.0,
         }
 
@@ -312,6 +328,8 @@ __all__ = [
     "EEMJudgeMetric",
     "LLMJudgeMCDMetric",
     "LoCoMoF1Metric",
+    "LoCoMoOfficialF1Metric",
+    "LoCoMoLegacyMedMemoryBenchMetric",
     "LoCoMoAdversarialMetric",
     "LoCoMoTemporalMetric",
     "RETRIEVAL_QUALITY_GROUP",

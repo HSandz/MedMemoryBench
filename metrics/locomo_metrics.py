@@ -6,8 +6,9 @@ This module implements the official LoCoMo evaluation metrics as described in:
 The metrics follow the official implementation from:
 https://github.com/snap-research/locomo/blob/main/task_eval/evaluation.py
 
-The primary score is the official token/stem F1.  A conservative enhanced score
-is retained only as an explicitly labelled diagnostic.
+The primary score is the official token/stem F1.  The historical
+MedMemoryBench-enhanced score is retained separately for reproducibility, while
+a conservative enhanced score remains an explicitly labelled diagnostic.
 """
 
 import re
@@ -189,7 +190,7 @@ def normalize_numbers(text: str) -> str:
     return text_lower
 
 
-def semantic_contains(prediction: str, expected: str) -> bool:
+def conservative_semantic_contains(prediction: str, expected: str) -> bool:
     """Conservative optional containment check for diagnostic reporting only.
 
     This deliberately requires whole normalized tokens and refuses a match in a
@@ -209,8 +210,8 @@ def semantic_contains(prediction: str, expected: str) -> bool:
     return False
 
 
-def enhanced_f1_score(prediction: str, ground_truth: str) -> float:
-    """Enhanced F1 score with semantic matching fallback.
+def compute_conservative_enhanced_f1(prediction: str, ground_truth: str) -> float:
+    """Compute the diagnostic F1 using the conservative containment matcher.
 
     First computes standard F1, then checks semantic containment
     to handle cases where the answer is correct but verbose.
@@ -223,15 +224,166 @@ def enhanced_f1_score(prediction: str, ground_truth: str) -> float:
         return f1
 
     # Check semantic containment - if expected answer is contained in prediction
-    if semantic_contains(prediction, ground_truth):
+    if conservative_semantic_contains(prediction, ground_truth):
         # Boost F1 to at least 0.5 (threshold for correct)
         return max(f1, 0.5)
 
     return f1
 
 
+# These aliases retain the former helper API.  They are diagnostics only and
+# must not be mistaken for the historical MedMemoryBench evaluator below.
+semantic_contains = conservative_semantic_contains
+enhanced_f1_score = compute_conservative_enhanced_f1
+
+
+def legacy_medmemorybench_semantic_contains(prediction: str, expected: str) -> bool:
+    """Return the exact permissive containment result from MedMemoryBench.
+
+    This intentionally preserves historical substring false positives so old
+    MedMemoryBench experiments can be compared with newly scored artifacts.
+    """
+    pred_lower = prediction.lower().strip()
+    exp_lower = expected.lower().strip()
+
+    if exp_lower in pred_lower:
+        return True
+
+    pred_norm = normalize_answer(prediction)
+    exp_norm = normalize_answer(expected)
+    if exp_norm in pred_norm:
+        return True
+
+    if exp_lower in ["yes", "likely yes"]:
+        if pred_lower.startswith("yes") or pred_lower.startswith("likely yes"):
+            return True
+    if exp_lower in ["no", "likely no"]:
+        if pred_lower.startswith("no") or pred_lower.startswith("likely no"):
+            return True
+
+    pred_num = normalize_numbers(pred_lower)
+    exp_num = normalize_numbers(exp_lower)
+    if exp_num in pred_num:
+        return True
+
+    return False
+
+
+def compute_legacy_medmemorybench_enhanced_f1(
+    prediction: str,
+    ground_truth: str,
+) -> float:
+    """Compute the historical MedMemoryBench enhanced F1 exactly."""
+    f1 = f1_score_with_stemming(prediction, ground_truth)
+    if f1 >= 0.5:
+        return f1
+    if legacy_medmemorybench_semantic_contains(prediction, ground_truth):
+        return max(f1, 0.5)
+    return f1
+
+
+def _locomo_answer_for_category(answer: str, category: int) -> str:
+    """Apply LoCoMo's category-3 reference-answer preprocessing."""
+    return answer.split(";")[0].strip() if category == 3 else answer
+
+
+def compute_official_locomo_f1(
+    prediction: str,
+    ground_truth: str,
+    category: int,
+) -> float:
+    """Compute the official LoCoMo F1 for a category 1--4 query."""
+    answer = _locomo_answer_for_category(ground_truth, category)
+    if category == 1:
+        return compute_multi_hop_f1(prediction, answer)
+    return compute_f1(prediction, answer)
+
+
+def compute_legacy_medmemorybench_locomo_f1(
+    prediction: str,
+    ground_truth: str,
+    category: int,
+) -> float:
+    """Compute the historical MedMemoryBench LoCoMo F1 for one model output."""
+    answer = _locomo_answer_for_category(ground_truth, category)
+    if category == 1:
+        score = compute_multi_hop_f1(prediction, answer)
+        if score < 0.5 and legacy_medmemorybench_semantic_contains(prediction, answer):
+            return max(score, 0.5)
+        return score
+    return compute_legacy_medmemorybench_enhanced_f1(prediction, answer)
+
+
+class LoCoMoOfficialF1Metric(BaseMetric):
+    """Explicit metric for official LoCoMo F1 only."""
+    NAME = "locomo_official_f1"
+
+    def compute(
+        self,
+        query_id: str,
+        query_type: str,
+        model_output: str,
+        expected_answers: List[str],
+        question: str = "",
+        category: int = 1,
+        **kwargs,
+    ) -> MetricResult:
+        answer = expected_answers[0] if expected_answers else ""
+        answer = _locomo_answer_for_category(answer, category)
+        score = (
+            compute_official_locomo_f1(model_output, answer, category)
+            if expected_answers else 0.0
+        )
+        return MetricResult(
+            query_id=query_id,
+            query_type=query_type,
+            score=score,
+            is_correct=score >= 0.5,
+            model_output=model_output,
+            expected_answer=answer,
+            question=question,
+            details={"category": category, "metric": self.NAME, "official_f1": score},
+        )
+
+
+class LoCoMoLegacyMedMemoryBenchMetric(BaseMetric):
+    """Explicit metric for historical MedMemoryBench LoCoMo compatibility."""
+    NAME = "locomo_legacy_medmemorybench_f1"
+
+    def compute(
+        self,
+        query_id: str,
+        query_type: str,
+        model_output: str,
+        expected_answers: List[str],
+        question: str = "",
+        category: int = 1,
+        **kwargs,
+    ) -> MetricResult:
+        answer = expected_answers[0] if expected_answers else ""
+        answer = _locomo_answer_for_category(answer, category)
+        score = (
+            compute_legacy_medmemorybench_locomo_f1(model_output, answer, category)
+            if expected_answers else 0.0
+        )
+        return MetricResult(
+            query_id=query_id,
+            query_type=query_type,
+            score=score,
+            is_correct=score >= 0.5,
+            model_output=model_output,
+            expected_answer=answer,
+            question=question,
+            details={
+                "category": category,
+                "metric": self.NAME,
+                "legacy_medmemorybench_score": score,
+            },
+        )
+
+
 class LoCoMoF1Metric(BaseMetric):
-    """LoCoMo F1 metric following official implementation.
+    """Compatibility metric that records official and legacy LoCoMo F1.
 
     Official evaluation logic (from evaluation.py):
     - Category 1 (multi_hop): use f1() which splits both prediction and answer
@@ -239,8 +391,9 @@ class LoCoMoF1Metric(BaseMetric):
     - Category 3 (open_domain): use f1_score() but first take answer.split(';')[0].strip()
     - Category 4 (single_hop): use f1_score() directly
 
-    ``score`` and ``is_correct`` always describe the official score.  The
-    optional enhanced value is an audit field and cannot silently boost a run.
+    ``score`` and ``is_correct`` always describe official LoCoMo F1.  The
+    historical MedMemoryBench score is computed from the same model output and
+    stored separately; it never changes the canonical score.
     """
     NAME = "locomo_f1"
 
@@ -252,7 +405,6 @@ class LoCoMoF1Metric(BaseMetric):
         expected_answers: List[str],
         question: str = "",
         category: int = 1,
-        use_enhanced: bool = False,
         **kwargs
     ) -> MetricResult:
         if not expected_answers:
@@ -267,33 +419,24 @@ class LoCoMoF1Metric(BaseMetric):
                 details={"category": category, "metric": self.NAME},
             )
 
-        answer = expected_answers[0]
-
-        # Official implementation: for open_domain (category 3), take first part before ';'
-        if category == 3:
-            answer = answer.split(';')[0].strip()
-
-        if category == 1:
-            official_score = compute_multi_hop_f1(model_output, answer)
-        else:
-            official_score = compute_f1(model_output, answer)
-
-        enhanced_score = (
-            enhanced_f1_score(model_output, answer)
+        answer = _locomo_answer_for_category(expected_answers[0], category)
+        official_score = compute_official_locomo_f1(model_output, answer, category)
+        legacy_score = compute_legacy_medmemorybench_locomo_f1(
+            model_output, answer, category
+        )
+        conservative_diagnostic = (
+            compute_conservative_enhanced_f1(model_output, answer)
             if category != 1 else max(
                 official_score,
-                0.5 if semantic_contains(model_output, answer) else 0.0,
+                0.5 if conservative_semantic_contains(model_output, answer) else 0.0,
             )
         )
-        score = official_score
-
-        is_correct = score >= 0.5
 
         return MetricResult(
             query_id=query_id,
             query_type=query_type,
-            score=score,
-            is_correct=is_correct,
+            score=official_score,
+            is_correct=official_score >= 0.5,
             model_output=model_output,
             expected_answer=answer,
             question=question,
@@ -302,8 +445,15 @@ class LoCoMoF1Metric(BaseMetric):
                 "metric": self.NAME,
                 "f1_score": official_score,
                 "official_f1": official_score,
-                "enhanced_f1": enhanced_score,
-                "enhanced_diagnostic_requested": bool(use_enhanced),
+                "legacy_medmemorybench_score": legacy_score,
+                "f1_variants": {
+                    "official_locomo": official_score,
+                    "legacy_medmemorybench": legacy_score,
+                },
+                "conservative_enhanced_f1": conservative_diagnostic,
+                # Compatibility alias for artifacts produced before the
+                # diagnostic received an explicit conservative name.
+                "enhanced_f1": conservative_diagnostic,
             }
         )
 

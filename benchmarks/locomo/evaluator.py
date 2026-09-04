@@ -788,15 +788,25 @@ class LoCoMoEvaluator:
             build_time = float(existing.get("memory_build_time", 0.0) or 0.0)
             snapshot_state = existing.get("memory_state", {})
             build_metrics = dict(existing.get("memory_build_metrics") or {})
+            build_metrics.pop("chunk_count", None)
+            inserted_record_count = int(
+                build_metrics.pop(
+                    "inserted_record_count",
+                    build_metrics.pop("inserted_count", 0),
+                )
+                or 0
+            )
+            build_metrics["inserted_record_count"] = inserted_record_count
             build_metrics.update(self._event_state_store_diagnostics(
                 snapshot_state, len(unit.sessions_to_inject)
             ))
             self._memory_build_logs.append({
                 "unit_id": unit.unit_id, "context_id": unit.context_id,
                 "session_ids": existing.get("session_ids", []),
-                "session_count": len(unit.sessions_to_inject), "chunk_count": 0,
-                "total_time": build_time, "inserted_record_count": 0,
-                "total_stored_chunks": 0, "build_metrics": build_metrics,
+                "session_count": len(unit.sessions_to_inject),
+                "total_time": build_time,
+                "inserted_record_count": inserted_record_count,
+                "build_metrics": build_metrics, "reporting_kind": "event_state",
                 "final_store": self._event_state_store_diagnostics(
                     snapshot_state, len(unit.sessions_to_inject)
                 ), "restored_from_snapshot": True,
@@ -819,11 +829,19 @@ class LoCoMoEvaluator:
                     key: value for key, value in memory_result.to_dict().items()
                     if key not in {
                         "memory_entries", "all_passages", "input_content",
-                        "stored_content", "extraction_result",
+                        "stored_content", "extraction_result", "chunk_count",
                     }
                 }
+                inserted_record_count = int(
+                    build_metrics.pop(
+                        "inserted_count", len(memory_result.memory_entries or [])
+                    )
+                    or 0
+                )
+                build_metrics["inserted_record_count"] = inserted_record_count
             else:
                 build_metrics = {"raw_result": str(memory_result)}
+                inserted_record_count = 0
             final_store = self._event_state_store_diagnostics(
                 self.agent_manager.export_memory_state(context_id=unit.context_id),
                 len(unit.sessions_to_inject),
@@ -837,10 +855,10 @@ class LoCoMoEvaluator:
             self._memory_build_logs.append({
                 "unit_id": unit.unit_id, "context_id": unit.context_id,
                 "session_ids": [session.session_id for session in unit.sessions_to_inject],
-                "session_count": len(unit.sessions_to_inject), "chunk_count": 0,
+                "session_count": len(unit.sessions_to_inject),
                 "total_time": build_time,
-                "inserted_record_count": len(getattr(memory_result, "memory_entries", []) or []),
-                "total_stored_chunks": 0, "build_metrics": build_metrics,
+                "inserted_record_count": inserted_record_count,
+                "build_metrics": build_metrics, "reporting_kind": "event_state",
                 "final_store": final_store, "staged_session_count": len(prepared),
             })
             self._write_memory_snapshot(unit, build_time, build_metrics)
@@ -1386,6 +1404,11 @@ class LoCoMoEvaluator:
 
         memory_build_summary = self._summarize_memory_builds()
         build_metrics = self._compact_build_metrics()
+        is_event_state = self.method_config.method_name.lower() == "event_state"
+        memory_size = self._event_state_memory_size() if is_event_state else {}
+        feature_configuration = (
+            self._event_state_feature_configuration() if is_event_state else {}
+        )
 
         llm_usage = get_usage_tracker().get_stats()
         stage_usage = self._stage_usage_report(llm_usage)
@@ -1437,7 +1460,9 @@ class LoCoMoEvaluator:
                 "dry_run": self.dry_run,
                 "locomo_scoring": {
                     "primary_metric": "official_token_stem_f1",
-                    "enhanced_f1": "diagnostic_only",
+                    "official_locomo": "canonical_score",
+                    "legacy_medmemorybench": "historical_compatibility_score",
+                    "conservative_enhanced_f1": "diagnostic_only",
                 },
             },
             metadata={
@@ -1455,6 +1480,8 @@ class LoCoMoEvaluator:
                 },
                 "memory_build_summary": memory_build_summary,
                 "build_metrics": build_metrics,
+                "memory_size": memory_size,
+                "feature_configuration": feature_configuration,
                 "memory_chunk_size": self.memory_chunk_size,
                 "llm_usage": llm_usage,
                 "stage_usage": stage_usage,
@@ -1515,7 +1542,7 @@ class LoCoMoEvaluator:
         return aggregated
 
     def _apply_locomo_summary(self, summary: Dict[str, Any]) -> None:
-        """Make continuous official F1 the LoCoMo headline, not a threshold count."""
+        """Make official F1 primary while retaining legacy compatibility totals."""
         results = [
             result for result in self.aggregator.results
             if result.score is not None and result.details.get("metric") == "locomo_f1"
@@ -1531,6 +1558,32 @@ class LoCoMoEvaluator:
         summary["fraction_f1_ge_0_5"] = (
             summary["queries_f1_ge_0_5"] / len(results) if results else 0.0
         )
+        legacy_scores = [
+            float(result.details["legacy_medmemorybench_score"])
+            for result in results
+            if result.details.get("legacy_medmemorybench_score") is not None
+        ]
+        legacy_correct_count = sum(score >= 0.5 for score in legacy_scores)
+        summary["metric_variants"] = {
+            "official_locomo": {
+                "f1_query_count": len(results),
+                "mean_f1": summary["mean_f1"],
+                "queries_f1_ge_0_5": summary["queries_f1_ge_0_5"],
+                "fraction_f1_ge_0_5": summary["fraction_f1_ge_0_5"],
+            },
+            "legacy_medmemorybench": {
+                "f1_query_count": len(legacy_scores),
+                "mean_f1": (
+                    sum(legacy_scores) / len(legacy_scores)
+                    if legacy_scores else 0.0
+                ),
+                "queries_f1_ge_0_5": legacy_correct_count,
+                "fraction_f1_ge_0_5": (
+                    legacy_correct_count / len(legacy_scores)
+                    if legacy_scores else 0.0
+                ),
+            },
+        }
         for query_type, stats in summary.get("by_type", {}).items():
             if query_type == "adversarial":
                 continue
@@ -1658,11 +1711,6 @@ class LoCoMoEvaluator:
             for log in self._memory_build_logs
         )
 
-        total_chunks = sum(
-            log.get("chunk_count", 0)
-            for log in self._memory_build_logs
-        )
-
         total_time = sum(
             log.get("total_time", 0)
             for log in self._memory_build_logs
@@ -1673,21 +1721,71 @@ class LoCoMoEvaluator:
             for log in self._memory_build_logs
         )
 
+        summary = {
+            "total_units": total_units,
+            "total_sessions": total_sessions,
+            "total_time": total_time,
+            "inserted_record_count": inserted_record_count,
+            "avg_time_per_unit": total_time / total_units if total_units > 0 else 0,
+        }
+        if self.method_config.method_name.lower() == "event_state":
+            return summary
+
+        total_chunks = sum(
+            log.get("chunk_count", 0)
+            for log in self._memory_build_logs
+        )
         total_stored_chunks = sum(
             log.get("total_stored_chunks", 0)
             for log in self._memory_build_logs
         )
-
-        return {
-            "total_units": total_units,
-            "total_sessions": total_sessions,
+        summary.update({
             "total_memory_chunks": total_chunks,
-            "total_time": total_time,
-            "inserted_record_count": inserted_record_count,
             "total_stored_chunks": total_stored_chunks,
-            "avg_time_per_unit": total_time / total_units if total_units > 0 else 0,
             "avg_chunks_per_unit": total_chunks / total_units if total_units > 0 else 0,
             "chunk_size_config": self.memory_chunk_size,
+        })
+        return summary
+
+    def _event_state_memory_size(self) -> Dict[str, int]:
+        """Report compact final-store cardinalities for Event-State LoCoMo runs."""
+        totals = {
+            "final_episode_count": 0,
+            "final_claim_count": 0,
+            "final_memory_object_count": 0,
+        }
+        found_diagnostics = False
+        for log in self._memory_build_logs:
+            diagnostics = log.get("final_store") or log.get("build_metrics")
+            if not isinstance(diagnostics, dict):
+                continue
+            if not any(field in diagnostics for field in totals):
+                continue
+            found_diagnostics = True
+            for field in totals:
+                totals[field] += int(diagnostics.get(field, 0) or 0)
+        return totals if found_diagnostics else {}
+
+    def _event_state_feature_configuration(self) -> Dict[str, Any]:
+        """Expose the compact effective settings needed to interpret an artifact."""
+        build_config = dict(getattr(self.method_config, "build_config", {}) or {})
+        retrieval_config = dict(
+            getattr(self.method_config, "retrieval_config", {}) or {}
+        )
+        embedding = getattr(self.method_config, "embedding", None)
+        return {
+            "semantic_version": build_config.get("event_state_semantic_version"),
+            "planner_enabled": int(retrieval_config.get("planner_rounds", 0) or 0) > 0,
+            "ppr_enabled": retrieval_config.get("ppr_enabled", False),
+            "temporal_retrieval_enabled": retrieval_config.get(
+                "temporal_retrieval_enabled", True
+            ),
+            "selector_mode": retrieval_config.get("selector_mode", "state_mmr"),
+            "evidence_count": retrieval_config.get("evidence_count", 8),
+            "claim_top_k": retrieval_config.get("claim_top_k", 30),
+            "episode_top_k": retrieval_config.get("episode_top_k", 20),
+            "candidate_count": retrieval_config.get("candidate_count", 40),
+            "embedding_model": getattr(embedding, "model", None),
         }
 
     def _compact_build_metrics(self) -> Dict[str, Any]:
@@ -1697,6 +1795,8 @@ class LoCoMoEvaluator:
             "memory_entries", "all_passages", "input_content", "stored_content",
             "extraction_result", "raw_result",
         }
+        if self.method_config.method_name.lower() == "event_state":
+            excluded.add("chunk_count")
         for log in self._memory_build_logs:
             metrics = log.get("build_metrics", {})
             if not isinstance(metrics, dict):
@@ -1705,7 +1805,9 @@ class LoCoMoEvaluator:
                 key: value for key, value in metrics.items() if key not in excluded
             }
         return {
-            "schema_version": 1,
+            "schema_version": (
+                2 if self.method_config.method_name.lower() == "event_state" else 1
+            ),
             "units": units,
         }
 

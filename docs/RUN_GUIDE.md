@@ -285,10 +285,18 @@ answers recorded in the query checkpoint.
 
 ### LoCoMo Reporting
 
-LoCoMo reports official token/stem `mean_f1` as the primary score. The
-`queries_f1_ge_0_5` and `fraction_f1_ge_0_5` fields are debugging thresholds,
-not benchmark accuracy. Any `enhanced_f1` is an explicitly labelled diagnostic
-and never changes official F1.
+LoCoMo reports official token/stem `mean_f1` as the primary score. Each
+category 1--4 query also preserves its historical MedMemoryBench value in
+`evaluation_details.legacy_medmemorybench_score`; the canonical query `score`
+and `evaluation_details.official_f1` remain official LoCoMo F1. The aggregate
+`metric_variants` field labels the two sets as `official_locomo` and
+`legacy_medmemorybench`; per-query `f1_variants` uses the same labels. The
+legacy score deliberately retains the historical
+permissive matcher, including its substring quirks, so it is for comparison
+with prior MedMemoryBench runs rather than paper-quality LoCoMo reporting.
+`queries_f1_ge_0_5` and `fraction_f1_ge_0_5` are debugging thresholds, not
+benchmark accuracy. `conservative_enhanced_f1` is a separately labelled
+diagnostic and never changes official F1.
 
 When LoCoMo evidence annotations are present, query artifacts include
 evaluator-only diagnostics for selected-memory source sessions and exact source
@@ -299,6 +307,22 @@ such as `D8:6; D9:17` are expanded only by the evaluator. `stage_usage` records
 batch answer tokens from completed query results, batch-job wall time, and
 separate retrieval-preparation operation versus end-to-end wall times; it never
 treats batch wall time as a per-request latency.
+
+For Event-State LoCoMo artifacts, `memory_build_summary.avg_time_per_unit` is
+the actual build duration per conversation. Efficiency additionally reports
+`amortized_memory_construction_time_per_query`, which divides total build time
+across evaluated queries. The legacy `avg_memory_construction_time` remains an
+alias for that amortized value and includes an explicit semantics marker.
+`true_duration_seconds` subtracts one measured failure-duration source in this
+order: explicit `api_failure_duration_seconds`, valid durations in
+`api_failures`, `llm_usage.total.failure_duration_seconds`, then zero. These
+sources are alternatives, so recovered retries and terminal failures are not
+subtracted twice.
+Compact Event-State build metrics use schema version 2 and report inserted
+records plus final episode, claim, and memory-object counts; they do not label
+inserted records as legacy chunks. `memory_size` repeats those final-store
+counts, while `feature_configuration` records only the compact effective
+Event-State settings needed to interpret the run.
 
 LoCoMo session timestamps are normalized by the dataset adapter before they
 enter generic Event-State temporal handling; the raw timestamp is retained for

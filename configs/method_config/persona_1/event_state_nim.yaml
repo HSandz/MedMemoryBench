@@ -3,14 +3,20 @@ method_type: agentic_memory
 description: Event-State Hybrid conversational memory with evidence-preserving state compilation
 model:
   provider: openai
-  name: Gemini2/gemini-3.5-flash-lite
+  name: NIM/nvidia/nemotron-3-ultra-550b-a55b
   temperature: 0.0
   max_completion_tokens: 32000
+  nim:
+    enable_thinking: true
+    reasoning_budget: 5000
 memorize_model:
   provider: openai
-  name: Gemini2/gemini-3.5-flash-lite
+  name: NIM/nvidia/nemotron-3-ultra-550b-a55b
   temperature: 0.0
   max_completion_tokens: 32000
+  nim:
+    enable_thinking: false
+    reasoning_budget: 5000
 embedding:
   provider: local
   model: sentence-transformers/all-MiniLM-L6-v2
@@ -69,5 +75,5 @@ retrieval_config:
   max_source_excerpts_per_claim: 2
 dataset_overrides:
   persona_ids:
-  - 1
-  max_sessions_per_persona: 50
+  - 2
+  max_sessions_per_persona: null

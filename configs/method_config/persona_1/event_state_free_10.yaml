@@ -76,4 +76,4 @@ retrieval_config:
 dataset_overrides:
   persona_ids:
   - 1
-  max_sessions_per_persona: 10
+  max_sessions_per_persona: 20

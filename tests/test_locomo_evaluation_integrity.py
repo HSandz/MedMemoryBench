@@ -200,6 +200,121 @@ def test_result_serializes_locomo_coverage_modality_and_f1_terminology(tmp_path)
     assert payload["summary"]["by_metric"]["locomo_f1"]["fraction_f1_ge_0_5"] == 1.0
 
 
+def test_event_state_locomo_reporting_uses_record_and_timing_semantics(tmp_path):
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.method_config = SimpleNamespace(
+        method_name="event_state",
+        build_config={"event_state_semantic_version": "2.9"},
+        retrieval_config={
+            "planner_rounds": 0,
+            "ppr_enabled": False,
+            "temporal_retrieval_enabled": True,
+            "selector_mode": "state_mmr",
+            "evidence_count": 8,
+            "claim_top_k": 30,
+            "episode_top_k": 20,
+            "candidate_count": 40,
+        },
+        embedding=SimpleNamespace(model="sentence-transformers/all-MiniLM-L6-v2"),
+    )
+    evaluator.memory_chunk_size = 0
+    evaluator._memory_build_logs = [{
+        "reporting_kind": "event_state",
+        "unit_id": 0,
+        "context_id": "conv-26",
+        "session_ids": ["D1", "D2"],
+        "session_count": 2,
+        "total_time": 1000.0,
+        "inserted_record_count": 88,
+        "staged_session_count": 2,
+        "build_metrics": {
+            "chunk_count": 88,
+            "inserted_record_count": 88,
+            "final_episode_count": 2,
+            "final_claim_count": 7,
+            "final_memory_object_count": 9,
+        },
+        "final_store": {
+            "final_episode_count": 2,
+            "final_claim_count": 7,
+            "final_memory_object_count": 9,
+        },
+    }]
+
+    build_summary = evaluator._summarize_memory_builds()
+    compact_metrics = evaluator._compact_build_metrics()
+    assert build_summary["inserted_record_count"] == 88
+    assert build_summary["avg_time_per_unit"] == 1000.0
+    assert "total_memory_chunks" not in build_summary
+    assert compact_metrics["schema_version"] == 2
+    assert "chunk_count" not in compact_metrics["units"]["conv-26"]
+    assert compact_metrics["units"]["conv-26"]["inserted_record_count"] == 88
+
+    aggregator = MetricsAggregator()
+    for query_id in ("q1", "q2"):
+        aggregator.add_result(MetricResult(
+            query_id=query_id, query_type="single_hop", score=1.0,
+            is_correct=True, model_output="", expected_answer="", question="",
+            memory_construction_time=500.0,
+        ))
+    efficiency = aggregator.get_summary()["efficiency"]
+    assert efficiency["total_memory_construction_time"] == 1000.0
+    assert efficiency["amortized_memory_construction_time_per_query"] == 500.0
+    assert efficiency["avg_memory_construction_time"] == 500.0
+    assert efficiency["avg_memory_construction_time_semantics"] == (
+        "legacy_alias_for_amortized_memory_construction_time_per_query"
+    )
+
+    report = EvaluationReport(
+        method_name="event_state", model_name="test", dataset_name="locomo",
+        start_time="", end_time="", duration_seconds=1000.0,
+        summary={"total": 2, "efficiency": efficiency},
+        metadata={
+            "memory_build_summary": build_summary,
+            "build_metrics": compact_metrics,
+            "memory_size": evaluator._event_state_memory_size(),
+            "feature_configuration": evaluator._event_state_feature_configuration(),
+        },
+    )
+    result_path, memory_build_path, _ = ResultCollector().save_reports(
+        report, tmp_path, evaluator._memory_build_logs,
+        include_query_answer=False, use_method_subdir=False,
+    )
+    result_data = json.loads(Path(result_path).read_text(encoding="utf-8"))
+    build_data = json.loads(Path(memory_build_path).read_text(encoding="utf-8"))
+
+    assert result_data["memory_size"] == {
+        "final_episode_count": 2,
+        "final_claim_count": 7,
+        "final_memory_object_count": 9,
+    }
+    assert result_data["feature_configuration"]["semantic_version"] == "2.9"
+    assert result_data["feature_configuration"]["planner_enabled"] is False
+    assert "chunk_count" not in build_data["units"][0]
+    assert build_data["units"][0]["inserted_record_count"] == 88
+    assert "chunk_count" not in build_data["units"][0]["build_metrics"]
+
+
+def test_legacy_locomo_chunk_metrics_remain_serialized(tmp_path):
+    report = EvaluationReport(
+        method_name="embedding_rag", model_name="test", dataset_name="locomo",
+        start_time="", end_time="", duration_seconds=0.0, summary={}, metadata={},
+    )
+    logs = [{
+        "unit_id": 0,
+        "context_id": "conv-26",
+        "build_result": {"method": "embedding_rag", "chunk_count": 4},
+    }]
+
+    _, memory_build_path, _ = ResultCollector().save_reports(
+        report, tmp_path, logs, include_result=False,
+        include_query_answer=False, use_method_subdir=False,
+    )
+    build_data = json.loads(Path(memory_build_path).read_text(encoding="utf-8"))
+
+    assert build_data["units"][0]["chunk_count"] == 4
+
+
 def test_month_name_temporal_dates_are_complete_and_generic():
     for question in (
         "What happened on October 13, 2023?",
