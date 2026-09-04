@@ -11,24 +11,24 @@ from .contracts import RETRIEVAL_BUDGETS
 
 
 class ReadRouteContractMixin:
-    def _controller_gaps(self, decision, question, frame):
-        gaps = super()._controller_gaps(decision, question, frame)
-        if str(decision.get("operator") or "").upper() == "MULTI_OPTION":
-            # OPTION_CONTEXT is an exploration surface, not a participant fact
-            # that must exist. Real shared requirements (FOCAL_STATE,
-            # CONSTRAINT, etc.) remain required; a synthetic option-context-only
-            # fallback must never make an MC query insufficient merely because
-            # some choices have no personal-memory hit.
-            if gaps and all(str(gap.role).upper() == "OPTION_CONTEXT" for gap in gaps):
-                for gap in gaps:
-                    gap.required = False
-        return gaps
-
     def _controller_plan(self, decision, question, frame):
         plan = super()._controller_plan(decision, question, frame)
         initial_route = str(decision.get("operator") or "DIRECT").upper()
         semantic_mode = str(plan.get("query_mode") or initial_route).upper()
-        slot_types = {str(slot.get("type") or "DIRECT").upper() for slot in plan.get("required_slots", [])}
+        slot_types = {
+            str(slot.get("type") or "DIRECT").upper()
+            for slot in plan.get("required_slots", [])
+        }
+
+        # OPTION_CONTEXT is not a claim that every option needs a memory hit.
+        # It is a required *exploration* contract: every visible label must be
+        # probed once, while an individual probe is allowed to return zero hits.
+        if semantic_mode == "MULTI_OPTION":
+            expected_labels = sorted(str(label) for label in (plan.get("visible_options") or {}))
+            for slot in plan.get("required_slots", []):
+                if str(slot.get("evidence_role") or "").upper() == "OPTION_CONTEXT":
+                    slot["required"] = True
+                    slot["option_labels"] = list(expected_labels)
 
         active_strategy = semantic_mode
         route_lock_released = False
@@ -39,7 +39,7 @@ class ReadRouteContractMixin:
             active_strategy = "TEMPORAL" if "TEMPORAL" in slot_types else "FOCAL"
             route_lock_released = True
             # A neutral recovery from a failed fast path needs enough room to
-            # expose competing evidence, but it is still a single bounded plan.
+            # expose competing evidence, but it is still one bounded plan.
             if plan.get("budget_tier") == "SMALL":
                 plan["budget_tier"] = "MEDIUM"
                 plan["max_memories"] = RETRIEVAL_BUDGETS["MEDIUM"]["max_memories"]
