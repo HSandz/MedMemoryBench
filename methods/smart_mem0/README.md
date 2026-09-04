@@ -35,24 +35,42 @@ The implementation lives in this package and is split by runtime responsibility.
 | `retrieval.py` | Deterministic temporal, state, semantic, and causal operations |
 | `execution.py` | Deterministic typed coverage, stopping, and pure arbitration |
 | `query.py` | Final support boundary, context packing, telemetry, and answer request |
+| `read_controller.py` | One-call semantic requirement and seed-coverage contract |
+| `read_plan_contract.py` | Deterministic compilation of missing requirements into operations |
+| `read_execution_contract.py` | Structural proof of controller-authorized seed coverage |
 
 ## Runtime Paths
 
 ```text
 WRITE: capture -> consolidation -> transactional commit -> index refresh
-READ EASY: recall -> one-seed answerability gate -> answer
-READ HARD: recall -> compact controller -> typed query spec -> local operations -> context -> answer
+READ: Dense + BM25 -> RRF Top-8 -> Top-3 seeds -> semantic controller
+  ANSWER -> validate exactly one atomic seed -> return grounded value
+  PLAN   -> validate covered requirements -> retrieve only missing requirements
+         -> pure arbitration -> evidence on demand -> context -> answer
 ```
 
-The planner emits target entities/property, answer type, reasoning requirement,
-typed slots, and operations. Code derives query mode and memory/operation budget
-from that validated structure; the LLM does not self-score query difficulty.
-Planner zero-operation plans remain valid. Slot coverage is structural and
-deterministic; the baseline does not call a separate semantic validator or recovery
-LLM. `CURRENT_STATE` accepts only resolved state-head memories. Temporal operations
-preserve a small focal candidate set. For inference, patient-specific facts remain
-memory-grounded while the answer model may explicitly infer standard domain mechanisms
-between those grounded endpoints.
+The active semantic controller uses the same configured read client
+(`gemini-3.5-flash-lite` in `configs/method_config/smart_mem0.yaml`) for one compact
+JSON call. Its inputs are the original question, visible answer options, deterministic
+syntax hints, and the Top-3 seed payloads. It returns semantic fields only: route,
+operator, answer slot, temporal contract, immutable evidence requirements, each
+requirement's `COVERED|MISSING` state, seed references, raw-evidence need, and whether a
+general-domain reasoning bridge is authorized. It never emits store identities or
+retrieval operations.
+
+Code is the deterministic authority. It validates `$seed0..2`, subject and hard query
+constraints, active/current state, typed temporal axes, transition/causal relations,
+and conflicts. Only validated covered requirements enter `seed_coverage`; only missing
+requirements are compiled into local retrieval operations. A PLAN with complete seed
+coverage and `operations=[]` is valid. Dense/BM25 scores remain ranking telemetry and
+never prove sufficiency. The baseline calls no semantic slot validator, repair LLM, or
+LLM replan.
+
+Raw source turns are dereferenced only when the controller explicitly requests exact
+evidence, an executed verification returns pointers, or a conflict remains unresolved.
+The final answer may use standard domain knowledge only when
+`world_knowledge_bridge=true`; that bridge can connect grounded participant facts but
+cannot create new participant history.
 
 The planning context map is built from compact write-time tags and salience metadata.
 It gives the planner a bounded view of durable identity, trajectory, risk, constraint,
@@ -67,14 +85,12 @@ never treated as a memory fact that must be retrieved. Causal plans retrieve gro
 endpoints and use stored `CAUSES` only when an explicit participant-specific edge
 exists.
 
-The default read path separates answerability from planning. The mini gate can only
-authorize one atomic seed; it cannot define slots, operations, or an answer. A failed
-or structurally skipped gate invokes the plan-only controller. Deterministic recovery
-may issue explicit operations for uncovered typed slots without another LLM call.
-The default config uses one compact controller call that returns either a direct seed
-reference or a typed plan. The separate semantic slot validator, LLM replan, and
-planner repair remain ablation switches; the legacy gate-plus-planner route is also
-available for controlled comparison.
+The default read path separates semantic authority from execution authority inside one
+controller contract. `ANSWER` is the atomic fast path; `PLAN` is the optional retrieval
+path. Deterministic recovery may broaden an uncovered target through explicit traced
+operations without another LLM call. The normal upper bound is therefore two method
+LLM calls per query: controller plus answer, or just the controller when its atomic
+answer passes grounding validation.
 
 The split follows the useful boundaries visible in the bundled implementations:
 Mem0 separates memory/index backends, MemoRAG separates prompts and retrieval, and

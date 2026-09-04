@@ -36,12 +36,12 @@ agent_params:
   write_provisional_limit: 4
   max_new_memories: 12
 
-  # Baseline read route: answerability gate for a possible direct seed, then a
-  # typed planner only when the gate cannot answer. The unified controller below
-  # is an explicit latency ablation, not the default architecture.
+  # Compatibility switch retained by the benchmark facade. In the active
+  # two-stage path, planning is compiled deterministically from the semantic
+  # controller contract and does not make a second planner LLM call.
   enable_planner: true
-  # Gate first; invoke the planner only when the gate cannot answer from one
-  # seed. This is the optional-planner route used by the locked architecture.
+  # Active read route: one compact semantic-controller call returns ANSWER or
+  # PLAN after inspecting the question and Top-3 RRF seeds.
   enable_unified_controller: true
   # Keep semantic sufficiency validation for inference, decisions, options,
   # comparisons, transitions, and multi-slot plans. Simple one-slot plans use
