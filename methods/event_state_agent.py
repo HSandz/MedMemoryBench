@@ -327,7 +327,7 @@ class EventStateAgent(BaseAgent):
             if explicit_scope is None and len(order) == 1:
                 explicit_scope = metadata.get("conversation_scope")
             scope = normalize_scope(text if len(order) == 1 else session_text, explicit_scope)
-            sessions.append({"source_session_id": session_id, "source_session_index": turns[0].get("source_session_index", metadata.get("source_session_index", index)), "source_event_id": turns[0].get("source_event_id", metadata.get("source_event_id")), "timestamp": turns[0].get("timestamp", metadata.get("timestamp")), "conversation_scope": scope, "turns": turns})
+            sessions.append({"source_session_id": session_id, "source_session_index": turns[0].get("source_session_index", metadata.get("source_session_index", index)), "source_event_id": turns[0].get("source_event_id", metadata.get("source_event_id")), "timestamp": turns[0].get("timestamp", metadata.get("timestamp")), "recorded_at_raw": turns[0].get("recorded_at_raw", metadata.get("recorded_at_raw")), "conversation_scope": scope, "turns": turns})
         return sessions
 
     def _extract(self, session: Dict[str, Any]) -> Dict[str, Any]:
@@ -634,7 +634,7 @@ class EventStateAgent(BaseAgent):
         raw_lines = [f"[turn_id={turn.source_turn_id}] [role={turn.role or 'unknown'}] [speaker={turn.speaker}]\n{turn.text}" + (f"\n[Shared image: {turn.image_caption}]" if turn.image_caption else "") for turn in normalized]
         raw = f"[conversation_scope={session['conversation_scope']}]\n[recorded_at={session.get('timestamp') or 'unknown'}]\n\n" + "\n\n".join(raw_lines)
         episode_id = self._store(context_id).stable_id("E", [context_id, session["source_session_id"], raw])
-        episode = Episode(episode_id, context_id, session["source_session_id"], session["source_session_index"], session["source_event_id"], session.get("timestamp"), sorted({turn.speaker for turn in normalized}), session["conversation_scope"], raw if self.store_raw_episode_text else "", extracted["episode_summary"], [TurnEvidence(turn.source_turn_id, turn.speaker, turn.role, turn.text, turn.timestamp, turn.image_caption, turn.source_session_id, turn.source_session_index, turn.source_event_id) for turn in normalized] if self.preserve_turn_evidence else [])
+        episode = Episode(episode_id, context_id, session["source_session_id"], session["source_session_index"], session["source_event_id"], session.get("timestamp"), sorted({turn.speaker for turn in normalized}), session["conversation_scope"], raw if self.store_raw_episode_text else "", extracted["episode_summary"], [TurnEvidence(turn.source_turn_id, turn.speaker, turn.role, turn.text, turn.timestamp, turn.image_caption, turn.source_session_id, turn.source_session_index, turn.source_event_id) for turn in normalized] if self.preserve_turn_evidence else [], session.get("recorded_at_raw"))
         claims: List[Claim] = []
         if self.enable_state_claims:
             for index, raw_claim in enumerate(extracted["claims"]):

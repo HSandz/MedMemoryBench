@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, Any, List, Iterator, Optional
 
 from benchmarks.base import BaseDataset, Session, Query, EvaluationUnit
@@ -17,6 +18,19 @@ LOCOMO_CATEGORY_MAPPING = {
 }
 
 LOCOMO_CATEGORY_REVERSE = {v: k for k, v in LOCOMO_CATEGORY_MAPPING.items()}
+
+
+def normalize_locomo_timestamp(value: Any) -> Optional[str]:
+    """Convert complete LoCoMo record timestamps to a canonical local ISO time."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = " ".join(value.strip().split())
+    for pattern in ("%I:%M %p on %d %B, %Y", "%I:%M %p on %d %b, %Y"):
+        try:
+            return datetime.strptime(normalized, pattern).isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    return None
 
 
 @dataclass
@@ -125,6 +139,7 @@ class LoCoMoDataset(BaseDataset):
             session_num = int(session_key.split("_")[1])
             date_time_key = f"session_{session_num}_date_time"
             date_time = conversation.get(date_time_key, "")
+            recorded_at = normalize_locomo_timestamp(date_time)
 
             dialogues = conversation.get(session_key, [])
 
@@ -151,6 +166,9 @@ class LoCoMoDataset(BaseDataset):
                     "sample_id": sample_id,
                     "session_key": session_key,
                     "turn_count": len(dialogues),
+                    "recorded_at_raw": date_time,
+                    "recorded_at": recorded_at,
+                    "timestamp_parse_failed": bool(date_time and recorded_at is None),
                 },
                 date_time=date_time,
                 speaker_a=speaker_a,

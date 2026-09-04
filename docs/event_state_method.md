@@ -140,7 +140,11 @@ fall back to `NEW`. `2.5`, `2.6`, `2.7`, and `2.8` snapshots use older build
 semantics and must be rebuilt. Version 1 and 2 snapshots are rejected rather
 than silently reinterpreted. Claims retain canonical subject IDs and lifecycle
 statuses (`active`, `superseded`, `refined`, `contested`, or `standalone`)
-together with their evidence references.
+together with their evidence references. Dataset adapters may provide a
+canonical `recorded_at` alongside an immutable `recorded_at_raw` display value.
+Event-State uses the canonical record time for its existing generic temporal
+helpers and preserves the raw value in episode metadata. This does not infer
+claim valid time or introduce dataset-specific retrieval behavior.
 
 ## Configuration
 

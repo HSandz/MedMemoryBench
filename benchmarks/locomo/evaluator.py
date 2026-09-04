@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import re
+import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +22,7 @@ from benchmarks.locomo.dataset import LoCoMoDataset, LoCoMoQuery, LoCoMoSession
 from benchmarks.base import EvaluationUnit
 from methods.base import MemoryBuildResult
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
+from metrics.retrieval_quality import compute_session_retrieval_quality
 from utils.templates import get_prompt_manager
 from utils.logger import truncate_error_message
 from utils.batch_client import create_batch_client
@@ -121,6 +124,7 @@ class LoCoMoEvaluator:
         self._memory_snapshot_manifest: Optional[Dict[str, Any]] = None
         self._memory_snapshot_dir_path: Optional[Path] = None
         self._query_checkpoint: Dict[str, Any] = {"results": {}}
+        self._batch_retrieval_preparation_wall_time = 0.0
 
         # Memory chunk configuration
         # Get from dataset config or use default
@@ -143,6 +147,25 @@ class LoCoMoEvaluator:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
         if self.logger:
             self.logger.info(message)
+
+    @staticmethod
+    def _git_metadata() -> Dict[str, Any]:
+        """Record local repository identity without making Git a runtime dependency."""
+        def run(*args: str) -> Optional[str]:
+            try:
+                value = subprocess.run(
+                    ["git", *args], cwd=PROJECT_ROOT, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+                ).stdout.strip()
+                return value or None
+            except (OSError, subprocess.CalledProcessError):
+                return None
+        status = run("status", "--porcelain")
+        return {
+            "git_commit_sha": run("rev-parse", "HEAD"),
+            "git_branch": run("branch", "--show-current"),
+            "git_dirty": None if status is None else bool(status),
+        }
 
     def _init_dataset(self) -> None:
         self._log(f"Loading dataset: {self.dataset_config.dataset_name}")
@@ -250,7 +273,7 @@ class LoCoMoEvaluator:
         self._memory_snapshot_dir_path = path
         self._memory_snapshot_manifest = {
             "format": "locomo.event_state_memory_manifest",
-            "version": 1,
+            "version": 2,
             "build_id": str(uuid.uuid4()),
             "status": "building",
             "method_name": self.method_config.method_name,
@@ -275,7 +298,7 @@ class LoCoMoEvaluator:
             raise FileNotFoundError(f"Cannot read LoCoMo memory manifest: {manifest_path}") from exc
         if (
             manifest.get("format") != "locomo.event_state_memory_manifest"
-            or manifest.get("version") != 1
+            or manifest.get("version") not in {1, 2}
             or manifest.get("status") != "complete"
             or manifest.get("sample_ids") != [str(unit.context_id) for unit in units]
             or not is_manifest_query_compatible(manifest, self.method_config, self.dataset_config, manifest_path)
@@ -291,7 +314,7 @@ class LoCoMoEvaluator:
         path = self._snapshot_path(unit)
         payload = {
             "format": "locomo.event_state_memory_snapshot",
-            "version": 1,
+            "version": 2,
             "build_id": self._memory_snapshot_manifest["build_id"],
             "sample_id": str(unit.context_id),
             "unit_id": unit.unit_id,
@@ -328,7 +351,7 @@ class LoCoMoEvaluator:
             raise ValueError(f"Cannot read LoCoMo snapshot {path}") from exc
         if (
             payload.get("format") != "locomo.event_state_memory_snapshot"
-            or payload.get("version") != 1
+            or payload.get("version") not in {1, 2}
             or payload.get("build_id") != self._memory_snapshot_manifest.get("build_id")
             or str(payload.get("sample_id")) != str(unit.context_id)
             or payload.get("integrity_hash") != self._snapshot_integrity_hash(payload)
@@ -713,13 +736,43 @@ class LoCoMoEvaluator:
                     "speaker": turn.get("speaker", "Unknown"),
                     "content": turn.get("text", ""),
                     "blip_caption": turn.get("blip_caption", ""),
-                    "timestamp": session.date_time,
+                    # The adapter owns LoCoMo-specific timestamp parsing; the
+                    # memory method receives a generic canonical record time.
+                    "timestamp": session.metadata.get("recorded_at", session.date_time),
+                    "recorded_at_raw": session.metadata.get("recorded_at_raw"),
                     "source_session_id": session.session_id,
                     "source_session_index": session_index,
                     "source_turn_id": turn.get("dia_id"),
                     "source_event_id": session.metadata.get("session_key"),
                 })
         return items
+
+    @staticmethod
+    def _event_state_store_diagnostics(
+        state: Dict[str, Any], input_session_count: int,
+    ) -> Dict[str, Any]:
+        episodes = state.get("episodes", []) if isinstance(state, dict) else []
+        claims = state.get("claims", []) if isinstance(state, dict) else []
+        source_ids = [item.get("source_session_id") for item in episodes if item.get("source_session_id") is not None]
+        episode_count = len(episodes)
+        unique_source_count = len(set(source_ids))
+        duplicate_source_count = len(source_ids) - unique_source_count
+        return {
+            "input_session_count": input_session_count,
+            "unique_source_session_id_count": unique_source_count,
+            "final_episode_count": episode_count,
+            "final_claim_count": len(claims),
+            "final_memory_object_count": episode_count + len(claims),
+            "duplicate_episode_source_id_count": duplicate_source_count,
+            "source_identity_integrity": {
+                "expected": input_session_count,
+                "actual_unique_source_session_ids": unique_source_count,
+                "actual_episodes": episode_count,
+                "valid": (
+                    input_session_count == unique_source_count == episode_count
+                ),
+            },
+        }
 
     def _evaluate_event_state_unit(self, unit: EvaluationUnit) -> List[MetricResult]:
         if self.dry_run:
@@ -733,12 +786,20 @@ class LoCoMoEvaluator:
         if existing is not None:
             self.agent_manager.import_memory_state(existing["memory_state"], context_id=unit.context_id)
             build_time = float(existing.get("memory_build_time", 0.0) or 0.0)
+            snapshot_state = existing.get("memory_state", {})
+            build_metrics = dict(existing.get("memory_build_metrics") or {})
+            build_metrics.update(self._event_state_store_diagnostics(
+                snapshot_state, len(unit.sessions_to_inject)
+            ))
             self._memory_build_logs.append({
                 "unit_id": unit.unit_id, "context_id": unit.context_id,
                 "session_ids": existing.get("session_ids", []),
                 "session_count": len(unit.sessions_to_inject), "chunk_count": 0,
-                "total_time": build_time, "total_entries": 0,
-                "total_stored_chunks": 0, "restored_from_snapshot": True,
+                "total_time": build_time, "inserted_record_count": 0,
+                "total_stored_chunks": 0, "build_metrics": build_metrics,
+                "final_store": self._event_state_store_diagnostics(
+                    snapshot_state, len(unit.sessions_to_inject)
+                ), "restored_from_snapshot": True,
             })
         else:
             started = time.time()
@@ -752,15 +813,35 @@ class LoCoMoEvaluator:
                 prepared, context_id=unit.context_id
             )
             build_time = time.time() - started
-            build_metrics = memory_result.to_dict() if isinstance(memory_result, MemoryBuildResult) else {"raw_result": str(memory_result)}
+            if isinstance(memory_result, MemoryBuildResult):
+                # Keep compact build telemetry, not a second copy of raw memory.
+                build_metrics = {
+                    key: value for key, value in memory_result.to_dict().items()
+                    if key not in {
+                        "memory_entries", "all_passages", "input_content",
+                        "stored_content", "extraction_result",
+                    }
+                }
+            else:
+                build_metrics = {"raw_result": str(memory_result)}
+            final_store = self._event_state_store_diagnostics(
+                self.agent_manager.export_memory_state(context_id=unit.context_id),
+                len(unit.sessions_to_inject),
+            )
+            build_metrics.update(final_store)
+            if not final_store["source_identity_integrity"]["valid"]:
+                raise RuntimeError(
+                    "LoCoMo Event-State ingestion lost or duplicated source sessions: "
+                    f"{final_store['source_identity_integrity']}"
+                )
             self._memory_build_logs.append({
                 "unit_id": unit.unit_id, "context_id": unit.context_id,
                 "session_ids": [session.session_id for session in unit.sessions_to_inject],
                 "session_count": len(unit.sessions_to_inject), "chunk_count": 0,
                 "total_time": build_time,
-                "total_entries": len(getattr(memory_result, "memory_entries", []) or []),
+                "inserted_record_count": len(getattr(memory_result, "memory_entries", []) or []),
                 "total_stored_chunks": 0, "build_metrics": build_metrics,
-                "staged_session_count": len(prepared),
+                "final_store": final_store, "staged_session_count": len(prepared),
             })
             self._write_memory_snapshot(unit, build_time, build_metrics)
         if self.execution_stage == "memory":
@@ -939,7 +1020,13 @@ class LoCoMoEvaluator:
                 input_tokens=batch_response.input_tokens,
                 output_tokens=batch_response.output_tokens,
             )
-            results.append(self._score_agent_response(query, response))
+            result = self._score_agent_response(query, response)
+            result.details.setdefault("execution_usage", {})["answer"] = {
+                "transport": "batch",
+                "input_tokens": batch_response.input_tokens,
+                "output_tokens": batch_response.output_tokens,
+            }
+            results.append(result)
         return results
 
     def _prepare_combined_batch_queries(
@@ -1004,11 +1091,16 @@ class LoCoMoEvaluator:
             )
 
         worker_count = getattr(self, "workers", 1)
+        preparation_started = time.perf_counter()
         if worker_count > 1 and len(query_items) > 1:
             with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
                 prepared_items = list(executor.map(prepare_item, query_items))
         else:
             prepared_items = [prepare_item(item) for item in query_items]
+        self._batch_retrieval_preparation_wall_time = (
+            getattr(self, "_batch_retrieval_preparation_wall_time", 0.0)
+            + time.perf_counter() - preparation_started
+        )
 
         for item, prepared in zip(query_items, prepared_items):
             query, request_id, saved_request, batch_request_time, _ = item
@@ -1081,6 +1173,12 @@ class LoCoMoEvaluator:
                     output_tokens=batch_response.output_tokens,
                 )
                 result = self._score_agent_response(query, response)
+                if hasattr(result, "details"):
+                    result.details.setdefault("execution_usage", {})["answer"] = {
+                        "transport": "batch",
+                        "input_tokens": batch_response.input_tokens,
+                        "output_tokens": batch_response.output_tokens,
+                    }
 
             result.memory_construction_time = item["memory_time_per_query"]
             status = "✓" if result.is_correct else "✗"
@@ -1143,22 +1241,105 @@ class LoCoMoEvaluator:
             },
         )
 
+    @staticmethod
+    def _gold_evidence_turns(evidence: List[str]) -> List[str]:
+        """Keep only canonical LoCoMo evidence IDs (for evaluator-only use)."""
+        values, seen = [], set()
+        for value in evidence or []:
+            normalized = str(value).strip()
+            if not re.fullmatch(r"D\d+:[^\s:]+", normalized) or normalized in seen:
+                continue
+            values.append(normalized)
+            seen.add(normalized)
+        return values
+
+    @staticmethod
+    def _turn_quality(gold_turn_ids: List[str], visible_turn_ids: List[str]) -> Dict[str, Any]:
+        """Score exact evidence turns rendered in final answer context."""
+        predicted = list(dict.fromkeys(str(value) for value in visible_turn_ids))
+        gold = list(dict.fromkeys(gold_turn_ids))
+        predicted_set, gold_set = set(predicted), set(gold)
+        matched = [value for value in predicted if value in gold_set]
+        precision = len(matched) / len(predicted) if predicted else 0.0
+        recall = len(matched) / len(gold) if gold else None
+        return {
+            "stage": "answer_visible_exact_source_evidence",
+            "unit": "locomo_turn_id",
+            "available": bool(gold),
+            "gold_turn_ids": gold,
+            "answer_visible_turn_ids": predicted,
+            "matched_turn_ids": matched,
+            "precision": precision if gold else None,
+            "recall": recall,
+            "hit": bool(matched) if gold else None,
+            "true_positive_count": len(matched),
+            "false_positive_count": len(predicted_set - gold_set),
+            "false_negative_count": len(gold_set - predicted_set),
+        }
+
+    @staticmethod
+    def _locomo_turn_id(source_session_id: Any, turn_id: Any) -> Optional[str]:
+        value = str(turn_id).strip()
+        if re.fullmatch(r"D\d+:[^\s:]+", value):
+            return value
+        if source_session_id is None or not value:
+            return None
+        return f"D{source_session_id}:{value}"
+
+    def _locomo_retrieval_quality(
+        self, query: LoCoMoQuery, retrieved_memories: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Derive gold diagnostics after retrieval, never before method execution."""
+        gold_turn_ids = self._gold_evidence_turns(query.evidence)
+        gold_session_ids = [match.group(1) for item in gold_turn_ids if (match := re.fullmatch(r"D(\d+):[^\s:]+", item))]
+        session_quality = compute_session_retrieval_quality(
+            retrieved_memories, [], {"gold_session_ids": gold_session_ids},
+        )
+        session_quality["stage"] = "selected_memory_objects"
+        visible_turn_ids = []
+        for record in retrieved_memories or []:
+            if not isinstance(record, dict):
+                continue
+            source_session = record.get("source_session_id")
+            for turn_id in record.get("episode_evidence_turn_ids", []) if record.get("included_in_context") else []:
+                normalized = self._locomo_turn_id(source_session, turn_id)
+                if normalized:
+                    visible_turn_ids.append(normalized)
+            for item in record.get("included_provenance_evidence", []):
+                evidence = item.get("evidence", item) if isinstance(item, dict) else {}
+                if not isinstance(evidence, dict):
+                    continue
+                source_session = evidence.get("source_session_id")
+                for turn_id in evidence.get("source_turn_ids", []):
+                    normalized = self._locomo_turn_id(source_session, turn_id)
+                    if normalized:
+                        visible_turn_ids.append(normalized)
+        return {
+            "gold_evidence_turn_ids": gold_turn_ids,
+            "gold_evidence_session_ids": list(dict.fromkeys(gold_session_ids)),
+            "selected_memory_session": session_quality,
+            "answer_visible_exact_turn": self._turn_quality(gold_turn_ids, visible_turn_ids),
+        }
+
     def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
         if isinstance(response, dict):
             model_output = response.get("output", "")
             query_time = response.get("query_time", 0.0)
             retrieved_memories = response.get("retrieved_memories", [])
             retrieved_count = response.get("retrieved_count", 0)
+            response_extra = response.get("extra", {})
         elif hasattr(response, "output"):
             model_output = response.output
             query_time = getattr(response, "query_time", 0.0)
             retrieved_memories = getattr(response, "retrieved_memories", [])
             retrieved_count = getattr(response, "retrieved_count", 0)
+            response_extra = getattr(response, "extra", {})
         else:
             model_output = str(response)
             query_time = 0.0
             retrieved_memories = []
             retrieved_count = 0
+            response_extra = {}
 
         tracker = get_usage_tracker()
         tracker.set_phase("judge")
@@ -1178,11 +1359,16 @@ class LoCoMoEvaluator:
         result.query_time = query_time
         result.retrieved_memories = retrieved_memories
         result.retrieved_count = retrieved_count
+        if isinstance(response_extra, dict):
+            result.details["method_retrieval"] = response_extra
 
         if "category" not in result.details:
             result.details["category"] = query.category
         if "evidence" not in result.details:
             result.details["evidence"] = query.evidence
+        result.details["locomo_retrieval_quality"] = self._locomo_retrieval_quality(
+            query, retrieved_memories
+        )
 
         return result
 
@@ -1193,10 +1379,30 @@ class LoCoMoEvaluator:
         duration: float,
     ) -> EvaluationReport:
         summary = self.aggregator.get_summary()
+        self._apply_locomo_summary(summary)
 
         memory_build_summary = self._summarize_memory_builds()
+        build_metrics = self._compact_build_metrics()
 
         llm_usage = get_usage_tracker().get_stats()
+        stage_usage = self._stage_usage_report(llm_usage)
+        results = self.aggregator.results
+        expected_queries = self.dataset.get_total_queries()
+        scored_queries = sum(result.score is not None for result in results)
+        api_error_count = sum(
+            bool(result.details.get("api_error")) for result in results
+        )
+        category_filter = self.dataset.category_filter
+        evaluation_coverage = {
+            "expected_query_count": expected_queries,
+            "scored_query_count": scored_queries,
+            "api_error_count": api_error_count,
+            "skipped_query_count": max(expected_queries - len(results), 0),
+            "unscored_query_count": max(expected_queries - scored_queries, 0),
+            "category_filter": category_filter,
+            "category_coverage": self.dataset.get_category_distribution(),
+            "complete": scored_queries == expected_queries,
+        }
 
         report = EvaluationReport(
             method_name=self.method_config.method_name,
@@ -1226,13 +1432,26 @@ class LoCoMoEvaluator:
                     ),
                 },
                 "dry_run": self.dry_run,
+                "locomo_scoring": {
+                    "primary_metric": "official_token_stem_f1",
+                    "enhanced_f1": "diagnostic_only",
+                },
             },
             metadata={
+                "run_metadata": self._git_metadata(),
                 "total_samples": len(self.dataset.get_sample_ids()),
+                "evaluated_sample_count": len(self.dataset.get_sample_ids()),
+                "configured_max_samples": self.dataset.max_samples,
+                "sample_ids": self.dataset.get_sample_ids(),
                 "category_distribution": self.dataset.get_category_distribution(),
+                "image_input_mode": "caption_only" if self.dataset.include_images else "disabled",
+                "image_caption_field": "blip_caption" if self.dataset.include_images else None,
                 "memory_build_summary": memory_build_summary,
+                "build_metrics": build_metrics,
                 "memory_chunk_size": self.memory_chunk_size,
                 "llm_usage": llm_usage,
+                "stage_usage": stage_usage,
+                "evaluation_coverage": evaluation_coverage,
             }
         )
 
@@ -1248,6 +1467,104 @@ class LoCoMoEvaluator:
         self._log(f"Query answer details saved to: {query_answer_path}")
 
         return report
+
+    @staticmethod
+    def _aggregate_locomo_retrieval(results: List[MetricResult]) -> Dict[str, Any]:
+        """Macro aggregate evaluator-only selected-session and visible-turn metrics."""
+        stages = {
+            "selected_memory_session": "selected_memory_session",
+            "answer_visible_exact_turn": "answer_visible_exact_turn",
+        }
+        aggregated: Dict[str, Any] = {}
+        for output_name, source_name in stages.items():
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for result in results:
+                quality = result.details.get("locomo_retrieval_quality", {})
+                value = quality.get(source_name) if isinstance(quality, dict) else None
+                if isinstance(value, dict):
+                    groups.setdefault(result.query_type, []).append(value)
+
+            def summarize(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+                available = [item for item in items if item.get("available")]
+                def mean(field: str) -> Optional[float]:
+                    values = [float(item[field]) for item in available if item.get(field) is not None]
+                    return sum(values) / len(values) if values else None
+                return {
+                    "queries_with_gold_evidence": len(available),
+                    "queries_without_gold_evidence": len(items) - len(available),
+                    "hit_rate": mean("hit"), "recall": mean("recall"),
+                    "precision": mean("precision"),
+                    "mean_average_precision": mean("average_precision"),
+                    "mean_reciprocal_rank": mean("reciprocal_rank"),
+                }
+            all_items = [item for items in groups.values() for item in items]
+            aggregated[output_name] = {
+                "stage": source_name,
+                **summarize(all_items),
+                "by_query_type": {
+                    query_type: summarize(items) for query_type, items in sorted(groups.items())
+                },
+            }
+        return aggregated
+
+    def _apply_locomo_summary(self, summary: Dict[str, Any]) -> None:
+        """Make continuous official F1 the LoCoMo headline, not a threshold count."""
+        results = [
+            result for result in self.aggregator.results
+            if result.score is not None and result.details.get("metric") == "locomo_f1"
+        ]
+        summary["f1_query_count"] = len(results)
+        summary["mean_f1"] = (
+            sum(float(result.score) for result in results) / len(results)
+            if results else 0.0
+        )
+        summary["queries_f1_ge_0_5"] = sum(
+            float(result.score) >= 0.5 for result in results
+        )
+        summary["fraction_f1_ge_0_5"] = (
+            summary["queries_f1_ge_0_5"] / len(results) if results else 0.0
+        )
+        for query_type, stats in summary.get("by_type", {}).items():
+            if query_type == "adversarial":
+                continue
+            stats["mean_f1"] = stats.get("avg_score", 0.0)
+            stats["queries_f1_ge_0_5"] = stats.pop("correct", 0)
+            stats["fraction_f1_ge_0_5"] = stats.pop("accuracy", 0.0)
+        summary["retrieval_quality"] = self._aggregate_locomo_retrieval(results)
+
+    def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose local phase accounting and batch lifecycle without fake latency."""
+        operations = llm_usage.get("operations", {})
+        query_operations = operations.get("query", {})
+        batch_stages = []
+        manifest_path = getattr(getattr(self, "_batch_client", None), "manifest_path", None)
+        if manifest_path:
+            try:
+                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+                for name, stage in (manifest.get("jobs") or {}).items():
+                    batch_stages.append({
+                        "stage": name, "state": stage.get("state"),
+                        "request_count": len(stage.get("requests") or []),
+                        "submitted_at": stage.get("submitted_at"),
+                        "completed_at": stage.get("completed_at"),
+                    })
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {
+            "schema_version": 1,
+            "memory": {"usage": llm_usage.get("memorize_phase", {})},
+            "retrieval_preparation": {
+                "usage": query_operations.get("query.retrieval_preparation", {}),
+                "wall_time_seconds": getattr(
+                    self, "_batch_retrieval_preparation_wall_time", 0.0
+                ),
+            },
+            "answer_generation": {
+                "usage": query_operations.get("query.answer_realtime", {}),
+            },
+            "judge": {"usage": llm_usage.get("judge_phase", {})},
+            "batch_stages": batch_stages,
+        }
 
     def _summarize_memory_builds(self) -> Dict[str, Any]:
         if not self._memory_build_logs:
@@ -1270,8 +1587,8 @@ class LoCoMoEvaluator:
             for log in self._memory_build_logs
         )
 
-        total_entries = sum(
-            log.get("total_entries", 0)
+        inserted_record_count = sum(
+            log.get("inserted_record_count", log.get("total_entries", 0))
             for log in self._memory_build_logs
         )
 
@@ -1285,11 +1602,30 @@ class LoCoMoEvaluator:
             "total_sessions": total_sessions,
             "total_memory_chunks": total_chunks,
             "total_time": total_time,
-            "total_entries": total_entries,
+            "inserted_record_count": inserted_record_count,
             "total_stored_chunks": total_stored_chunks,
             "avg_time_per_unit": total_time / total_units if total_units > 0 else 0,
             "avg_chunks_per_unit": total_chunks / total_units if total_units > 0 else 0,
             "chunk_size_config": self.memory_chunk_size,
+        }
+
+    def _compact_build_metrics(self) -> Dict[str, Any]:
+        """Keep useful Event-State diagnostics in result.json without raw memory."""
+        units = {}
+        excluded = {
+            "memory_entries", "all_passages", "input_content", "stored_content",
+            "extraction_result", "raw_result",
+        }
+        for log in self._memory_build_logs:
+            metrics = log.get("build_metrics", {})
+            if not isinstance(metrics, dict):
+                continue
+            units[str(log.get("context_id"))] = {
+                key: value for key, value in metrics.items() if key not in excluded
+            }
+        return {
+            "schema_version": 1,
+            "units": units,
         }
 
 

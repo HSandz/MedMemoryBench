@@ -6,7 +6,8 @@ This module implements the official LoCoMo evaluation metrics as described in:
 The metrics follow the official implementation from:
 https://github.com/snap-research/locomo/blob/main/task_eval/evaluation.py
 
-Enhanced with semantic matching to reduce false negatives from format variations.
+The primary score is the official token/stem F1.  A conservative enhanced score
+is retained only as an explicitly labelled diagnostic.
 """
 
 import re
@@ -189,41 +190,22 @@ def normalize_numbers(text: str) -> str:
 
 
 def semantic_contains(prediction: str, expected: str) -> bool:
-    """Check if prediction semantically contains the expected answer.
+    """Conservative optional containment check for diagnostic reporting only.
 
-    Handles cases like:
-    - "Yes" in "Likely yes, because..."
-    - "beach" in "close to the beach"
-    - "July 2023" in "in July 2023"
+    This deliberately requires whole normalized tokens and refuses a match in a
+    negating statement.  It is never used to alter the official LoCoMo score.
     """
-    pred_lower = prediction.lower().strip()
-    exp_lower = expected.lower().strip()
-
-    # Direct containment
-    if exp_lower in pred_lower:
+    prediction_tokens = normalize_answer(normalize_numbers(prediction)).split()
+    expected_tokens = normalize_answer(normalize_numbers(expected)).split()
+    if not prediction_tokens or not expected_tokens:
+        return False
+    negations = {"no", "not", "never", "cannot", "cant", "without"}
+    for start in range(len(prediction_tokens) - len(expected_tokens) + 1):
+        if prediction_tokens[start:start + len(expected_tokens)] != expected_tokens:
+            continue
+        if any(token in negations for token in prediction_tokens[:start]):
+            return False
         return True
-
-    # Normalize and check again
-    pred_norm = normalize_answer(prediction)
-    exp_norm = normalize_answer(expected)
-
-    if exp_norm in pred_norm:
-        return True
-
-    # Handle Yes/No variations
-    if exp_lower in ['yes', 'likely yes']:
-        if pred_lower.startswith('yes') or pred_lower.startswith('likely yes'):
-            return True
-    if exp_lower in ['no', 'likely no']:
-        if pred_lower.startswith('no') or pred_lower.startswith('likely no'):
-            return True
-
-    # Handle number variations
-    pred_num = normalize_numbers(pred_lower)
-    exp_num = normalize_numbers(exp_lower)
-    if exp_num in pred_num:
-        return True
-
     return False
 
 
@@ -257,7 +239,8 @@ class LoCoMoF1Metric(BaseMetric):
     - Category 3 (open_domain): use f1_score() but first take answer.split(';')[0].strip()
     - Category 4 (single_hop): use f1_score() directly
 
-    Enhanced with semantic matching to reduce false negatives.
+    ``score`` and ``is_correct`` always describe the official score.  The
+    optional enhanced value is an audit field and cannot silently boost a run.
     """
     NAME = "locomo_f1"
 
@@ -269,7 +252,7 @@ class LoCoMoF1Metric(BaseMetric):
         expected_answers: List[str],
         question: str = "",
         category: int = 1,
-        use_enhanced: bool = True,
+        use_enhanced: bool = False,
         **kwargs
     ) -> MetricResult:
         if not expected_answers:
@@ -291,17 +274,18 @@ class LoCoMoF1Metric(BaseMetric):
             answer = answer.split(';')[0].strip()
 
         if category == 1:
-            # Multi-hop: split both prediction and answer by comma
-            score = compute_multi_hop_f1(model_output, answer)
-            # Also check semantic containment for multi-hop
-            if use_enhanced and score < 0.5 and semantic_contains(model_output, answer):
-                score = max(score, 0.5)
+            official_score = compute_multi_hop_f1(model_output, answer)
         else:
-            # Single-hop, temporal, open_domain: direct F1 with enhancement
-            if use_enhanced:
-                score = enhanced_f1_score(model_output, answer)
-            else:
-                score = compute_f1(model_output, answer)
+            official_score = compute_f1(model_output, answer)
+
+        enhanced_score = (
+            enhanced_f1_score(model_output, answer)
+            if category != 1 else max(
+                official_score,
+                0.5 if semantic_contains(model_output, answer) else 0.0,
+            )
+        )
+        score = official_score
 
         is_correct = score >= 0.5
 
@@ -316,8 +300,10 @@ class LoCoMoF1Metric(BaseMetric):
             details={
                 "category": category,
                 "metric": self.NAME,
-                "f1_score": score,
-                "enhanced": use_enhanced,
+                "f1_score": official_score,
+                "official_f1": official_score,
+                "enhanced_f1": enhanced_score,
+                "enhanced_diagnostic_requested": bool(use_enhanced),
             }
         )
 

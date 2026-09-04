@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import subprocess
 from dataclasses import asdict, is_dataclass
 from dataclasses import replace
 from datetime import datetime
@@ -395,6 +396,12 @@ class Evaluator:
         return run_id, self.run_container_dir / run_id
 
     def _run_config_payload(self, status: str, **updates: Any) -> Dict[str, Any]:
+        dataset_snapshot = self._config_value(self.dataset_config)
+        # ``inject_noise`` belongs to MedMemoryBench's mixed-data pipeline and
+        # must not appear as an active LoCoMo option through dataclass defaults.
+        if getattr(self.dataset_config, "dataset_name", "") == "locomo":
+            dataset_snapshot.pop("inject_noise", None)
+        git_metadata = self._git_metadata()
         payload = {
             "format": "medmemorybench.run_config",
             "version": 1,
@@ -405,7 +412,10 @@ class Evaluator:
             "method_config_name": self.method_config_name,
             "dataset_config_name": self.dataset_config_name,
             "method_config": self._method_config_snapshot(),
-            "dataset_config": self._config_value(self.dataset_config),
+            "dataset_config": dataset_snapshot,
+            "git_commit_sha": git_metadata["git_commit_sha"],
+            "git_dirty": git_metadata["git_dirty"],
+            "git_branch": git_metadata["git_branch"],
             "api_config": self._config_value(get_api_config()),
             "config_sources": {
                 "method": str(self.method_config_path) if self.method_config_path else None,
@@ -438,6 +448,26 @@ class Evaluator:
             payload["config_inference"] = self.config_inference
         payload.update(updates)
         return payload
+
+    @staticmethod
+    def _git_metadata() -> Dict[str, Any]:
+        """Best-effort local source identity; evaluation never depends on Git."""
+        def run(*args: str) -> Optional[str]:
+            try:
+                value = subprocess.run(
+                    ["git", *args], cwd=PROJECT_ROOT, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    check=True,
+                ).stdout.strip()
+                return value or None
+            except (OSError, subprocess.CalledProcessError):
+                return None
+        status = run("status", "--porcelain")
+        return {
+            "git_commit_sha": run("rev-parse", "HEAD"),
+            "git_branch": run("branch", "--show-current"),
+            "git_dirty": None if status is None else bool(status),
+        }
 
     def _write_run_config(
         self,

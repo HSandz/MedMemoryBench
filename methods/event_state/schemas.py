@@ -56,6 +56,8 @@ class Episode:
     raw_text: str
     summary: str
     turn_evidence: List[TurnEvidence] = field(default_factory=list)
+    # Dataset adapters may retain an authoritative human-readable record time.
+    recorded_at_raw: Optional[str] = None
 
     def retrieval_text(self) -> str:
         """Return an information-dense but bounded embedding representation."""

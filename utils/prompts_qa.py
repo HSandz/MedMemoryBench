@@ -199,10 +199,10 @@ Question: {question}
 
 CRITICAL DATE FORMAT RULES:
 1. Convert ALL relative times to ABSOLUTE dates:
-   - "yesterday" before "6 July 2023" → "5 July 2023"
-   - "last week" before "9 June 2023" → "The week before 9 June 2023"
-   - "two days ago" before "12 July 2023" → "10 July 2023"
-   - "last Friday" before "15 July 2023" → "The Friday before 15 July 2023"
+   - "yesterday" before "20 February 2030" → "19 February 2030"
+   - "last week" before "9 June 2032" → "The week before 9 June 2032"
+   - "two days ago" before "11 March 2031" → "9 March 2031"
+   - "last Friday" before "15 July 2033" → "The Friday before 15 July 2033"
 
 2. Use these EXACT formats:
    - Specific dates: "7 May 2023", "10 July 2023"

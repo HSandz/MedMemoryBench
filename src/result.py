@@ -55,7 +55,7 @@ def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, A
     efficiency["query_time_kind"] = "per_request_latency_unavailable_for_batch"
     efficiency["stage_wall_time_seconds"] = {
         name: (stage_usage.get(name, {}).get("usage", {}).get("wall_time"))
-        for name in ("retrieval_preparation", "answer", "judge")
+        for name in ("retrieval_preparation", "answer_generation", "judge")
     }
     efficiency["batch_stage_count"] = len(batch_stages)
     return efficiency
@@ -169,14 +169,25 @@ class ResultCollector:
         """Save evaluation metrics file (result.json)."""
         filepath = output_dir / f"{prefix}_result.json"
 
+        is_locomo = report.dataset_name == "locomo"
         result_summary = {
             "total_queries": report.summary.get("total", 0),
-            "correct_count": report.summary.get("correct", 0),
-            "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
             "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
             "by_type": report.summary.get("by_type", {}),
             "by_metric": report.summary.get("by_metric", {}),
         }
+        if is_locomo:
+            result_summary.update({
+                "mean_f1": report.summary.get("mean_f1", 0.0),
+                "queries_f1_ge_0_5": report.summary.get("queries_f1_ge_0_5", 0),
+                "fraction_f1_ge_0_5": report.summary.get("fraction_f1_ge_0_5", 0.0),
+                "retrieval_quality": report.summary.get("retrieval_quality", {}),
+            })
+        else:
+            result_summary.update({
+                "correct_count": report.summary.get("correct", 0),
+                "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
+            })
         metric_groups = report.summary.get("metric_groups")
         if isinstance(metric_groups, dict) and metric_groups:
             result_summary["metric_groups"] = metric_groups
@@ -200,6 +211,7 @@ class ResultCollector:
             "llm_usage": report.metadata.get("llm_usage", {}),
             "stage_usage": report.metadata.get("stage_usage", {}),
             "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
+            "run_metadata": report.metadata.get("run_metadata", {}),
             "config": {
                 "evaluation_mode": report.metadata.get("evaluation_mode", ""),
                 "evaluation_interval": report.metadata.get("evaluation_interval", 0),
@@ -364,6 +376,12 @@ class ResultCollector:
                                     "stored_content", "extraction_result", "all_passages",
                                     "memory_entries", "chunk_count", "success"]
                     },
+                    "build_metrics": log.get("build_metrics", build_result),
+                    "final_store": log.get("final_store", {}),
+                    "inserted_record_count": log.get(
+                        "inserted_record_count", len(build_result.get("memory_entries", []))
+                    ),
+                    "restored_from_snapshot": log.get("restored_from_snapshot", False),
                 }
 
             processed_units.append(processed_unit)
@@ -381,6 +399,7 @@ class ResultCollector:
             "llm_usage": report.metadata.get("llm_usage", {}),
             "stage_usage": report.metadata.get("stage_usage", {}),
             "memory_chunk_size": report.metadata.get("memory_chunk_size"),
+            "run_metadata": report.metadata.get("run_metadata", {}),
             "total_units": len(processed_units),
             "units": processed_units,
         }
@@ -459,7 +478,11 @@ class ResultCollector:
                     "retrieved_memories": retrieved_memories,
                     "retrieved_count": result.get("retrieved_count", 0),
                     "evaluation_status": details.get("evaluation_status", "scored"),
-                    "retrieval_quality": (details.get("metric_groups", {}) or {}).get("retrieval_quality"),
+                    "retrieval_quality": (
+                        details.get("locomo_retrieval_quality")
+                        if report.dataset_name == "locomo"
+                        else (details.get("metric_groups", {}) or {}).get("retrieval_quality")
+                    ),
                     **({"planner": planner} if planner is not None else {}),
                 })
                 retrieval_reference = {
@@ -527,8 +550,12 @@ class ResultCollector:
         if retrieval_records:
             retrieval_records_path = output_dir / f"{prefix}_retrieval_records.json"
             retrieval_data = {
-                "format": "medmemorybench.query_retrieval_records",
-                "version": 1,
+                "format": (
+                    "memorybench.query_retrieval_records"
+                    if report.dataset_name == "locomo"
+                    else "medmemorybench.query_retrieval_records"
+                ),
+                "version": 2 if report.dataset_name == "locomo" else 1,
                 "method_name": report.method_name,
                 "model_name": report.model_name,
                 "dataset_name": report.dataset_name,
@@ -539,8 +566,6 @@ class ResultCollector:
 
         query_summary = {
             "total_queries": len(query_details),
-            "correct_count": sum(1 for q in query_details if q["is_correct"] is True),
-            "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
             "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
             "by_type": report.summary.get("by_type", {}),
             "by_metric": report.summary.get("by_metric", {}),
@@ -557,14 +582,36 @@ class ResultCollector:
                 if query_details else 0.0
             ),
         }
+        if report.dataset_name == "locomo":
+            query_summary.update({
+                "mean_f1": report.summary.get("mean_f1", 0.0),
+                "queries_f1_ge_0_5": report.summary.get("queries_f1_ge_0_5", 0),
+                "fraction_f1_ge_0_5": report.summary.get("fraction_f1_ge_0_5", 0.0),
+                "retrieval_quality": report.summary.get("retrieval_quality", {}),
+            })
+            if (report.metadata.get("stage_usage") or {}).get("batch_stages"):
+                query_summary.update({
+                    "query_time_kind": "per_request_latency_unavailable_for_batch",
+                    "total_query_time": None,
+                    "avg_query_time": None,
+                })
+        else:
+            query_summary.update({
+                "correct_count": sum(1 for q in query_details if q["is_correct"] is True),
+                "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
+            })
         metric_groups = report.summary.get("metric_groups")
         if isinstance(metric_groups, dict) and metric_groups:
             query_summary["metric_groups"] = metric_groups
 
         query_answer_data = {
-            "format": "medmemorybench.query_answers",
-            # Version 3 distinguishes method-facing source UIDs from benchmark IDs.
-            "version": 3,
+            "format": (
+                "memorybench.query_answers"
+                if report.dataset_name == "locomo"
+                else "medmemorybench.query_answers"
+            ),
+            # Version 4 adds neutral naming and LoCoMo diagnostic fields.
+            "version": 4 if report.dataset_name == "locomo" else 3,
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,

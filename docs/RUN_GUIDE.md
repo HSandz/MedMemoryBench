@@ -283,6 +283,25 @@ workers restore independent Event-State instances; `--resume` reuses completed
 sample snapshots, rebuilds only a sample without a valid snapshot, and skips
 answers recorded in the query checkpoint.
 
+### LoCoMo Reporting
+
+LoCoMo reports official token/stem `mean_f1` as the primary score. The
+`queries_f1_ge_0_5` and `fraction_f1_ge_0_5` fields are debugging thresholds,
+not benchmark accuracy. Any `enhanced_f1` is an explicitly labelled diagnostic
+and never changes official F1.
+
+When LoCoMo evidence annotations are present, query artifacts include
+evaluator-only diagnostics for selected-memory source sessions and exact source
+turns rendered into final answer context. Gold evidence is not sent to the
+memory method or answer model. Batch runs mark per-request answer latency as
+unavailable and report stage and batch wall times instead.
+
+LoCoMo session timestamps are normalized by the dataset adapter before they
+enter generic Event-State temporal handling; the raw timestamp is retained for
+audit. With `include_images: true`, LoCoMo provides `blip_caption` text only:
+Event-State does not consume image pixels. A run configured with
+`max_samples: 1` is a one-conversation development run, not a full benchmark.
+
 When `-d` is omitted, query stage restores the exact stored dataset config. To
 apply a revised query selection from the same named config (for example,
 `locomo_1` with `evaluation.category_filter: [1, 2, 3, 4]`), pass it explicitly:
