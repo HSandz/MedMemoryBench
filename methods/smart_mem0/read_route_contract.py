@@ -51,3 +51,13 @@ class ReadRouteContractMixin:
         spec["initial_route"] = initial_route
         spec["active_strategy"] = active_strategy
         return plan
+
+    def _coverage_map(self, plan, slot_support, selected, relations):
+        coverage = super()._coverage_map(plan, slot_support, selected, relations)
+        # Optional gaps may enrich answer context but can never block execution
+        # or trigger deterministic recovery. Active MC exploration is explicitly
+        # required above, so this does not skip SHARED_OPTIONS probing.
+        for slot in plan.get("required_slots", []):
+            if slot.get("required") is False:
+                coverage[slot["id"]] = True
+        return coverage
