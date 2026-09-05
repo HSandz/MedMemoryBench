@@ -1140,3 +1140,68 @@ def test_support_and_related_do_not_expand_query_context(packing_query_case, leg
     assert [m["id"] for m in traversed] == ["m1"]
     assert used == []
     assert agent._relations == edges
+
+
+@pytest.mark.parametrize("role, expected_count", [
+    ("REQUIREMENT", 2), ("COMPARAND", 1), ("ANSWER", 1),
+])
+def test_direct_candidate_quota_is_specific_to_generic_requirement(monkeypatch, role, expected_count):
+    memories = [_memory(f"m{i}", value=f"medication value {i}") for i in range(3)]
+    harness = _MinimalHarness(memories)
+    monkeypatch.setattr(
+        harness, "_hybrid_search", lambda *_a, **_k: memories, raising=False,
+    )
+    slot = {"id": "r1", "type": "DIRECT", "evidence_role": role, "target_surface": "medication"}
+    supports = harness._operation_slot_support(slot, memories, [])
+    assert [m["id"] for m in supports] == [m["id"] for m in memories[:expected_count]]
+
+
+def test_direct_requirement_backup_reaches_answer_without_supplement_or_extra_search(
+    monkeypatch, packing_query_case,
+):
+    agent, run = packing_query_case
+    candidates = [
+        _memory("m1", "oral medication adjustment"),
+        _memory("m2", "metformin was discontinued"),
+        _memory("m3", "other treatment notes"),
+    ]
+    agent._memories = candidates
+    calls = []
+
+    def execute_operation(operation, outputs, seeds, frame):
+        calls.append(deepcopy(operation))
+        return deepcopy(candidates), [], []
+
+    monkeypatch.setattr(agent, "_execute_operation", execute_operation)
+    monkeypatch.setattr(agent, "_hybrid_search", lambda *_a, **_k: deepcopy(candidates))
+    plan = {
+        "required_slots": [{
+            "id": "r1", "type": "DIRECT", "evidence_role": "REQUIREMENT",
+            "description": "Which medication was stopped?",
+        }],
+        "seed_coverage": [], "semantic_relations": [], "max_memories": 3,
+        "budget_tier": "SMALL", "query_spec": {"requires_inference": False},
+        "operations": [{
+            "op": "SEMANTIC_SEARCH", "query": "Which medication was stopped?",
+            "top_k": 3, "produces": ["r1"],
+        }],
+    }
+    execution = agent._execute_plan(plan, [], question="Which medication was stopped?")
+    assert len(calls) == 1
+    assert calls[0]["top_k"] == 3
+    assert execution["slot_support"] == {"r1": ["m1", "m2"]}
+    assert execution["retrieval_complete"]
+    run.update({
+        "plan": plan, "replan": None, "replan_called": False,
+        "trace": execution["trace"], "slot_support": execution["slot_support"],
+        "slot_coverage": execution["slot_coverage"],
+        "requirement_status": execution["requirement_status"],
+        "operation_candidates": candidates,
+        "operation_output_ids": {m["id"] for m in candidates},
+        "beliefs": execution["selected"],
+    })
+    prepared = QueryMixin.prepare_batch_query(agent, "Which medication was stopped?")
+    assert set(prepared["extra"]["final_memory_ids"]) == {"m1", "m2"}
+    assert "metformin was discontinued" in prepared["messages"][0]["content"]
+    assert not any(m.get("_supplementary_context") for m in prepared["retrieved_memories"])
+    assert not prepared["extra"]["boundary_violation"]

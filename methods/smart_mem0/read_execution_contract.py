@@ -747,22 +747,9 @@ class ReadExecutionContractMixin:
                 and self._memory_matches_slot_role(slot, memory)
             ]
             if strict:
-                # One retrieval requirement is one evidence obligation. Keep
-                # only its best candidate by default; shared-option retrieval
-                # deliberately preserves several propositions for final
-                # evaluation without turning them into semantic requirements.
-                limit = (
-                    min(
-                        6,
-                        max(
-                            2,
-                            len(getattr(self, "_last_option_probe_coverage", {}) or {}),
-                        ),
-                    )
-                    if role == "REQUIREMENT"
-                    and getattr(self, "_last_option_probe_coverage", {})
-                    else 1
-                )
+                # Generic requirements report candidate availability, not
+                # semantic proof. Keep a backup for the final answer model.
+                limit = 2 if role == "REQUIREMENT" else 1
                 return strict[:limit]
             # An atomic categorical question can name the class but not the
             # answer token (e.g. "which chronic metabolic disease"). Keep a
