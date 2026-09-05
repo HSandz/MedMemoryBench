@@ -137,13 +137,14 @@ def install_smart_mem0_batch_integration(evaluator_cls) -> None:
                     batch_request_time=batch_request_time,
                 )
 
-            # Preserve a previously staged request exactly when resuming an old
-            # manifest. For a fresh preparation, a surviving precomputed answer
-            # is already final and must not pay for an unused remote generation.
-            if saved_request is not None:
-                requests.append(saved_request)
-            elif str(prepared.get("precomputed_answer") or "").strip():
+            # A precomputed answer is terminal even when it came from a restored
+            # staged request. Re-submitting that request would add an unused
+            # second generation and can semantically damage an already-grounded
+            # controller answer. Only non-terminal restored requests are replayed.
+            if str(prepared.get("precomputed_answer") or "").strip():
                 local_precomputed.add(request_id)
+            elif saved_request is not None:
+                requests.append(saved_request)
             else:
                 requests.append(
                     BatchChatRequest(
