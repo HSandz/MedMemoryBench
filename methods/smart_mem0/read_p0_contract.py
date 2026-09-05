@@ -18,7 +18,7 @@ class ReadP0ContractMixin:
 
         ``resolved_keys`` are produced from the immutable question focus by the
         compiler. They may therefore identify the same durable concept family,
-        but arbitrary retrieval hints or seed text never authorize a match.
+        but arbitrary retrieval hints or seed text never authorize a proof.
         """
         if super()._rc_memory_matches_target(slot, memory):
             return True
@@ -69,36 +69,35 @@ class ReadP0ContractMixin:
             return supported[:1]
         return supported
 
-    def _run_query_retrieval(
-        self,
-        question: str,
-        initial_seeds: List[Dict[str, Any]],
-        frame: QueryFrame,
-        fast_supports: Optional[List[Dict[str, Any]]],
-        gate: Dict[str, Any],
-        planning_seeds: Optional[List[Dict[str, Any]]] = None,
-        planning_context: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Preserve at most one target-compatible Top-3 seed per requirement.
+    def _seed_is_context_eligible(self, slot, seed):
+        memory_id = str(seed.get("id") or "")
+        if not memory_id or not self._memory_value(seed):
+            return False
+        status = str(
+            seed.get(
+                "_status",
+                self._belief_status.get(memory_id, "active"),
+            )
+            or "active"
+        ).lower()
+        if not bool(slot.get("history")) and status == "superseded":
+            return False
+        return self._rc_owner_match(slot, seed)
 
-        The base executor computes FOUND/EMPTY before this method returns. We
-        add the seed only to the context support map after execution, so
-        ``requirement_status`` and ``retrieval_complete`` remain unchanged. A
-        preserved seed is useful answer context, not retroactive retrieval proof.
+    def _reserve_seed_context(self, run, initial_seeds):
+        """Reserve one bounded seed without changing retrieval proof state.
+
+        Strict target compatibility is preferred. For a single-requirement
+        query only, if metadata cannot express a semantic family relation (for
+        example ``antibiotic to avoid`` -> ``cefuroxime allergy``), preserve the
+        top-ranked RRF seed as *unverified context*. That fallback is deliberately
+        forbidden from changing FOUND/EMPTY and is not used for multi-requirement
+        plans where a top seed cannot be assigned safely to a particular slot.
         """
-        run = super()._run_query_retrieval(
-            question,
-            initial_seeds,
-            frame,
-            fast_supports,
-            gate,
-            planning_seeds=planning_seeds,
-            planning_context=planning_context,
-        )
         run["reserved_seed_context"] = {}
+        run["reserved_seed_context_mode"] = {}
         if run.get("fast_supports") is not None:
-            self._last_reserved_seed_context = {}
-            return run
+            return
 
         slots = []
         seen_slot_ids = set()
@@ -109,58 +108,95 @@ class ReadP0ContractMixin:
                     slots.append(slot)
                     seen_slot_ids.add(slot_id)
 
+        requirements = [
+            slot
+            for slot in slots
+            if str(slot.get("evidence_role") or "").upper() == "REQUIREMENT"
+            and str(slot.get("target_surface") or "").strip()
+        ]
         slot_support = run.setdefault("slot_support", {})
         planning_seed_list = run.setdefault("planning_seeds", [])
         planning_seed_ids = {
             str(memory.get("id") or "") for memory in planning_seed_list
         }
-        reserved = run["reserved_seed_context"]
 
-        for slot in slots:
-            if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
-                continue
-            if not str(slot.get("target_surface") or "").strip():
-                continue
+        for slot in requirements:
             slot_id = str(slot.get("id") or "")
-            allow_history = bool(slot.get("history"))
+            chosen = None
+            mode = ""
             for seed in initial_seeds[:3]:
-                memory_id = str(seed.get("id") or "")
-                if not memory_id or not self._memory_value(seed):
+                if not self._seed_is_context_eligible(slot, seed):
                     continue
-                status = str(
-                    seed.get(
-                        "_status",
-                        self._belief_status.get(memory_id, "active"),
-                    )
-                    or "active"
-                ).lower()
-                if not allow_history and status == "superseded":
-                    continue
-                if not self._slot_contract_match(slot, seed, True):
-                    continue
+                if self._slot_contract_match(slot, seed, True):
+                    chosen = seed
+                    mode = "strict_target"
+                    break
 
-                supports = slot_support.setdefault(slot_id, [])
-                if memory_id not in supports:
-                    supports.append(memory_id)
-                reserved[slot_id] = memory_id
+            if chosen is None and len(requirements) == 1:
+                chosen = next(
+                    (
+                        seed
+                        for seed in initial_seeds[:1]
+                        if self._seed_is_context_eligible(slot, seed)
+                    ),
+                    None,
+                )
+                if chosen is not None:
+                    mode = "top1_unverified"
 
-                # QueryMixin's boundary treats planning_seeds as the authorized
-                # seed set. Initial Top-3 seeds are already retrieval-authorized;
-                # make that provenance explicit when the planning subset omitted
-                # the one reserved for final answer context.
-                if memory_id not in planning_seed_ids:
-                    planning_seed_list.append(self._snapshot(seed))
-                    planning_seed_ids.add(memory_id)
-                break
+            if chosen is None:
+                continue
+            memory_id = str(chosen.get("id") or "")
+            supports = slot_support.setdefault(slot_id, [])
+            if memory_id not in supports:
+                supports.append(memory_id)
+            run["reserved_seed_context"][slot_id] = memory_id
+            run["reserved_seed_context_mode"][slot_id] = mode
 
-        self._last_reserved_seed_context = dict(reserved)
+            # QueryMixin's boundary treats planning_seeds as the authorized seed
+            # set. Initial Top-3 seeds are already retrieval-authorized; make the
+            # provenance explicit when the planning subset omitted the reserved
+            # seed. This affects final context only, never requirement_status.
+            if memory_id not in planning_seed_ids:
+                planning_seed_list.append(self._snapshot(chosen))
+                planning_seed_ids.add(memory_id)
+
+    def _run_query_retrieval(
+        self,
+        question: str,
+        initial_seeds: List[Dict[str, Any]],
+        frame: QueryFrame,
+        fast_supports: Optional[List[Dict[str, Any]]],
+        gate: Dict[str, Any],
+        planning_seeds: Optional[List[Dict[str, Any]]] = None,
+        planning_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Run the base proof first, then preserve bounded seed context."""
+        run = super()._run_query_retrieval(
+            question,
+            initial_seeds,
+            frame,
+            fast_supports,
+            gate,
+            planning_seeds=planning_seeds,
+            planning_context=planning_context,
+        )
+        self._reserve_seed_context(run, initial_seeds)
+        self._last_reserved_seed_context = dict(run.get("reserved_seed_context") or {})
+        self._last_reserved_seed_context_mode = dict(
+            run.get("reserved_seed_context_mode") or {}
+        )
         return run
 
     def prepare_batch_query(self, question, system_message=None, **kwargs):
         prepared = super().prepare_batch_query(
             question, system_message=system_message, **kwargs
         )
-        prepared.setdefault("extra", {})["reserved_seed_context"] = dict(
+        extra = prepared.setdefault("extra", {})
+        extra["reserved_seed_context"] = dict(
             getattr(self, "_last_reserved_seed_context", {}) or {}
+        )
+        extra["reserved_seed_context_mode"] = dict(
+            getattr(self, "_last_reserved_seed_context_mode", {}) or {}
         )
         return prepared
