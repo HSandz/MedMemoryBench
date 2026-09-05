@@ -89,6 +89,24 @@ answer may use a standard-domain bridge only when the requirement graph contains
 `POSSIBLE_CAUSE` or `INFER`; that bridge may connect grounded participant facts but
 cannot create participant history.
 
+Only the semantic controller requests `VERIFY_SOURCE`; selecting `document_time`
+does not automatically request raw turns. Intermediate `LOCATE` requirements remain
+available as temporal anchors for other requirements, even for entity/value answers.
+An unresolved question subject stays unconstrained; seed owners never become a hard
+subject filter. Causal endpoints use generic `REQUIREMENT` slots, with stored causal
+proof evaluated separately in relation status.
+
+Supplementary candidates must come from trace entries whose `produces` includes the
+same requirement. Their provenance records both the requirement and retrieval round,
+including recovery rounds that reuse an operation index.
+
+The baseline capture settings are `write_context_mode: none` and
+`max_new_memories: 12`. Measurement families prefer the discriminative predicate
+before a generic object, keeping fasting and postprandial readings separate.
+Write schema 9 invalidates snapshots built with the earlier measurement identity.
+Retained write fixes mean a fresh build is not a query-only ablation against old
+results; a query-only comparison must use the same frozen unit memories.
+
 Visible options are detected deterministically and use one `SHARED_OPTIONS` physical
 operation with an independent probe per option. They are propositions, not semantic
 memory requirements. Stored `CAUSES` traversal remains strict and requires relation

@@ -31,10 +31,10 @@ agent_params:
   write_window_max_tokens: 8000
   # full = bounded cross-session beliefs + within-session continuity.
   # window = continuity only; none = clean ablation without write context.
-  write_context_mode: full
+  write_context_mode: none
   write_prior_belief_limit: 8
   write_provisional_limit: 4
-  max_new_memories: 20
+  max_new_memories: 12
 
   # Compatibility switch retained by the benchmark facade. The active path
   # compiles retrieval deterministically from minimal semantic IR and never

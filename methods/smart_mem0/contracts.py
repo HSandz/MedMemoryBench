@@ -81,7 +81,7 @@ VALID_MEMORY_TIERS = {"HOT", "COLD"}
 
 # Bump this whenever capture, normalization, identity, or consolidation changes
 # can alter the durable ledger. It is included in the snapshot fingerprint.
-MEMORY_WRITE_SCHEMA_VERSION = 8
+MEMORY_WRITE_SCHEMA_VERSION = 9
 
 # These are topical labels, not versionable attributes. If a capture model emits
 # one without an object owner, treating every later symptom/emotion as a new

@@ -582,14 +582,10 @@ class ReadExecutionContractMixin:
 
     @staticmethod
     def _status_relation_key(relation: Dict[str, Any]) -> str:
-        return ":".join(
-            str(value or "")
-            for value in (
-                relation.get("type"),
-                relation.get("from"),
-                relation.get("to"),
-            )
-        )
+        parts = [relation.get("type"), relation.get("from"), relation.get("to")]
+        if relation.get("type") == "TEMPORAL_ORDER":
+            parts.append(relation.get("relation"))
+        return ":".join(str(value or "") for value in parts)
 
     @staticmethod
     def _temporal_interval(value: Any):

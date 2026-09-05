@@ -114,9 +114,9 @@ def measurement_identity(memory: dict) -> str:
         return "lab.uacr"
 
     # Generic fallback for measurements outside the small alias table. Prefer
-    # the measured object, then the predicate, and remove representation-only
+    # the discriminative predicate, then the object, and remove representation-only
     # suffixes so "blood_glucose" and "blood_glucose_level" share a family.
-    for raw in (memory.get("object_anchor"), memory.get("state_key")):
+    for raw in (memory.get("state_key"), memory.get("object_anchor")):
         normalized = re.sub(r"[^a-z0-9]+", "_", str(raw or "").lower()).strip("_")
         normalized = re.sub(
             r"_(?:level|value|result|reading|measurement|concentration)$", "", normalized

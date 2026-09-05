@@ -5,13 +5,17 @@ import re
 from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
+
 from methods.smart_mem0.contracts import QueryFrame
+from methods.smart_mem0.agent import SmartMem0Agent
 from methods.smart_mem0.canonicalization import (
     is_state_projection_eligible,
     state_identity,
 )
 from methods.smart_mem0.execution import ExecutionMixin
 from methods.smart_mem0.core import CoreMemoryMixin
+from methods.smart_mem0.query import QueryMixin
 from methods.smart_mem0.read_controller import SEMANTIC_IR_POLICY, ReadContractMixin
 from methods.smart_mem0.read_execution_contract import ReadExecutionContractMixin
 from methods.smart_mem0.read_option_contract import ReadOptionContractMixin
@@ -535,7 +539,7 @@ def test_possible_cause_derives_general_knowledge_bridge():
     assert plan["query_spec"]["world_knowledge_bridge_allowed"] is True
     assert [
         slot["evidence_role"] for slot in plan["required_slots"]
-    ] == ["FOCAL_TRIGGER", "OUTCOME"]
+    ] == ["REQUIREMENT", "REQUIREMENT"]
 
 
 def test_current_relation_compiles_state_resolution():
@@ -571,8 +575,8 @@ def test_temporal_axis_is_preserved_without_fallback():
     assert operation["op"] == "TEMPORAL_FILTER"
     assert operation["axis"] == "document_time"
     assert operation["fallback_axis"] == ""
-    assert plan["need_evidence"] is True
-    assert plan["operations"][-1]["op"] == "VERIFY_EVIDENCE"
+    assert plan["need_evidence"] is False
+    assert all(op["op"] != "VERIFY_EVIDENCE" for op in plan["operations"])
 
 
 def test_visible_options_compile_one_shared_physical_operation():
@@ -874,3 +878,176 @@ def test_two_stage_usage_has_hard_two_call_budget():
     harness.prepared["extra"]["slot_validation"] = [{"called": True}]
     prepared = harness.prepare_batch_query("q")
     assert prepared["extra"]["method_llm_calls"]["two_stage_budget_violation"] is True
+
+
+@pytest.mark.parametrize("relation_type", ["CAUSES", "POSSIBLE_CAUSE"])
+def test_causal_endpoints_accept_structural_paraphrase_support(relation_type):
+    memory = _memory(value="high-carb takeout at 1-2 a.m.")
+    harness = _MinimalHarness([memory])
+    ir = _ir(
+        [
+            {"id": "r1", "focus_span": "those occasional late-night delivery orders"},
+            {"id": "r2", "focus_span": "morning symptoms"},
+        ],
+        relations=[{"type": relation_type, "from": "r1", "to": "r2"}],
+    )
+    plan = harness._controller_plan(ir, "Could those orders explain symptoms?", QueryFrame())
+    assert all(slot["evidence_role"] == "REQUIREMENT" for slot in plan["required_slots"])
+    assert harness._slot_covered(plan["required_slots"][0], ["m1"], [memory], [])
+    statuses = harness._relation_status_map(plan, {"r1": ["m1"], "r2": ["m1"]}, [memory], [])
+    assert statuses == ({"CAUSES:r1:r2": "UNPROVEN"} if relation_type == "CAUSES" else {})
+
+
+@pytest.mark.parametrize("verify_source", [False, True])
+def test_document_time_does_not_imply_source_verification(verify_source):
+    harness = _MinimalHarness()
+    ir = harness._rc_normalize_ir(
+        {
+            "answer_type": "DATE",
+            "requirements": [{
+                "id": "r1", "focus_span": "HbA1c mentioned",
+                "time_constraint": {"axis": "document_time", "relation": "LATEST"},
+            }],
+            "relations": [{"type": "VERIFY_SOURCE", "from": "r1"}] if verify_source else [],
+        },
+        "When was HbA1c mentioned most recently?",
+        QueryFrame(),
+    )
+    assert any(r["type"] == "VERIFY_SOURCE" for r in ir["relations"]) == verify_source
+    before = deepcopy(ir)
+    plan = harness._controller_plan(ir, "When was HbA1c mentioned most recently?", QueryFrame())
+    assert ir == before
+    assert plan["need_evidence"] == verify_source
+    assert any(op["op"] == "VERIFY_EVIDENCE" for op in plan["operations"]) == verify_source
+
+
+@pytest.mark.parametrize("edge", [
+    {"type": "TEMPORAL_ORDER", "from": "r2", "to": "r1", "relation": "OVERLAPS"},
+    {"type": "DEPENDS_ON", "from": "r2", "to": "r1"},
+])
+def test_locate_survives_as_intermediate_anchor_for_entity_answer(edge):
+    harness = _MinimalHarness()
+    question = "Which medication was I taking when the rash first appeared?"
+    ir = harness._rc_normalize_ir(
+        {
+            "answer_type": "ENTITY",
+            "requirements": [
+                {"id": "r1", "focus_span": "rash first appeared", "time_constraint": {
+                    "axis": "event_time", "relation": "LOCATE",
+                }},
+                {"id": "r2", "focus_span": "Which medication"},
+            ],
+            "relations": [edge],
+        }, question, QueryFrame(),
+    )
+    assert ir["requirements"][0]["time_constraint"]["relation"] == "LOCATE"
+    plan = harness._controller_plan(ir, question, QueryFrame())
+    anchor = plan["required_slots"][0]
+    assert anchor["type"] == "TEMPORAL"
+    assert not harness._slot_covered(anchor, ["m1"], [_memory(event_time="UNKNOWN")], [])
+
+
+def test_temporal_order_status_keeps_distinct_predicates():
+    first = _memory("m1", event_time="2024-01-01")
+    second = _memory("m2", event_time="2024-02-01")
+    harness = _MinimalHarness([first, second])
+    plan = {"semantic_relations": [
+        {"type": "TEMPORAL_ORDER", "from": "r1", "to": "r2", "relation": order}
+        for order in ("BEFORE", "AFTER", "OVERLAPS")
+    ]}
+    assert harness._relation_status_map(
+        plan, {"r1": ["m1"], "r2": ["m2"]}, [first, second], [],
+    ) == {
+        "TEMPORAL_ORDER:r1:r2:BEFORE": "PROVEN",
+        "TEMPORAL_ORDER:r1:r2:AFTER": "UNPROVEN",
+        "TEMPORAL_ORDER:r1:r2:OVERLAPS": "UNPROVEN",
+    }
+
+
+@pytest.mark.parametrize("subject_span", ["my mother", ""])
+def test_unresolved_subject_is_not_inferred_from_seed_owners(subject_span):
+    harness = _MinimalHarness([_memory(subject_id="primary_user")])
+    ir = harness._rc_normalize_ir(
+        {"subject_span": subject_span, "requirements": [{"id": "r1", "focus_span": "medication"}]},
+        "What medication does my mother take?", QueryFrame(),
+    )
+    assert ir["_resolved_subject_id"] == ""
+    plan = harness._controller_plan(ir, "What medication does my mother take?", QueryFrame())
+    assert plan["required_slots"][0]["subject_id"] == ""
+
+
+def test_question_resolved_subject_remains_a_hard_owner():
+    harness = _MinimalHarness([_memory(subject_id="primary_user"), _memory("m2", subject_id="mother")])
+    harness.subject_aliases = {"my mother": "mother"}
+    ir = harness._rc_normalize_ir(
+        {"subject_span": "my mother", "requirements": [{"id": "r1", "focus_span": "medication"}]},
+        "What medication does my mother take?", QueryFrame(),
+    )
+    assert ir["_resolved_subject_id"] == "mother"
+
+
+def test_measurement_predicate_preserves_fasting_and_postprandial_families():
+    base = _memory(semantic_role="MEASUREMENT", scope="measurement", object_anchor="blood_glucose")
+    fasting = dict(base, state_key="fasting_blood_glucose_level")
+    postprandial = dict(base, state_key="postprandial_blood_glucose_level")
+    assert state_identity(fasting) != state_identity(postprandial)
+    assert state_identity(fasting) == state_identity(dict(fasting, state_key="fasting_blood_glucose_result"))
+    assert state_identity(dict(base, state_key="")) == state_identity(dict(base, state_key="measurement"))
+
+
+def test_supplementary_packing_preserves_slot_provenance_across_recovery(monkeypatch):
+    agent = object.__new__(SmartMem0Agent)
+    first = _memory("m1", "initial observation")
+    second = _memory("m2", "treatment decision")
+    unrelated = _memory("m3", "decision alternative")
+    recovered = _memory("m4", "independent observation")
+    candidates = [unrelated, recovered, first, second]
+    agent._memories = candidates
+    agent._evidence = []
+    agent._relations = []
+    agent._belief_status = {}
+    agent._tokenizer = SimpleNamespace(encode=list, decode="".join)
+    agent.max_context_tokens = 32000
+    agent.max_question_tokens = 1200
+    agent.enable_two_stage_controller = True
+    monkeypatch.setattr(agent, "_constraint_first_search", lambda *_a, **_k: [])
+    monkeypatch.setattr(agent, "_select_initial_seeds", lambda rows: rows)
+    monkeypatch.setattr(agent, "_planning_seed_set", lambda _q, rows: rows)
+    monkeypatch.setattr(agent, "_effective_runtime_config", lambda: {})
+    slots = [
+        {"id": sid, "description": sid, "type": "DIRECT", "evidence_role": "REQUIREMENT"}
+        for sid in ("r1", "r2")
+    ]
+    plan = {
+        "required_slots": slots, "operations": [], "max_memories": 4,
+        "budget_tier": "MEDIUM", "query_spec": {"requires_inference": True},
+    }
+    run = {
+        "query_tokens": {}, "plan": plan, "replan": {**plan, "required_slots": [slots[0]]},
+        "planner_called": True, "replan_called": True, "slot_validation": [],
+        "trace": [
+            {"retrieval_round": 1, "operation_index": 0, "operation": "SEMANTIC_SEARCH",
+             "produces": ["r2"], "output_ids": ["m2", "m3"]},
+            {"retrieval_round": 2, "operation_index": 0, "operation": "SEMANTIC_SEARCH",
+             "produces": ["r1"], "output_ids": ["m1", "m4"]},
+        ],
+        "operation_output_ids": {m["id"] for m in candidates},
+        "operation_candidates": candidates, "evidence_refs": [],
+        "slot_support": {"r1": ["m1"], "r2": ["m2"]},
+        "slot_coverage": {"r1": True, "r2": True},
+        "requirement_status": {"r1": "FOUND", "r2": "FOUND"},
+        "relation_status": {}, "retrieval_complete": True,
+        "relations": [], "beliefs": [first, second],
+    }
+    monkeypatch.setattr(agent, "_run_query_retrieval", lambda *_a, **_k: deepcopy(run))
+
+    prepared = QueryMixin.prepare_batch_query(agent, "Explain the decision using the observations.")
+
+    assert set(prepared["extra"]["final_memory_ids"]) == {"m1", "m2", "m3", "m4"}
+    provenance = {item["memory_id"]: item for item in prepared["extra"]["retrieval_provenance"]}
+    assert provenance["m3"]["slot_ids"] == ["r2"]
+    assert provenance["m4"]["slot_ids"] == ["r1"]
+    assert provenance["m3"]["retrieval_round"] == 1
+    assert provenance["m4"]["retrieval_round"] == 2
+    assert not prepared["extra"]["boundary_violation"]
+    assert not prepared["extra"]["arbitration_expansion_violation"]

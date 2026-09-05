@@ -27,6 +27,7 @@ Return only answer_type, requirement nodes, relations between those nodes, and a
 
 For every requirement:
 - focus_span is the shortest useful contiguous span copied from QUESTION. It is the immutable question-owned anchor.
+- For a comparison, include each side's local temporal selector in its focus_span when present in QUESTION.
 - retrieval_hint is a soft semantic description informed by QUESTION and, when useful, SEEDS. It may broaden the evidence neighborhood but is never a fact, hard filter, answer, or durable key.
 - time_constraint is optional. document_time is when something was documented or mentioned; event_time is when it happened; origin_document_time is the original source date; effective_event_time is the explicitly combined event/source chronology. LOCATE means the requested time is unknown. EXACT/BEFORE/AFTER/BETWEEN constrain a known time. EARLIEST/LATEST request an extremum.
 
@@ -38,7 +39,7 @@ Relations are generic requirement-graph edges:
 - TEMPORAL_ORDER orders two requirement nodes by event time. Its relation is BEFORE, AFTER, or OVERLAPS; temporal order never implies causality.
 - INFER authorizes a general-domain bridge after all referenced participant requirements are grounded.
 - CURRENT marks one requirement as the current state.
-- VERIFY_SOURCE asks for exact linked source evidence.
+- VERIFY_SOURCE asks for exact linked source evidence when wording, source attribution, or what was said in a particular source matters. A document_time filter or a question asking only for a documentation date does not by itself require raw evidence.
 
 Use to="ANSWER" for an INFER edge whose result is the answer rather than another requirement. Temporal order alone is not CAUSES.
 Use CAUSES only when the requested relation is explicitly stated in participant evidence. For "likely explains", clinical deduction, or mechanism questions where the endpoints may be observed but the connecting rule is not stored, use POSSIBLE_CAUSE or INFER instead; do not demand a nonexistent stored CAUSES edge.
@@ -390,28 +391,32 @@ class ReadContractMixin:
             if relation not in relations:
                 relations.append(relation)
 
-        # LOCATE is meaningful only when time itself is the requested answer.
-        # Relative/current wording can guide retrieval, but it must not turn an
-        # ordinary value requirement into a temporal-answer contract.
+        # Keep intermediate temporal obligations referenced by the requirement
+        # graph, even when the final answer is an entity or value.
+        temporal_dependencies = {
+            endpoint
+            for relation in relations
+            if relation.get("type") == "TEMPORAL_ORDER"
+            for endpoint in (relation.get("from"), relation.get("to"))
+        }
+        temporal_dependencies.update(
+            relation.get("to")
+            for relation in relations
+            if relation.get("type") == "DEPENDS_ON"
+        )
         if answer_type not in {"DATE", "RELATIVE_TIME"}:
             for requirement in requirements:
                 constraint = requirement.get("time_constraint") or {}
-                if constraint.get("relation") == "LOCATE":
+                if (
+                    constraint.get("relation") == "LOCATE"
+                    and requirement["id"] not in temporal_dependencies
+                ):
                     requirement["time_constraint"] = {
                         "axis": "",
                         "relation": "",
                         "anchor": "",
                         "end": "",
                     }
-
-        # A document-time obligation necessarily needs the linked source turn.
-        for requirement in requirements:
-            constraint = requirement.get("time_constraint") or {}
-            if constraint.get("axis") != "document_time":
-                continue
-            marker = {"type": "VERIFY_SOURCE", "from": requirement["id"], "to": ""}
-            if marker not in relations:
-                relations.append(marker)
 
         candidate = parsed.get("candidate")
         if not isinstance(candidate, dict):
@@ -484,15 +489,7 @@ class ReadContractMixin:
                 ]
                 relations = []
 
-        owners = {
-            self._rc_owner(memory.get("subject_id") or memory.get("subject") or "")
-            for memory in getattr(self, "_active_controller_seeds", [])[:3]
-            if memory.get("subject_id") or memory.get("subject")
-        }
-        owners.discard("")
         subject_id = self._rc_known_subject(subject_span)
-        if not subject_id and len(owners) == 1:
-            subject_id = next(iter(owners))
 
         return {
             "answer_type": answer_type,

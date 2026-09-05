@@ -287,6 +287,18 @@ class QueryMixin:
             for candidate_plan in (plan, replan or {})
             for slot in candidate_plan.get("required_slots", [])
         ]
+        slot_candidate_ids: Dict[str, List[str]] = {}
+        for item in trace:
+            # A recovery round may reuse operation_index; the trace entry's
+            # own produces/output_ids pair is the authoritative association.
+            for slot_id in item.get("produces") or []:
+                ids = slot_candidate_ids.setdefault(slot_id, [])
+                ids.extend(
+                    memory_id
+                    for memory_id in item.get("output_ids") or []
+                    if memory_id in operation_output_ids and memory_id not in ids
+                )
+        context_assignments: Dict[str, List[str]] = {}
 
         # Final support set contains only gate-authorized seeds or typed slot supports.
         if fast_supports is not None:
@@ -344,8 +356,6 @@ class QueryMixin:
             rich_roles = {
                 "REQUIREMENT",
                 "COMPARAND",
-                "FOCAL_TRIGGER",
-                "OUTCOME",
             }
             candidate_by_id_for_supplement = {
                 memory["id"]: memory for memory in operation_candidates
@@ -354,8 +364,11 @@ class QueryMixin:
                 role = str(slot.get("evidence_role") or "ANSWER").upper()
                 if role not in rich_roles:
                     continue
-                added_for_role = 0
-                for memory_id, memory in candidate_by_id_for_supplement.items():
+                slot_id = str(slot.get("id") or "")
+                for memory_id in slot_candidate_ids.get(slot_id, []):
+                    memory = candidate_by_id_for_supplement.get(memory_id)
+                    if not memory:
+                        continue
                     if memory_id in support_ids:
                         continue
                     if not self._memory_matches_slot_role(slot, memory):
@@ -366,13 +379,14 @@ class QueryMixin:
                     if status == "superseded" and not slot.get("history"):
                         continue
                     supplementary_ids.add(memory_id)
-                    added_for_role += 1
-                    if added_for_role >= 1:
-                        break
+                    assignments = context_assignments.setdefault(memory_id, [])
+                    if slot_id not in assignments:
+                        assignments.append(slot_id)
+                    break
 
         if supplementary_ids:
             remaining = max(0, context_memory_limit - len(support_ids))
-            for memory_id in list(supplementary_ids):
+            for memory_id in context_assignments:
                 if remaining <= 0:
                     supplementary_ids.discard(memory_id)
                     continue
@@ -431,12 +445,13 @@ class QueryMixin:
                         break
                     if (
                         memory["id"] not in support_ids
-                        and memory["id"] in operation_output_ids
+                        and memory["id"] in slot_candidate_ids.get(slot["id"], [])
                         and eligible_best_effort(memory)
                         and self._memory_matches_slot_role(slot, memory)
                     ):
                         support_ids.add(memory["id"])
                         unverified_context_ids.add(memory["id"])
+                        context_assignments.setdefault(memory["id"], []).append(slot["id"])
                         added += 1
                         break
                 if added >= 2:
@@ -630,8 +645,16 @@ class QueryMixin:
                 for slot_id, memory_ids in slot_support.items()
                 if memory["id"] in memory_ids
             ]
+            slot_ids = list(dict.fromkeys(
+                [*slot_ids, *context_assignments.get(memory["id"], [])]
+            ))
             introducing_trace = next(
-                (item for item in trace if memory["id"] in item["output_ids"]), None
+                (
+                    item for item in trace
+                    if memory["id"] in item["output_ids"]
+                    and (not slot_ids or set(slot_ids).intersection(item.get("produces") or []))
+                ),
+                None,
             )
             provenance.append(
                 {
@@ -641,6 +664,10 @@ class QueryMixin:
                         introducing_trace.get("operation_index")
                         if introducing_trace
                         else None
+                    ),
+                    "retrieval_round": (
+                        introducing_trace.get("retrieval_round")
+                        if introducing_trace else None
                     ),
                     "slot_ids": slot_ids,
                     "reason": (
