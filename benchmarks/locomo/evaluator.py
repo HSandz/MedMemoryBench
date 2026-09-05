@@ -260,7 +260,7 @@ class LoCoMoEvaluator:
                 raise ValueError(f"Cannot resume LoCoMo memory manifest: {exc}") from exc
             if (
                 manifest.get("format") != "locomo.event_state_memory_manifest"
-                or manifest.get("version") != 1
+                or manifest.get("version") not in {1, 2}
                 or not is_manifest_build_compatible(
                     manifest, compute_build_config_hash(self.method_config, self.dataset_config), manifest_path
                 )
@@ -1355,14 +1355,25 @@ class LoCoMoEvaluator:
             "answer_visible_turn_ids"
         )
         visible_turn_ids = []
+        visible_routes: Dict[str, set[str]] = {}
+
+        def add_visible(turn_id: Optional[str], route: str) -> None:
+            if not turn_id:
+                return
+            visible_turn_ids.append(turn_id)
+            visible_routes.setdefault(turn_id, set()).add(route)
+
         for record in retrieved_memories or []:
             if not isinstance(record, dict):
                 continue
             source_session = record.get("source_session_id")
+            route = (
+                "direct_immutable_turn" if record.get("type") == "immutable_turn"
+                else "episode_excerpt"
+            )
             for turn_id in record.get("episode_evidence_turn_ids", []) if record.get("included_in_context") else []:
                 normalized = self._locomo_turn_id(source_session, turn_id)
-                if normalized:
-                    visible_turn_ids.append(normalized)
+                add_visible(normalized, route)
             for item in record.get("included_provenance_evidence", []):
                 evidence = item.get("evidence", item) if isinstance(item, dict) else {}
                 if not isinstance(evidence, dict):
@@ -1370,8 +1381,11 @@ class LoCoMoEvaluator:
                 source_session = evidence.get("source_session_id")
                 for turn_id in evidence.get("source_turn_ids", []):
                     normalized = self._locomo_turn_id(source_session, turn_id)
-                    if normalized:
-                        visible_turn_ids.append(normalized)
+                    add_visible(normalized, "claim_provenance")
+        route_counts = {
+            route: sum(route in visible_routes.get(turn_id, set()) for turn_id in gold_turn_ids)
+            for route in ("claim_provenance", "episode_excerpt", "direct_immutable_turn")
+        }
         return {
             "gold_evidence_turn_ids": gold_turn_ids,
             "gold_evidence_session_ids": list(dict.fromkeys(gold_session_ids)),
@@ -1386,6 +1400,15 @@ class LoCoMoEvaluator:
             "selected_memory_session": session_quality,
             "selected_episode_archive_exact_turn": archive_quality,
             "answer_visible_exact_turn": self._turn_quality(gold_turn_ids, visible_turn_ids),
+            # Routes are additive: one visible gold turn can have more than
+            # one rendering route, while answer_visible_exact_turn is their union.
+            "answer_visible_gold_turn_routes": {
+                turn_id: sorted(visible_routes[turn_id])
+                for turn_id in gold_turn_ids if turn_id in visible_routes
+            },
+            "answer_visible_gold_turn_via_claim_count": route_counts["claim_provenance"],
+            "answer_visible_gold_turn_via_episode_excerpt_count": route_counts["episode_excerpt"],
+            "answer_visible_gold_turn_via_direct_turn_count": route_counts["direct_immutable_turn"],
         }
 
     def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
@@ -1588,6 +1611,18 @@ class LoCoMoEvaluator:
                     query_type: summarize(items) for query_type, items in sorted(groups.items())
                 },
             }
+        route_fields = (
+            "answer_visible_gold_turn_via_claim_count",
+            "answer_visible_gold_turn_via_episode_excerpt_count",
+            "answer_visible_gold_turn_via_direct_turn_count",
+        )
+        for field in route_fields:
+            values = [
+                int(quality.get(field, 0))
+                for result in results
+                if isinstance((quality := result.details.get("locomo_retrieval_quality")), dict)
+            ]
+            aggregated[field] = sum(values)
         return aggregated
 
     def _apply_locomo_summary(self, summary: Dict[str, Any]) -> None:

@@ -277,6 +277,7 @@ class Evaluator:
 
         from benchmarks.medmemorybench.checkpoint import (
             compute_config_hash,
+            is_supported_memory_manifest,
             is_manifest_query_compatible,
             is_manifest_build_compatible,
         )
@@ -296,12 +297,7 @@ class Evaluator:
             )
 
         compatible = (
-            isinstance(manifest, dict)
-            and manifest.get("format") in {
-                "medmemorybench.memory_manifest",
-                "locomo.event_state_memory_manifest",
-            }
-            and manifest.get("version") == 1
+            is_supported_memory_manifest(manifest)
             and manifest.get("status") in ({"complete", "building"} if self.append else {"complete"})
             and manifest.get("method_name") == self.method_config.method_name
             and config_compatible

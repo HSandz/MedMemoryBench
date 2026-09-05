@@ -274,7 +274,14 @@ changes state compilation. `turn_top_k` defaults to `8` and
 `turn_retrieval_weight` to `1.0`. Optional deterministic lexical turn ranking
 is available through `turn_lexical_retrieval_enabled`, which defaults to
 `false`. Claim-derived and direct turn evidence are deduplicated by immutable
-episode/turn provenance before rendering.
+episode/turn provenance before rendering. `evidence_count` is the maximum
+number of unique selected retrieval evidence objects after this
+provenance-aware deduplication. When a selected direct immutable turn duplicates
+a selected claim's rendered provenance turn, ESHM continues through the existing
+deterministic MMR order until that effective budget is filled or candidates are
+exhausted. Episode objects retain their independent `("episode", episode_id)`
+identity and are never collapsed merely because one of their archived turns is
+also selected.
 
 `max_episode_source_excerpts_total` is an explicit query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of
@@ -359,14 +366,22 @@ Query diagnostics keep dense, fusion, PPR, final, and selection scores
 separate, and report `selected_ids` independently from `included_ids`. State
 claims expose `all_provenance_evidence` for complete lineage and
 `included_provenance_evidence` for evidence that survived context budgeting.
-They also report pre/post-candidate counts, selected claim/episode/turn counts,
-raw-source excerpt budget and counts, source-turn contribution counts, and
-selected/included context tokens. LoCoMo adds evaluator-private stage reports
-after query completion for fused candidates, the candidate-count pool, final
-memory-object selection, selected episode archive availability, and
-answer-visible exact turns; those gold annotations never enter Event-State.
-Retrieval-record schema version 2 adds immutable-turn records and these stage
-diagnostics. Schema-4 snapshots remain loadable: their archived turns are
+They also report pre/post-candidate counts, `selected_candidate_count`, selected
+claim/episode/turn counts, direct-turn deduplication and backfill counts,
+effective record and turn counts, raw-source excerpt budget and counts,
+answer-visible distinct source-turn count, and selected/included context tokens.
+`retrieved_count` remains the effective returned-record count. LoCoMo adds
+evaluator-private stage reports after query completion for fused candidates, the
+candidate-count pool, final memory-object selection, selected episode archive
+availability, and answer-visible exact turns; those gold annotations never enter
+Event-State. `selected_episode_archive_exact_turn` means a gold turn exists in
+an archive belonging to a selected episode object; direct immutable-turn
+retrieval can make a turn answer-visible without this diagnostic being true.
+Answer-visible gold turns also carry additive route diagnostics for
+`claim_provenance`, `episode_excerpt`, and `direct_immutable_turn`; their union
+is the existing answer-visible exact-turn metric. Retrieval-record schema version
+3 adds effective-selection telemetry and delivery routes. Snapshot schema 5 is
+unchanged; schema-4 snapshots remain loadable, and their archived turns are
 embedded once during restore to reconstruct the derived turn index.
 When enabled, claim source expansion scores every immutable turn cited by every
 claim EvidenceRef with the query embedding, ranks each reference by its best

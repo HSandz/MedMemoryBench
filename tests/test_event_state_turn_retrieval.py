@@ -6,12 +6,16 @@ from types import SimpleNamespace
 from benchmarks.locomo.dataset import LoCoMoQuery
 from benchmarks.locomo.evaluator import LoCoMoEvaluator
 from methods.event_state.schemas import (
+    Claim,
     EPISODE_RETRIEVAL_MAX_CHARS,
+    EvidenceRef,
     Episode,
     TurnEvidence,
     select_episode_retrieval_turns,
 )
+from methods.event_state.store import EventStateStore
 from methods.event_state.temporal import parse_temporal_query
+from methods.event_state.retrieval import EventStateRetriever
 from methods.event_state_agent import EventStateAgent
 from src.config import ConfigLoader
 
@@ -39,6 +43,33 @@ class ClaimedNeedleLLM:
                 '"predicate":"detail","value":"needle","source_turn_ids":["t"]}]}'
             ))
         return SimpleNamespace(content='{"operation":"NEW","confidence":1}')
+
+
+def _selection_fixture(turn_ids=("x", "y", "z", "w")):
+    agent = EventStateAgent(
+        llm_client=EmptyExtractionLLM(), memory_llm_client=EmptyExtractionLLM(),
+        embedding_client=KeywordEmbedder(), evidence_count=3,
+        max_source_excerpts_per_claim=2,
+    )
+    store = EventStateStore("ctx")
+    keys = {}
+    for index, turn_id in enumerate(turn_ids):
+        episode = Episode(
+            f"E{turn_id}", "ctx", f"session-{turn_id}", index, None, None,
+            ["A"], "primary_user", "", f"episode-{turn_id}",
+            [TurnEvidence(turn_id, "A", "user", f"needle {turn_id}")],
+        )
+        store.add_episode(episode, [1.0, 0.0], [[1.0, 0.0]])
+        keys[turn_id] = store.turn_key(episode.episode_id, 0)
+    return agent, store, keys
+
+
+def _claim_for_turns(turn_ids):
+    evidence = [
+        EvidenceRef(f"E{turn_id}", f"session-{turn_id}", [turn_id])
+        for turn_id in turn_ids
+    ]
+    return Claim("C", "A", "speaker:a", "detail", "needle", evidence=evidence)
 
 
 def test_episode_retrieval_sampling_spans_source_order_and_keeps_captions():
@@ -146,6 +177,111 @@ def test_claim_provenance_and_direct_turn_retrieval_render_one_copy():
     assert claim["included_provenance_evidence"][0]["evidence"]["source_turn_ids"] == ["t"]
 
 
+def test_effective_selection_backfills_direct_turn_deduplicated_by_claim_provenance():
+    agent, store, keys = _selection_fixture()
+    store.add_claim(_claim_for_turns(["x"]), [1.0, 0.0])
+    selection_order = [
+        {"id": "C", "type": "state_claim"},
+        {"id": keys["x"], "type": "turn"},
+        {"id": keys["y"], "type": "turn"},
+    ]
+    agent._retrieval_config["evidence_count"] = 2
+
+    selected, telemetry = agent._effective_evidence_selection(
+        store, selection_order, [[1.0, 0.0]],
+    )
+
+    assert [item["id"] for item in selected] == ["C", keys["y"]]
+    assert telemetry["effective_retrieved_record_count"] == 2
+    assert telemetry["deduplicated_selected_turn_count"] == 1
+    assert telemetry["backfilled_after_turn_dedup_count"] == 1
+    assert telemetry["selected_turn_ids_before_dedup"] == [keys["x"], keys["y"]]
+    assert telemetry["selected_turn_ids_after_dedup"] == [keys["y"]]
+
+
+def test_effective_selection_backfills_multiple_claim_provenance_duplicates_deterministically():
+    agent, store, keys = _selection_fixture()
+    store.add_claim(_claim_for_turns(["x", "y"]), [1.0, 0.0])
+    selection_order = [
+        {"id": "C", "type": "state_claim"},
+        {"id": keys["x"], "type": "turn"},
+        {"id": keys["y"], "type": "turn"},
+        {"id": keys["z"], "type": "turn"},
+        {"id": keys["w"], "type": "turn"},
+    ]
+
+    first, telemetry = agent._effective_evidence_selection(store, selection_order, [[1.0, 0.0]])
+    second, _ = agent._effective_evidence_selection(store, selection_order, [[1.0, 0.0]])
+
+    assert [item["id"] for item in first] == ["C", keys["z"], keys["w"]]
+    assert [item["id"] for item in first] == [item["id"] for item in second]
+    assert telemetry["effective_retrieved_record_count"] == 3
+    assert telemetry["deduplicated_turn_count"] == 2
+    assert telemetry["backfilled_candidate_count"] == 2
+
+
+def test_evidence_count_is_filled_after_provenance_deduplication_when_candidates_exist():
+    turn_ids = tuple(f"t{index}" for index in range(10))
+    agent, store, keys = _selection_fixture(turn_ids)
+    store.add_claim(_claim_for_turns(["t0"]), [1.0, 0.0])
+    selection_order = [{"id": "C", "type": "state_claim"}] + [
+        {"id": keys[turn_id], "type": "turn"} for turn_id in turn_ids
+    ]
+    agent._retrieval_config["evidence_count"] = 8
+
+    selected, telemetry = agent._effective_evidence_selection(store, selection_order, [[1.0, 0.0]])
+
+    assert len(selected) == 8
+    assert telemetry["effective_retrieved_record_count"] == 8
+    assert keys["t0"] not in [item["id"] for item in selected]
+    assert telemetry["backfilled_candidate_count"] == 1
+
+
+def test_episode_object_is_not_collapsed_when_its_turn_duplicates_claim_provenance():
+    agent, store, keys = _selection_fixture()
+    store.add_claim(_claim_for_turns(["x"]), [1.0, 0.0])
+    selection_order = [
+        {"id": "C", "type": "state_claim"},
+        {"id": "Ex", "type": "episode"},
+        {"id": keys["x"], "type": "turn"},
+        {"id": keys["y"], "type": "turn"},
+    ]
+
+    selected, telemetry = agent._effective_evidence_selection(store, selection_order, [[1.0, 0.0]])
+
+    assert [item["id"] for item in selected] == ["C", "Ex", keys["y"]]
+    assert telemetry["deduplicated_selected_turn_count"] == 1
+
+
+def test_all_selector_modes_and_turn_source_identity_handle_turn_candidates():
+    _agent, store, keys = _selection_fixture()
+    store.add_claim(_claim_for_turns(["x"]), [1.0, 0.0])
+    candidates = [
+        {"id": "C", "type": "state_claim", "final_score": 1.0, "score": 1.0},
+        {"id": "Ex", "type": "episode", "final_score": 0.8, "score": 0.8},
+        {"id": keys["y"], "type": "turn", "final_score": 0.6, "score": 0.6},
+    ]
+    for selector_mode in ("topk", "mmr", "state_mmr"):
+        retriever = EventStateRetriever(
+            store, KeywordEmbedder(), selector_mode=selector_mode, evidence_count=3,
+        )
+        selected, _ = retriever.select_candidates(candidates)
+        assert {item["id"] for item in selected} == {"C", "Ex", keys["y"]}
+        assert retriever._source_ids(next(item for item in selected if item["type"] == "turn")) == {"session-y"}
+
+
+def test_turn_rrf_channels_apply_their_independent_weights_once():
+    _agent, store, keys = _selection_fixture()
+    retriever = EventStateRetriever(
+        store, KeywordEmbedder(), rrf_k=60.0,
+        turn_retrieval_weight=2.0, turn_lexical_retrieval_weight=3.0,
+    )
+    fused = retriever._rrf([], [], [(keys["x"], 0.9)], [(keys["x"], 0.8)])
+
+    assert len(fused) == 1
+    assert abs(fused[0]["score"] - 5.0 / 61.0) < 1e-12
+
+
 def test_locomo_stage_telemetry_remains_evaluator_only():
     evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
     query = LoCoMoQuery(
@@ -178,3 +314,5 @@ def test_locomo_stage_telemetry_remains_evaluator_only():
     assert quality["selected_memory_session"]["hit"] is True
     assert quality["selected_episode_archive_exact_turn"]["hit"] is True
     assert quality["answer_visible_exact_turn"]["hit"] is True
+    assert quality["answer_visible_gold_turn_via_direct_turn_count"] == 1
+    assert quality["answer_visible_gold_turn_via_episode_excerpt_count"] == 0

@@ -17,7 +17,7 @@ from methods.base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import BaseLLMClient, LLMAPIError, create_llm_client, format_messages, get_usage_tracker
 
 from .event_state.compiler import StateCompiler, parse_json
-from .event_state.context import episode_turn_embedding_text, fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
+from .event_state.context import evidence_identity, episode_turn_embedding_text, fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
 from .event_state.embeddings import DenseEmbedder
 from .event_state.prompts import (
     ANSWER_SYSTEM_PROMPT,
@@ -886,6 +886,90 @@ class EventStateAgent(BaseAgent):
             "selected_rank": item.get("selected_rank"),
         }
 
+    def _effective_evidence_selection(
+        self,
+        store: EventStateStore,
+        selection_order: List[Dict[str, Any]],
+        query_vectors: List[List[float]],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Fill the evidence budget after removing redundant direct turns.
+
+        MMR has already produced ``selection_order``. This pass only applies
+        immutable provenance identity and never changes retrieval scores.
+        """
+        target = int(self._retrieval_config["evidence_count"])
+        selected: List[Dict[str, Any]] = []
+        selected_claim_evidence: Dict[str, Any] = {}
+        claimed_turns = set()
+        considered_turn_ids: List[str] = []
+        deduplicated_turn_ids: List[str] = []
+        considered_count = 0
+
+        def remove_redundant_turns() -> None:
+            nonlocal selected
+            retained = []
+            for candidate in selected:
+                if candidate["type"] != "turn":
+                    retained.append(candidate)
+                    continue
+                episode, turn = store.turn_for_key(candidate["id"])
+                if episode is None or turn is None:
+                    continue
+                identity = evidence_identity("turn", episode.episode_id, turn.turn_id)
+                if identity in claimed_turns:
+                    deduplicated_turn_ids.append(candidate["id"])
+                    continue
+                retained.append(candidate)
+            selected = retained
+
+        for candidate in selection_order:
+            if len(selected) >= target:
+                break
+            considered_count += 1
+            if candidate["type"] == "turn":
+                considered_turn_ids.append(candidate["id"])
+                episode, turn = store.turn_for_key(candidate["id"])
+                if episode is None or turn is None:
+                    continue
+                if evidence_identity("turn", episode.episode_id, turn.turn_id) in claimed_turns:
+                    deduplicated_turn_ids.append(candidate["id"])
+                    continue
+            selected.append(candidate)
+            if candidate["type"] != "state_claim" or not self.inject_source_evidence:
+                continue
+            claim = store.claims[candidate["id"]]
+            selections = select_claim_evidence(
+                claim,
+                store.episodes,
+                query_vectors[0],
+                self._embedder,
+                self.max_source_excerpts_per_claim,
+                query_vectors=query_vectors,
+            )
+            selected_claim_evidence[claim.claim_id] = selections
+            claimed_turns.update(
+                evidence_identity("turn", episode_id, turn_id)
+                for episode_id, turn_id in selected_claim_evidence_turn_keys(selections)
+            )
+            remove_redundant_turns()
+
+        for rank, candidate in enumerate(selected, 1):
+            candidate["selected_rank"] = rank
+        selected_turn_ids = [item["id"] for item in selected if item["type"] == "turn"]
+        backfilled = max(0, considered_count - target)
+        return selected, {
+            "selected_candidate_count": considered_count,
+            "deduplicated_turn_count": len(deduplicated_turn_ids),
+            "deduplicated_selected_turn_count": len(deduplicated_turn_ids),
+            "backfilled_candidate_count": backfilled,
+            "backfilled_after_turn_dedup_count": backfilled,
+            "selected_turn_ids_before_dedup": considered_turn_ids,
+            "selected_turn_ids_after_dedup": selected_turn_ids,
+            "effective_selected_turn_count": len(selected_turn_ids),
+            "effective_retrieved_record_count": len(selected),
+            "selected_claim_evidence": selected_claim_evidence,
+        }
+
     def supports_batch_queries(self) -> bool:
         return self.planner_rounds == 0
 
@@ -897,21 +981,23 @@ class EventStateAgent(BaseAgent):
         selected_memory_items = [item for item in selected if item["type"] != "turn"]
         selected_turn_items = [item for item in selected if item["type"] == "turn"]
         selected_claims = [store.claims[item["id"]] for item in selected_memory_items if item["type"] == "state_claim"]
-        selected_claim_evidence = {}
+        selected_claim_evidence = dict(retrieval_extra.pop("selected_claim_evidence", {}))
         claimed_turns = set()
         if self.inject_source_evidence:
             turn_vector_cache = {}
             for claim in selected_claims:
-                selections = select_claim_evidence(
-                    claim,
-                    store.episodes,
-                    query_vector,
-                    self._embedder,
-                    self.max_source_excerpts_per_claim,
-                    turn_vector_cache=turn_vector_cache,
-                    query_vectors=query_vectors,
-                )
-                selected_claim_evidence[claim.claim_id] = selections
+                selections = selected_claim_evidence.get(claim.claim_id)
+                if selections is None:
+                    selections = select_claim_evidence(
+                        claim,
+                        store.episodes,
+                        query_vector,
+                        self._embedder,
+                        self.max_source_excerpts_per_claim,
+                        turn_vector_cache=turn_vector_cache,
+                        query_vectors=query_vectors,
+                    )
+                    selected_claim_evidence[claim.claim_id] = selections
                 claimed_turns.update(selected_claim_evidence_turn_keys(selections))
         selected_episodes = [
             (index, store.episodes[item["id"]])
@@ -1036,7 +1122,7 @@ class EventStateAgent(BaseAgent):
             str(record["source_session_id"]) for record in records
             if record["type"] == "episode" and record.get("source_session_id") is not None
         }
-        extra = {**base_extra, "retrieval_record_schema_version": 2, "retrieval_stage_candidates": candidate_stages, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "turn_candidate_count": retrieval_extra.get("turn_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": selected_context_tokens, "included_context_tokens": included_tokens, "context_truncated": included_tokens < selected_context_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_memory_object_count": sum(record["type"] != "immutable_turn" for record in records), "selected_raw_turn_count": sum(record["type"] == "immutable_turn" for record in records), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "raw_episode_turn_candidate_count": episode_evidence_candidate_turn_count + len(indexed_turns), "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "configured_global_raw_excerpt_budget": self.max_episode_source_excerpts_total, "source_evidence_turns_contributed_by_claims": sum(len(item.get("evidence", {}).get("source_turn_ids", [])) for item in (item for record in records for item in record.get("included_provenance_evidence", []))), "total_answer_visible_distinct_source_turns": source_turn_count, "candidate_episode_source_session_count": len(candidate_episode_sessions), "selected_episode_source_session_count": len(selected_episode_sessions), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
+        extra = {**base_extra, "retrieval_record_schema_version": 3, "retrieval_stage_candidates": candidate_stages, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "turn_candidate_count": retrieval_extra.get("turn_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": selected_context_tokens, "included_context_tokens": included_tokens, "context_truncated": included_tokens < selected_context_tokens, "selected_candidate_count": retrieval_extra.get("selected_candidate_count", len(selected)), "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_memory_object_count": sum(record["type"] != "immutable_turn" for record in records), "selected_turn_count": sum(record["type"] == "immutable_turn" for record in records), "selected_raw_turn_count": sum(record["type"] == "immutable_turn" for record in records), "deduplicated_turn_count": retrieval_extra.get("deduplicated_turn_count", 0), "deduplicated_selected_turn_count": retrieval_extra.get("deduplicated_selected_turn_count", 0), "backfilled_candidate_count": retrieval_extra.get("backfilled_candidate_count", 0), "backfilled_after_turn_dedup_count": retrieval_extra.get("backfilled_after_turn_dedup_count", 0), "effective_selected_turn_count": retrieval_extra.get("effective_selected_turn_count", sum(record["type"] == "immutable_turn" for record in records)), "effective_retrieved_record_count": len(records), "selected_turn_ids_before_dedup": retrieval_extra.get("selected_turn_ids_before_dedup", []), "selected_turn_ids_after_dedup": retrieval_extra.get("selected_turn_ids_after_dedup", []), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "raw_episode_turn_candidate_count": episode_evidence_candidate_turn_count + len(indexed_turns), "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "configured_global_raw_excerpt_budget": self.max_episode_source_excerpts_total, "source_evidence_turns_contributed_by_claims": sum(len(item.get("evidence", {}).get("source_turn_ids", [])) for item in (item for record in records for item in record.get("included_provenance_evidence", []))), "answer_visible_distinct_source_turn_count": source_turn_count, "total_answer_visible_distinct_source_turns": source_turn_count, "candidate_episode_source_session_count": len(candidate_episode_sessions), "selected_episode_source_session_count": len(selected_episode_sessions), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
         return {"messages": format_messages(user_content, answer_system), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     def _initial_query_context(self, question: str, system_message: Optional[str], **kwargs):
@@ -1049,9 +1135,24 @@ class EventStateAgent(BaseAgent):
                 ranked, retrieval_extra = retriever.rank_candidates(
                     retrieval_question, query_vector=query_vector, parse_temporal_query=False
                 )
-                selected, retrieval_extra = retriever.select_candidates(ranked, retrieval_extra)
+                selection_order, retrieval_extra = retriever.select_candidates(
+                    ranked, retrieval_extra, count=len(ranked),
+                )
+                selected, effective_extra = self._effective_evidence_selection(
+                    store, selection_order, [query_vector],
+                )
+                retrieval_extra.update(effective_extra)
             else:
-                selected, retrieval_extra = retriever.retrieve(retrieval_question, query_vector=query_vector)
+                ranked, retrieval_extra = retriever.rank_candidates(
+                    retrieval_question, query_vector=query_vector,
+                )
+                selection_order, retrieval_extra = retriever.select_candidates(
+                    ranked, retrieval_extra, count=len(ranked),
+                )
+                selected, effective_extra = self._effective_evidence_selection(
+                    store, selection_order, [query_vector],
+                )
+                retrieval_extra.update(effective_extra)
         return self._compile_query_context(question, system_message, store, selected, retrieval_extra, [query_vector]), retriever, store, [ranked] if self.planner_rounds else None, query_vector
 
     def prepare_batch_query(self, question: str, system_message: Optional[str] = None, **kwargs) -> Dict[str, Any]:
@@ -1140,7 +1241,13 @@ class EventStateAgent(BaseAgent):
                 telemetry["candidate_trace"]["planner_channels"].append({"request_index": len(telemetry["candidate_trace"]["planner_channels"]), "request": request.to_dict(), "ranked": self._candidate_trace(ranked_request, store, trace_limit)})
             merged = retriever.merge_rank_channels(channels)
             telemetry["candidate_trace"]["merged_preselect"] = self._candidate_trace(merged, store, trace_limit)
-            selected, retrieval_extra = retriever.select_candidates(merged)
+            selection_order, retrieval_extra = retriever.select_candidates(
+                merged, count=len(merged),
+            )
+            selected, effective_extra = self._effective_evidence_selection(
+                store, selection_order, query_vectors,
+            )
+            retrieval_extra.update(effective_extra)
             base_selected_id_set = set(base_selected_ids)
             for item in selected:
                 item["planner_added_to_final"] = item["id"] not in base_selected_id_set

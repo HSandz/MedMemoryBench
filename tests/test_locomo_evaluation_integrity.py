@@ -7,10 +7,12 @@ from types import SimpleNamespace
 from benchmarks.locomo.dataset import normalize_locomo_timestamp
 from benchmarks.locomo.dataset import LoCoMoQuery
 from benchmarks.locomo.evaluator import LoCoMoEvaluator
+from benchmarks.medmemorybench.checkpoint import compute_build_config_hash
 from metrics import MetricResult, MetricsAggregator
 from metrics.locomo_metrics import LoCoMoF1Metric
 from methods.event_state.schemas import Episode
 from methods.event_state.temporal import parse_stored_date, parse_temporal_query
+from src.config import ConfigLoader
 from src.result import EvaluationReport, ResultCollector, _efficiency_with_timing_semantics
 
 
@@ -39,6 +41,32 @@ def test_timestamp_normalization_enables_generic_temporal_parsing():
     assert normalize_locomo_timestamp("not a timestamp") is None
     episode = Episode("E", "ctx", 1, 0, None, recorded_at, [], "primary_user", "", "")
     assert parse_stored_date(episode.recorded_at).isoformat() == "2023-05-08"
+
+
+def test_locomo_memory_resume_accepts_v2_manifest(tmp_path: Path):
+    loader = ConfigLoader()
+    method_config = loader.load_method_config("event_state_gemini")
+    dataset_config = loader.load_dataset_config("locomo_1")
+    manifest = {
+        "format": "locomo.event_state_memory_manifest",
+        "version": 2,
+        "build_config_hash": compute_build_config_hash(method_config, dataset_config),
+    }
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.resume = True
+    evaluator.output_dir = tmp_path
+    evaluator.memory_source_run_dir = None
+    evaluator.method_config = method_config
+    evaluator.dataset_config = dataset_config
+
+    evaluator._start_memory_snapshot_manifest([])
+
+    assert evaluator._memory_snapshot_manifest == manifest
+    assert evaluator._memory_snapshot_dir_path == memory_dir
 
 
 def test_selected_session_and_answer_visible_turn_metrics_are_distinct():

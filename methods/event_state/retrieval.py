@@ -130,8 +130,17 @@ class EventStateRetriever:
             "selected_temporal_episode_count": 0,
         }
 
-    def select_candidates(self, candidates: Sequence[Dict[str, Any]], extra: Dict[str, Any] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        selected = self._select(candidates, int(self.config.get("evidence_count", 8)))
+    def select_candidates(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        extra: Dict[str, Any] | None = None,
+        *,
+        count: int | None = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        selected = self._select(
+            candidates,
+            int(self.config.get("evidence_count", 8)) if count is None else max(0, int(count)),
+        )
         diagnostics = dict(extra or {})
         selected_claims = [self.store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
         diagnostics.update({

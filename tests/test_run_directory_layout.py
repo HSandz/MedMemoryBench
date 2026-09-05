@@ -23,6 +23,7 @@ from benchmarks.medmemorybench.checkpoint import (
     compute_memory_query_compatibility_hash,
     compute_config_hash,
     derive_legacy_build_config_hash,
+    is_supported_memory_manifest,
     is_manifest_query_compatible,
     is_manifest_build_compatible,
 )
@@ -373,6 +374,47 @@ def test_explicit_query_runs_are_nested_under_the_memory_run(tmp_path: Path):
     assert config["execution"]["memory_source_run_dir"] == str(source_run.resolve())
 
 
+def test_explicit_query_accepts_locomo_v2_memory_manifest(tmp_path: Path):
+    method = MethodConfig(
+        method_name="event_state",
+        method_type="agentic_memory",
+        model=ModelConfig(provider="openai", name="test-model"),
+        raw_config={
+            "method_name": "event_state",
+            "method_type": "agentic_memory",
+            "model": {"provider": "openai", "name": "test-model"},
+        },
+    )
+    dataset = DatasetConfig(
+        dataset_name="locomo",
+        raw_config={"dataset_name": "locomo"},
+    )
+    source_run = _write_memory_run(
+        tmp_path,
+        "20260905_182952",
+        experiment="event_state_test-model",
+        stored_method_name="event_state",
+        manifest_method_name="event_state",
+        dataset_config_name="locomo",
+        config_hash=compute_config_hash(method, dataset),
+        manifest_updates={
+            "format": "locomo.event_state_memory_manifest",
+            "version": 2,
+        },
+    )
+    evaluator = Evaluator.__new__(Evaluator)
+    evaluator.memory_run = source_run.name
+    evaluator.execution_stage = "query"
+    evaluator.append = False
+    evaluator.experiment_dir = tmp_path / "event_state_test-model"
+    evaluator.method_config = method
+    evaluator.dataset_config = dataset
+
+    resolved = evaluator._resolve_memory_source_run_dir(source_run)
+
+    assert resolved == source_run.resolve()
+
+
 def test_pending_batch_run_records_pending_status_for_resume(tmp_path: Path, monkeypatch):
     manifest_path = tmp_path / "batch" / "manifest.json"
 
@@ -412,6 +454,44 @@ def test_query_config_is_inferred_from_one_completed_memory_run(tmp_path: Path):
     assert inferred["base_output_dir"] == tmp_path
     assert inferred["method_config_snapshot"]["raw_config"]["method_name"] == "amem"
     assert inferred["dataset_config_snapshot"]["raw_config"]["dataset_name"] == "medmemorybench"
+
+
+def test_query_config_is_inferred_from_completed_locomo_v2_memory_run(tmp_path: Path):
+    run_dir = _write_memory_run(
+        tmp_path,
+        "20260905_182952",
+        experiment="event_state_test-model",
+        method_config_name="event_state_gemini",
+        dataset_config_name="locomo",
+        stored_method_name="event_state",
+        manifest_method_name="event_state",
+        manifest_updates={
+            "format": "locomo.event_state_memory_manifest",
+            "version": 2,
+        },
+    )
+
+    inferred = cli.infer_query_config_from_memory_run(tmp_path, run_dir.name)
+
+    assert inferred["run_dir"] == run_dir
+    assert inferred["memory_manifest"]["version"] == 2
+
+
+@pytest.mark.parametrize(
+    ("manifest_format", "version", "expected"),
+    [
+        ("medmemorybench.memory_manifest", 1, True),
+        ("medmemorybench.memory_manifest", 2, False),
+        ("locomo.event_state_memory_manifest", 1, True),
+        ("locomo.event_state_memory_manifest", 2, True),
+        ("locomo.event_state_memory_manifest", 3, False),
+    ],
+)
+def test_supported_memory_manifest_versions(manifest_format, version, expected):
+    assert is_supported_memory_manifest({
+        "format": manifest_format,
+        "version": version,
+    }) is expected
 
 
 def test_explicit_query_uses_run_snapshot_without_loading_current_yaml(tmp_path: Path):

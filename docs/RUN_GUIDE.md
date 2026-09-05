@@ -281,7 +281,9 @@ python main.py --stage query --memory-run YYYYMMDD_HHMMSS --workers 4
 LoCoMo snapshots retain original session and turn provenance. Query-stage
 workers restore independent Event-State instances; `--resume` reuses completed
 sample snapshots, rebuilds only a sample without a valid snapshot, and skips
-answers recorded in the query checkpoint.
+answers recorded in the query checkpoint. Current LoCoMo memory manifests use
+schema version 2; staged query and memory-resume workflows also accept legacy
+version-1 LoCoMo manifests. MedMemoryBench memory manifests remain version 1.
 
 ### LoCoMo Reporting
 
@@ -335,7 +337,10 @@ and caption-only input cannot be mistaken for a full raw-image run.
 For final or publication benchmark runs, prefer artifacts whose `run_metadata`
 has a non-null `git_commit_sha` and `git_dirty: false`. Dirty working trees are
 allowed for development; their results simply may not exactly correspond to the
-recorded commit.
+recorded commit. Commit the exact dataset configuration used for a development
+sample before publishing or comparing its results; for example,
+`configs/dataset_config/locomo_conv30.yaml` preserves the named LoCoMo sample
+configuration without changing Event-State behavior.
 
 New LoCoMo query-answer artifacts use version 5 and retrieval-record sidecars
 use version 3. Older artifacts remain historical records and are not rewritten

@@ -9,6 +9,20 @@ from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Any, Optional
 
 
+MEMORY_MANIFEST_VERSIONS = {
+    "medmemorybench.memory_manifest": {1},
+    "locomo.event_state_memory_manifest": {1, 2},
+}
+
+
+def is_supported_memory_manifest(manifest: Dict[str, Any]) -> bool:
+    """Return whether a staged-memory manifest uses a supported schema."""
+    if not isinstance(manifest, dict):
+        return False
+    versions = MEMORY_MANIFEST_VERSIONS.get(manifest.get("format"))
+    return bool(versions and manifest.get("version") in versions)
+
+
 @dataclass
 class MedMemoryBenchCheckpoint:
     """Checkpoint data structure for MedMemoryBench (independent mode only)."""

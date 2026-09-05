@@ -22,6 +22,7 @@ from src.config import (
 from src.evaluator import create_evaluator
 from src.agent import list_available_methods
 from benchmarks.medmemorybench.rejudge import rejudge_medmemorybench
+from benchmarks.medmemorybench.checkpoint import is_supported_memory_manifest
 from utils.logger import format_limited_traceback, truncate_error_message
 
 
@@ -194,13 +195,7 @@ def infer_query_config_from_memory_run(
         if not isinstance(manifest, dict) or not isinstance(run_config, dict):
             rejected.append(f"{run_dir}: manifest and run config must be JSON objects")
             continue
-        if (
-            manifest.get("format") not in {
-                "medmemorybench.memory_manifest",
-                "locomo.event_state_memory_manifest",
-            }
-            or manifest.get("version") != 1
-        ):
+        if not is_supported_memory_manifest(manifest):
             rejected.append(f"{run_dir}: unsupported memory manifest")
             continue
         if (

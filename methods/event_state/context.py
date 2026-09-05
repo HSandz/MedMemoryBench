@@ -80,6 +80,19 @@ def episode_turn_embedding_text(turn: Any) -> str:
     return f"{turn.speaker}{role}: {turn.text}{caption}".strip()
 
 
+def evidence_identity(
+    record_type: str, episode_id: Any, source_turn_id: Any | None = None,
+) -> Tuple[Any, ...]:
+    """Return a provenance-aware identity for retrieval evidence."""
+    if record_type in {"turn", "immutable_turn"}:
+        if source_turn_id is None:
+            raise ValueError("Immutable-turn evidence requires a source turn ID")
+        return ("turn", episode_id, source_turn_id)
+    if record_type == "episode":
+        return ("episode", episode_id)
+    return (record_type, episode_id)
+
+
 @dataclass(frozen=True)
 class SelectedClaimEvidence:
     """One query-selected immutable provenance reference and its turns."""
