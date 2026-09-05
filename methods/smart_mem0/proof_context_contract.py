@@ -15,30 +15,27 @@ class ProofContextContractMixin:
     CONTEXT_POOL_KEY = "__answer_context_candidates__"
 
     def _requirement_target_proof(self, slot, memory):
-        """Return a conservative target certificate for one REQUIREMENT candidate."""
+        """Proof uses proof_anchor; semantic target stays recall-oriented."""
         if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
             return True
-        target = str(slot.get("target_surface") or "").strip()
+        if slot.get("degraded"):
+            return False
+        target = str(slot.get("proof_anchor") or slot.get("target_surface") or "").strip()
         if not target:
             return False
         text = self._rc_memory_target_text(memory)
         if self._rc_token_sequence_present(target, text):
             return True
-
         target_terms = list(dict.fromkeys(self._rc_content_terms(target)))
         if not target_terms:
             return False
         text_terms = set(self._rc_content_terms(text))
         overlap = sum(term in text_terms for term in target_terms)
-
-        # Proof is intentionally stricter than context relevance. One generic
-        # token must not certify a two-token target such as "disease state".
         if len(target_terms) == 1:
             return overlap == 1
         if len(target_terms) == 2:
             return overlap == 2
-        required = max(2, (3 * len(target_terms) + 4) // 5)  # ceil(60%)
-        return overlap >= required
+        return overlap >= max(2, (3 * len(target_terms) + 4) // 5)
 
     def _slot_covered(self, slot, support_ids, selected, relations):
         """Candidate availability is not deterministic requirement proof."""
@@ -466,6 +463,15 @@ class ProofContextContractMixin:
             slot_id: [memory_id for memory_id in values if memory_id in final_ids]
             for slot_id, values in context_candidates.items()
         }
+        extra["candidate_lifecycle"] = [
+            {
+                "slot_id": slot_id, "memory_id": memory_id,
+                "context_rank": rank + 1, "selected": memory_id in final_ids,
+                "drop_reason": "" if memory_id in final_ids else "CONTEXT_BUDGET_OR_ARBITRATION",
+            }
+            for slot_id, values in context_candidates.items()
+            for rank, memory_id in enumerate(values)
+        ]
         # Hide the private packing pool from public provenance if QueryMixin saw it.
         for item in extra.get("retrieval_provenance") or []:
             item["slot_ids"] = [
@@ -477,7 +483,29 @@ class ProofContextContractMixin:
         # Give the final answer model the evidence graph produced by call #1.
         # This adds no LLM call and does not treat target proof as answer truth.
         plan = extra.get("replan") or extra.get("plan") or {}
-        obligation_lines = self._reasoning_obligation_lines(plan)
+        # Use the original full graph, not only recovery's missing requirements.
+        source_plan = extra.get("plan") or plan
+        extra["graph_validation"] = source_plan.get("graph_validation") or {}
+        slots = source_plan.get("required_slots") or []
+        extra["requirement_diagnostics"] = {
+            str(slot["id"]): {
+                "focus_span": slot.get("focus_span", ""),
+                "retrieval_target": slot.get("retrieval_target", slot.get("target_surface", "")),
+                "proof_anchor": slot.get("proof_anchor", slot.get("target_surface", "")),
+                "proof_result": bool(proof_support.get(str(slot["id"]))),
+                "proof_miss_reason": "" if proof_support.get(str(slot["id"])) else
+                    "DEGRADED_TARGET" if slot.get("degraded") else
+                    "NO_CANDIDATE" if not context_candidates.get(str(slot["id"])) else
+                    "NO_TARGET_AND_TYPED_CONTRACT_CERTIFICATE",
+            } for slot in slots if slot.get("evidence_role") == "REQUIREMENT"
+        }
+        options = source_plan.get("visible_options") or {}
+        probed = getattr(self, "_last_option_probe_coverage", {}) or {}
+        extra["option_probe_complete"] = bool(options) and set(options).issubset(probed)
+        extra["retrieval_complete_semantics"] = (
+            "OPTION_EXPLORATION" if options else "DETERMINISTIC_EVIDENCE_CONTRACT"
+        )
+        obligation_lines = self._reasoning_obligation_lines(source_plan)
         if obligation_lines:
             addendum = (
                 "\n\n=== SEMANTIC EVIDENCE GRAPH ===\n"
@@ -485,7 +513,18 @@ class ProofContextContractMixin:
                 + "\nTarget certification is a retrieval/control-flow certificate, not a guarantee "
                 "that one certified memory is the final answer. Evaluate all supplied "
                 "authorized memories and use bridge goals only to connect grounded facts."
+                " DEPENDS_ON means the target is a prerequisite for the source, not a causal edge."
+                " Use grounded DERIVED values wherever the reasoning depends on them; never"
+                " replace a measured participant value with a generic assumption."
             )
+            graph = extra["graph_validation"]
+            if graph.get("orphan_requirements"):
+                addendum += (
+                    "\nINCOMPLETE CONTROLLER GRAPH: unconnected requirements "
+                    + ", ".join(graph["orphan_requirements"])
+                    + ". These remain evidence candidates, not proven causal links."
+                    " Do not manufacture a relation to repair the graph."
+                )
             for message in prepared.get("messages") or []:
                 if message.get("role") == "system":
                     message["content"] = str(message.get("content") or "") + addendum

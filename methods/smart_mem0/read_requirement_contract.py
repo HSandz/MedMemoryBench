@@ -6,6 +6,7 @@ variables; general-domain mechanisms remain reasoning bridges.
 
 import json
 import re
+from copy import deepcopy
 from typing import Any, Dict
 
 from .read_controller import VALID_ANSWER_TYPES, VALID_IR_RELATIONS
@@ -181,8 +182,53 @@ class ReadRequirementContractMixin:
             result["relation"] = "LOCATE"
         return result
 
+    @staticmethod
+    def _rq_graph_validation(requirements, relations):
+        """Check evidence dependency reachability, not causal truth or necessity."""
+        nodes = {item["id"] for item in requirements}
+        adjacency = {node: set() for node in nodes}
+        explicit_answer = False
+        for edge in relations:
+            source, target = edge.get("from"), edge.get("to")
+            kind = edge.get("type")
+            if source not in nodes or target not in nodes | {"ANSWER"}:
+                continue
+            if kind == "DEPENDS_ON":
+                adjacency[target].add(source)
+            else:
+                adjacency[source].add(target)
+                if kind in {"COMPARE", "TEMPORAL_ORDER"}:
+                    adjacency[target].add(source)
+            explicit_answer |= target == "ANSWER"
+        # Ordinary grounded lookup/synthesis needs no world-knowledge INFER.
+        implicit_outputs = set() if explicit_answer else {
+            item["id"] for item in requirements
+            if item.get("grounding_kind") == "QUESTION"
+        }
+        for node in implicit_outputs:
+            adjacency[node].add("ANSWER")
+        connected = {}
+        for node in nodes:
+            seen, pending = set(), [node]
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(adjacency.get(current, set()) - seen)
+            connected[node] = "ANSWER" in seen
+        orphans = sorted(node for node, reachable in connected.items() if not reachable)
+        return {
+            "connected_to_answer": dict(sorted(connected.items())),
+            "orphan_requirements": orphans,
+            "implicit_answer_requirements": sorted(implicit_outputs),
+            "valid": not orphans,
+            "scope": "dependency_reachability_not_semantic_proof",
+        }
+
     def _rc_normalize_ir(self, parsed: Dict[str, Any], question: str, frame: Any):
         """Normalize Requirement-v2 without collapsing a partly valid graph."""
+        parsed = parsed if isinstance(parsed, dict) else {}
         options = self._question_options(question) or {}
         answer_type = str(parsed.get("answer_type") or "TEXT").upper()
         answer_type = (
@@ -264,7 +310,8 @@ class ReadRequirementContractMixin:
                 "time_constraint": time_constraint,
             })
 
-        if not requirements:
+        degraded = not requirements
+        if degraded:
             if options:
                 requirements = [{
                     "id": "r1", "grounding_kind": "DERIVED", "focus_span": "",
@@ -282,6 +329,8 @@ class ReadRequirementContractMixin:
                     "time_constraint": {"axis": "", "relation": "", "anchor": "", "end": ""},
                 }]
                 actions.append({"action": "FALLBACK", "reason": "ALL_REQUIREMENTS_INVALID"})
+            for requirement in requirements:
+                requirement["degraded"] = True
 
         valid_nodes = {item["id"] for item in requirements}
         raw_relations = parsed.get("relations") if isinstance(parsed.get("relations"), list) else []
@@ -291,11 +340,15 @@ class ReadRequirementContractMixin:
                 continue
             relation_type = str(raw.get("type") or "").upper()
             source, target = str(raw.get("from") or ""), str(raw.get("to") or "")
-            if relation_type not in VALID_IR_RELATIONS or source not in valid_nodes:
+            if degraded or relation_type not in VALID_IR_RELATIONS or source not in valid_nodes:
+                actions.append({"action": "DROP_RELATION", "reason": "INVALID_RELATION_OR_ENDPOINT",
+                                "from": source, "to": target})
                 continue
             if relation_type in {"CURRENT", "VERIFY_SOURCE"}:
                 target = ""
             elif target != "ANSWER" and target not in valid_nodes:
+                actions.append({"action": "DROP_RELATION", "reason": "INVALID_ENDPOINT",
+                                "from": source, "to": target})
                 continue
             if relation_type in {"COMPARE", "CAUSES", "POSSIBLE_CAUSE", "DEPENDS_ON", "TEMPORAL_ORDER"} and target not in valid_nodes:
                 continue
@@ -340,7 +393,7 @@ class ReadRequirementContractMixin:
                 "requirement_ids": orphan_derived,
             })
 
-        candidate = parsed.get("candidate") if isinstance(parsed.get("candidate"), dict) else None
+        candidate = parsed.get("candidate") if not degraded and isinstance(parsed.get("candidate"), dict) else None
         if candidate is not None:
             answer = str(candidate.get("answer") or "").strip()
             support_ref = str(candidate.get("support_ref") or "")
@@ -373,6 +426,11 @@ class ReadRequirementContractMixin:
             "relations": relations[:8],
             "candidate": candidate,
             "visible_options": dict(options),
+            "normalization_status": "DEGRADED" if degraded else "REPAIRED" if any(
+                action.get("action") in {"DROP", "REPAIR", "DROP_RELATION"} for action in actions
+            ) else "VALID",
+            "normalization_actions": deepcopy(actions),
+            "graph_validation": self._rq_graph_validation(requirements, relations),
         }
 
     def _requirement_slot(self, requirement, ir, compiled_mode):
@@ -384,31 +442,12 @@ class ReadRequirementContractMixin:
         slot["grounding_kind"] = kind
         slot["focus_span"] = focus
         slot["target_surface"] = target
+        slot["retrieval_target"] = target
+        slot["degraded"] = bool(requirement.get("degraded"))
         slot["proof_anchor"] = focus if kind == "QUESTION" and focus else target
         slot["description"] = str(requirement.get("retrieval_hint") or "").strip() or target or "participant evidence"
         slot["resolved_keys"] = self._rc_resolve_target_keys(target, str(slot.get("subject_id") or ""))
         return slot
-
-    def _requirement_target_proof(self, slot, memory):
-        """Proof uses proof_anchor; semantic target stays recall-oriented."""
-        if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
-            return True
-        target = str(slot.get("proof_anchor") or slot.get("target_surface") or "").strip()
-        if not target:
-            return False
-        text = self._rc_memory_target_text(memory)
-        if self._rc_token_sequence_present(target, text):
-            return True
-        target_terms = list(dict.fromkeys(self._rc_content_terms(target)))
-        if not target_terms:
-            return False
-        text_terms = set(self._rc_content_terms(text))
-        overlap = sum(term in text_terms for term in target_terms)
-        if len(target_terms) == 1:
-            return overlap == 1
-        if len(target_terms) == 2:
-            return overlap == 2
-        return overlap >= max(2, (3 * len(target_terms) + 4) // 5)
 
     def _rq_context_candidate_strength(self, slot, memory):
         target = str(slot.get("proof_anchor") or slot.get("target_surface") or "")
@@ -503,6 +542,14 @@ class ReadRequirementContractMixin:
     def _controller_plan(self, ir, question, frame):
         plan = super()._controller_plan(ir, question, frame)
         plan.setdefault("query_spec", {})["semantic_ir_version"] = "minimal-v2-evidence-lookup"
+        for key in ("normalization_status", "normalization_actions", "graph_validation"):
+            plan[key] = deepcopy(ir.get(key))
+            plan["semantic_ir"][key] = deepcopy(ir.get(key))
+        if ir.get("normalization_status") == "DEGRADED":
+            plan["planner_fallback"] = True
+            plan["fallback_reason"] = "ALL_REQUIREMENTS_INVALID"
+            if not ir.get("visible_options"):
+                plan["compiled_mode"] = plan["query_mode"] = "DEGRADED"
         return plan
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
@@ -549,6 +596,9 @@ class ReadRequirementContractMixin:
             "relation_count": len(ir["relations"]),
             "semantic_ir": self._rc_public_ir(ir),
             "controller_raw_ir": raw_ir,
+            "normalized_ir": self._rc_public_ir(ir),
+            "normalization_status": ir["normalization_status"],
+            "graph_validation": ir["graph_validation"],
             "normalization_actions": actions,
             "graph_warnings": warnings,
         }
@@ -594,6 +644,9 @@ class ReadRequirementContractMixin:
         extra["requirement_context_reorders"] = list(
             getattr(self, "_last_requirement_context_reorders", []) or []
         )
+        controller = extra.get("semantic_controller") or {}
+        for key in ("controller_raw_ir", "normalized_ir", "normalization_status", "normalization_actions"):
+            extra[key] = deepcopy(controller.get(key))
         instruction = self._compact_reasoning_output_instruction(kwargs.get("query_type"))
         if instruction:
             for message in prepared.get("messages") or []:

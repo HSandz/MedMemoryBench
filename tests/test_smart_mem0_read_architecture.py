@@ -1059,6 +1059,35 @@ def test_supplementary_packing_preserves_slot_provenance_across_recovery(packing
     assert not prepared["extra"]["arbitration_expansion_violation"]
 
 
+def test_final_telemetry_and_reasoning_keep_full_graph_after_partial_recovery(packing_query_case):
+    agent, run = packing_query_case
+    agent.subject_aliases = {}
+    for slot, target in zip(run["plan"]["required_slots"], ("observation", "decision")):
+        slot.update(target_surface=target, retrieval_target=target, proof_anchor=target,
+                    focus_span=target, required_fields=[])
+    run["plan"]["semantic_ir"] = {
+        "requirements": [{"id": "r1", "grounding_kind": "QUESTION", "focus_span": "observation"},
+                         {"id": "r2", "grounding_kind": "DERIVED", "retrieval_hint": "decision"}],
+        "relations": [{"type": "DEPENDS_ON", "from": "r1", "to": "r2"}],
+    }
+    graph = {"connected_to_answer": {"r1": True, "r2": True}, "orphan_requirements": [], "valid": True}
+    run["plan"]["graph_validation"] = graph
+    run["deterministic_recovery_called"] = True
+    agent._prepare_requirement_context_state(run, [])
+    prepared = agent.prepare_batch_query("Explain the observation and decision.")
+    extra = prepared["extra"]
+    assert extra["deterministic_recovery_called"]
+    assert extra["graph_validation"] == graph
+    assert set(extra["requirement_diagnostics"]) == {"r1", "r2"}
+    assert extra["candidate_lifecycle"]
+    assert all(row["selected"] == (row["memory_id"] in extra["final_memory_ids"])
+               for row in extra["candidate_lifecycle"])
+    assert not extra["option_probe_complete"]
+    assert extra["retrieval_complete_semantics"] == "DETERMINISTIC_EVIDENCE_CONTRACT"
+    assert "requirement r2 [DERIVED]" in prepared["messages"][0]["content"]
+    assert not extra["boundary_violation"]
+
+
 def test_support_does_not_make_requirement_found():
     empty = _memory("m1", value="")
     corroborating = _memory("m2", value="a recorded value")
@@ -1190,7 +1219,8 @@ def test_direct_requirement_backup_reaches_answer_without_supplement_or_extra_se
     assert len(calls) == 1
     assert calls[0]["top_k"] == 3
     assert execution["slot_support"] == {"r1": ["m1", "m2"]}
-    assert execution["retrieval_complete"]
+    # Candidate availability is not proof: this fixture supplies no proof target.
+    assert not execution["retrieval_complete"]
     run.update({
         "plan": plan, "replan": None, "replan_called": False,
         "trace": execution["trace"], "slot_support": execution["slot_support"],

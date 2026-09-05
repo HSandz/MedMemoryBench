@@ -778,6 +778,7 @@ class ExecutionMixin:
         replan: Optional[Dict[str, Any]] = None
         planner_called = False
         replan_called = False
+        deterministic_recovery_called = False
         trace: List[Dict[str, Any]] = []
         slot_validation: List[Dict[str, Any]] = []
         operation_output_ids = set()
@@ -907,6 +908,7 @@ class ExecutionMixin:
                 )
                 if replan:
                     replan_called = True
+                    deterministic_recovery_called = True
             elif broad_replan and missing_slots:
                 # Compatibility LLM replan, only outside the two-stage route.
                 replan_called = True
@@ -1033,6 +1035,7 @@ class ExecutionMixin:
             "replan": replan,
             "planner_called": planner_called,
             "replan_called": replan_called,
+            "deterministic_recovery_called": deterministic_recovery_called,
             "trace": trace,
             "slot_validation": slot_validation,
             "operation_output_ids": operation_output_ids,

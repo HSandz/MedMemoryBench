@@ -860,6 +860,7 @@ class QueryMixin:
                 },
                 "plan": plan,
                 "replan_called": replan_called,
+                "deterministic_recovery_called": bool(run.get("deterministic_recovery_called")),
                 "replan": replan,
                 "fast_gate": gate,
                 "semantic_controller": controller,
