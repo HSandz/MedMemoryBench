@@ -1,6 +1,6 @@
 """P0 retrieval guards for the minimal-IR SmartMem0 read path.
 
-These guards deliberately stay below semantic answerability.  They tighten the
+These guards deliberately stay below semantic answerability. They tighten the
 structural meaning of REQUIREMENT support and preserve one useful initial seed
 for final answer context without turning that seed into retrieval proof.
 """
@@ -13,14 +13,47 @@ from .contracts import QueryFrame
 class ReadP0ContractMixin:
     """Repair target authorization and bounded seed-to-context preservation."""
 
+    def _rc_memory_matches_target(self, slot, memory):
+        """Match the question surface or a deterministic target-derived family.
+
+        ``resolved_keys`` are produced from the immutable question focus by the
+        compiler. They may therefore identify the same durable concept family,
+        but arbitrary retrieval hints or seed text never authorize a match.
+        """
+        if super()._rc_memory_matches_target(slot, memory):
+            return True
+        if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
+            return False
+        resolved_keys = [
+            " ".join(self._rc_content_terms(key))
+            for key in slot.get("resolved_keys") or []
+            if self._rc_content_terms(key)
+        ]
+        if not resolved_keys:
+            return False
+        memory_keys = set(self._rc_memory_concept_keys(memory))
+        memory_key_terms = [set(self._rc_content_terms(key)) for key in memory_keys]
+        for resolved in resolved_keys:
+            resolved_terms = set(self._rc_content_terms(resolved))
+            if not resolved_terms:
+                continue
+            if any(
+                resolved_terms == terms
+                or resolved_terms.issubset(terms)
+                or terms.issubset(resolved_terms)
+                for terms in memory_key_terms
+                if terms
+            ):
+                return True
+        return False
+
     def _slot_contract_match(self, slot, memory, strict_targets=None):
-        """A REQUIREMENT may be FOUND only on its question-owned target surface.
+        """A REQUIREMENT may be FOUND only on its question-owned target family.
 
         Older callers explicitly passed ``False`` for REQUIREMENT temporal and
-        current-state slots.  That made any dated/current same-owner value a
-        structural success.  Override that exception whenever the compiler has
-        a question-owned target surface; empty legacy targets retain the prior
-        behavior rather than becoming impossible to satisfy.
+        current-state slots. That made any dated/current same-owner value a
+        structural success. Override that exception whenever the compiler has a
+        question-owned target surface; empty legacy targets retain prior behavior.
         """
         role = str(slot.get("evidence_role") or "").upper()
         if role == "REQUIREMENT" and str(slot.get("target_surface") or "").strip():
@@ -48,11 +81,10 @@ class ReadP0ContractMixin:
     ) -> Dict[str, Any]:
         """Preserve at most one target-compatible Top-3 seed per requirement.
 
-        The base executor computes FOUND/EMPTY before this method returns.  We
-        therefore add the seed only to the context support map after execution;
-        ``requirement_status`` and ``retrieval_complete`` remain unchanged.  In
-        particular, a preserved seed is useful answer context, not retroactive
-        proof that an operation satisfied the requirement.
+        The base executor computes FOUND/EMPTY before this method returns. We
+        add the seed only to the context support map after execution, so
+        ``requirement_status`` and ``retrieval_complete`` remain unchanged. A
+        preserved seed is useful answer context, not retroactive retrieval proof.
         """
         run = super()._run_query_retrieval(
             question,
@@ -65,6 +97,7 @@ class ReadP0ContractMixin:
         )
         run["reserved_seed_context"] = {}
         if run.get("fast_supports") is not None:
+            self._last_reserved_seed_context = {}
             return run
 
         slots = []
@@ -113,11 +146,21 @@ class ReadP0ContractMixin:
 
                 # QueryMixin's boundary treats planning_seeds as the authorized
                 # seed set. Initial Top-3 seeds are already retrieval-authorized;
-                # make that provenance explicit if the planning subset omitted
-                # the one we reserved.
+                # make that provenance explicit when the planning subset omitted
+                # the one reserved for final answer context.
                 if memory_id not in planning_seed_ids:
                     planning_seed_list.append(self._snapshot(seed))
                     planning_seed_ids.add(memory_id)
                 break
 
+        self._last_reserved_seed_context = dict(reserved)
         return run
+
+    def prepare_batch_query(self, question, system_message=None, **kwargs):
+        prepared = super().prepare_batch_query(
+            question, system_message=system_message, **kwargs
+        )
+        prepared.setdefault("extra", {})["reserved_seed_context"] = dict(
+            getattr(self, "_last_reserved_seed_context", {}) or {}
+        )
+        return prepared
