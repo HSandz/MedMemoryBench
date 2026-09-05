@@ -301,6 +301,9 @@ class MedMemoryBenchEvaluator:
                 else {}
             )
         if method_name.lower() == "event_state":
+            retrieval_config = getattr(method_config, "retrieval_config", {})
+            if not isinstance(retrieval_config, dict):
+                retrieval_config = {}
             features = {
                 "episode_archive": bool(build_config.get("enable_episodes", True)),
                 "claim_extraction": bool(build_config.get("enable_state_claims", True)),
@@ -310,7 +313,7 @@ class MedMemoryBenchEvaluator:
             }
             enabled = [name for name, enabled_flag in features.items() if enabled_flag]
             return {
-                "schema_version": 3,
+                "schema_version": 4,
                 "method_name": method_name,
                 "combination_id": "+".join(enabled) if enabled else "none",
                 "enabled_features": enabled,
@@ -318,6 +321,7 @@ class MedMemoryBenchEvaluator:
                 "dependencies": [],
                 "build_config_hash": self._batch_config_hash() if hasattr(self, "dataset_config") else "",
                 "build_config": copy.deepcopy(build_config),
+                "retrieval_config": copy.deepcopy(retrieval_config),
             }
         is_experimental = method_name.lower().startswith("amem_test")
         features = {

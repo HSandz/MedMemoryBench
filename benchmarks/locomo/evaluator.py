@@ -1308,15 +1308,52 @@ class LoCoMoEvaluator:
         return f"D{source_session_id}:{value}"
 
     def _locomo_retrieval_quality(
-        self, query: LoCoMoQuery, retrieved_memories: List[Dict[str, Any]],
+        self,
+        query: LoCoMoQuery,
+        retrieved_memories: List[Dict[str, Any]],
+        method_retrieval: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Derive gold diagnostics after retrieval, never before method execution."""
+        """Derive evaluator-private gold diagnostics after retrieval completes."""
         gold_turn_ids = self._gold_evidence_turns(query.evidence)
         gold_session_ids = [match.group(1) for item in gold_turn_ids if (match := re.fullmatch(r"D(\d+):[^\s:]+", item))]
+        gold_metadata = {"gold_session_ids": gold_session_ids}
+
+        # These method traces contain only generic source IDs and ranking
+        # outcomes. Gold annotations are joined here, after the agent has
+        # completed selection and answer construction.
+        stage_candidates = (
+            method_retrieval.get("retrieval_stage_candidates", {})
+            if isinstance(method_retrieval, dict) else {}
+        )
+
+        def candidate_quality(stage: str, candidates: Any) -> Dict[str, Any]:
+            records = []
+            for candidate in candidates if isinstance(candidates, list) else []:
+                if not isinstance(candidate, dict):
+                    continue
+                for source_id in candidate.get("source_session_ids", []):
+                    records.append({"source_session_id": source_id})
+            quality = compute_session_retrieval_quality(records, [], gold_metadata)
+            quality["stage"] = stage
+            return quality
+
         session_quality = compute_session_retrieval_quality(
-            retrieved_memories, [], {"gold_session_ids": gold_session_ids},
+            retrieved_memories, [], gold_metadata,
         )
         session_quality["stage"] = "selected_memory_objects"
+        archive_turn_ids = []
+        for record in retrieved_memories or []:
+            if not isinstance(record, dict) or record.get("type") != "episode":
+                continue
+            for turn_id in record.get("episode_archive_turn_ids", []):
+                normalized = self._locomo_turn_id(record.get("source_session_id"), turn_id)
+                if normalized:
+                    archive_turn_ids.append(normalized)
+        archive_quality = self._turn_quality(gold_turn_ids, archive_turn_ids)
+        archive_quality["stage"] = "selected_episode_archive"
+        archive_quality["selected_episode_archive_turn_ids"] = archive_quality.pop(
+            "answer_visible_turn_ids"
+        )
         visible_turn_ids = []
         for record in retrieved_memories or []:
             if not isinstance(record, dict):
@@ -1338,7 +1375,16 @@ class LoCoMoEvaluator:
         return {
             "gold_evidence_turn_ids": gold_turn_ids,
             "gold_evidence_session_ids": list(dict.fromkeys(gold_session_ids)),
+            "pre_candidate_truncation_fused_session": candidate_quality(
+                "pre_candidate_truncation_fused",
+                stage_candidates.get("pre_candidate_truncation_fused"),
+            ),
+            "post_candidate_count_session": candidate_quality(
+                "post_candidate_count",
+                stage_candidates.get("post_candidate_count"),
+            ),
             "selected_memory_session": session_quality,
+            "selected_episode_archive_exact_turn": archive_quality,
             "answer_visible_exact_turn": self._turn_quality(gold_turn_ids, visible_turn_ids),
         }
 
@@ -1388,7 +1434,7 @@ class LoCoMoEvaluator:
         if "evidence" not in result.details:
             result.details["evidence"] = query.evidence
         result.details["locomo_retrieval_quality"] = self._locomo_retrieval_quality(
-            query, retrieved_memories
+            query, retrieved_memories, response_extra if isinstance(response_extra, dict) else None,
         )
 
         return result
@@ -1506,7 +1552,10 @@ class LoCoMoEvaluator:
     def _aggregate_locomo_retrieval(results: List[MetricResult]) -> Dict[str, Any]:
         """Macro aggregate evaluator-only selected-session and visible-turn metrics."""
         stages = {
+            "pre_candidate_truncation_fused_session": "pre_candidate_truncation_fused_session",
+            "post_candidate_count_session": "post_candidate_count_session",
             "selected_memory_session": "selected_memory_session",
+            "selected_episode_archive_exact_turn": "selected_episode_archive_exact_turn",
             "answer_visible_exact_turn": "answer_visible_exact_turn",
         }
         aggregated: Dict[str, Any] = {}
@@ -1784,6 +1833,13 @@ class LoCoMoEvaluator:
             "evidence_count": retrieval_config.get("evidence_count", 8),
             "claim_top_k": retrieval_config.get("claim_top_k", 30),
             "episode_top_k": retrieval_config.get("episode_top_k", 20),
+            "retrieve_turns": retrieval_config.get("retrieve_turns", True),
+            "turn_top_k": retrieval_config.get("turn_top_k", 8),
+            "turn_retrieval_weight": retrieval_config.get("turn_retrieval_weight", 1.0),
+            "turn_lexical_retrieval_enabled": retrieval_config.get("turn_lexical_retrieval_enabled", False),
+            "max_episode_source_excerpts_total": retrieval_config.get("max_episode_source_excerpts_total", 2),
+            "episode_retrieval_sampling": "evenly_spaced_source_order",
+            "episode_retrieval_max_turns": 8,
             "candidate_count": retrieval_config.get("candidate_count", 40),
             "embedding_model": getattr(embedding, "model", None),
         }

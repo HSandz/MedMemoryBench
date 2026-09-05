@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+
+EPISODE_RETRIEVAL_MAX_TURNS = 8
+EPISODE_RETRIEVAL_MAX_CHARS = 4000
 
 
 @dataclass
@@ -62,10 +66,29 @@ class Episode:
     def retrieval_text(self) -> str:
         """Return an information-dense but bounded embedding representation."""
         salient = " ".join(
-            f"{turn.speaker}: {turn.text} {turn.image_caption or ''}".strip()
-            for turn in self.turn_evidence[:8]
+            f"{turn.speaker}{f' ({turn.role})' if turn.role else ''}: "
+            f"{turn.text} {turn.image_caption or ''}".strip()
+            for turn in select_episode_retrieval_turns(self.turn_evidence)
         )
-        return f"{self.summary} {salient}".strip()[:4000]
+        return f"{self.summary} {salient}".strip()[:EPISODE_RETRIEVAL_MAX_CHARS]
+
+
+def select_episode_retrieval_turns(
+    turns: Sequence[TurnEvidence], max_turns: int = EPISODE_RETRIEVAL_MAX_TURNS,
+) -> List[TurnEvidence]:
+    """Return a deterministic source-ordered sample spanning an episode."""
+    limit = max(0, int(max_turns))
+    if len(turns) <= limit:
+        return list(turns)
+    if limit == 0:
+        return []
+    if limit == 1:
+        return [turns[0]]
+    indices = {
+        int(index * (len(turns) - 1) / (limit - 1))
+        for index in range(limit)
+    }
+    return [turn for index, turn in enumerate(turns) if index in indices]
 
 
 @dataclass

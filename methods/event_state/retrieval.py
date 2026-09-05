@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from copy import deepcopy
+import re
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .embeddings import cosine
@@ -49,6 +50,7 @@ class EventStateRetriever:
         parse_temporal_query: bool = True,
         retrieve_claims_override: bool | None = None,
         retrieve_episodes_override: bool | None = None,
+        retrieve_turns_override: bool | None = None,
         state_view: str = "current",
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         query_vector = list(query_vector) if query_vector is not None else self.embedder.embed_query(question)
@@ -57,21 +59,30 @@ class EventStateRetriever:
             temporal = globals()["parse_temporal_query"](question)
         retrieve_claims = self.config.get("retrieve_claims", True) if retrieve_claims_override is None else retrieve_claims_override
         retrieve_episodes = self.config.get("retrieve_episodes", True) if retrieve_episodes_override is None else retrieve_episodes_override
+        retrieve_turns = self.config.get("retrieve_turns", True) if retrieve_turns_override is None else retrieve_turns_override
         claim_vectors, hidden_prior_state_count = self._visible_claim_vectors(temporal, state_view)
         claim_rank = dense_rank(query_vector, claim_vectors, self.config.get("claim_top_k", 30)) if retrieve_claims else []
         episode_rank = dense_rank(query_vector, self.store.episode_embeddings, self.config.get("episode_top_k", 20)) if retrieve_episodes else []
+        turn_rank = dense_rank(query_vector, self.store.turn_embeddings, self.config.get("turn_top_k", 8)) if retrieve_turns else []
+        lexical_turn_rank = self._lexical_turn_rank(question) if retrieve_turns and self.config.get("turn_lexical_retrieval_enabled", False) else []
         temporal_claim_rank, temporal_episode_rank = [], []
         if temporal is not None:
             temporal_claim_rank = self._temporal_claim_rank(query_vector, temporal, state_view) if retrieve_claims else []
             temporal_episode_rank = self._temporal_episode_rank(query_vector, temporal) if retrieve_episodes else []
-        candidates = self._rrf(claim_rank, episode_rank, temporal_claim_rank, temporal_episode_rank)
+        candidates = self._rrf(
+            claim_rank, episode_rank, turn_rank, lexical_turn_rank,
+            temporal_claim_rank, temporal_episode_rank,
+        )
         if self.config.get("ppr_enabled", False):
-            candidates = self._ppr(candidates)
+            graph_candidates = [item for item in candidates if item["type"] != "turn"]
+            turn_candidates = [item for item in candidates if item["type"] == "turn"]
+            candidates = self._ppr(graph_candidates) + turn_candidates
         candidates = [item for item in candidates if item["type"] != "state_claim" or self._claim_is_directly_visible(item["id"], temporal, state_view)]
         values = normalize_scores([item.get("score", 0.0) for item in candidates])
         for item, final_score in zip(candidates, values):
             item["final_score"] = final_score
         candidates.sort(key=lambda item: (-item["final_score"], item["id"]))
+        pre_candidate_truncation = [dict(item) for item in candidates]
         candidate_count = int(self.config.get("candidate_count", 40))
         candidates = candidates[:candidate_count]
         claim_candidate_statuses = Counter(self.store.claims[identifier].status for identifier, _ in claim_rank)
@@ -92,7 +103,13 @@ class EventStateRetriever:
         return candidates, {
             "claim_candidates": len(claim_rank),
             "episode_candidates": len(episode_rank),
+            "turn_candidates": len(turn_rank),
+            "lexical_turn_candidates": len(lexical_turn_rank),
+            "pre_candidate_truncation_fused_candidate_count": len(pre_candidate_truncation),
             "candidate_count": len(candidates),
+            "post_candidate_truncation_candidate_count": len(candidates),
+            "pre_candidate_truncation_candidates": pre_candidate_truncation,
+            "post_candidate_truncation_candidates": [dict(item) for item in candidates],
             "ppr_enabled": bool(self.config.get("ppr_enabled", False)),
             "selector_mode": self.config.get("selector_mode", "state_mmr"),
             "selected_ids": [],
@@ -123,6 +140,10 @@ class EventStateRetriever:
             "selected_claim_persistence_counts": dict(sorted(Counter(claim.persistence for claim in selected_claims).items())),
             "selected_temporal_claim_count": sum(1 for item in selected if item["type"] == "state_claim" and item.get("temporal_score", 0.0)),
             "selected_temporal_episode_count": sum(1 for item in selected if item["type"] == "episode" and item.get("temporal_score", 0.0)),
+            "selected_memory_object_count": sum(1 for item in selected if item["type"] != "turn"),
+            "selected_turn_count": sum(1 for item in selected if item["type"] == "turn"),
+            "selected_claim_count": sum(1 for item in selected if item["type"] == "state_claim"),
+            "selected_episode_count": sum(1 for item in selected if item["type"] == "episode"),
         })
         return selected, diagnostics
 
@@ -248,12 +269,19 @@ class EventStateRetriever:
         self,
         claims: Sequence[Tuple[str, float]],
         episodes: Sequence[Tuple[str, float]],
+        turns: Sequence[Tuple[str, float]] = (),
+        lexical_turns: Sequence[Tuple[str, float]] = (),
         temporal_claims: Sequence[Tuple[str, float, str]] = (),
         temporal_episodes: Sequence[Tuple[str, float, str]] = (),
     ) -> List[Dict[str, Any]]:
         values: Dict[str, Dict[str, Any]] = {}
         rrf_k = float(self.config.get("rrf_k", 60.0))
-        channels = (("state_claim", claims, float(self.config.get("claim_retrieval_weight", 1.0))), ("episode", episodes, float(self.config.get("episode_retrieval_weight", 1.0))))
+        channels = (
+            ("state_claim", claims, float(self.config.get("claim_retrieval_weight", 1.0))),
+            ("episode", episodes, float(self.config.get("episode_retrieval_weight", 1.0))),
+            ("turn", turns, float(self.config.get("turn_retrieval_weight", 1.0))),
+            ("turn", lexical_turns, float(self.config.get("turn_lexical_retrieval_weight", 1.0))),
+        )
         for record_type, rows, weight in channels:
             for rank, (identifier, dense_score) in enumerate(rows, 1):
                 item = values.setdefault(identifier, {"id": identifier, "type": record_type, "score": 0.0, "dense_score": dense_score, "fusion_score": 0.0, "ppr_score": 0.0})
@@ -270,6 +298,23 @@ class EventStateRetriever:
                 item["temporal_score"] = max(float(item.get("temporal_score", 0.0)), match_score)
                 item["temporal_match_type"] = item.get("temporal_match_type") or match_type
         return list(values.values())
+
+    def _lexical_turn_rank(self, question: str) -> List[Tuple[str, float]]:
+        """Return dependency-free literal-term rankings for archived turns."""
+        query_tokens = set(re.findall(r"[a-z0-9]+", question.casefold()))
+        if not query_tokens:
+            return []
+        rows = []
+        for key in self.store.turn_embeddings:
+            episode, turn = self.store.turn_for_key(key)
+            if episode is None or turn is None:
+                continue
+            tokens = set(re.findall(r"[a-z0-9]+", f"{turn.speaker} {turn.text} {turn.image_caption or ''}".casefold()))
+            overlap = len(query_tokens & tokens)
+            if overlap:
+                rows.append((key, overlap / len(query_tokens)))
+        rows.sort(key=lambda item: (-item[1], item[0]))
+        return rows[:max(0, int(self.config.get("turn_top_k", 8)))]
 
     def _ppr(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         with get_usage_tracker().scope("event_state.ppr"):
@@ -342,8 +387,13 @@ class EventStateRetriever:
             relevance = normalize_scores([float(item.get("final_score", item.get("score", 0.0))) for item in remaining])
         relevance_by_id = {item["id"]: value for item, value in zip(remaining, relevance)}
         while remaining and len(selected) < count:
+            # Preserve the established semantic/episode evidence path when it
+            # exists; immutable turns complement it rather than replacing the
+            # only selected memory object under a small evidence budget.
+            semantic_remaining = [item for item in remaining if item["type"] != "turn"]
+            choices = semantic_remaining if semantic_remaining and not selected else remaining
             if mode == "topk":
-                choice, choice_score = max(((item, item.get("final_score", item.get("score", 0.0))) for item in remaining), key=lambda pair: (pair[1], pair[0]["id"] ))
+                choice, choice_score = max(((item, item.get("final_score", item.get("score", 0.0))) for item in choices), key=lambda pair: (pair[1], pair[0]["id"] ))
             else:
                 weight = float(self.config.get("mmr_lambda", .7))
                 def score(item: Dict[str, Any]) -> float:
@@ -358,7 +408,7 @@ class EventStateRetriever:
                         if self._source_ids(item) - set().union(*(self._source_ids(other) for other in selected)):
                             value += float(self.config.get("source_diversity_bonus", .02))
                     return value
-                choice = max(remaining, key=lambda item: (score(item), item["id"]))
+                choice = max(choices, key=lambda item: (score(item), item["id"]))
                 choice_score = score(choice)
             choice["selection_score"] = choice_score
             selected.append(choice)
@@ -368,9 +418,15 @@ class EventStateRetriever:
         return selected
 
     def _vector(self, identifier: str, record_type: str) -> Sequence[float]:
-        return self.store.claim_embeddings.get(identifier, []) if record_type == "state_claim" else self.store.episode_embeddings.get(identifier, [])
+        if record_type == "state_claim":
+            return self.store.claim_embeddings.get(identifier, [])
+        if record_type == "turn":
+            return self.store.turn_embeddings.get(identifier, [])
+        return self.store.episode_embeddings.get(identifier, [])
 
     def _source_ids(self, item: Dict[str, Any]) -> set[Any]:
         if item["type"] == "episode":
             return {self.store.episodes[item["id"]].source_session_id}
+        if item["type"] == "turn":
+            return {self.store.turn_metadata.get(item["id"], {}).get("source_session_id")}
         return {ref.source_session_id for ref in self.store.claims[item["id"]].evidence}

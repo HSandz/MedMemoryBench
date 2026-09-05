@@ -4,8 +4,9 @@
 conversation episodes alongside compact, versioned semantic claims. Repeated
 claims share evidence references; later changes create superseded versions and
 unresolved contradictions remain contested. Retrieval independently searches
-claims and episode summaries, fuses ranks, and selects a small top-k/MMR
-evidence set. Optional typed PPR is query-only and does not alter snapshots.
+claims, episode summaries, and immutable archived turns, fuses ranks, and
+selects a small top-k/MMR evidence set. Optional typed PPR is query-only and
+does not alter snapshots.
 
 Claim self-references are resolved from cited source turns, so alternating
 named speakers remain separate subject namespaces. Repeating an older
@@ -120,7 +121,7 @@ so late-session information is not silently discarded. Build telemetry separates
 fragment salvage, structural repair, recovery extraction, and semantic-unavailable
 counts; malformed outputs also retain bounded previews and SHA-256 diagnostics.
 
-Snapshots use schema version 4 plus the Event-State build semantic version.
+Snapshots use schema version 5 plus the Event-State build semantic version.
 Semantic version `2.9` adds extraction recovery and temporal-ingress validation
 to the `2.8` non-exact state-value relation semantics: equivalent observations
 corroborate an active claim across sessions (or are
@@ -230,7 +231,7 @@ Temporal retrieval is query-only and is enabled by `temporal_retrieval_enabled`
 (`true` by default), with a neutral `temporal_retrieval_weight` of `1.0`.
 The deterministic parser recognizes explicit `YYYY-MM-DD` and `YYYY/MM/DD`
 dates, plus complete unambiguous English calendar dates such as `October 13,
-2023`, `Oct 13, 2023`, and `13 October 2023`. It supports `as of`/`by` (state
+2023`, `Oct 13, 2023`, `13 October 2023`, and `1 February, 2023`. It supports `as of`/`by` (state
 as-of), `before`, `after`, `between ... and ...` or `from ... to ...`
 (record-time bounds), and record cues such as `record
 dated DATE` (exact record time). Planner valid-time constraints consume claim
@@ -261,7 +262,21 @@ metrics exclude it; retrieval metrics include it when retrieval ground truth is
 available. Resuming deferred judges is idempotent. This query-only work does
 not change the write-side semantic version, which remains `2.9`.
 
-`max_episode_source_excerpts_total` is an optional query-only
+Episodes embed their summary plus a deterministic, evenly spaced sample of up
+to eight source turns. The sample preserves source order and includes the first
+and final turn, so later details and image captions have retrieval
+representation without embedding an entire transcript.
+
+`retrieve_turns` is enabled by default and adds a dense query-time index over
+the same immutable `turn_evidence` archive. It stores compact speaker, role,
+text, and image-caption vectors with each snapshot; it never creates claims or
+changes state compilation. `turn_top_k` defaults to `8` and
+`turn_retrieval_weight` to `1.0`. Optional deterministic lexical turn ranking
+is available through `turn_lexical_retrieval_enabled`, which defaults to
+`false`. Claim-derived and direct turn evidence are deduplicated by immutable
+episode/turn provenance before rendering.
+
+`max_episode_source_excerpts_total` is an explicit query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of
 raw source turns across all selected episodes, rather than two turns per
 episode. Claim-provenance excerpts have priority: their exact
@@ -328,10 +343,31 @@ with `retrieval_config.ppr_enabled: false` and then `true`; no extraction or
 embedding calls are required after the snapshot is imported. No benchmark
 annotations are passed to the method during memory construction or retrieval.
 
+To ablate the raw episode source-excerpt budget on a fixed snapshot, copy the
+method YAML, change only `retrieval_config.max_episode_source_excerpts_total`
+(for example `2`, `4`, or `8`), and run the query stage against the same memory
+run:
+
+```bash
+python main.py -m event_state_gemini_excerpts_8 -d locomo --stage query --memory-run <memory-run-directory>
+```
+
+The snapshot supplies semantic memory and the immutable-turn index; this
+query-only override does not rebuild extraction or state compilation.
+
 Query diagnostics keep dense, fusion, PPR, final, and selection scores
 separate, and report `selected_ids` independently from `included_ids`. State
 claims expose `all_provenance_evidence` for complete lineage and
 `included_provenance_evidence` for evidence that survived context budgeting.
+They also report pre/post-candidate counts, selected claim/episode/turn counts,
+raw-source excerpt budget and counts, source-turn contribution counts, and
+selected/included context tokens. LoCoMo adds evaluator-private stage reports
+after query completion for fused candidates, the candidate-count pool, final
+memory-object selection, selected episode archive availability, and
+answer-visible exact turns; those gold annotations never enter Event-State.
+Retrieval-record schema version 2 adds immutable-turn records and these stage
+diagnostics. Schema-4 snapshots remain loadable: their archived turns are
+embedded once during restore to reconstruct the derived turn index.
 When enabled, claim source expansion scores every immutable turn cited by every
 claim EvidenceRef with the query embedding, ranks each reference by its best
 cited-turn cosine score, and keeps at most `max_source_excerpts_per_claim`

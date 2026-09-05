@@ -18,7 +18,7 @@ _MONTH_NAMES = (
 _MONTH_ABBREVIATIONS = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
 _MONTH_PATTERN = rf"(?:{_MONTH_NAMES}|{_MONTH_ABBREVIATIONS})"
 _MONTH_NAME_DATE_PATTERN = rf"\b(?:{_MONTH_PATTERN})\s+\d{{1,2}},\s*\d{{4}}\b"
-_DAY_MONTH_DATE_PATTERN = rf"\b\d{{1,2}}\s+(?:{_MONTH_PATTERN})\s+\d{{4}}\b"
+_DAY_MONTH_DATE_PATTERN = rf"\b\d{{1,2}}\s+(?:{_MONTH_PATTERN}),?\s+\d{{4}}\b"
 _QUERY_DATE_PATTERN = (
     rf"(?:{_DATE_PATTERN}|{_MONTH_NAME_DATE_PATTERN}|{_DAY_MONTH_DATE_PATTERN})"
 )
@@ -64,7 +64,11 @@ def _query_dates(question: str) -> list[date]:
             if re.fullmatch(_DATE_PATTERN, value):
                 dates.append(date.fromisoformat(value.replace("/", "-")))
                 continue
-            for pattern in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
+            for pattern in (
+                "%B %d, %Y", "%b %d, %Y",
+                "%d %B %Y", "%d %b %Y",
+                "%d %B, %Y", "%d %b, %Y",
+            ):
                 try:
                     dates.append(datetime.strptime(value, pattern).date())
                     break

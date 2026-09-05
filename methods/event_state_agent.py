@@ -17,7 +17,7 @@ from methods.base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import BaseLLMClient, LLMAPIError, create_llm_client, format_messages, get_usage_tracker
 
 from .event_state.compiler import StateCompiler, parse_json
-from .event_state.context import fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
+from .event_state.context import episode_turn_embedding_text, fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
 from .event_state.embeddings import DenseEmbedder
 from .event_state.prompts import (
     ANSWER_SYSTEM_PROMPT,
@@ -150,6 +150,7 @@ class PreparedMemorySession:
     extracted: Dict[str, Any]
     episode: Episode
     episode_embedding: List[float]
+    turn_embeddings: List[List[float]]
     claims: List[Claim]
     claim_embeddings: List[List[float]]
     claim_slot_embeddings: List[List[float]]
@@ -160,7 +161,7 @@ class EventStateAgent(BaseAgent):
 
     METHOD_TYPE = "agentic_memory"
 
-    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, claim_top_k=30, episode_top_k=20, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_temperature=0.0, planner_max_tokens=1200, planner_merge_mode="coverage_interleave", **kwargs):
+    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, retrieve_turns=True, claim_top_k=30, episode_top_k=20, turn_top_k=8, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, turn_retrieval_weight=1.0, turn_lexical_retrieval_enabled=False, turn_lexical_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_temperature=0.0, planner_max_tokens=1200, planner_merge_mode="coverage_interleave", **kwargs):
         super().__init__(model, temperature, max_tokens, **kwargs)
         if fusion_mode != "rrf":
             raise ValueError("Event-State fusion_mode currently supports only 'rrf'")
@@ -172,7 +173,7 @@ class EventStateAgent(BaseAgent):
             raise ValueError("evidence_count must be >= 1 and <= candidate_count")
         if not 0 <= float(mmr_lambda) <= 1 or not 0 <= float(ppr_alpha) <= 1 or not 0 <= float(ppr_mix_weight) <= 1 or not 0 <= float(update_min_confidence) <= 1:
             raise ValueError("mmr_lambda, ppr_alpha, ppr_mix_weight, and update_min_confidence must be between 0 and 1")
-        if any(int(value) < 0 for value in (claim_top_k, episode_top_k, candidate_count)):
+        if any(int(value) < 0 for value in (claim_top_k, episode_top_k, turn_top_k, candidate_count)):
             raise ValueError("retrieval top-k values must be non-negative")
         if int(planner_rounds) < 0 or (int(planner_rounds) > 0 and int(planner_max_requests) < 1) or int(planner_max_tokens) <= 0:
             raise ValueError("planner_rounds must be >= 0, planner_max_requests >= 1 when enabled, and planner_max_tokens > 0")
@@ -198,7 +199,7 @@ class EventStateAgent(BaseAgent):
         self._stores: Dict[Any, EventStateStore] = {}
         self._context_id = None
         self._build_config = {"enable_episodes": self.enable_episodes, "enable_state_claims": self.enable_state_claims, "enable_state_compilation": self.enable_state_compilation, "extraction_max_tokens": self.extraction_max_tokens, "extraction_temperature": self.extraction_temperature, "max_claims_per_episode": self.max_claims_per_episode, "state_candidate_top_k": int(state_candidate_top_k), "state_current_candidate_top_k": max(1, int(state_current_candidate_top_k)), "state_candidate_min_similarity": float(state_candidate_min_similarity), "update_min_confidence": float(update_min_confidence), "update_temperature": self.update_temperature, "update_max_tokens": self.update_max_tokens, "store_raw_episode_text": self.store_raw_episode_text, "enable_bitemporal_time": self.enable_bitemporal_time, "preserve_turn_evidence": self.preserve_turn_evidence}
-        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "planner_rounds": self.planner_rounds, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens, "planner_merge_mode": self.planner_merge_mode}
+        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "retrieve_turns": bool(retrieve_turns), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "turn_top_k": int(turn_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "turn_retrieval_weight": float(turn_retrieval_weight), "turn_lexical_retrieval_enabled": bool(turn_lexical_retrieval_enabled), "turn_lexical_retrieval_weight": float(turn_lexical_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "max_episode_source_excerpts_total": self.max_episode_source_excerpts_total, "planner_rounds": self.planner_rounds, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens, "planner_merge_mode": self.planner_merge_mode}
 
     def _store(self, context_id=None) -> EventStateStore:
         key = self._context_id if context_id is None else context_id
@@ -660,9 +661,17 @@ class EventStateAgent(BaseAgent):
                     state_slot = normalize_state_slot(raw_claim["predicate"])
                     extracted["state_claim_slot_fallback_count"] = extracted.get("state_claim_slot_fallback_count", 0) + 1
                 claims.append(Claim(self._store(context_id).stable_id("C", [episode_id, index, resolution.subject_id, raw_claim["predicate"], raw_claim["value"]]), resolution.subject_display, resolution.subject_id, raw_claim["predicate"], raw_claim["value"], raw_claim["qualifiers"], raw_claim["polarity"], raw_claim["modality"], persistence, session.get("timestamp"), valid_from, valid_to, raw_claim.get("valid_time_text"), "standalone" if persistence == "history" else "active", [EvidenceRef(episode_id, session["source_session_id"], raw_claim["source_turn_ids"], "origin")], raw_claim["confidence"], resolution.subject_id, state_slot))
+        turn_embeddings: List[List[float]] = []
         if self.enable_episodes:
+            # Build the immutable-turn index with the episode, so restored
+            # query runs never need to re-embed an already indexed snapshot.
+            embedding_texts = [episode.retrieval_text()] + [
+                episode_turn_embedding_text(turn) for turn in episode.turn_evidence
+            ]
             with get_usage_tracker().scope("event_state.embedding"):
-                episode_embedding = self._embedder.embed_documents([episode.retrieval_text()])[0]
+                embeddings = self._embedder.embed_documents(embedding_texts)
+            episode_embedding = embeddings[0]
+            turn_embeddings = [list(item) for item in embeddings[1:]]
         else:
             episode_embedding = []
         claim_embeddings, claim_slot_embeddings = [], [[] for _ in claims]
@@ -674,7 +683,7 @@ class EventStateAgent(BaseAgent):
                     state_slot_embeddings = self._embedder.embed_documents([text for _, text in state_slot_items])
                     for (index, _), slot_embedding in zip(state_slot_items, state_slot_embeddings):
                         claim_slot_embeddings[index] = list(slot_embedding)
-        return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), claims, [list(item) for item in claim_embeddings], [list(item) for item in claim_slot_embeddings])
+        return PreparedMemorySession(context_id, session, normalized, extracted, episode, list(episode_embedding), turn_embeddings, claims, [list(item) for item in claim_embeddings], [list(item) for item in claim_slot_embeddings])
 
     def prepare_memory_sessions(
         self,
@@ -740,7 +749,7 @@ class EventStateAgent(BaseAgent):
         counts["allowed_source_turn_ids"].extend(extracted.get("allowed_source_turn_ids", []))
         episode = prepared.episode
         if self.enable_episodes:
-            store.add_episode(episode, prepared.episode_embedding)
+            store.add_episode(episode, prepared.episode_embedding, prepared.turn_embeddings)
             counts["episodes_added"] += 1
             added_records.append({"id": episode.episode_id, "type": "episode", "memory": episode.summary, "source_uid": episode.source_session_id, "source_session_id": episode.source_session_id})
         if not self.enable_state_claims:
@@ -851,11 +860,31 @@ class EventStateAgent(BaseAgent):
         planner_added_to_final = bool(item.get("planner_added_to_final"))
         if item["type"] == "episode":
             episode = store.episodes[item["id"]]
-            return {"id": episode.episode_id, "type": "episode", "memory": render_episode(episode), "source_uid": episode.source_session_id, "source_session_id": episode.source_session_id, "timestamp": episode.recorded_at, "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "temporal_score": item.get("temporal_score", 0.0), "temporal_match_type": item.get("temporal_match_type"), "selected_rank": item.get("selected_rank"), "episode_evidence_turn_ids": [turn.turn_id for turn in episode_evidence or ()], "planner_channel_retrieval": planner_channel_retrieval, "planner_added_to_final": planner_added_to_final, "planner_retrieval": planner_channel_retrieval, **{key: item[key] for key in ("planner_request_indices", "planner_channel_support_count", "planner_fusion_score") if key in item}}
+            return {"id": episode.episode_id, "type": "episode", "memory": render_episode(episode), "source_uid": episode.source_session_id, "source_session_id": episode.source_session_id, "timestamp": episode.recorded_at, "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "temporal_score": item.get("temporal_score", 0.0), "temporal_match_type": item.get("temporal_match_type"), "selected_rank": item.get("selected_rank"), "episode_evidence_turn_ids": [turn.turn_id for turn in episode_evidence or ()], "episode_archive_turn_ids": [turn.turn_id for turn in episode.turn_evidence], "planner_channel_retrieval": planner_channel_retrieval, "planner_added_to_final": planner_added_to_final, "planner_retrieval": planner_channel_retrieval, **{key: item[key] for key in ("planner_request_indices", "planner_channel_support_count", "planner_fusion_score") if key in item}}
         claim = store.claims[item["id"]]
         evidence = [{"evidence": {"source_uid": ref.source_session_id, "source_session_id": ref.source_session_id, "episode_id": ref.episode_id, "source_turn_ids": ref.source_turn_ids, "support_type": ref.support_type}} for ref in claim.evidence]
         source_uid = claim.evidence[0].source_session_id if claim.evidence else None
         return {"id": claim.claim_id, "type": "state_claim", "memory": render_claim(claim, store.edges, store.claims), "subject": claim.subject, "subject_id": claim.subject_id or claim.subject_key, "status": claim.status, "source_uid": source_uid, "source_session_id": source_uid, "all_provenance_evidence": evidence, "provenance_evidence": evidence[:1], "dense_score": item.get("dense_score", 0.0), "fusion_score": item.get("fusion_score", item.get("score", 0.0)), "ppr_score": item.get("ppr_score", 0.0), "final_score": item.get("final_score", item.get("score", 0.0)), "selection_score": item.get("selection_score", item.get("score", 0.0)), "temporal_score": item.get("temporal_score", 0.0), "temporal_match_type": item.get("temporal_match_type"), "selected_rank": item.get("selected_rank"), "planner_channel_retrieval": planner_channel_retrieval, "planner_added_to_final": planner_added_to_final, "planner_retrieval": planner_channel_retrieval, **{key: item[key] for key in ("planner_request_indices", "planner_channel_support_count", "planner_fusion_score") if key in item}}
+
+    @staticmethod
+    def _turn_record(store: EventStateStore, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose a selected immutable turn without representing it as a claim."""
+        episode, turn = store.turn_for_key(item["id"])
+        if episode is None or turn is None:
+            raise ValueError(f"Selected Event-State turn is missing from the archive: {item['id']}")
+        return {
+            "id": item["id"], "type": "immutable_turn",
+            "source_uid": episode.source_session_id,
+            "source_session_id": episode.source_session_id,
+            "episode_id": episode.episode_id,
+            "source_turn_id": turn.turn_id,
+            "episode_evidence_turn_ids": [turn.turn_id],
+            "dense_score": item.get("dense_score", 0.0),
+            "fusion_score": item.get("fusion_score", item.get("score", 0.0)),
+            "final_score": item.get("final_score", item.get("score", 0.0)),
+            "selection_score": item.get("selection_score", item.get("score", 0.0)),
+            "selected_rank": item.get("selected_rank"),
+        }
 
     def supports_batch_queries(self) -> bool:
         return self.planner_rounds == 0
@@ -865,7 +894,9 @@ class EventStateAgent(BaseAgent):
 
     def _compile_query_context(self, question, system_message, store, selected, retrieval_extra, query_vectors):
         query_vector = query_vectors[0]
-        selected_claims = [store.claims[item["id"]] for item in selected if item["type"] == "state_claim"]
+        selected_memory_items = [item for item in selected if item["type"] != "turn"]
+        selected_turn_items = [item for item in selected if item["type"] == "turn"]
+        selected_claims = [store.claims[item["id"]] for item in selected_memory_items if item["type"] == "state_claim"]
         selected_claim_evidence = {}
         claimed_turns = set()
         if self.inject_source_evidence:
@@ -884,19 +915,37 @@ class EventStateAgent(BaseAgent):
                 claimed_turns.update(selected_claim_evidence_turn_keys(selections))
         selected_episodes = [
             (index, store.episodes[item["id"]])
-            for index, item in enumerate(selected)
+            for index, item in enumerate(selected_memory_items)
             if item["type"] == "episode"
         ]
+        indexed_turns = []
+        indexed_turn_keys = set()
+        for item in selected_turn_items:
+            episode, turn = store.turn_for_key(item["id"])
+            if episode is None or turn is None:
+                continue
+            key = (episode.episode_id, turn.turn_id)
+            if key in claimed_turns or key in indexed_turn_keys:
+                continue
+            indexed_turn_keys.add(key)
+            indexed_turns.append((item, episode, turn))
         episode_evidence_by_id, episode_evidence_candidate_turn_count, episode_evidence_deduplicated_against_claim_count = select_global_episode_evidence(
             selected_episodes,
             query_vector,
             self._embedder,
             self.max_episode_source_excerpts_total,
-            claimed_turns,
+            claimed_turns | indexed_turn_keys,
             query_vectors=query_vectors,
         )
-        records = [self._record(store, item, episode_evidence_by_id.get(item["id"])) for item in selected]
-        blocks = [{"text": record["memory"], "kind": "state" if record["type"] == "state_claim" else "episode", "record_id": record["id"]} for record in records]
+        records = [
+            self._record(store, item, episode_evidence_by_id.get(item["id"]))
+            for item in selected_memory_items
+        ]
+        records.extend(self._turn_record(store, item) for item, _episode, _turn in indexed_turns)
+        blocks = [
+            {"text": record["memory"], "kind": "state" if record["type"] == "state_claim" else "episode", "record_id": record["id"]}
+            for record in records if record["type"] != "immutable_turn"
+        ]
         if self.inject_source_evidence:
             rendered_turns = set()
             for record in records:
@@ -916,10 +965,24 @@ class EventStateAgent(BaseAgent):
             {"text": render_episode_evidence(store.episodes[record["id"]], episode_evidence_by_id[record["id"]]), "kind": "source", "record_id": record["id"]}
             for record in records if record["type"] == "episode" and episode_evidence_by_id.get(record["id"])
         )
+        for item, episode, turn in indexed_turns:
+            text = (
+                f"[Retrieved Immutable Evidence {episode.episode_id} / session {episode.source_session_id}]\n"
+                f"  {turn.speaker} ({turn.timestamp or episode.recorded_at or 'unknown'}): {turn.text}"
+                + (f" [Shared image: {turn.image_caption}]" if turn.image_caption else "")
+            )
+            blocks.append({"text": text, "kind": "source", "record_id": item["id"]})
         instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
         answer_system = "\n\n".join(item for item in (ANSWER_SYSTEM_PROMPT, (system_message or "").strip()) if item)
         included_blocks, included_tokens = fit_context(blocks, answer_system, instruction, question, self.max_context_tokens, self.max_tokens, self.count_tokens, self.truncate_to_tokens)
-        included_ids = [record["id"] for record in records if record["memory"] in included_blocks]
+        included_counts = Counter(included_blocks)
+        included_ids = []
+        for block in blocks:
+            record_id = block.get("record_id")
+            if record_id and included_counts[block["text"]] > 0:
+                included_counts[block["text"]] -= 1
+                included_ids.append(record_id)
+        included_ids = list(dict.fromkeys(included_ids))
         for record in records:
             record["included_in_context"] = record["id"] in included_ids
         included_source_counts = Counter(included_blocks)
@@ -935,7 +998,45 @@ class EventStateAgent(BaseAgent):
             record["included_provenance_evidence"] = included_provenance_by_claim.get(record["id"], [])
         context = "\n\n".join(included_blocks)
         user_content = f"{instruction}\n\n{context}\n\n{question}" if context else f"{instruction}\n\n{question}"
-        extra = {**retrieval_extra, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": sum(self.count_tokens(block["text"]) for block in blocks), "included_context_tokens": included_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
+        pre_candidates = retrieval_extra.get("pre_candidate_truncation_candidates", [])
+        post_candidates = retrieval_extra.get("post_candidate_truncation_candidates", [])
+        candidate_stages = {
+            "pre_candidate_truncation_fused": self._candidate_trace(pre_candidates, store, len(pre_candidates)),
+            "post_candidate_count": self._candidate_trace(post_candidates, store, len(post_candidates)),
+            "final_memory_object_selection": self._candidate_trace(selected, store, len(selected)),
+        }
+        base_extra = {
+            key: value for key, value in retrieval_extra.items()
+            if key not in {"pre_candidate_truncation_candidates", "post_candidate_truncation_candidates"}
+        }
+        selected_context_tokens = sum(self.count_tokens(block["text"]) for block in blocks)
+        source_turn_count = len({
+            (episode_id, turn_id)
+            for record in records if record.get("included_in_context")
+            for episode_id, turn_id in (
+                [(record.get("episode_id"), record.get("source_turn_id"))]
+                if record["type"] == "immutable_turn" else []
+            )
+        })
+        source_turn_count += len({
+            (record["id"], turn_id)
+            for record in records if record["type"] == "episode" and record.get("included_in_context")
+            for turn_id in record.get("episode_evidence_turn_ids", [])
+        })
+        source_turn_count += len({
+            (item["evidence"].get("episode_id"), turn_id)
+            for item in (item for record in records for item in record.get("included_provenance_evidence", []))
+            for turn_id in item.get("evidence", {}).get("source_turn_ids", [])
+        })
+        candidate_episode_sessions = {
+            source_id for item in candidate_stages["post_candidate_count"]
+            if item.get("type") == "episode" for source_id in item.get("source_session_ids", [])
+        }
+        selected_episode_sessions = {
+            str(record["source_session_id"]) for record in records
+            if record["type"] == "episode" and record.get("source_session_id") is not None
+        }
+        extra = {**base_extra, "retrieval_record_schema_version": 2, "retrieval_stage_candidates": candidate_stages, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "turn_candidate_count": retrieval_extra.get("turn_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": selected_context_tokens, "included_context_tokens": included_tokens, "context_truncated": included_tokens < selected_context_tokens, "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_memory_object_count": sum(record["type"] != "immutable_turn" for record in records), "selected_raw_turn_count": sum(record["type"] == "immutable_turn" for record in records), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "raw_episode_turn_candidate_count": episode_evidence_candidate_turn_count + len(indexed_turns), "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "configured_global_raw_excerpt_budget": self.max_episode_source_excerpts_total, "source_evidence_turns_contributed_by_claims": sum(len(item.get("evidence", {}).get("source_turn_ids", [])) for item in (item for record in records for item in record.get("included_provenance_evidence", []))), "total_answer_visible_distinct_source_turns": source_turn_count, "candidate_episode_source_session_count": len(candidate_episode_sessions), "selected_episode_source_session_count": len(selected_episode_sessions), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
         return {"messages": format_messages(user_content, answer_system), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     def _initial_query_context(self, question: str, system_message: Optional[str], **kwargs):
@@ -1034,7 +1135,7 @@ class EventStateAgent(BaseAgent):
                 telemetry["planner_requests"].append(request.to_dict())
                 vector = self._embedder.embed_query(request.query)
                 query_vectors.append(vector)
-                ranked_request, _request_extra = retriever.rank_candidates(request.query, query_vector=vector, temporal_constraint=request.temporal_constraint, parse_temporal_query=False, retrieve_claims_override=request.sources in {"claims", "both"}, retrieve_episodes_override=request.sources in {"episodes", "both"}, state_view=request.state_view)
+                ranked_request, _request_extra = retriever.rank_candidates(request.query, query_vector=vector, temporal_constraint=request.temporal_constraint, parse_temporal_query=False, retrieve_claims_override=request.sources in {"claims", "both"}, retrieve_episodes_override=request.sources in {"episodes", "both"}, retrieve_turns_override=request.sources in {"episodes", "both"}, state_view=request.state_view)
                 channels.append(ranked_request)
                 telemetry["candidate_trace"]["planner_channels"].append({"request_index": len(telemetry["candidate_trace"]["planner_channels"]), "request": request.to_dict(), "ranked": self._candidate_trace(ranked_request, store, trace_limit)})
             merged = retriever.merge_rank_channels(channels)
@@ -1088,6 +1189,8 @@ class EventStateAgent(BaseAgent):
                 source_ids.add(store.episodes[identifier].source_session_id)
             elif item.get("type") == "state_claim" and identifier in store.claims:
                 source_ids.update(ref.source_session_id for ref in store.claims[identifier].evidence)
+            elif item.get("type") == "turn":
+                source_ids.add(store.turn_metadata.get(identifier, {}).get("source_session_id"))
             rows.append({"id": identifier, "type": item.get("type"), "rank": rank, "source_session_ids": sorted(str(value) for value in source_ids if value is not None), "final_score": float(item.get("final_score", item.get("score", 0.0)) or 0.0), **({"planner_fusion_score": float(item["planner_fusion_score"])} if "planner_fusion_score" in item else {}), "temporal_score": float(item.get("temporal_score", 0.0) or 0.0), "temporal_match_type": item.get("temporal_match_type")})
         return rows
 
@@ -1101,6 +1204,26 @@ class EventStateAgent(BaseAgent):
         stored_context = state.get("context_id")
         key = context_id if context_id is not None else (self._context_id if self._context_id is not None else stored_context)
         restored = EventStateStore.from_export(state)
+        missing_turn_keys = [
+            key for key in restored.turn_metadata
+            if key not in restored.turn_embeddings
+        ]
+        if missing_turn_keys:
+            # Older snapshots retain immutable evidence but predate the turn
+            # vectors. Reconstruct only this derived query index on restore.
+            texts = []
+            valid_keys = []
+            for key in missing_turn_keys:
+                _episode, turn = restored.turn_for_key(key)
+                if turn is not None:
+                    valid_keys.append(key)
+                    texts.append(episode_turn_embedding_text(turn))
+            if texts:
+                with get_usage_tracker().scope("event_state.embedding"):
+                    vectors = self._embedder.embed_documents(texts)
+                restored.turn_embeddings.update(
+                    {key: list(vector) for key, vector in zip(valid_keys, vectors)}
+                )
         restored.context_id = key
         self._stores[key] = restored
         self._context_id = key

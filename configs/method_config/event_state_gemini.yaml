@@ -40,13 +40,17 @@ retrieval_config:
   max_context_tokens: 120000
   retrieve_claims: true
   retrieve_episodes: true
+  retrieve_turns: true
   claim_top_k: 30
   episode_top_k: 20
+  turn_top_k: 8
   candidate_count: 40
   fusion_mode: rrf
   rrf_k: 60.0
   claim_retrieval_weight: 1.0
   episode_retrieval_weight: 1.0
+  turn_retrieval_weight: 1.0
+  turn_lexical_retrieval_enabled: false
   temporal_retrieval_enabled: true
   temporal_retrieval_weight: 1.0
   ppr_enabled: false
@@ -67,3 +71,4 @@ retrieval_config:
   representation_balance_bonus: 0.02
   inject_source_evidence: true
   max_source_excerpts_per_claim: 2
+  max_episode_source_excerpts_total: 2

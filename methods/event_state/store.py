@@ -14,7 +14,7 @@ from .validation import normalize_state_slot
 class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     SEMANTIC_VERSION = "2.9"
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
@@ -24,6 +24,10 @@ class EventStateStore:
         self.operations: List[StateOperation] = []
         self.edges: List[Dict[str, Any]] = []
         self.episode_embeddings: Dict[str, List[float]] = {}
+        # This is an index over immutable episode evidence, not a semantic
+        # memory layer. Keys are stable across exported snapshots.
+        self.turn_embeddings: Dict[str, List[float]] = {}
+        self.turn_metadata: Dict[str, Dict[str, Any]] = {}
         self.claim_embeddings: Dict[str, List[float]] = {}
         self.claim_slot_embeddings: Dict[str, List[float]] = {}
 
@@ -32,7 +36,12 @@ class EventStateStore:
         encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
         return f"{prefix}{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]}"
 
-    def add_episode(self, episode: Episode, embedding: List[float]) -> None:
+    def add_episode(
+        self,
+        episode: Episode,
+        embedding: List[float],
+        turn_embeddings: Optional[List[List[float]]] = None,
+    ) -> None:
         conflicting_episode = next(
             (
                 existing.episode_id
@@ -51,6 +60,43 @@ class EventStateStore:
         if episode.episode_id not in self.episodes:
             self.episodes[episode.episode_id] = episode
             self.episode_embeddings[episode.episode_id] = list(embedding)
+            self._index_episode_turns(episode, turn_embeddings)
+
+    def turn_key(self, episode_id: str, turn_index: int) -> str:
+        """Return the stable identifier for one archived source turn."""
+        return self.stable_id("T", [episode_id, int(turn_index)])
+
+    def _index_episode_turns(
+        self,
+        episode: Episode,
+        vectors: Optional[List[List[float]]] = None,
+    ) -> None:
+        for turn_index, turn in enumerate(episode.turn_evidence):
+            key = self.turn_key(episode.episode_id, turn_index)
+            self.turn_metadata[key] = {
+                "episode_id": episode.episode_id,
+                "source_session_id": turn.source_session_id
+                if turn.source_session_id is not None else episode.source_session_id,
+                "source_turn_id": turn.turn_id,
+                "source_session_index": turn.source_session_index
+                if turn.source_session_index is not None else episode.source_session_index,
+                "source_turn_index": turn_index,
+            }
+            if vectors is not None and turn_index < len(vectors):
+                self.turn_embeddings[key] = list(vectors[turn_index])
+
+    def rebuild_turn_metadata(self) -> None:
+        """Reconstruct index metadata for snapshots that predate turn search."""
+        for episode in self.episodes.values():
+            self._index_episode_turns(episode)
+
+    def turn_for_key(self, key: str) -> tuple[Optional[Episode], Optional[Any]]:
+        metadata = self.turn_metadata.get(key, {})
+        episode = self.episodes.get(metadata.get("episode_id"))
+        index = metadata.get("source_turn_index")
+        if episode is None or not isinstance(index, int) or not 0 <= index < len(episode.turn_evidence):
+            return None, None
+        return episode, episode.turn_evidence[index]
 
     def add_claim(self, claim: Claim, embedding: List[float], slot_embedding: Optional[List[float]] = None) -> None:
         if claim.persistence == "history":
@@ -103,6 +149,9 @@ class EventStateStore:
         for episode_id in self.episodes:
             if episode_id not in self.episode_embeddings:
                 errors.append(f"missing episode embedding: {episode_id}")
+        for key, metadata in self.turn_metadata.items():
+            if metadata.get("episode_id") not in self.episodes:
+                errors.append(f"turn index references missing episode: {key}")
         adjacency: Dict[str, List[str]] = {}
         for edge in version_edges:
             adjacency.setdefault(edge["source_id"], []).append(edge["target_id"])
@@ -190,15 +239,15 @@ class EventStateStore:
         }
 
     def export(self) -> Dict[str, Any]:
-        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "claim_embeddings": self.claim_embeddings, "claim_slot_embeddings": self.claim_slot_embeddings}
+        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "turn_embeddings": self.turn_embeddings, "turn_metadata": self.turn_metadata, "claim_embeddings": self.claim_embeddings, "claim_slot_embeddings": self.claim_slot_embeddings}
 
     @classmethod
     def from_export(cls, state: Dict[str, Any]) -> "EventStateStore":
         if state.get("method") != "event_state":
             raise ValueError("Not an Event-State Hybrid Memory snapshot")
-        if state.get("schema_version") != cls.SCHEMA_VERSION:
+        if state.get("schema_version") not in {4, cls.SCHEMA_VERSION}:
             raise ValueError(
-                f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v4; rebuild the memory snapshot."
+                f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v{cls.SCHEMA_VERSION}; rebuild the memory snapshot."
             )
         if state.get("semantic_version") != cls.SEMANTIC_VERSION:
             raise ValueError("Event-State snapshot semantic version is incompatible; rebuild the memory snapshot.")
@@ -208,6 +257,12 @@ class EventStateStore:
         store.operations = [StateOperation(**item) for item in state.get("state_operations", [])]
         store.edges = list(state.get("edges", []))
         store.episode_embeddings = {key: list(value) for key, value in state.get("episode_embeddings", {}).items()}
+        store.turn_embeddings = {key: list(value) for key, value in state.get("turn_embeddings", {}).items()}
+        store.turn_metadata = {
+            key: dict(value) for key, value in state.get("turn_metadata", {}).items()
+            if isinstance(value, dict)
+        }
+        store.rebuild_turn_metadata()
         store.claim_embeddings = {key: list(value) for key, value in state.get("claim_embeddings", {}).items()}
         store.claim_slot_embeddings = {key: list(value) for key, value in state.get("claim_slot_embeddings", {}).items()}
         return store
