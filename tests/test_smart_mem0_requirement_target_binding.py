@@ -1,4 +1,4 @@
-"""Regression tests for proof/context separation and grounded requirements."""
+"""Regression tests for proof/context separation and evidence-lookup requirements."""
 
 from methods.smart_mem0.agent import SmartMem0Agent
 from methods.smart_mem0.contracts import QueryFrame
@@ -124,15 +124,24 @@ def test_temporal_requirement_binds_target_before_accepting_date():
 
 def test_relation_proof_cannot_use_wrong_requirement_endpoint():
     agent = _agent()
-    first = _memory("m1", "Unrelated dated observation.", "one", event_time="2024-01-01")
-    second = _memory("m2", "Another unrelated dated observation.", "two", event_time="2024-01-02")
+    first = _memory(
+        "m1", "Unrelated dated observation.", "one", event_time="2024-01-01"
+    )
+    second = _memory(
+        "m2", "Another unrelated dated observation.", "two", event_time="2024-01-02"
+    )
     plan = {
         "required_slots": [
             _requirement("HbA1c result", time_axis="event_time"),
             _requirement("insulin dose", slot_id="r2", time_axis="event_time"),
         ],
         "semantic_relations": [
-            {"type": "TEMPORAL_ORDER", "from": "r1", "to": "r2", "relation": "BEFORE"}
+            {
+                "type": "TEMPORAL_ORDER",
+                "from": "r1",
+                "to": "r2",
+                "relation": "BEFORE",
+            }
         ],
     }
     statuses = agent._relation_status_map(
@@ -181,7 +190,9 @@ def test_recovery_candidates_precede_failed_round_and_seed_context():
     agent = _agent()
     seed = _memory("m67", "Emergency danger sign safety instruction.", "urgent care")
     old = _memory("m70", "Avoid NSAIDs because of gastric bleeding history.", "NSAIDs")
-    recovery_first = _memory("m65", "Stop empagliflozin before a procedure.", "empagliflozin")
+    recovery_first = _memory(
+        "m65", "Stop empagliflozin before a procedure.", "empagliflozin"
+    )
     cefuroxime = _memory(
         "m21",
         "Patient has a documented allergic reaction to cefuroxime (cephalosporins).",
@@ -201,7 +212,11 @@ def test_recovery_candidates_precede_failed_round_and_seed_context():
         "beliefs": [],
         "trace": [
             {"retrieval_round": 1, "produces": ["r1"], "output_ids": ["m70"]},
-            {"retrieval_round": 2, "produces": ["r1"], "output_ids": ["m65", "m21"]},
+            {
+                "retrieval_round": 2,
+                "produces": ["r1"],
+                "output_ids": ["m65", "m21"],
+            },
         ],
         "relations": [],
     }
@@ -209,7 +224,10 @@ def test_recovery_candidates_precede_failed_round_and_seed_context():
     agent._prepare_requirement_context_state(run, [seed])
 
     assert run["requirement_context_candidates"]["r1"][:4] == [
-        "m65", "m21", "m70", "m67"
+        "m65",
+        "m21",
+        "m70",
+        "m67",
     ]
     assert run["slot_support"]["r1"] == []
     packed = agent._role_aware_support_ids(
@@ -224,7 +242,9 @@ def test_recovery_candidates_precede_failed_round_and_seed_context():
 def test_found_reserves_proof_but_does_not_exclude_high_recall_alternate():
     agent = _agent()
     proof = _memory("m1", "The requested HbA1c result was 8.1%.", "8.1%")
-    alternate = _memory("m2", "A nearby lab note discussed glycemic control.", "poor control")
+    alternate = _memory(
+        "m2", "A nearby lab note discussed glycemic control.", "poor control"
+    )
     run = {
         "fast_supports": None,
         "plan": {"required_slots": [_requirement("HbA1c result")]},
@@ -236,7 +256,13 @@ def test_found_reserves_proof_but_does_not_exclude_high_recall_alternate():
         "operation_output_ids": {"m1", "m2"},
         "operation_candidates": [proof.copy(), alternate.copy()],
         "beliefs": [proof.copy(), alternate.copy()],
-        "trace": [{"retrieval_round": 1, "produces": ["r1"], "output_ids": ["m1", "m2"]}],
+        "trace": [
+            {
+                "retrieval_round": 1,
+                "produces": ["r1"],
+                "output_ids": ["m1", "m2"],
+            }
+        ],
         "relations": [],
     }
     agent._prepare_requirement_context_state(run, [])
@@ -256,7 +282,10 @@ def test_multi_requirement_packing_is_round_robin_before_second_candidate():
         "r1": ["a1", "a2"],
         "r2": ["b1", "b2"],
     }
-    slots = [_requirement("first fact"), _requirement("second fact", slot_id="r2")]
+    slots = [
+        _requirement("first fact"),
+        _requirement("second fact", slot_id="r2"),
+    ]
     support = {agent.CONTEXT_POOL_KEY: ["a1", "a2", "b1", "b2"]}
     packed = agent._role_aware_support_ids(
         slots, support, ["a1", "a2", "b1", "b2"], 4
@@ -265,7 +294,37 @@ def test_multi_requirement_packing_is_round_robin_before_second_candidate():
     assert set(packed[2:]) == {"a2", "b2"}
 
 
-def test_intermediate_requirement_has_own_retrieval_target_and_bridge_goal():
+def test_question_focus_is_provenance_while_target_is_lookup_variable():
+    agent = _agent()
+    question = "What antibiotic was the patient clearly instructed to avoid?"
+    ir = agent._rc_normalize_ir(
+        {
+            "answer_type": "ENTITY",
+            "requirements": [
+                {
+                    "id": "r1",
+                    "grounding_kind": "QUESTION",
+                    "focus_span": "antibiotic",
+                    "target": "prior antibiotic avoidance",
+                    "retrieval_hint": "medication allergy or explicit avoid instruction",
+                }
+            ],
+        },
+        question,
+        QueryFrame(),
+    )
+    requirement = ir["requirements"][0]
+    assert requirement["focus_span"] == "antibiotic"
+    assert requirement["target"] == "prior antibiotic avoidance"
+
+    plan = agent._controller_plan(ir, question, QueryFrame())
+    slot = plan["required_slots"][0]
+    assert slot["focus_span"] == "antibiotic"
+    assert slot["target_surface"] == "prior antibiotic avoidance"
+    assert plan["query_spec"]["semantic_ir_version"] == "minimal-v2-evidence-lookup"
+
+
+def test_derived_requirement_is_first_class_lookup_without_focus_span():
     agent = _agent()
     question = "Could late-night takeout explain morning blurry vision?"
     parsed = {
@@ -275,19 +334,21 @@ def test_intermediate_requirement_has_own_retrieval_target_and_bridge_goal():
                 "id": "r1",
                 "grounding_kind": "QUESTION",
                 "focus_span": "late-night takeout",
+                "target": "late-night meal pattern",
                 "retrieval_hint": "late-night food exposure",
             },
             {
                 "id": "r2",
-                "grounding_kind": "INTERMEDIATE",
+                "grounding_kind": "DERIVED",
                 "focus_span": "",
-                "evidence_target": "morning hyperglycemia",
-                "retrieval_hint": "participant morning glucose state",
+                "target": "morning glycemic state",
+                "retrieval_hint": "fasting glucose or morning hyperglycemia",
             },
             {
                 "id": "r3",
                 "grounding_kind": "QUESTION",
                 "focus_span": "morning blurry vision",
+                "target": "morning visual symptoms",
                 "retrieval_hint": "morning visual symptom",
             },
         ],
@@ -296,13 +357,13 @@ def test_intermediate_requirement_has_own_retrieval_target_and_bridge_goal():
                 "type": "POSSIBLE_CAUSE",
                 "from": "r1",
                 "to": "r2",
-                "bridge_goal": "Explain how the grounded late-night exposure could contribute to the grounded morning glucose state.",
+                "bridge_goal": "Explain how the grounded late-night exposure could affect the grounded morning glycemic state.",
             },
             {
                 "type": "INFER",
                 "from": "r2",
                 "to": "r3",
-                "bridge_goal": "Explain how the grounded glucose state could account for the grounded morning symptom.",
+                "bridge_goal": "Explain how the grounded glycemic state could account for the grounded visual symptom.",
             },
         ],
     }
@@ -310,18 +371,20 @@ def test_intermediate_requirement_has_own_retrieval_target_and_bridge_goal():
     ir = agent._rc_normalize_ir(parsed, question, QueryFrame())
     assert len(ir["requirements"]) == 3
     middle = ir["requirements"][1]
-    assert middle["grounding_kind"] == "INTERMEDIATE"
+    assert middle["grounding_kind"] == "DERIVED"
     assert middle["focus_span"] == ""
-    assert middle["evidence_target"] == "morning hyperglycemia"
+    assert middle["target"] == "morning glycemic state"
     assert ir["relations"][0]["bridge_goal"].startswith("Explain how")
 
     plan = agent._controller_plan(ir, question, QueryFrame())
-    middle_slot = next(slot for slot in plan["required_slots"] if slot["id"] == "r2")
-    assert middle_slot["target_surface"] == "morning hyperglycemia"
-    assert middle_slot["grounding_kind"] == "INTERMEDIATE"
+    middle_slot = next(
+        slot for slot in plan["required_slots"] if slot["id"] == "r2"
+    )
+    assert middle_slot["target_surface"] == "morning glycemic state"
+    assert middle_slot["grounding_kind"] == "DERIVED"
 
 
-def test_malformed_intermediate_without_retrieval_target_is_removed():
+def test_malformed_derived_without_lookup_target_is_removed_with_relations():
     agent = _agent()
     question = "Could late-night takeout explain morning blurry vision?"
     ir = agent._rc_normalize_ir(
@@ -331,12 +394,13 @@ def test_malformed_intermediate_without_retrieval_target_is_removed():
                     "id": "r1",
                     "grounding_kind": "QUESTION",
                     "focus_span": "late-night takeout",
+                    "target": "late-night meal pattern",
                 },
                 {
                     "id": "r2",
-                    "grounding_kind": "INTERMEDIATE",
+                    "grounding_kind": "DERIVED",
                     "focus_span": "",
-                    "evidence_target": "",
+                    "target": "",
                 },
             ],
             "relations": [{"type": "INFER", "from": "r2", "to": "r1"}],
@@ -346,3 +410,68 @@ def test_malformed_intermediate_without_retrieval_target_is_removed():
     )
     assert [item["id"] for item in ir["requirements"]] == ["r1"]
     assert ir["relations"] == []
+
+
+def test_question_like_target_with_question_mark_is_not_accepted_as_requirement():
+    agent = _agent()
+    question = "My neck feels sore. Can I take some painkillers?"
+    ir = agent._rc_normalize_ir(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "grounding_kind": "QUESTION",
+                    "focus_span": "My neck feels sore",
+                    "target": "work-related neck symptoms",
+                },
+                {
+                    "id": "r2",
+                    "grounding_kind": "QUESTION",
+                    "focus_span": "Can I take some painkillers",
+                    "target": "Can I take some painkillers?",
+                },
+            ]
+        },
+        question,
+        QueryFrame(),
+    )
+    assert [item["id"] for item in ir["requirements"]] == ["r1"]
+
+
+def test_requirement_target_is_bounded_and_atomic_by_shape():
+    agent = _agent()
+    question = "Could my recent routine affect how I feel in the morning?"
+    overlong = " ".join(f"evidence{i}" for i in range(20))
+    ir = agent._rc_normalize_ir(
+        {
+            "requirements": [
+                {
+                    "id": "r1",
+                    "grounding_kind": "QUESTION",
+                    "focus_span": "recent routine",
+                    "target": "recent routine pattern",
+                },
+                {
+                    "id": "r2",
+                    "grounding_kind": "DERIVED",
+                    "target": overlong,
+                },
+            ]
+        },
+        question,
+        QueryFrame(),
+    )
+    assert [item["id"] for item in ir["requirements"]] == ["r1"]
+
+
+def test_multi_hop_output_instruction_preserves_structure_but_avoids_repetition():
+    instruction = SmartMem0Agent._compact_reasoning_output_instruction(
+        "multi_hop_clinical_deduction"
+    )
+    assert "Evidence:" in instruction
+    assert "Reasoning:" in instruction
+    assert "Conclusion:" in instruction
+    assert "Do not repeat" in instruction
+    assert SmartMem0Agent._compact_reasoning_output_instruction(
+        "entity_exact_match"
+    ) == ""
