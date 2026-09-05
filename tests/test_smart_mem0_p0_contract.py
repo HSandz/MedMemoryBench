@@ -96,6 +96,7 @@ def _memory(memory_id, value, claim, **extra):
     return {
         "id": memory_id,
         "subject": "primary_user",
+        "subject_id": "primary_user",
         "kind": "FACT",
         "claim": claim,
         "value": value,
@@ -200,6 +201,9 @@ def test_target_derived_resolved_key_can_authorize_same_concept_family():
 
 
 class _RunBase:
+    target_surface = "cefuroxime"
+    resolved_keys = ["cefuroxime"]
+
     def _run_query_retrieval(
         self,
         question,
@@ -221,8 +225,8 @@ class _RunBase:
                         "evidence_role": "REQUIREMENT",
                         "subject": "primary_user",
                         "subject_id": "primary_user",
-                        "target_surface": "cefuroxime",
-                        "resolved_keys": ["cefuroxime"],
+                        "target_surface": self.target_surface,
+                        "resolved_keys": list(self.resolved_keys),
                         "required_fields": [],
                     }
                 ]
@@ -248,10 +252,17 @@ class _SeedHarness(ReadP0ContractMixin, _RunBase):
         return deepcopy(value)
 
     @staticmethod
+    def _rc_owner_match(slot, memory):
+        wanted = slot.get("subject_id") or slot.get("subject") or ""
+        actual = memory.get("subject_id") or memory.get("subject") or ""
+        return not wanted or wanted == actual
+
+    @staticmethod
     def _slot_contract_match(slot, memory, strict_targets=None):
         del strict_targets
         return (
-            slot.get("subject") == memory.get("subject")
+            (slot.get("subject_id") or slot.get("subject"))
+            == (memory.get("subject_id") or memory.get("subject"))
             and slot.get("target_surface", "").casefold()
             in (memory.get("claim", "") + " " + memory.get("value", "")).casefold()
         )
@@ -273,6 +284,35 @@ def test_reserved_seed_is_context_only_not_retrieval_proof():
     )
     assert run["slot_support"]["r1"] == ["m_cefuroxime"]
     assert run["reserved_seed_context"] == {"r1": "m_cefuroxime"}
+    assert run["reserved_seed_context_mode"] == {"r1": "strict_target"}
     assert run["planning_seeds"][0]["id"] == "m_cefuroxime"
+    assert run["requirement_status"]["r1"] == "EMPTY"
+    assert run["retrieval_complete"] is False
+
+
+def test_cefuroxime_like_semantic_seed_survives_as_unverified_top1_context():
+    class _SemanticSeedHarness(_SeedHarness):
+        target_surface = "antibiotic that the patient has been clearly instructed to avoid"
+        resolved_keys = []
+
+    seed = _memory(
+        "m_17",
+        "cefuroxime",
+        "Patient has a documented allergy to cefuroxime (cephalosporins).",
+        semantic_role="SAFETY_CONSTRAINT",
+        object_anchor="cefuroxime",
+        entities=["cefuroxime", "cephalosporins"],
+    )
+    harness = _SemanticSeedHarness()
+    run = harness._run_query_retrieval(
+        "What is the name of the antibiotic that the patient has been clearly instructed to avoid?",
+        [seed],
+        object(),
+        None,
+        {},
+    )
+    assert run["reserved_seed_context"] == {"r1": "m_17"}
+    assert run["reserved_seed_context_mode"] == {"r1": "top1_unverified"}
+    assert run["slot_support"]["r1"] == ["m_17"]
     assert run["requirement_status"]["r1"] == "EMPTY"
     assert run["retrieval_complete"] is False
