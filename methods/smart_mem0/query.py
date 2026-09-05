@@ -549,8 +549,6 @@ class QueryMixin:
         }
         if "CAUSES" in semantic_relation_types:
             needed_relation_types.add("CAUSES")
-        if "COMPARISON" in slot_types:
-            needed_relation_types.update({"SUPERSEDE", "REFINE", "SUPPORT", "CONFLICT"})
         if unresolved:
             needed_relation_types.add("CONFLICT")
         all_relations = [

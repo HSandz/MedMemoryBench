@@ -995,7 +995,8 @@ def test_measurement_predicate_preserves_fasting_and_postprandial_families():
     assert state_identity(dict(base, state_key="")) == state_identity(dict(base, state_key="measurement"))
 
 
-def test_supplementary_packing_preserves_slot_provenance_across_recovery(monkeypatch):
+@pytest.fixture
+def packing_query_case(monkeypatch):
     agent = object.__new__(SmartMem0Agent)
     first = _memory("m1", "initial observation")
     second = _memory("m2", "treatment decision")
@@ -1040,6 +1041,11 @@ def test_supplementary_packing_preserves_slot_provenance_across_recovery(monkeyp
         "relations": [], "beliefs": [first, second],
     }
     monkeypatch.setattr(agent, "_run_query_retrieval", lambda *_a, **_k: deepcopy(run))
+    return agent, run
+
+
+def test_supplementary_packing_preserves_slot_provenance_across_recovery(packing_query_case):
+    agent, _run = packing_query_case
 
     prepared = QueryMixin.prepare_batch_query(agent, "Explain the decision using the observations.")
 
@@ -1051,3 +1057,86 @@ def test_supplementary_packing_preserves_slot_provenance_across_recovery(monkeyp
     assert provenance["m4"]["retrieval_round"] == 2
     assert not prepared["extra"]["boundary_violation"]
     assert not prepared["extra"]["arbitration_expansion_violation"]
+
+
+def test_support_does_not_make_requirement_found():
+    empty = _memory("m1", value="")
+    corroborating = _memory("m2", value="a recorded value")
+    harness = _MinimalHarness([empty, corroborating])
+    plan = {"required_slots": [
+        {"id": "r1", "type": "DIRECT", "evidence_role": "REQUIREMENT"},
+    ]}
+    edge = {"type": "SUPPORT", "source_id": "m2", "target_id": "m1"}
+    baseline = harness._retrieval_status(plan, {"r1": ["m1"]}, [empty], [])
+    with_support = harness._retrieval_status(plan, {"r1": ["m1"]}, [empty], [edge])
+    assert baseline == with_support == ({"r1": "EMPTY"}, {}, False)
+    assert harness._retrieval_status(
+        plan, {"r1": ["m2"]}, [corroborating], [edge]
+    ) == ({"r1": "FOUND"}, {}, True)
+
+
+@pytest.mark.parametrize("edge_type", ["RELATED", "SUPPORT"])
+def test_related_does_not_make_relation_proven(edge_type):
+    first = _memory("m1", event_time="2024-01-01")
+    second = _memory("m2", event_time="2024-01-02")
+    harness = _MinimalHarness([first, second])
+    plan = {
+        "required_slots": [
+            {"id": sid, "type": "DIRECT", "evidence_role": "REQUIREMENT"}
+            for sid in ("r1", "r2")
+        ],
+        "semantic_relations": [
+            {"type": "CAUSES", "from": "r1", "to": "r2"},
+            {"type": "TEMPORAL_ORDER", "from": "r1", "to": "r2", "relation": "AFTER"},
+        ],
+    }
+    support = {"r1": ["m1"], "r2": ["m2"]}
+    edge = {
+        "type": edge_type, "source_id": "m1", "target_id": "m2",
+        "provenance_evidence_ids": ["ev1"], "confidence": 1.0,
+    }
+    baseline = harness._retrieval_status(plan, support, [first, second], [])
+    assert harness._retrieval_status(plan, support, [first, second], [edge]) == baseline
+    assert baseline == (
+        {"r1": "FOUND", "r2": "FOUND"},
+        {"CAUSES:r1:r2": "UNPROVEN", "TEMPORAL_ORDER:r1:r2:AFTER": "UNPROVEN"},
+        False,
+    )
+
+
+@pytest.mark.parametrize("legacy_comparison", [False, True])
+def test_support_and_related_do_not_expand_query_context(packing_query_case, legacy_comparison):
+    agent, run = packing_query_case
+    if legacy_comparison:
+        run["plan"]["required_slots"][0]["type"] = "COMPARISON"
+    question = "Compare the observations and the decision."
+    request = {"batch_request_time": "2024-03-01 00:00:00"}
+    baseline = QueryMixin.prepare_batch_query(agent, question, **request)
+    neighbor = _memory("m5", "unretrieved neighbor")
+    agent._memories.append(neighbor)
+    edges = [
+        {"type": kind, "source_id": "m1", "target_id": target,
+         "confidence": 1.0, "provenance_evidence_ids": ["ev1"]}
+        for kind in ("SUPPORT", "RELATED")
+        for target in ("m2", "m5")
+    ]
+    agent._relations = deepcopy(edges)
+    run["relations"] = deepcopy(edges)
+    with_edges = QueryMixin.prepare_batch_query(agent, question, **request)
+
+    assert with_edges["messages"] == baseline["messages"]
+    assert with_edges["retrieved_memories"] == baseline["retrieved_memories"]
+    for field in (
+        "final_memory_ids", "operation_output_ids", "retrieval_trace",
+        "requirement_status", "relation_status", "retrieval_complete",
+        "replan_called", "relations_used", "raw_evidence_requested",
+    ):
+        assert with_edges["extra"][field] == baseline["extra"][field]
+    assert with_edges["extra"]["relations_used"] == []
+    traversed, used = agent._follow_causes(
+        {"start": ["$seed0"], "direction": "OUT", "depth": 3},
+        [], [agent._memories[2]],
+    )
+    assert [m["id"] for m in traversed] == ["m1"]
+    assert used == []
+    assert agent._relations == edges
