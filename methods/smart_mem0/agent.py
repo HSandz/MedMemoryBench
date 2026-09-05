@@ -11,6 +11,7 @@ from .read_controller import ReadContractMixin
 from .read_temporal_contract import ReadTemporalContractMixin
 from .read_option_contract import ReadOptionContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
+from .read_p0_contract import ReadP0ContractMixin
 from .read_plan_contract import ReadPlanContractMixin
 from .read_usage_contract import ReadUsageContractMixin
 from .retrieval import RetrievalOperationsMixin
@@ -23,6 +24,7 @@ class SmartMem0Agent(
     ReadPlanContractMixin,
     ReadUsageContractMixin,
     ReadOptionContractMixin,
+    ReadP0ContractMixin,
     ReadExecutionContractMixin,
     QueryMixin,
     ExecutionMixin,
