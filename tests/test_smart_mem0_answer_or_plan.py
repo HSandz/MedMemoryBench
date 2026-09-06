@@ -43,7 +43,7 @@ def _memory(memory_id, claim, value, *, event_time="", document_time=""):
     }
 
 
-def test_atomic_candidate_projects_away_unneeded_derived_plan():
+def test_connected_derived_obligation_cannot_be_hidden_by_direct_projection():
     agent = _agent()
     question = "Which antibiotic was the patient instructed to avoid?"
     ir = agent._rc_normalize_ir(
@@ -75,15 +75,9 @@ def test_atomic_candidate_projects_away_unneeded_derived_plan():
         QueryFrame(),
     )
 
-    assert ir["candidate"] == {"answer": "cefuroxime", "support_ref": "$seed0"}
-    projected = agent._aop_direct_projection(ir, question)
-    assert projected is not None
-    assert [item["id"] for item in projected["requirements"]] == ["r1"]
-    assert projected["relations"] == []
-    assert any(
-        item.get("action") == "DIRECT_CANDIDATE_PROJECTION"
-        for item in projected["normalization_actions"]
-    )
+    assert [item["id"] for item in ir["requirements"]] == ["r1", "r2"]
+    assert ir["candidate"] is None
+    assert agent._aop_direct_projection(ir, question) is None
 
 
 def test_advice_question_never_uses_direct_candidate_shortcut():
@@ -190,7 +184,11 @@ def test_restored_precomputed_batch_request_is_finalized_locally(monkeypatch):
     evaluator = Evaluator()
     evaluator.method_config = SimpleNamespace(
         method_name="smart_mem0",
-        model=SimpleNamespace(temperature=0.0, max_completion_tokens=128, max_tokens=128),
+        model=SimpleNamespace(
+            temperature=0.0,
+            max_completion_tokens=128,
+            max_tokens=128,
+        ),
     )
     evaluator._checkpoint_manager = None
     evaluator._is_deferred_judge_query = lambda _query_id: False
@@ -201,10 +199,20 @@ def test_restored_precomputed_batch_request_is_finalized_locally(monkeypatch):
     evaluator.agent_manager = AgentManager()
     batch_client = BatchClient()
     evaluator._get_batch_client = lambda: batch_client
-    evaluator._score_agent_response = lambda query, response, **kwargs: response.output
+    evaluator._score_agent_response = (
+        lambda query, response, **kwargs: response.output
+    )
 
-    query = SimpleNamespace(query_id="q1", query_type="entity_exact_match", question="diagnosis?")
-    unit = SimpleNamespace(unit_id="u1", context_id="c1", queries_to_evaluate=[query])
+    query = SimpleNamespace(
+        query_id="q1",
+        query_type="entity_exact_match",
+        question="diagnosis?",
+    )
+    unit = SimpleNamespace(
+        unit_id="u1",
+        context_id="c1",
+        queries_to_evaluate=[query],
+    )
     result = evaluator._evaluate_batch_queries(unit, 0.0)
 
     assert result == ["SAID (autoimmune diabetes)"]

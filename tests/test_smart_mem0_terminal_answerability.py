@@ -1,7 +1,16 @@
-"""Regressions for complete terminal answers and post-retrieval answerability."""
+"""Regressions for terminal rendering and read answerability ownership."""
 
 from methods.smart_mem0.agent import SmartMem0Agent
 from methods.smart_mem0.contracts import QueryFrame
+from methods.smart_mem0.read_answerability_contract import (
+    ReadAnswerabilityContractMixin,
+)
+from methods.smart_mem0.read_certificate_contract import (
+    ReadCertificateContractMixin,
+)
+from methods.smart_mem0.read_terminal_answer_contract import (
+    ReadTerminalAnswerContractMixin,
+)
 
 
 def _agent():
@@ -57,7 +66,7 @@ def _memory(
     }
 
 
-def _direct_slot(target, *, proof_status="UNSPECIFIED", history=False):
+def _direct_slot(target, *, proof_spec=None, history=False):
     return {
         "id": "r1",
         "type": "DIRECT",
@@ -69,15 +78,44 @@ def _direct_slot(target, *, proof_status="UNSPECIFIED", history=False):
         "retrieval_target": target,
         "description": target,
         "resolved_keys": [],
-        "proof_spec": {"status": proof_status},
+        "proof_spec": proof_spec or {"status": "UNSPECIFIED"},
         "history": history,
         "degraded": False,
+        "required_fields": [],
     }
 
 
-def test_answerability_and_terminal_contracts_are_first_in_runtime_mro():
+def _single_slot_plan(slot, answer_type):
+    return {
+        "required_slots": [slot],
+        "semantic_ir": {
+            "answer_type": answer_type,
+            "requirements": [
+                {
+                    "id": "r1",
+                    "grounding_kind": "QUESTION",
+                    "target": slot["target_surface"],
+                }
+            ],
+        },
+        "visible_options": {},
+        "need_evidence": False,
+        "query_spec": {"world_knowledge_bridge_allowed": False},
+        "semantic_relations": [],
+    }
+
+
+def test_runtime_mro_keeps_answerability_and_terminal_as_small_front_contracts():
     assert SmartMem0Agent.__mro__[1].__name__ == "ReadAnswerabilityContractMixin"
     assert SmartMem0Agent.__mro__[2].__name__ == "ReadTerminalAnswerContractMixin"
+
+
+def test_contract_ownership_has_no_shadow_controller_or_duplicate_closure():
+    assert "_semantic_controller" not in ReadTerminalAnswerContractMixin.__dict__
+    assert "_rc_normalize_ir" not in ReadAnswerabilityContractMixin.__dict__
+    assert "_post_retrieval_closure" not in ReadAnswerabilityContractMixin.__dict__
+    assert "_prepare_requirement_context_state" not in ReadCertificateContractMixin.__dict__
+    assert "_post_retrieval_closure" not in ReadCertificateContractMixin.__dict__
 
 
 def test_complete_text_candidate_is_not_limited_to_scalar_answer():
@@ -118,7 +156,9 @@ def test_complete_text_candidate_is_not_limited_to_scalar_answer():
         QueryFrame(),
     )
     projected = agent._aop_direct_projection(ir, question)
-    supports, reason = agent._authorize_controller_answer(projected, [seed], QueryFrame())
+    supports, reason = agent._authorize_controller_answer(
+        projected, [seed], QueryFrame()
+    )
     assert reason == "AUTHORIZED_COMPLETE_PROPOSITION"
     assert [memory["id"] for memory in supports] == ["m1"]
 
@@ -126,7 +166,10 @@ def test_complete_text_candidate_is_not_limited_to_scalar_answer():
 def test_short_status_candidate_renders_full_grounded_proposition():
     agent = _agent()
     seed = _memory(
-        claim="The patient's weight loss has stopped and the patient's weight is stabilizing.",
+        claim=(
+            "The patient's weight loss has stopped and the patient's "
+            "weight is stabilizing."
+        ),
         value="stabilized",
         semantic_role="MEASUREMENT",
         scope="measurement",
@@ -140,10 +183,10 @@ def test_short_status_candidate_renders_full_grounded_proposition():
     assert answer == seed["claim"]
 
 
-def test_uncertified_is_not_reported_as_empty_when_candidate_is_present():
+def test_retrieval_presence_uses_found_empty_not_certificate_status():
     agent = _agent()
     memory = _memory(
-        claim="The patient takes metformin 1500 mg per day.",
+        claim="The patient's current metformin regimen is metformin 1500 mg per day.",
         value="metformin 1500 mg/day",
         evidence_ids=[],
     )
@@ -152,12 +195,13 @@ def test_uncertified_is_not_reported_as_empty_when_candidate_is_present():
     status, relations, complete = agent._retrieval_status(
         plan, {"r1": ["m1"]}, [memory], []
     )
-    assert status == {"r1": "UNCERTIFIED"}
+    assert status == {"r1": "FOUND"}
     assert relations == {}
-    assert complete is False
+    assert complete is True
+    assert agent._last_answerability_state == "SYNTHESIZE"
 
 
-def test_round_one_cefuroxime_can_close_as_direct_b_without_exact_proof_spec():
+def test_uncertified_relevance_cannot_open_direct_b():
     agent = _agent()
     memory = _memory(
         claim=(
@@ -170,30 +214,63 @@ def test_round_one_cefuroxime_can_close_as_direct_b_without_exact_proof_spec():
         object_anchor="cefuroxime",
     )
     agent._memories = [memory]
-    agent._active_answer_question = "Which antibiotic was the patient instructed to avoid?"
+    agent._active_answer_question = (
+        "Which antibiotic was the patient instructed to avoid?"
+    )
     slot = _direct_slot("antibiotic instructed to avoid", history=True)
-    plan = {
-        "required_slots": [slot],
-        "semantic_ir": {
-            "answer_type": "ENTITY",
-            "requirements": [
-                {
-                    "id": "r1",
-                    "grounding_kind": "QUESTION",
-                    "target": "antibiotic instructed to avoid",
-                }
-            ],
+    closure = agent._post_retrieval_closure(
+        _single_slot_plan(slot, "ENTITY"),
+        [memory],
+        QueryFrame(),
+        [],
+    )
+    assert closure is None
+    assert (
+        agent._last_terminal_closure_diagnostic["reason"]
+        == "NO_VALID_STRUCTURED_CERTIFICATE"
+    )
+
+
+def test_strict_structured_certificate_can_open_direct_b():
+    agent = _agent()
+    memory = _memory(
+        claim="The patient was explicitly instructed to avoid cefuroxime.",
+        value="cefuroxime",
+        semantic_role="SAFETY_CONSTRAINT",
+        scope="medication_safety",
+        state_key="avoid_antibiotic",
+        object_anchor="cefuroxime",
+    )
+    agent._memories = [memory]
+    agent._active_answer_question = (
+        "Which antibiotic was the patient instructed to avoid?"
+    )
+    proof_spec = {
+        "status": "VALID",
+        "match": {
+            "subject_id": "primary_user",
+            "scope": "medication_safety",
+            "state_key": "avoid_antibiotic",
+            "object_anchor": "cefuroxime",
+            "stance": "AFFIRM",
         },
-        "visible_options": {},
-        "need_evidence": False,
-        "query_spec": {"world_knowledge_bridge_allowed": False},
-        "semantic_relations": [],
+        "answer_field": "object_anchor",
     }
-    closure = agent._post_retrieval_closure(plan, [memory], QueryFrame(), [])
+    slot = _direct_slot(
+        "antibiotic instructed to avoid",
+        proof_spec=proof_spec,
+        history=True,
+    )
+    closure = agent._post_retrieval_closure(
+        _single_slot_plan(slot, "ENTITY"),
+        [memory],
+        QueryFrame(),
+        [],
+    )
     assert closure is not None
     assert closure["answer"] == "cefuroxime"
     assert closure["support_ids"] == ["m1"]
-    assert closure["reason"] == "RUNTIME_STABLE_SEMANTIC_CERTIFICATE"
+    assert closure["reason"] == "STRUCTURED_TERMINAL_CERTIFICATE"
 
 
 def test_started_date_query_compiles_to_earliest_event_time():
@@ -207,7 +284,18 @@ def test_started_date_query_compiles_to_earliest_event_time():
     assert constraint["relation"] == "EARLIEST"
 
 
-def test_orphan_derived_requirement_is_dropped_not_silently_legalized():
+def test_latest_value_query_keeps_temporal_selector_even_for_value_answer():
+    agent = _agent()
+    constraint = agent._rq_repair_time_constraint(
+        {"axis": "", "relation": "", "anchor": "", "end": ""},
+        "What was the latest HbA1c result?",
+        "VALUE",
+    )
+    assert constraint["axis"] == "event_time"
+    assert constraint["relation"] == "LATEST"
+
+
+def test_orphan_derived_requirement_is_dropped_at_requirement_normalization():
     agent = _agent()
     question = "What are the patient's current symptoms?"
     ir = agent._rc_normalize_ir(
@@ -243,13 +331,15 @@ def test_orphan_derived_requirement_is_dropped_not_silently_legalized():
     )
 
 
-def test_dataset_query_type_cannot_change_reasoning_instruction():
+def test_dataset_query_type_cannot_change_method_behavior():
     agent = _agent()
-    assert agent._compact_reasoning_output_instruction("multi_hop_clinical_deduction") == ""
-    assert agent._compact_reasoning_output_instruction("entity_exact_match") == ""
-    infer_plan = {
-        "semantic_relations": [
-            {"type": "INFER", "from": "r1", "to": "ANSWER"}
-        ]
-    }
-    assert agent._semantic_reasoning_output_instruction(infer_plan)
+    assert (
+        agent._compact_reasoning_output_instruction(
+            "multi_hop_clinical_deduction"
+        )
+        == ""
+    )
+    assert (
+        agent._compact_reasoning_output_instruction("entity_exact_match")
+        == ""
+    )

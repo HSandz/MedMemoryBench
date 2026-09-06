@@ -1,9 +1,8 @@
 """Answer-or-plan control flow for SmartMem0 reads.
 
-The semantic controller gets one chance to finish an atomic grounded query from the
-Top-3 seeds. Only when that candidate cannot be deterministically authorized do we
-compile and execute Requirement-v2 retrieval. This keeps Requirement-v2 as the planned
-branch rather than turning the controller into a mandatory semantic planner.
+The single semantic controller either proposes a complete answer already contained in one
+seed or emits the minimal evidence obligations required for retrieval. "DIRECT" is a
+semantic-completeness decision, never a short-answer mode.
 """
 
 import json
@@ -20,37 +19,25 @@ from .read_requirement_contract import (
 
 ANSWER_OR_PLAN_PRIORITY = """
 CONTROL-FLOW PRIORITY — ANSWER OR PLAN:
-Before inventing DERIVED requirements or a reasoning graph, inspect the Top-3 SEEDS and
-ask whether ONE seed already contains the exact participant-specific answer requested by
-QUESTION.
+Inspect the Top-3 SEEDS before building a retrieval plan.
 
-If YES, emit candidate and exactly ONE minimal QUESTION requirement. Do not emit DERIVED
-requirements, DEPENDS_ON, or INFER merely to explain an answer already explicit in that
-seed. The candidate is a proposed final answer, not a retrieval hint. Code will still
-reject it unless the cited seed structurally and atomically grounds it.
+Emit candidate only when EXACTLY ONE cited seed already contains the COMPLETE
+participant-specific answer to QUESTION. The answer may be an entity, value, date,
+sentence, or short paragraph. Length never decides routing. Every proposition in the
+candidate must be grounded by that one seed; do not combine seeds, add a general-domain
+rule, infer a cause, or turn advice/recommendation into a direct memory answer.
 
-A direct candidate is allowed only for atomic extraction/localization:
-- ENTITY, VALUE, or short TEXT explicitly present in one seed; or
-- DATE when the requested temporal axis is present on that same seed and the candidate is
-  exactly that date.
-Never use the direct path for visible options, recommendations/advice, comparisons,
-causal explanations, source-verification questions, or answers that require combining
-multiple participant memories or applying a general-domain rule.
+When the answer is already explicit in one seed, emit exactly ONE minimal QUESTION
+requirement and no DERIVED requirements. Do not add DEPENDS_ON/INFER merely to explain an
+answer already present in the seed.
 
-If NO, then and only then build the minimal Requirement-v2 evidence plan. DERIVED is not
-"potentially useful context": create a DERIVED lookup only when retrieving that value is
-necessary to answer the question or to complete a genuinely required reasoning bridge.
-Prefer zero DERIVED nodes for ordinary extraction and usually no more than one for a
-planned query. More nodes are justified only by genuinely independent answer-critical
-evidence obligations.
+Otherwise emit no candidate and build the smallest Requirement-v2 evidence plan.
+DERIVED is an answer-critical participant-memory lookup variable, not optional context.
 """
 
 _DIRECT_BLOCK_PATTERNS = (
     r"\bwhy\b",
     r"\bexplain\b",
-    r"\bcompare\b",
-    r"\bversus\b",
-    r"\bvs\.?\b",
     r"\bshould i\b",
     r"\bcan i\b",
     r"\bcould i\b",
@@ -75,21 +62,11 @@ _HARD_DIRECT_RELATIONS = {
 
 
 def _answer_or_plan_policy() -> str:
-    """Reuse Requirement-v2 policy while removing its obsolete temporal fast-path ban."""
-    old = (
-        "candidate is optional and only for one atomic non-temporal QUESTION requirement when exactly\n"
-        "one seed directly contains the answer. Code independently authorizes it."
-    )
-    new = (
-        "candidate is optional only for one atomic QUESTION answer directly contained in exactly\n"
-        "one seed. DATE localization may use a candidate when the requested temporal axis is\n"
-        "present on that same seed. Code independently authorizes every candidate."
-    )
-    return ANSWER_OR_PLAN_PRIORITY + "\n" + REQUIREMENT_CONTROLLER_POLICY.replace(old, new)
+    return ANSWER_OR_PLAN_PRIORITY + "\n" + REQUIREMENT_CONTROLLER_POLICY
 
 
 class ReadAnswerOrPlanContractMixin:
-    """Restore the original SmartMem0 semantic invariant: answer first, otherwise plan."""
+    """Own exactly one semantic decision: complete grounded answer, otherwise plan."""
 
     @staticmethod
     def _aop_raw_candidate(parsed: Any):
@@ -117,14 +94,19 @@ class ReadAnswerOrPlanContractMixin:
         return not bool(relation_types & _HARD_DIRECT_RELATIONS)
 
     def _rc_normalize_ir(self, parsed: Dict[str, Any], question: str, frame: Any):
-        """Keep a safe raw candidate available even when Requirement-v2 over-decomposes."""
+        """Preserve a safe raw candidate without erasing semantic obligations."""
         ir = super()._rc_normalize_ir(parsed, question, frame)
         raw_candidate = self._aop_raw_candidate(parsed)
-        # Requirement-v2 intentionally used to drop temporal candidates and candidates
-        # accompanied by DERIVED nodes. The answer-or-plan layer owns that decision now.
+        requirements = ir.get("requirements") or []
+        single_question = (
+            len(requirements) == 1
+            and str(requirements[0].get("grounding_kind") or "QUESTION").upper()
+            == "QUESTION"
+        )
         ir["candidate"] = (
             raw_candidate
             if raw_candidate
+            and single_question
             and ir.get("normalization_status") != "DEGRADED"
             and self._aop_direct_surface_allowed(question, ir)
             else None
@@ -132,43 +114,29 @@ class ReadAnswerOrPlanContractMixin:
         return ir
 
     def _aop_direct_projection(self, ir: Dict[str, Any], question: str):
-        """Project over-decomposed IR back to one atomic QUESTION obligation for fast exit."""
+        """Compatibility hook: direct routing never drops a real semantic obligation."""
         if not ir.get("candidate") or not self._aop_direct_surface_allowed(question, ir):
             return None
-        question_requirements = [
-            requirement
-            for requirement in ir.get("requirements") or []
-            if str(requirement.get("grounding_kind") or "QUESTION").upper() == "QUESTION"
-        ]
-        if len(question_requirements) != 1:
+        requirements = ir.get("requirements") or []
+        if (
+            len(requirements) != 1
+            or str(requirements[0].get("grounding_kind") or "QUESTION").upper()
+            != "QUESTION"
+        ):
             return None
-        primary = deepcopy(question_requirements[0])
         projected = deepcopy(ir)
-        projected["requirements"] = [primary]
-        projected["relations"] = [
-            deepcopy(relation)
-            for relation in ir.get("relations") or []
-            if str(relation.get("type") or "").upper() == "CURRENT"
-            and relation.get("from") == primary.get("id")
-        ]
-        projected["graph_validation"] = self._rq_graph_validation(
-            projected["requirements"], projected["relations"]
-        )
         projected["normalization_actions"] = [
             *(projected.get("normalization_actions") or []),
             {
-                "action": "DIRECT_CANDIDATE_PROJECTION",
-                "reason": "ANSWERABLE_ATOMIC_SEED",
-                "kept_requirement_id": primary.get("id"),
-                "dropped_derived_count": max(
-                    0, len(ir.get("requirements") or []) - 1
-                ),
+                "action": "DIRECT_CANDIDATE_VALIDATED",
+                "reason": "COMPLETE_ONE_SEED_ANSWER",
+                "kept_requirement_id": requirements[0].get("id"),
             },
         ]
         return projected
 
     def _authorize_controller_answer(self, ir, seeds, frame):
-        """Authorize normal atomic candidates plus directly grounded DATE localization."""
+        """Retain lower scalar checks and add directly localized DATE candidates."""
         supports, reason = super()._authorize_controller_answer(ir, seeds, frame)
         if supports is not None:
             return supports, reason
@@ -193,7 +161,7 @@ class ReadAnswerOrPlanContractMixin:
         axis = str(constraint.get("axis") or "")
         relation = str(constraint.get("relation") or "").upper()
         if axis not in VALID_TEMPORAL_AXES or relation not in {"", "LOCATE", "EXACT"}:
-            return None, "TEMPORAL_QUERY_REQUIRES_RETRIEVAL"
+            return None, "TEMPORAL_SELECTOR_REQUIRES_RETRIEVAL"
 
         reference = str(candidate.get("support_ref") or "")
         match = re.fullmatch(r"\$seed(\d+)", reference)
@@ -214,9 +182,12 @@ class ReadAnswerOrPlanContractMixin:
         return valid, "AUTHORIZED"
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
-        """One LLM call decides: authorized atomic answer, otherwise Requirement-v2 plan."""
+        """The one read-controller LLM call: complete answer or minimal evidence plan."""
         del context_map
         self._last_option_probe_coverage = {}
+        reset_terminal = getattr(self, "_terminal_reset_state", None)
+        if callable(reset_terminal):
+            reset_terminal()
         self._active_controller_seeds = list(seeds[:3])
         options = self._question_options(question) or {}
         hints = {
@@ -249,7 +220,7 @@ class ReadAnswerOrPlanContractMixin:
 
         projection = self._aop_direct_projection(ir, question)
         supports = None
-        authorization = "NO_ATOMIC_CANDIDATE"
+        authorization = "NO_COMPLETE_CANDIDATE"
         active_ir = ir
         if projection is not None:
             supports, authorization = self._authorize_controller_answer(
@@ -263,9 +234,8 @@ class ReadAnswerOrPlanContractMixin:
         warnings = [item for item in actions if item.get("action") == "GRAPH_WARNING"]
         common = {
             "called": True,
-            "fallback_reason": error or (
-                authorization if ir.get("candidate") and supports is None else ""
-            ),
+            "fallback_reason": error
+            or (authorization if ir.get("candidate") and supports is None else ""),
             "error": error,
             "usage": usage,
             "answer_type": active_ir["answer_type"],
@@ -282,15 +252,22 @@ class ReadAnswerOrPlanContractMixin:
         }
         if supports is not None:
             candidate = active_ir["candidate"]
+            answer = candidate["answer"]
+            renderer = getattr(self, "_terminal_render_seed_answer", None)
+            if callable(renderer):
+                answer = renderer(
+                    question, active_ir, candidate["answer"], supports[0]
+                )
             telemetry = dict(common)
             telemetry.update(
                 {
                     "route": "DIRECT",
-                    "route_source": "answer_or_plan_authorized_atomic_candidate",
-                    "answer": candidate["answer"],
+                    "route_source": "answer_or_plan_complete_grounded_seed",
+                    "answer": answer,
                     "support_ref": candidate["support_ref"],
                     "support_refs": [candidate["support_ref"]],
                     "fallback_reason": "",
+                    "terminal_rendered": answer != candidate["answer"],
                 }
             )
             return supports, {}, telemetry
@@ -304,6 +281,7 @@ class ReadAnswerOrPlanContractMixin:
                 "answer": "",
                 "support_ref": "",
                 "support_refs": [],
+                "terminal_rendered": False,
             }
         )
         return None, plan, telemetry
