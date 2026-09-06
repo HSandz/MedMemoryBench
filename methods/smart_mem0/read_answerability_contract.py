@@ -200,11 +200,13 @@ class ReadAnswerabilityContractMixin:
         obligation_families = self._obligation_families(slot)
         memory_families = self._memory_families(memory)
         family_match = bool(obligation_families & memory_families)
+        # Family compatibility is a ranking signal, never proof by itself.
+        # Runtime proof still requires a durable-key hit or obligation/predicate
+        # terms to be present on the same auditable memory.
         aligned = bool(
             resolved_key_match
             or (overlap >= 2 and coverage >= 0.45)
             or (target_terms and len(target_terms) <= 2 and coverage == 1.0)
-            or family_match
         )
         return aligned, {
             "target_overlap": round(coverage, 4),
