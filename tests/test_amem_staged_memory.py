@@ -1174,7 +1174,7 @@ def test_run_scoped_query_selects_sibling_memory_and_records_source(tmp_path: Pa
     assert evaluator._memory_snapshot_run_dir == experiment_dir / "20260101_010102" / "memory"
     source = json.loads((query_run / "memory_source.json").read_text())
     assert source["source_run_id"] == "20260101_010102"
-    assert source["build_id"] == "build-20260101_010102"
+    assert source["memory_identity"]["build_id"] == "build-20260101_010102"
 
 
 def test_nested_query_run_selects_its_parent_memory_and_records_source(tmp_path: Path):
@@ -1205,8 +1205,13 @@ def test_nested_query_run_selects_its_parent_memory_and_records_source(tmp_path:
 
     assert evaluator._memory_snapshot_run_dir == memory_dir
     source = json.loads((query_run / "memory_source.json").read_text())
+    assert source["version"] == 2
     assert source["source_run_id"] == source_run.name
     assert source["selection"] == "explicit"
+    assert source["memory_identity"]["build_id"] == "parent-build"
+    assert "build_metrics" not in source
+    assert "memory_size" not in source
+    assert "feature_configuration" not in source
     assert (query_run / source["manifest_path"]).resolve() == (
         memory_dir / "manifest.json"
     ).resolve()

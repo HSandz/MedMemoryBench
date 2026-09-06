@@ -24,6 +24,7 @@ from utils.llm_client import (
     is_vertex_batch_provider,
 )
 from utils.logger import get_eval_logger, truncate_error_message
+from utils.json_artifacts import dump_json_artifact
 from utils.vertex_batch import VertexBatchPending
 
 
@@ -228,7 +229,29 @@ class Evaluator:
                 **snapshot["build_config"],
                 **snapshot["retrieval_config"],
             }
+        agent_params = snapshot.get("agent_params")
+        derived_agent_params = {
+            **snapshot.get("build_config", {}),
+            **snapshot.get("retrieval_config", {}),
+        }
+        if agent_params == derived_agent_params:
+            # The two scoped configurations remain independently auditable.
+            snapshot.pop("agent_params", None)
         return snapshot
+
+    @staticmethod
+    def _judge_configuration() -> Dict[str, Any]:
+        """Persist only evaluation settings that affect judge behavior."""
+        api_config = get_api_config()
+        return {
+            "provider": api_config.get_judge_provider(),
+            "model": api_config.get_judge_model(),
+            "max_tokens": getattr(api_config, "judge_max_tokens", None),
+            "mcd_max_tokens": getattr(api_config, "judge_mcd_max_tokens", None),
+            "client_max_tokens": getattr(api_config, "judge_client_max_tokens", None),
+            "temperature": getattr(api_config, "judge_temperature", None),
+            "reasoning_effort": getattr(api_config, "judge_reasoning_effort", None),
+        }
 
     def _new_run_id(self) -> str:
         base = self.run_started_at.strftime("%Y%m%d_%H%M%S")
@@ -400,7 +423,7 @@ class Evaluator:
         git_metadata = self._git_metadata()
         payload = {
             "format": "medmemorybench.run_config",
-            "version": 1,
+            "version": 2,
             "run_id": self.run_id,
             "status": status,
             "started_at": self.run_started_at.isoformat(),
@@ -409,10 +432,12 @@ class Evaluator:
             "dataset_config_name": self.dataset_config_name,
             "method_config": self._method_config_snapshot(),
             "dataset_config": dataset_snapshot,
-            "git_commit_sha": git_metadata["git_commit_sha"],
-            "git_dirty": git_metadata["git_dirty"],
-            "git_branch": git_metadata["git_branch"],
-            "api_config": self._config_value(get_api_config()),
+            "source_revision": {
+                "commit_sha": git_metadata["git_commit_sha"],
+                "dirty": git_metadata["git_dirty"],
+                "branch": git_metadata["git_branch"],
+            },
+            "judge_configuration": self._judge_configuration(),
             "config_sources": {
                 "method": str(self.method_config_path) if self.method_config_path else None,
                 "dataset": str(self.dataset_config_path) if self.dataset_config_path else None,
@@ -437,8 +462,6 @@ class Evaluator:
                 "batch_wait": self.batch_wait,
                 "workers": self.workers,
             },
-            "command": [sys.executable, *sys.argv],
-            "output_dir": str(self.output_dir),
         }
         if self.config_inference:
             payload["config_inference"] = self.config_inference
@@ -482,6 +505,13 @@ class Evaluator:
         payload = dict(existing)
         payload.update(self._run_config_payload(status))
         payload.update(updates)
+        # Version 1 duplicated report data and broad provider settings that are
+        # either owned by dedicated artifacts or irrelevant to this run.
+        for field_name in (
+            "api_config", "command", "output_dir", "git_commit_sha",
+            "git_dirty", "git_branch", "score_summary", "summary",
+        ):
+            payload.pop(field_name, None)
         payload["started_at"] = existing.get(
             "started_at", self.run_started_at.isoformat()
         )
@@ -503,7 +533,7 @@ class Evaluator:
             payload.pop("batch_pending", None)
         temporary_path = path.with_suffix(".tmp")
         with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            dump_json_artifact(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
@@ -635,7 +665,6 @@ class Evaluator:
             completed_at=end_time.isoformat(),
             duration_seconds=(end_time - self.run_started_at).total_seconds(),
             last_invocation_duration_seconds=duration,
-            summary=report.summary,
         )
 
         return report

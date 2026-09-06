@@ -13,6 +13,38 @@ uv pip install -r requirements.txt
 cp .env.example .env
 ```
 
+## Reading JSON Artifacts
+
+Each report file has one authoritative role, with its compact summary before
+long records:
+
+- `*_result.json` contains scores, query coverage, run timing, and links to
+  related artifacts. It does not copy token, build, config, or answer details.
+- `*_query_answer.json` contains answers, retrieval references, query/judge
+  token usage, execution timing, and batch-job details. Scores remain in the
+  result artifact.
+- `*_memory_build.json` contains build-only memory size, feature configuration,
+  memorization token usage, feature/operation telemetry, and per-unit logs. It
+  does not retain query, judge, or evaluation-score fields.
+
+`artifact_references` links related files rather than reproducing their
+contents. To migrate an existing run to this ordering and split, use:
+
+```bash
+python scripts/reorder_json_artifacts.py outputs/<experiment>/<run_id>
+```
+
+`run_config.json` is a version-2 reproducibility and lifecycle record. It keeps
+the source YAML (`raw_config`), resolved configuration, judge settings, source
+revision, execution options, and invocation history. Scores, answers, build
+telemetry, broad provider credentials/settings, and duplicate command/output
+paths belong to their dedicated artifacts and are not copied into it.
+
+For staged query runs, `memory_source.json` is a version-2 source-selection
+pointer. It records the selected manifest path, source run, selection reason,
+and compact expected manifest identity. Memory size, feature settings, and
+build telemetry remain only in the linked memory manifest/build artifact.
+
 Set only the credentials required by the selected method. Keep `.env`, `service-account.json`, and private GCS paths out of commits.
 
 ## Configure a Run
@@ -305,16 +337,15 @@ evaluator-only diagnostics for selected-memory source sessions and exact source
 turns rendered into final answer context. Gold evidence is not sent to the
 memory method or answer model. Batch runs mark per-request answer latency as
 unavailable and report stage and batch wall times instead. Packed annotations
-such as `D8:6; D9:17` are expanded only by the evaluator. `stage_usage` records
-batch answer tokens from completed query results, batch-job wall time, and
-separate retrieval-preparation operation versus end-to-end wall times; it never
-treats batch wall time as a per-request latency.
+such as `D8:6; D9:17` are expanded only by the evaluator.
+`execution_summary` and `batch_jobs` retain those timing records, while
+query-answer `llm_usage` records the query and judge tokens. Batch wall time is
+never presented as a per-request latency.
 
-For Event-State LoCoMo artifacts, `memory_build_summary.avg_time_per_unit` is
-the actual build duration per conversation. Efficiency additionally reports
-`amortized_memory_construction_time_per_query`, which divides total build time
-across evaluated queries. The legacy `avg_memory_construction_time` remains an
-alias for that amortized value and includes an explicit semantics marker.
+For Event-State LoCoMo artifacts,
+`memory_build.build_summary.avg_time_per_unit` is the actual build duration per
+conversation. Memory-build artifacts retain the construction measurements;
+result and query artifacts do not repeat them.
 `true_duration_seconds` subtracts one measured failure-duration source in this
 order: explicit `api_failure_duration_seconds`, valid durations in
 `api_failures`, `llm_usage.total.failure_duration_seconds`, then zero. These
@@ -394,11 +425,12 @@ each supported non-empty stage uses its provider's Batch API regardless of
 request count. An unsupported stage logs the fallback and remains real-time
 without disabling batch execution for other supported stages.
 
-Result `llm_usage` keeps answer/query calls and evaluator judge calls in separate
-phase objects: `query_phase` contains retrieval preparation and final-answer
-generation, `judge_phase` contains LLM-based scoring, and `total` combines both
-with `memorize_phase`. The per-operation breakdown uses matching `query` and
-`judge` operation buckets.
+Query-answer `llm_usage` keeps answer/query calls and evaluator judge calls in
+separate phase objects: `query_phase` contains retrieval preparation and
+final-answer generation, `judge_phase` contains LLM-based scoring, and `total`
+combines those two phases. The per-operation breakdown uses matching `query`
+and `judge` operation buckets. Memory-build usage is stored separately in
+`build_summary.llm_usage` and contains only `memorize_phase` operations.
 
 Vertex Gemini uses Cloud Storage JSONL staging and requires
 `GOOGLE_BATCH_GCS_URI` or `--batch-gcs-uri`. OpenRouter submits inline requests
@@ -463,7 +495,12 @@ least `1`.
 
 Runs are organized as `outputs/<method-model>/<timestamp>/`, with `run_config.json`, `evaluation.log`, memory artifacts, checkpoints, and query answers. Explicit query reruns and append runs are nested under the source run's `query_runs/`.
 
-Result JSON files report `duration_seconds` as total evaluation wall time. `true_duration_seconds` subtracts measured failed API-attempt time and retry waits, including failures that later recover and terminal API failures; successful API-call time remains included. The matching `llm_usage` totals expose the measured retry/error time as `failure_duration_seconds`.
+Result JSON files report `duration_seconds` as total evaluation wall time.
+`true_duration_seconds` subtracts measured failed API-attempt time and retry
+waits, including failures that later recover and terminal API failures;
+successful API-call time remains included. The relevant query-answer or
+memory-build usage ledger exposes the measured retry/error time as
+`failure_duration_seconds`.
 
 Runs with failed API attempts also write a separate `*_api_failures.json` file.
 It lists terminal failures that affected the run and includes aggregate counts

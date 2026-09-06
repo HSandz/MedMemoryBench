@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List, Optional, Tuple
 
 from metrics import MetricResult
+from utils.json_artifacts import dump_json_artifact, score_summary
 
 
 def _true_duration_seconds(report: "EvaluationReport") -> float:
@@ -116,6 +117,71 @@ def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, A
     return efficiency
 
 
+_USAGE_TOTAL_FIELDS = (
+    "input_tokens", "output_tokens", "visible_output_tokens", "thinking_tokens",
+    "total_tokens", "call_count", "successful_calls", "attempted_calls",
+    "failed_attempts", "retry_count", "operation_count", "total_latency",
+    "wall_time", "failure_duration_seconds",
+)
+
+
+def _usage_for_phases(
+    usage: Any,
+    phases: Tuple[str, ...],
+    *,
+    include_total: bool = True,
+) -> Dict[str, Any]:
+    """Keep usage that belongs to an artifact, excluding unrelated stages."""
+    if not isinstance(usage, dict):
+        return {}
+    selected: Dict[str, Any] = {}
+    totals = {field: 0 for field in _USAGE_TOTAL_FIELDS}
+    for phase in phases:
+        phase_key = f"{phase}_phase"
+        phase_usage = usage.get(phase_key)
+        if not isinstance(phase_usage, dict):
+            continue
+        selected[phase_key] = phase_usage
+        for field in _USAGE_TOTAL_FIELDS:
+            value = phase_usage.get(field, 0)
+            if isinstance(value, (int, float)):
+                totals[field] += value
+    operations = usage.get("operations")
+    if isinstance(operations, dict):
+        selected_operations = {
+            phase: operations[phase]
+            for phase in phases
+            if isinstance(operations.get(phase), dict)
+        }
+        if selected_operations:
+            selected["operations"] = selected_operations
+    if selected and include_total:
+        successful_calls = totals["successful_calls"]
+        totals["avg_latency"] = (
+            totals["total_latency"] / successful_calls if successful_calls else 0.0
+        )
+        selected["total"] = totals
+    return selected
+
+
+def _artifact_references(
+    prefix: str,
+    *,
+    include_result: bool,
+    include_memory_build: bool,
+    include_query_answer: bool,
+) -> Dict[str, str]:
+    """Refer to sibling artifacts rather than copying their contents."""
+    references: Dict[str, str] = {}
+    if include_result:
+        references["result"] = f"{prefix}_result.json"
+    if include_memory_build:
+        references["memory_build"] = f"{prefix}_memory_build.json"
+    if include_query_answer:
+        references["query_answer"] = f"{prefix}_query_answer.json"
+    return references
+
+
 @dataclass
 class EvaluationReport:
     """Evaluation report data structure."""
@@ -186,19 +252,36 @@ class ResultCollector:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = f"{report.dataset_name}_{report.method_name}_{report.model_name}_{timestamp}"
         prefix = prefix.replace("/", "-").replace("\\", "-")
+        artifact_references = _artifact_references(
+            prefix,
+            include_result=include_result,
+            include_memory_build=include_memory_build,
+            include_query_answer=include_query_answer,
+        )
+        if (method_output_dir / "run_config.json").is_file():
+            artifact_references["run_config"] = "run_config.json"
+        if (method_output_dir / "memory_source.json").is_file():
+            artifact_references["memory_source"] = "memory_source.json"
 
         result_path = (
-            self._save_result_json(report, method_output_dir, prefix)
+            self._save_result_json(
+                report, method_output_dir, prefix,
+                {key: value for key, value in artifact_references.items() if key != "result"},
+            )
             if include_result else None
         )
         memory_build_path = (
             self._save_memory_build_json(
-                report, memory_build_logs, method_output_dir, prefix
+                report, memory_build_logs, method_output_dir, prefix,
+                {key: value for key, value in artifact_references.items() if key != "memory_build"},
             )
             if include_memory_build else None
         )
         query_answer_path = (
-            self._save_query_answer_json(report, method_output_dir, prefix)
+            self._save_query_answer_json(
+                report, method_output_dir, prefix,
+                {key: value for key, value in artifact_references.items() if key != "query_answer"},
+            )
             if include_query_answer else None
         )
         self.last_api_failure_path = None
@@ -220,6 +303,7 @@ class ResultCollector:
         report: EvaluationReport,
         output_dir: Path,
         prefix: str,
+        artifact_references: Dict[str, str],
     ) -> Path:
         """Save evaluation metrics file (result.json)."""
         filepath = output_dir / f"{prefix}_result.json"
@@ -256,47 +340,19 @@ class ResultCollector:
             "end_time": report.end_time,
             "duration_seconds": report.duration_seconds,
             "true_duration_seconds": _true_duration_seconds(report),
-            "summary": result_summary,
-            "efficiency": _efficiency_with_timing_semantics(report),
-            "memory_build_summary": report.metadata.get("memory_build_summary", {}),
-            "build_metrics": report.metadata.get("build_metrics", {}),
-            "llm_usage": report.metadata.get("llm_usage", {}),
-            "stage_usage": report.metadata.get("stage_usage", {}),
+            "score_summary": score_summary(result_summary),
             "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
             "run_metadata": report.metadata.get("run_metadata", {}),
-            "config": {
-                "evaluation_mode": report.metadata.get("evaluation_mode", ""),
-                "evaluation_interval": report.metadata.get("evaluation_interval", 0),
-                "total_personas": report.metadata.get("total_personas", 0),
-                "method_config": report.config.get("method_config", {}),
-                "dataset_config": report.config.get("dataset_config", {}),
-            },
+            "artifact_references": artifact_references,
         }
-        self._add_memory_reporting_fields(result_data, report)
         for key in ("dataset_coverage", "input_modality"):
             if key in report.metadata:
                 result_data[key] = report.metadata[key]
 
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(result_data, f, ensure_ascii=False, indent=2)
+            dump_json_artifact(result_data, f)
 
         return filepath
-
-    @staticmethod
-    def _add_memory_reporting_fields(
-        artifact: Dict[str, Any],
-        report: EvaluationReport,
-    ) -> None:
-        """Avoid empty Event-State LoCoMo placeholders while preserving legacy output."""
-        is_event_state_locomo = (
-            report.dataset_name == "locomo"
-            and report.method_name.lower() == "event_state"
-        )
-        for field_name in ("memory_size", "feature_configuration"):
-            value = report.metadata.get(field_name, {})
-            if is_event_state_locomo and not value:
-                continue
-            artifact[field_name] = value
 
     def _save_api_failures_json(
         self,
@@ -321,7 +377,7 @@ class ResultCollector:
         }
 
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(failure_data, f, ensure_ascii=False, indent=2)
+            dump_json_artifact(failure_data, f)
 
         return filepath
 
@@ -331,6 +387,7 @@ class ResultCollector:
         memory_build_logs: List[Dict[str, Any]],
         output_dir: Path,
         prefix: str,
+        artifact_references: Dict[str, str],
     ) -> Path:
         """Save memory build details file (memory_build.json)."""
         filepath = output_dir / f"{prefix}_memory_build.json"
@@ -480,23 +537,51 @@ class ResultCollector:
 
             processed_units.append(processed_unit)
 
+        build_metrics = report.metadata.get("build_metrics", {})
+        if not isinstance(build_metrics, dict):
+            build_metrics = {}
+        detailed_build_metrics = {
+            key: value
+            for key, value in build_metrics.items()
+            if key not in {
+                "feature_configuration", "memory_size", "usage", "totals",
+                "unit_count", "session_count",
+            }
+        }
+        build_summary = dict(report.metadata.get("memory_build_summary", {}))
+        build_summary.update({
+            "total_units": len(processed_units),
+            "memory_chunk_size": report.metadata.get("memory_chunk_size"),
+        })
+        for field_name in ("memory_size", "feature_configuration"):
+            value = report.metadata.get(field_name, {})
+            if value:
+                build_summary[field_name] = value
+        raw_build_usage = build_metrics.get("usage")
+        if not isinstance(raw_build_usage, dict):
+            raw_build_usage = report.metadata.get("llm_usage", {})
+        build_usage = _usage_for_phases(
+            raw_build_usage, ("memorize",), include_total=False
+        )
+        if build_usage:
+            build_summary["llm_usage"] = build_usage
+        elif isinstance(raw_build_usage, dict) and raw_build_usage:
+            # Older build metrics can contain only one unlabelled build total.
+            build_summary["llm_usage"] = raw_build_usage
+
         memory_build_data = {
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,
-            "summary": report.metadata.get("memory_build_summary", {}),
-            "build_metrics": report.metadata.get("build_metrics", {}),
-            "llm_usage": report.metadata.get("llm_usage", {}),
-            "stage_usage": report.metadata.get("stage_usage", {}),
-            "memory_chunk_size": report.metadata.get("memory_chunk_size"),
+            "build_summary": build_summary,
+            "build_metrics": detailed_build_metrics,
             "run_metadata": report.metadata.get("run_metadata", {}),
-            "total_units": len(processed_units),
+            "artifact_references": artifact_references,
             "units": processed_units,
         }
-        self._add_memory_reporting_fields(memory_build_data, report)
 
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(memory_build_data, f, ensure_ascii=False, indent=2)
+            dump_json_artifact(memory_build_data, f)
 
         return filepath
 
@@ -505,6 +590,7 @@ class ResultCollector:
         report: EvaluationReport,
         output_dir: Path,
         prefix: str,
+        artifact_references: Dict[str, str],
     ) -> Path:
         """Save query answer details file (query_answer.json)."""
         filepath = output_dir / f"{prefix}_query_answer.json"
@@ -653,16 +739,10 @@ class ResultCollector:
                 "records": retrieval_records,
             }
             with open(retrieval_records_path, "w", encoding="utf-8") as f:
-                json.dump(retrieval_data, f, ensure_ascii=False, indent=2)
+                dump_json_artifact(retrieval_data, f)
 
-        query_summary = {
+        execution_summary = {
             "total_queries": len(query_details),
-            "overall_avg_score": report.summary.get("overall_avg_score", 0.0),
-            "by_type": report.summary.get("by_type", {}),
-            "by_metric": report.summary.get("by_metric", {}),
-            "evaluation_coverage": report.metadata.get("evaluation_coverage", {}),
-            "stage_usage": report.metadata.get("stage_usage", {}),
-            "efficiency": _efficiency_with_timing_semantics(report),
             "total_query_time": sum(q["query_time"] for q in query_details),
             "avg_query_time": (
                 sum(q["query_time"] for q in query_details) / len(query_details)
@@ -674,27 +754,26 @@ class ResultCollector:
             ),
         }
         if report.dataset_name == "locomo":
-            query_summary.update({
-                "mean_f1": report.summary.get("mean_f1", 0.0),
-                "queries_f1_ge_0_5": report.summary.get("queries_f1_ge_0_5", 0),
-                "fraction_f1_ge_0_5": report.summary.get("fraction_f1_ge_0_5", 0.0),
-                "metric_variants": report.summary.get("metric_variants", {}),
-                "retrieval_quality": report.summary.get("retrieval_quality", {}),
-            })
             if (report.metadata.get("stage_usage") or {}).get("batch_stages"):
-                query_summary.update({
+                execution_summary.update({
                     "query_time_kind": "per_request_latency_unavailable_for_batch",
                     "total_query_time": None,
                     "avg_query_time": None,
                 })
-        else:
-            query_summary.update({
-                "correct_count": sum(1 for q in query_details if q["is_correct"] is True),
-                "overall_accuracy": report.summary.get("overall_accuracy", 0.0),
-            })
-        metric_groups = report.summary.get("metric_groups")
-        if isinstance(metric_groups, dict) and metric_groups:
-            query_summary["metric_groups"] = metric_groups
+        efficiency = _efficiency_with_timing_semantics(report)
+        for key in ("query_time_kind", "stage_wall_time_seconds", "batch_stage_count"):
+            if key in efficiency:
+                execution_summary[key] = efficiency[key]
+        stage_usage = report.metadata.get("stage_usage", {})
+        batch_jobs = []
+        if isinstance(stage_usage, dict):
+            for batch_stage in stage_usage.get("batch_stages", []):
+                if isinstance(batch_stage, dict):
+                    batch_jobs.append({
+                        key: value
+                        for key, value in batch_stage.items()
+                        if key != "token_usage"
+                    })
 
         query_answer_data = {
             "format": (
@@ -707,7 +786,12 @@ class ResultCollector:
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,
-            "summary": query_summary,
+            "execution_summary": execution_summary,
+            "llm_usage": _usage_for_phases(
+                report.metadata.get("llm_usage", {}), ("query", "judge")
+            ),
+            "artifact_references": artifact_references,
+            "batch_jobs": batch_jobs,
             "retrieval_records_path": (
                 retrieval_records_path.name if retrieval_records_path is not None else None
             ),
@@ -716,7 +800,7 @@ class ResultCollector:
         }
 
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(query_answer_data, f, ensure_ascii=False, indent=2)
+            dump_json_artifact(query_answer_data, f)
 
         return filepath
 
@@ -766,6 +850,6 @@ def generate_comparison_report(
     filepath = output_dir / f"comparison_{timestamp}.json"
 
     with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(comparison, ensure_ascii=False, indent=2, fp=f)
+        dump_json_artifact(comparison, f)
 
     return filepath

@@ -24,6 +24,7 @@ from utils.llm_client import (
     get_usage_tracker,
 )
 from utils.logger import truncate_error_message
+from utils.json_artifacts import dump_json_artifact
 
 
 MANIFEST_VERSION = 2
@@ -580,7 +581,7 @@ class VertexBatchClient:
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest["updated_at"] = _utc_now()
         with self.manifest_path.open("w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            dump_json_artifact(manifest, handle)
 
     def _stage_paths(self, stage: str, run_id: str) -> Tuple[str, str]:
         stage_id = re.sub(r"[^a-zA-Z0-9_.-]", "-", stage)

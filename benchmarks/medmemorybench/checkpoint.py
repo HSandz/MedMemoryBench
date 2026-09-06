@@ -8,6 +8,8 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict, replace
 from typing import Dict, List, Any, Optional
 
+from utils.json_artifacts import dump_json_artifact
+
 
 MEMORY_MANIFEST_VERSIONS = {
     "medmemorybench.memory_manifest": {1},
@@ -210,7 +212,7 @@ class MedMemoryBenchCheckpointManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_name(f"{path.name}.tmp")
         with open(temporary_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            dump_json_artifact(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)

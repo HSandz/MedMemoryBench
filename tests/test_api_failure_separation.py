@@ -131,7 +131,7 @@ def test_api_failures_are_saved_outside_result_and_query_files(tmp_path):
     query_data = json.loads(query_path.read_text())
     failure_data = json.loads(collector.last_api_failure_path.read_text())
 
-    assert result_data["summary"]["total_queries"] == 0
+    assert result_data["score_summary"]["total_queries"] == 0
     assert result_data["duration_seconds"] == 1.0
     assert result_data["true_duration_seconds"] == 1.0
     assert "failures" not in result_data
@@ -251,8 +251,9 @@ def test_query_answer_uses_compact_retrieval_references_and_full_summary(tmp_pat
 
     query_data = json.loads(query_path.read_text())
     assert query_data["version"] == 3
-    assert query_data["summary"]["overall_accuracy"] == 0.5
-    assert query_data["summary"]["evaluation_coverage"]["complete"] is True
+    assert query_data["execution_summary"]["total_queries"] == 2
+    assert "score_summary" not in query_data
+    assert "evaluation_coverage" not in query_data
     batch_query, realtime_query = query_data["queries"]
     assert "retrieved_memories" not in batch_query
     assert batch_query["retrieved_memory_ids"] == ["m1"]

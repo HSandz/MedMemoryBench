@@ -237,12 +237,17 @@ def test_memory_only_output_persists_full_build_metrics(tmp_path: Path):
     )
     payload = json.loads(memory_path.read_text(encoding="utf-8"))
 
-    assert payload["build_metrics"] == metrics
-    assert payload["memory_size"] == metrics["memory_size"]
-    assert payload["feature_configuration"]["combination_id"] == (
+    assert payload["build_summary"]["memory_size"] == metrics["memory_size"]
+    assert payload["build_summary"]["feature_configuration"]["combination_id"] == (
         "base_memory+typed_relations+temporal_state"
     )
-    assert "llm_usage" in payload
+    assert payload["build_summary"]["llm_usage"]["memorize_phase"] == (
+        metrics["usage"]["memorize_phase"]
+    )
+    assert "query_phase" not in payload["build_summary"]["llm_usage"]
+    assert "total" not in payload["build_summary"]["llm_usage"]
+    assert "usage" not in payload["build_metrics"]
+    assert "memory_size" not in payload["build_metrics"]
 
 
 def test_query_result_output_carries_source_build_metrics(tmp_path: Path):
@@ -278,6 +283,6 @@ def test_query_result_output_carries_source_build_metrics(tmp_path: Path):
     )
     payload = json.loads(result_path.read_text(encoding="utf-8"))
 
-    assert payload["build_metrics"] == metrics
-    assert payload["memory_size"] == metrics["memory_size"]
-    assert payload["feature_configuration"] == metrics["feature_configuration"]
+    assert "build_metrics" not in payload
+    assert "memory_size" not in payload
+    assert "feature_configuration" not in payload

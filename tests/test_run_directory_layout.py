@@ -316,10 +316,35 @@ def test_run_config_records_sparse_amem_effective_defaults(tmp_path: Path):
     assert constructor_params["amem_chain_selection"] is False
     assert set(snapshot["build_config"]) == AMEM_BUILD_CONFIG_KEYS
     assert set(snapshot["retrieval_config"]) == AMEM_RETRIEVAL_CONFIG_KEYS
-    assert snapshot["agent_params"] == {
+    assert "agent_params" not in snapshot
+    restored = method_config_from_snapshot(snapshot)
+    assert restored.agent_params == {
         **snapshot["build_config"],
         **snapshot["retrieval_config"],
     }
+
+
+def test_run_config_keeps_audit_configuration_without_report_copies(tmp_path: Path):
+    evaluator = _evaluator(tmp_path)
+    evaluator._write_run_config(
+        status="complete",
+        summary={"overall_accuracy": 1.0},
+        score_summary={"overall_accuracy": 1.0},
+        api_config={"openai_api_key": "<redacted>"},
+        command=["python", "main.py"],
+        output_dir="duplicate-path",
+    )
+
+    config = json.loads((evaluator.output_dir / "run_config.json").read_text())
+
+    assert config["version"] == 2
+    assert config["source_revision"].keys() == {"commit_sha", "dirty", "branch"}
+    assert "provider" in config["judge_configuration"]
+    assert "summary" not in config
+    assert "score_summary" not in config
+    assert "api_config" not in config
+    assert "command" not in config
+    assert "output_dir" not in config
 
 
 def test_resume_reuses_only_an_incomplete_exactly_matching_run(tmp_path: Path):

@@ -32,6 +32,7 @@ from metrics.retrieval_quality import (
 )
 from utils.templates import get_prompt_manager
 from utils.logger import truncate_error_message
+from utils.json_artifacts import dump_json_artifact
 from utils.batch_client import create_batch_client
 from utils.llm_client import (
     LLMAPIError,
@@ -1544,13 +1545,7 @@ class MedMemoryBenchEvaluator:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_name(f"{path.name}.tmp")
         with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(
-                self._memory_snapshot_manifest,
-                handle,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
+            dump_json_artifact(self._memory_snapshot_manifest, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
@@ -1664,7 +1659,7 @@ class MedMemoryBenchEvaluator:
         )
         payload = {
             "format": "medmemorybench.memory_source",
-            "version": 1,
+            "version": 2,
             "selected_at": datetime.now().isoformat(),
             "selection": (
                 "explicit"
@@ -1677,22 +1672,21 @@ class MedMemoryBenchEvaluator:
             ),
             "source_run_id": source_run_id,
             "manifest_path": relative_manifest,
-            "build_id": manifest.get("build_id"),
-            "config_hash": manifest.get("config_hash"),
-            "build_config_hash": derive_legacy_build_config_hash(
-                manifest, manifest_path
-            ),
-            "feature_configuration": manifest.get("feature_configuration", {}),
-            "build_metrics": manifest.get("build_metrics", {}),
-            "memory_size": manifest.get("memory_size", {}),
-            "status": manifest.get("status"),
+            # The manifest owns build telemetry; this is only the identity we
+            # selected so a resumed query run can audit the same source.
+            "memory_identity": {
+                "build_id": manifest.get("build_id"),
+                "status": manifest.get("status"),
+                "config_hash": manifest.get("config_hash"),
+                "build_config_hash": derive_legacy_build_config_hash(
+                    manifest, manifest_path
+                ),
+            },
         }
         path = self.output_dir / "memory_source.json"
         temporary_path = path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            dump_json_artifact(payload, handle)
         temporary_path.replace(path)
 
     def _select_memory_snapshot_run(
@@ -2097,7 +2091,7 @@ class MedMemoryBenchEvaluator:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_name(f"{path.name}.tmp")
         with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            dump_json_artifact(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
@@ -2411,7 +2405,7 @@ class MedMemoryBenchEvaluator:
         }
         temporary_path = path.with_suffix(".tmp")
         with temporary_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            dump_json_artifact(payload, handle)
         temporary_path.replace(path)
 
     def _load_deferred_judges(self) -> None:
@@ -3311,12 +3305,6 @@ class MedMemoryBenchEvaluator:
             for result in query_results:
                 results.append(result)
                 total_query_time += result.query_time
-                if not result.is_correct:
-                    self._log(
-                        f"  Query not fully correct | id={result.query_id} | "
-                        f"type={result.query_type} | score={result.score:.2f}",
-                        level="INFO",
-                    )
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
                         result.query_id,
@@ -3358,13 +3346,6 @@ class MedMemoryBenchEvaluator:
                     continue
                 results.append(result)
                 total_query_time += result.query_time
-
-                if not result.is_correct:
-                    self._log(
-                        f"  Query not fully correct | id={query.query_id} | "
-                        f"type={query.query_type} | score={result.score:.2f}",
-                        level="INFO",
-                    )
 
                 if self._checkpoint_manager:
                     self._checkpoint_manager.mark_query_completed(
@@ -3867,10 +3848,6 @@ class MedMemoryBenchEvaluator:
                 context_id=item["persona_id"],
             )
             if result is not None:
-                status = "✓" if result.is_correct else "✗"
-                self._log(
-                    f"[{status}] {result.query_id} ({result.query_type}): {result.score:.2f}"
-                )
                 finalized.append({
                     "persona_id": item["persona_id"],
                     "result": result,

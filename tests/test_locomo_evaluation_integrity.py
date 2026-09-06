@@ -224,8 +224,8 @@ def test_result_serializes_locomo_coverage_modality_and_f1_terminology(tmp_path)
 
     assert payload["dataset_coverage"]["evaluated_sample_count"] == 1
     assert payload["input_modality"]["image_input_mode"] == "caption_only"
-    assert "accuracy" not in payload["summary"]["by_metric"]["locomo_f1"]
-    assert payload["summary"]["by_metric"]["locomo_f1"]["fraction_f1_ge_0_5"] == 1.0
+    assert "accuracy" not in payload["score_summary"]["by_metric"]["locomo_f1"]
+    assert payload["score_summary"]["by_metric"]["locomo_f1"]["fraction_f1_ge_0_5"] == 1.0
 
 
 def test_event_state_locomo_reporting_uses_record_and_timing_semantics(tmp_path):
@@ -311,13 +311,14 @@ def test_event_state_locomo_reporting_uses_record_and_timing_semantics(tmp_path)
     result_data = json.loads(Path(result_path).read_text(encoding="utf-8"))
     build_data = json.loads(Path(memory_build_path).read_text(encoding="utf-8"))
 
-    assert result_data["memory_size"] == {
+    assert "memory_size" not in result_data
+    assert build_data["build_summary"]["memory_size"] == {
         "final_episode_count": 2,
         "final_claim_count": 7,
         "final_memory_object_count": 9,
     }
-    assert result_data["feature_configuration"]["semantic_version"] == "2.9"
-    assert result_data["feature_configuration"]["planner_enabled"] is False
+    assert build_data["build_summary"]["feature_configuration"]["semantic_version"] == "2.9"
+    assert build_data["build_summary"]["feature_configuration"]["planner_enabled"] is False
     assert "chunk_count" not in build_data["units"][0]
     assert build_data["units"][0]["inserted_record_count"] == 88
     assert "chunk_count" not in build_data["units"][0]["build_metrics"]

@@ -884,7 +884,6 @@ class LoCoMoEvaluator:
             query_results = self._evaluate_realtime_queries(unit.queries_to_evaluate, unit.context_id)
         for result in query_results:
             result.memory_construction_time = memory_time_per_query
-            self._log(f"    [{'✓' if result.is_correct else '✗'}] {result.query_id} ({result.query_type}): {result.score:.2f}")
         return query_results
 
     def _supports_batch_queries(self) -> bool:
@@ -1199,10 +1198,6 @@ class LoCoMoEvaluator:
                     }
 
             result.memory_construction_time = item["memory_time_per_query"]
-            status = "✓" if result.is_correct else "✗"
-            self._log(
-                f"  [{status}] {result.query_id} ({result.query_type}): {result.score:.2f}"
-            )
             finalized.append({
                 "sample_id": item["sample_id"],
                 "result": result,
