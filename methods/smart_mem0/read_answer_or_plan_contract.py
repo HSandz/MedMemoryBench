@@ -11,10 +11,7 @@ from copy import deepcopy
 from typing import Any, Dict
 
 from .contracts import VALID_TEMPORAL_AXES
-from .read_requirement_contract import (
-    REQUIREMENT_CONTROLLER_POLICY,
-    REQUIREMENT_SCHEMA,
-)
+from .read_requirement_contract import REQUIREMENT_CONTROLLER_POLICY, REQUIREMENT_SCHEMA
 
 
 ANSWER_OR_PLAN_PRIORITY = """
@@ -94,34 +91,31 @@ class ReadAnswerOrPlanContractMixin:
         return not bool(relation_types & _HARD_DIRECT_RELATIONS)
 
     def _rc_normalize_ir(self, parsed: Dict[str, Any], question: str, frame: Any):
-        """Preserve a safe raw candidate without erasing semantic obligations."""
+        """Preserve a grounded raw candidate even if its optional plan fields malformed."""
         ir = super()._rc_normalize_ir(parsed, question, frame)
         raw_candidate = self._aop_raw_candidate(parsed)
         requirements = ir.get("requirements") or []
         single_question = (
             len(requirements) == 1
-            and str(requirements[0].get("grounding_kind") or "QUESTION").upper()
-            == "QUESTION"
+            and str(requirements[0].get("grounding_kind") or "QUESTION").upper() == "QUESTION"
         )
         ir["candidate"] = (
             raw_candidate
             if raw_candidate
             and single_question
-            and ir.get("normalization_status") != "DEGRADED"
             and self._aop_direct_surface_allowed(question, ir)
             else None
         )
         return ir
 
     def _aop_direct_projection(self, ir: Dict[str, Any], question: str):
-        """Compatibility hook: direct routing never drops a real semantic obligation."""
+        """Direct authorization never deletes a real semantic obligation."""
         if not ir.get("candidate") or not self._aop_direct_surface_allowed(question, ir):
             return None
         requirements = ir.get("requirements") or []
         if (
             len(requirements) != 1
-            or str(requirements[0].get("grounding_kind") or "QUESTION").upper()
-            != "QUESTION"
+            or str(requirements[0].get("grounding_kind") or "QUESTION").upper() != "QUESTION"
         ):
             return None
         projected = deepcopy(ir)
@@ -223,9 +217,7 @@ class ReadAnswerOrPlanContractMixin:
         authorization = "NO_COMPLETE_CANDIDATE"
         active_ir = ir
         if projection is not None:
-            supports, authorization = self._authorize_controller_answer(
-                projection, seeds, frame
-            )
+            supports, authorization = self._authorize_controller_answer(projection, seeds, frame)
             if supports is not None:
                 active_ir = projection
 
@@ -234,8 +226,7 @@ class ReadAnswerOrPlanContractMixin:
         warnings = [item for item in actions if item.get("action") == "GRAPH_WARNING"]
         common = {
             "called": True,
-            "fallback_reason": error
-            or (authorization if ir.get("candidate") and supports is None else ""),
+            "fallback_reason": error or (authorization if ir.get("candidate") and supports is None else ""),
             "error": error,
             "usage": usage,
             "answer_type": active_ir["answer_type"],
@@ -255,33 +246,27 @@ class ReadAnswerOrPlanContractMixin:
             answer = candidate["answer"]
             renderer = getattr(self, "_terminal_render_seed_answer", None)
             if callable(renderer):
-                answer = renderer(
-                    question, active_ir, candidate["answer"], supports[0]
-                )
+                answer = renderer(question, active_ir, candidate["answer"], supports[0])
             telemetry = dict(common)
-            telemetry.update(
-                {
-                    "route": "DIRECT",
-                    "route_source": "answer_or_plan_complete_grounded_seed",
-                    "answer": answer,
-                    "support_ref": candidate["support_ref"],
-                    "support_refs": [candidate["support_ref"]],
-                    "fallback_reason": "",
-                    "terminal_rendered": answer != candidate["answer"],
-                }
-            )
+            telemetry.update({
+                "route": "DIRECT",
+                "route_source": "answer_or_plan_complete_grounded_seed",
+                "answer": answer,
+                "support_ref": candidate["support_ref"],
+                "support_refs": [candidate["support_ref"]],
+                "fallback_reason": "",
+                "terminal_rendered": answer != candidate["answer"],
+            })
             return supports, {}, telemetry
 
         plan = self._controller_plan(ir, question, frame)
         telemetry = dict(common)
-        telemetry.update(
-            {
-                "route": "PLAN",
-                "route_source": "answer_or_plan_requires_retrieval",
-                "answer": "",
-                "support_ref": "",
-                "support_refs": [],
-                "terminal_rendered": False,
-            }
-        )
+        telemetry.update({
+            "route": "PLAN",
+            "route_source": "answer_or_plan_requires_retrieval",
+            "answer": "",
+            "support_ref": "",
+            "support_refs": [],
+            "terminal_rendered": False,
+        })
         return None, plan, telemetry

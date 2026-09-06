@@ -25,7 +25,7 @@ _PROPOSITION_QUESTION_PATTERNS = (
 class ReadTerminalAnswerContractMixin:
     """Own terminal authorization plus one renderer shared by DIRECT-A/B."""
 
-    TERMINAL_ANSWER_CONTRACT_VERSION = "complete-grounded-answer-v2"
+    TERMINAL_ANSWER_CONTRACT_VERSION = "complete-grounded-answer-v3"
 
     def _terminal_reset_state(self):
         self._last_terminal_closure_diagnostic = {}
@@ -48,10 +48,7 @@ class ReadTerminalAnswerContractMixin:
         return value
 
     def _terminal_grounding_terms(self, value: Any) -> List[str]:
-        return [
-            self._terminal_stem(term)
-            for term in self._rc_content_terms(value)
-        ]
+        return [self._terminal_stem(term) for term in self._rc_content_terms(value)]
 
     def _terminal_memory_text(self, memory: Dict[str, Any]) -> str:
         return " ".join(
@@ -66,35 +63,36 @@ class ReadTerminalAnswerContractMixin:
             )
         )
 
-    def _terminal_answer_grounded(
-        self, answer: str, memory: Dict[str, Any]
-    ) -> bool:
+    def _terminal_answer_grounded(self, answer: str, memory: Dict[str, Any]) -> bool:
         """Authorize a one-seed proposition without any maximum length rule."""
         answer = str(answer or "").strip()
         if not answer:
             return False
+
+        answer_norm = self._rc_text(answer)
+        for surface in (
+            memory.get("value"),
+            memory.get("verbatim_value"),
+            memory.get("object_anchor"),
+        ):
+            surface_norm = self._rc_text(str(surface or "").replace("_", " "))
+            if answer_norm and surface_norm and (
+                answer_norm == surface_norm
+                or answer_norm in surface_norm
+                or surface_norm in answer_norm
+            ):
+                return True
+
         evidence = self._terminal_memory_text(memory)
         if self._rc_token_sequence_present(answer, evidence):
             return True
 
-        answer_numbers = set(
-            re.findall(r"\d+(?:\.\d+)?", self._rc_text(answer))
-        )
-        evidence_numbers = set(
-            re.findall(r"\d+(?:\.\d+)?", self._rc_text(evidence))
-        )
+        answer_numbers = set(re.findall(r"\d+(?:\.\d+)?", self._rc_text(answer)))
+        evidence_numbers = set(re.findall(r"\d+(?:\.\d+)?", self._rc_text(evidence)))
         if answer_numbers and not answer_numbers.issubset(evidence_numbers):
             return False
 
-        polarity = {
-            "no",
-            "not",
-            "never",
-            "without",
-            "denied",
-            "deny",
-            "stopped",
-        }
+        polarity = {"no", "not", "never", "without", "denied", "deny", "stopped"}
         if not polarity.intersection(self._rc_terms(answer)).issubset(
             polarity.intersection(self._rc_terms(evidence))
         ):
@@ -104,18 +102,13 @@ class ReadTerminalAnswerContractMixin:
         evidence_terms = set(self._terminal_grounding_terms(evidence))
         if not answer_terms:
             return False
-        coverage = sum(
-            term in evidence_terms for term in answer_terms
-        ) / len(answer_terms)
+        coverage = sum(term in evidence_terms for term in answer_terms) / len(answer_terms)
         return coverage >= 0.90
 
     @staticmethod
     def _terminal_question_needs_proposition(question: str) -> bool:
         text = " ".join(str(question or "").casefold().split())
-        return any(
-            re.search(pattern, text)
-            for pattern in _PROPOSITION_QUESTION_PATTERNS
-        )
+        return any(re.search(pattern, text) for pattern in _PROPOSITION_QUESTION_PATTERNS)
 
     def _terminal_render_answer(
         self,
@@ -134,9 +127,7 @@ class ReadTerminalAnswerContractMixin:
         if field in VALID_TEMPORAL_AXES:
             return " ".join(str(self._date_for(memory, field) or "").split())
         if field in {"value", "verbatim_value", "object_anchor"}:
-            return " ".join(
-                str(memory.get(field) or "").replace("_", " ").split()
-            )
+            return " ".join(str(memory.get(field) or "").replace("_", " ").split())
 
         if answer_type in {"ENTITY", "VALUE", "DATE"}:
             return candidate_answer
@@ -145,11 +136,7 @@ class ReadTerminalAnswerContractMixin:
 
         claim = " ".join(str(memory.get("claim") or "").split())
         value = " ".join(str(self._memory_value(memory) or "").split())
-
-        # Candidate length affects only faithful rendering, never the route.
-        if candidate_answer and len(
-            self._rc_content_terms(candidate_answer)
-        ) >= 4:
+        if candidate_answer and len(self._rc_content_terms(candidate_answer)) >= 4:
             return candidate_answer
         if self._terminal_question_needs_proposition(question) and claim:
             return claim
@@ -171,9 +158,7 @@ class ReadTerminalAnswerContractMixin:
 
     def _authorize_controller_answer(self, ir, seeds, frame):
         """Allow complete one-seed TEXT after lower scalar/date authorization."""
-        supports, reason = super()._authorize_controller_answer(
-            ir, seeds, frame
-        )
+        supports, reason = super()._authorize_controller_answer(ir, seeds, frame)
         if supports is not None:
             return supports, reason
 
@@ -188,46 +173,46 @@ class ReadTerminalAnswerContractMixin:
             return None, reason
 
         relations = ir.get("relations") or []
-        if any(
-            str(edge.get("type") or "").upper() != "CURRENT"
-            for edge in relations
-        ):
+        if any(str(edge.get("type") or "").upper() != "CURRENT" for edge in relations):
             return None, "RELATIONAL_QUERY_REQUIRES_RETRIEVAL"
-
-        constraint = requirements[0].get("time_constraint") or {}
-        if getattr(frame, "dates", ()) and not constraint.get("axis"):
-            return None, "TEMPORAL_CONSTRAINT_REQUIRES_PLAN"
-        if constraint.get("axis") or constraint.get("relation"):
-            return None, "TEMPORAL_QUERY_REQUIRES_RETRIEVAL"
 
         reference = str(candidate.get("support_ref") or "")
         match = re.fullmatch(r"\$seed(\d+)", reference)
         if not match or int(match.group(1)) >= min(3, len(seeds)):
             return None, "INVALID_SUPPORT_REF"
-
         valid = self._validate_fast_support(reference, seeds, frame)
         if not valid:
             return None, "STRUCTURAL_SUPPORT_REJECTED"
         memory = valid[0]
+
+        constraint = requirements[0].get("time_constraint") or {}
+        axis = str(constraint.get("axis") or "")
+        relation = str(constraint.get("relation") or "").upper()
+        anchor = str(constraint.get("anchor") or "")
+        if axis or relation:
+            if (
+                relation == "EXACT"
+                and axis in VALID_TEMPORAL_AXES
+                and anchor
+                and self._date_matches(self._date_for(memory, axis), anchor)
+            ):
+                pass
+            else:
+                return None, "TEMPORAL_SELECTOR_REQUIRES_RETRIEVAL"
+        elif getattr(frame, "dates", ()) and not self._memory_satisfies_frame(memory, frame):
+            return None, "TEMPORAL_FILTER_MISMATCH"
+
         if relations and not self._is_state_head(memory):
             return None, "CURRENT_CANDIDATE_IS_NOT_STATE_HEAD"
-        if not self._terminal_answer_grounded(
-            str(candidate.get("answer") or ""), memory
-        ):
+        if not self._terminal_answer_grounded(str(candidate.get("answer") or ""), memory):
             return None, "ANSWER_PROPOSITION_NOT_GROUNDED"
         return valid, "AUTHORIZED_COMPLETE_PROPOSITION"
 
-    def _post_retrieval_closure(
-        self, plan, candidates, frame, relations
-    ):
+    def _post_retrieval_closure(self, plan, candidates, frame, relations):
         """DIRECT-B requires a strict structured certificate; relevance is not proof."""
         slots = plan.get("required_slots") or []
         ir = plan.get("semantic_ir") or {}
-        diagnostic = {
-            "eligible": False,
-            "reason": "",
-            "candidate_count": 0,
-        }
+        diagnostic = {"eligible": False, "reason": "", "candidate_count": 0}
         self._last_terminal_closure_diagnostic = diagnostic
 
         if (
@@ -235,9 +220,7 @@ class ReadTerminalAnswerContractMixin:
             or len(ir.get("requirements") or []) != 1
             or plan.get("visible_options")
             or plan.get("need_evidence")
-            or plan.get("query_spec", {}).get(
-                "world_knowledge_bridge_allowed"
-            )
+            or plan.get("query_spec", {}).get("world_knowledge_bridge_allowed")
         ):
             diagnostic["reason"] = "NON_SINGLE_MEMORY_OBLIGATION"
             return None
@@ -251,8 +234,7 @@ class ReadTerminalAnswerContractMixin:
         slot = slots[0]
         if (
             str(slot.get("grounding_kind") or "").upper() != "QUESTION"
-            or str(slot.get("evidence_role") or "").upper()
-            != "REQUIREMENT"
+            or str(slot.get("evidence_role") or "").upper() != "REQUIREMENT"
         ):
             diagnostic["reason"] = "NON_QUESTION_REQUIREMENT"
             return None
@@ -280,25 +262,19 @@ class ReadTerminalAnswerContractMixin:
                 diagnostic["reason"] = "INVALID_DATE_ANSWER_FIELD"
                 return None
             relation = str(
-                slot.get("temporal_relation")
-                or slot.get("time_relation")
-                or "LOCATE"
+                slot.get("temporal_relation") or slot.get("time_relation") or "LOCATE"
             ).upper()
             if relation not in {"LOCATE", "EXACT"}:
                 diagnostic["reason"] = "DATE_SELECTOR_REQUIRES_ARBITRATION"
                 return None
 
-        question = str(
-            getattr(self, "_active_answer_question", "") or ""
-        )
+        question = str(getattr(self, "_active_answer_question", "") or "")
         matches = []
         for memory in candidates:
             certified, reason = self._certificate_result(slot, memory)
             if not certified:
                 continue
-            if not self._slot_structure_covered(
-                slot, [memory["id"]], [memory], relations
-            ):
+            if not self._slot_structure_covered(slot, [memory["id"]], [memory], relations):
                 continue
             if not self._memory_satisfies_frame(memory, frame):
                 continue
@@ -306,15 +282,10 @@ class ReadTerminalAnswerContractMixin:
                 continue
 
             answer = self._terminal_render_answer(
-                question,
-                answer_type,
-                memory,
-                answer_field=field,
+                question, answer_type, memory, answer_field=field
             )
             if answer_type == "TEXT" and not answer:
-                answer = self._terminal_render_answer(
-                    question, answer_type, memory
-                )
+                answer = self._terminal_render_answer(question, answer_type, memory)
             if answer:
                 matches.append((memory, answer, reason))
 
@@ -323,15 +294,11 @@ class ReadTerminalAnswerContractMixin:
         if not matches:
             diagnostic["reason"] = "NO_CERTIFIED_ANSWER_BEARING_CANDIDATE"
             return None
-        normalized_answers = {
-            self._rc_text(answer) for _, answer, _ in matches
-        }
+        normalized_answers = {self._rc_text(answer) for _, answer, _ in matches}
         if len(normalized_answers) != 1:
             diagnostic["reason"] = "AMBIGUOUS_CERTIFIED_VALUES"
             return None
-        if self._has_unresolved_conflict(
-            [memory for memory, _, _ in matches]
-        ):
+        if self._has_unresolved_conflict([memory for memory, _, _ in matches]):
             diagnostic["reason"] = "UNRESOLVED_CONFLICT"
             return None
 

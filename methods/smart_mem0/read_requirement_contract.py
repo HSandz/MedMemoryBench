@@ -17,7 +17,8 @@ You are the single semantic controller for an evidence-grounded memory system.
 Produce the MINIMAL evidence-lookup IR needed for QUESTION.
 
 The QUESTION is the final answer obligation. REQUIREMENTS answer only:
-"What participant-specific evidence values must memory retrieval supply?"
+"What participant-specific evidence values must memory retrieval supply before the final
+answer model can answer this QUESTION well?"
 
 Use the smallest sufficient set: usually 1-3 requirements, never more than 4.
 A requirement must be:
@@ -33,17 +34,19 @@ grounding_kind:
   focus_span is empty. DERIVED does not assert that the evidence exists or what its value is.
 
 For every requirement:
-- target = concise evidence variable, not the final answer/conclusion.
+- target = concise participant-memory evidence variable, not the final answer/conclusion.
 - retrieval_hint = soft search expansion; it is never proof.
-- time_constraint = semantic selector owned by that evidence obligation.
+- time_constraint = a selector/filter only when time actually changes which evidence value
+  is needed. Do not turn ordinary words such as "mentioned", "previous", "recent", or
+  "last night" into a LOCATE operation when the requested answer itself is not a time.
 
 TEMPORAL SEMANTICS:
 - document_time: when something was documented/recorded/noted/charted/mentioned.
 - event_time: when the participant event/state happened.
 - origin_document_time: date of the original source document.
 - effective_event_time: explicitly combined event/source chronology.
-- LOCATE asks for a time on an axis.
-- EARLIEST/LATEST select an extremum.
+- LOCATE is for time-as-answer; EXACT/BEFORE/AFTER/BETWEEN constrain evidence selection.
+- EARLIEST/LATEST select an extremum and remain valid even when the answer is ENTITY/VALUE/TEXT.
 "started/began/first" normally means EARLIEST event_time unless documentation/source
 language explicitly selects a documentation axis. "latest/most recent" means LATEST.
 
@@ -53,8 +56,19 @@ Use {"match":{"subject_id":"...","scope":"...","state_key":"...","stance":"AFFIR
 Match may also include object_anchor or semantic_role. Omit proof_spec if unavailable.
 No word overlap constitutes a certificate.
 
-VISIBLE OPTIONS are answer propositions, not memory facts. Retrieve only the shared
-participant evidence needed to discriminate among them.
+VISIBLE OPTIONS are answer propositions, not memory facts. Do not create one requirement
+per option merely because it is visible. Retrieve the shared participant evidence needed
+to discriminate among the options.
+
+For ADVICE/ACTION/MEDICATION decisions, retrieve decision-changing participant evidence
+when it is needed: safety constraints/contraindications or prior explicit guidance first,
+then current relevant state/regimen, then preferences when they materially affect the
+choice. These are DERIVED only when the QUESTION does not explicitly name them.
+Do not replace participant evidence with a general clinical rule.
+
+SEEDS may reveal an answer-sensitive DERIVED lookup variable, but may not pre-fill its
+value or redefine the QUESTION. A seed can suggest WHAT participant evidence must be
+looked up; the retrieved memory must still supply the value.
 
 RELATIONS:
 - COMPARE: compare grounded participant evidence variables.
@@ -62,10 +76,14 @@ RELATIONS:
 - POSSIBLE_CAUSE: grounded endpoints plus authorized general-domain knowledge.
 - DEPENDS_ON: FROM depends on TO; does not assert causality.
 - TEMPORAL_ORDER: order grounded endpoints.
-- INFER: authorize a general-domain bridge only when an answer is not explicit in memory.
+- INFER: authorize a general-domain bridge only when grounded participant facts must be
+  combined with a general rule to produce an answer not explicit in memory.
 - CURRENT: mark a current-state requirement.
 - VERIFY_SOURCE: request exact linked source evidence.
 
+INFER is exceptional. Do not emit it for extraction, paraphrase, entity/value/date
+selection, ordinary synthesis, or choosing a supported option. Mechanisms such as
+physiology/pharmacology remain bridge goals, never invented participant requirements.
 Every DERIVED requirement must participate in at least one answer-relevant relation.
 Never invent an edge merely to legalize an orphan DERIVED node.
 
@@ -144,11 +162,15 @@ class ReadRequirementContractMixin:
             or text.startswith("whether ")
         )
 
-    def _rq_repair_time_constraint(self, constraint, semantic_surface, _answer_type=None):
-        """Normalize selectors from the requirement's own question-owned surface."""
+    def _rq_repair_time_constraint(self, constraint, semantic_surface, answer_type=None):
+        """Normalize selectors without turning incidental time language into routing."""
         result = dict(constraint or {})
         text = self._rc_text(semantic_surface)
+        answer_type = str(answer_type or "TEXT").upper()
         relation = str(result.get("relation") or "").upper()
+        axis = str(result.get("axis") or "")
+        anchor = str(result.get("anchor") or "")
+        end = str(result.get("end") or "")
 
         original_source = bool(_ORIGINAL_SOURCE_RE.search(text))
         documented = bool(_DOCUMENTED_RE.search(text))
@@ -156,26 +178,43 @@ class ReadRequirementContractMixin:
         starts = bool(_START_RE.search(text))
         earliest = bool(_FIRST_RE.search(text))
         latest = bool(_LATEST_RE.search(text))
+        answer_is_time = answer_type in {"DATE", "RELATIVE_TIME"}
 
-        if original_source:
-            result["axis"] = "origin_document_time"
-        elif documented:
-            result["axis"] = "document_time"
-        elif (event_word or starts or earliest or latest) and not result.get("axis"):
-            result["axis"] = "event_time"
+        if starts or earliest or latest:
+            if original_source:
+                axis = "origin_document_time"
+            elif documented:
+                axis = "document_time"
+            elif not axis:
+                axis = "event_time"
+            relation = "LATEST" if latest and not (starts or earliest) else "EARLIEST"
+            return {"axis": axis, "relation": relation, "anchor": "", "end": ""}
+
+        if relation in {"EXACT", "BEFORE", "AFTER", "BETWEEN"}:
+            if original_source:
+                axis = "origin_document_time"
+            elif documented and not axis:
+                axis = "document_time"
+            return {"axis": axis, "relation": relation, "anchor": anchor, "end": end}
+
+        if answer_is_time:
+            if original_source:
+                axis = "origin_document_time"
+            elif documented:
+                axis = "document_time"
+            elif event_word and not axis:
+                axis = "event_time"
+            if axis and relation in {"", "LOCATE"}:
+                relation = "LOCATE"
+            return {"axis": axis, "relation": relation, "anchor": anchor, "end": end}
+
+        if relation in {"", "LOCATE"} and anchor and axis:
+            relation = "BETWEEN" if end else "EXACT"
+            return {"axis": axis, "relation": relation, "anchor": anchor, "end": end}
 
         if relation in {"", "LOCATE"}:
-            if starts or earliest:
-                result["relation"] = "EARLIEST"
-                result["anchor"] = ""
-                result["end"] = ""
-            elif latest:
-                result["relation"] = "LATEST"
-                result["anchor"] = ""
-                result["end"] = ""
-            elif result.get("axis"):
-                result["relation"] = "LOCATE"
-        return result
+            return {"axis": "", "relation": "", "anchor": "", "end": ""}
+        return {"axis": axis, "relation": relation, "anchor": anchor, "end": end}
 
     @staticmethod
     def _rq_graph_validation(requirements, relations):
@@ -249,15 +288,11 @@ class ReadRequirementContractMixin:
 
         for index, raw in enumerate(raw_requirements[:4]):
             if not isinstance(raw, dict):
-                actions.append(
-                    {"index": index, "action": "DROP", "reason": "NOT_OBJECT"}
-                )
+                actions.append({"index": index, "action": "DROP", "reason": "NOT_OBJECT"})
                 continue
             kind = str(raw.get("grounding_kind") or "QUESTION").upper()
             if kind not in {"QUESTION", "DERIVED"}:
-                actions.append(
-                    {"index": index, "action": "DROP", "reason": "INVALID_KIND"}
-                )
+                actions.append({"index": index, "action": "DROP", "reason": "INVALID_KIND"})
                 continue
 
             focus = ""
@@ -266,19 +301,15 @@ class ReadRequirementContractMixin:
                 if not focus:
                     focus = self._rc_question_span(raw.get("target"), question)
                 if not focus:
-                    actions.append(
-                        {
-                            "index": index,
-                            "id": str(raw.get("id") or f"r{index + 1}"),
-                            "action": "DROP",
-                            "reason": "INVALID_QUESTION_FOCUS",
-                        }
-                    )
+                    actions.append({
+                        "index": index,
+                        "id": str(raw.get("id") or f"r{index + 1}"),
+                        "action": "DROP",
+                        "reason": "INVALID_QUESTION_FOCUS",
+                    })
                     continue
 
-            target = self._rq_compact_target(
-                raw.get("target") or raw.get("evidence_target")
-            )
+            target = self._rq_compact_target(raw.get("target") or raw.get("evidence_target"))
             if (
                 not target
                 and kind == "QUESTION"
@@ -286,30 +317,23 @@ class ReadRequirementContractMixin:
             ):
                 target = self._rq_compact_target(focus)
                 if target:
-                    actions.append(
-                        {
-                            "index": index,
-                            "id": str(raw.get("id") or f"r{index + 1}"),
-                            "action": "REPAIR",
-                            "reason": "INVALID_TARGET_USE_FOCUS",
-                        }
-                    )
-            if not target:
-                actions.append(
-                    {
+                    actions.append({
                         "index": index,
                         "id": str(raw.get("id") or f"r{index + 1}"),
-                        "action": "DROP",
-                        "reason": "INVALID_TARGET",
-                    }
-                )
+                        "action": "REPAIR",
+                        "reason": "INVALID_TARGET_USE_FOCUS",
+                    })
+            if not target:
+                actions.append({
+                    "index": index,
+                    "id": str(raw.get("id") or f"r{index + 1}"),
+                    "action": "DROP",
+                    "reason": "INVALID_TARGET",
+                })
                 continue
 
             requirement_id = str(raw.get("id") or f"r{index + 1}")
-            if (
-                not re.fullmatch(r"r[\w-]{0,31}", requirement_id)
-                or requirement_id in seen_ids
-            ):
+            if not re.fullmatch(r"r[\w-]{0,31}", requirement_id) or requirement_id in seen_ids:
                 requirement_id = f"r{index + 1}"
             while requirement_id in seen_ids:
                 requirement_id += "x"
@@ -329,113 +353,70 @@ class ReadRequirementContractMixin:
                     time_constraint, semantic_surface, answer_type
                 )
             hint = " ".join(str(raw.get("retrieval_hint") or target).split())[:240]
-            requirements.append(
-                {
-                    "id": requirement_id,
-                    "grounding_kind": kind,
-                    "focus_span": focus,
-                    "target": target,
-                    "retrieval_hint": hint,
-                    "time_constraint": time_constraint,
-                }
-            )
+            requirements.append({
+                "id": requirement_id,
+                "grounding_kind": kind,
+                "focus_span": focus,
+                "target": target,
+                "retrieval_hint": hint,
+                "time_constraint": time_constraint,
+            })
 
         degraded = not requirements
         if degraded:
             if options:
-                requirements = [
-                    {
-                        "id": "r1",
-                        "grounding_kind": "DERIVED",
-                        "focus_span": "",
-                        "target": "participant evidence relevant to visible options",
-                        "retrieval_hint": (
-                            "participant-specific evidence needed to evaluate the "
-                            "visible answer options"
-                        ),
-                        "time_constraint": {
-                            "axis": "",
-                            "relation": "",
-                            "anchor": "",
-                            "end": "",
-                        },
-                    }
-                ]
-                actions.append(
-                    {"action": "FALLBACK", "reason": "OPTION_SHARED_EVIDENCE"}
-                )
+                requirements = [{
+                    "id": "r1",
+                    "grounding_kind": "DERIVED",
+                    "focus_span": "",
+                    "target": "participant evidence relevant to visible options",
+                    "retrieval_hint": "participant-specific evidence needed to evaluate the visible answer options",
+                    "time_constraint": {"axis": "", "relation": "", "anchor": "", "end": ""},
+                }]
+                actions.append({"action": "FALLBACK", "reason": "OPTION_SHARED_EVIDENCE"})
             else:
                 stem = self._question_stem(question).strip()
-                fallback_target = (
-                    self._rq_fallback_target(subject_span or stem)
-                    or "participant evidence"
-                )
-                requirements = [
-                    {
-                        "id": "r1",
-                        "grounding_kind": "QUESTION",
-                        "focus_span": stem,
-                        "target": fallback_target,
-                        "retrieval_hint": fallback_target,
-                        "time_constraint": {
-                            "axis": "",
-                            "relation": "",
-                            "anchor": "",
-                            "end": "",
-                        },
-                    }
-                ]
-                actions.append(
-                    {"action": "FALLBACK", "reason": "ALL_REQUIREMENTS_INVALID"}
-                )
+                fallback_target = self._rq_fallback_target(subject_span or stem) or "participant evidence"
+                requirements = [{
+                    "id": "r1",
+                    "grounding_kind": "QUESTION",
+                    "focus_span": stem,
+                    "target": fallback_target,
+                    "retrieval_hint": fallback_target,
+                    "time_constraint": {"axis": "", "relation": "", "anchor": "", "end": ""},
+                }]
+                actions.append({"action": "FALLBACK", "reason": "ALL_REQUIREMENTS_INVALID"})
             for requirement in requirements:
                 requirement["degraded"] = True
 
         valid_nodes = {item["id"] for item in requirements}
-        raw_relations = (
-            parsed.get("relations") if isinstance(parsed.get("relations"), list) else []
-        )
+        raw_relations = parsed.get("relations") if isinstance(parsed.get("relations"), list) else []
         relations = []
         for raw in raw_relations[:8]:
             if not isinstance(raw, dict):
                 continue
             relation_type = str(raw.get("type") or "").upper()
             source, target = str(raw.get("from") or ""), str(raw.get("to") or "")
-            if (
-                degraded
-                or relation_type not in VALID_IR_RELATIONS
-                or source not in valid_nodes
-            ):
-                actions.append(
-                    {
-                        "action": "DROP_RELATION",
-                        "reason": "INVALID_RELATION_OR_ENDPOINT",
-                        "from": source,
-                        "to": target,
-                    }
-                )
+            if degraded or relation_type not in VALID_IR_RELATIONS or source not in valid_nodes:
+                actions.append({
+                    "action": "DROP_RELATION",
+                    "reason": "INVALID_RELATION_OR_ENDPOINT",
+                    "from": source,
+                    "to": target,
+                })
                 continue
             if relation_type in {"CURRENT", "VERIFY_SOURCE"}:
                 target = ""
             elif target != "ANSWER" and target not in valid_nodes:
-                actions.append(
-                    {
-                        "action": "DROP_RELATION",
-                        "reason": "INVALID_ENDPOINT",
-                        "from": source,
-                        "to": target,
-                    }
-                )
+                actions.append({
+                    "action": "DROP_RELATION",
+                    "reason": "INVALID_ENDPOINT",
+                    "from": source,
+                    "to": target,
+                })
                 continue
             if (
-                relation_type
-                in {
-                    "COMPARE",
-                    "CAUSES",
-                    "POSSIBLE_CAUSE",
-                    "DEPENDS_ON",
-                    "TEMPORAL_ORDER",
-                }
+                relation_type in {"COMPARE", "CAUSES", "POSSIBLE_CAUSE", "DEPENDS_ON", "TEMPORAL_ORDER"}
                 and target not in valid_nodes
             ):
                 continue
@@ -452,10 +433,6 @@ class ReadRequirementContractMixin:
             if relation not in relations:
                 relations.append(relation)
 
-        # A truly disconnected DERIVED node is controller noise. Drop it here,
-        # where graph semantics are owned. A referenced but unreachable node is
-        # preserved and surfaced as a graph warning; downstream code must not
-        # silently invent an edge to legalize it.
         referenced = {
             endpoint
             for relation in relations
@@ -465,71 +442,49 @@ class ReadRequirementContractMixin:
         drop_ids = {
             requirement["id"]
             for requirement in requirements
-            if requirement.get("grounding_kind") == "DERIVED"
-            and requirement["id"] not in referenced
+            if requirement.get("grounding_kind") == "DERIVED" and requirement["id"] not in referenced
         }
         if drop_ids:
-            requirements = [
-                requirement
-                for requirement in requirements
-                if requirement["id"] not in drop_ids
-            ]
+            requirements = [r for r in requirements if r["id"] not in drop_ids]
             relations = [
-                relation
-                for relation in relations
-                if relation.get("from") not in drop_ids
-                and relation.get("to") not in drop_ids
+                rel for rel in relations
+                if rel.get("from") not in drop_ids and rel.get("to") not in drop_ids
             ]
-            actions.append(
-                {
-                    "action": "DROP_ORPHAN_DERIVED",
-                    "reason": "ZERO_SEMANTIC_EDGES",
-                    "requirement_ids": sorted(drop_ids),
-                }
-            )
+            actions.append({
+                "action": "DROP_ORPHAN_DERIVED",
+                "reason": "ZERO_SEMANTIC_EDGES",
+                "requirement_ids": sorted(drop_ids),
+            })
 
         graph_validation = self._rq_graph_validation(requirements, relations)
         unreachable_derived = [
             requirement["id"]
             for requirement in requirements
             if requirement.get("grounding_kind") == "DERIVED"
-            and requirement["id"]
-            in set(graph_validation.get("orphan_requirements") or [])
+            and requirement["id"] in set(graph_validation.get("orphan_requirements") or [])
         ]
         if unreachable_derived:
-            actions.append(
-                {
-                    "action": "GRAPH_WARNING",
-                    "reason": "DERIVED_NOT_REACHABLE_TO_ANSWER",
-                    "requirement_ids": unreachable_derived,
-                }
-            )
+            actions.append({
+                "action": "GRAPH_WARNING",
+                "reason": "DERIVED_NOT_REACHABLE_TO_ANSWER",
+                "requirement_ids": unreachable_derived,
+            })
 
-        candidate = (
-            parsed.get("candidate")
-            if not degraded and isinstance(parsed.get("candidate"), dict)
-            else None
-        )
+        candidate = parsed.get("candidate") if not degraded and isinstance(parsed.get("candidate"), dict) else None
         if candidate is not None:
             answer = str(candidate.get("answer") or "").strip()
             support_ref = str(candidate.get("support_ref") or "")
-            only_question = (
-                len(requirements) == 1
-                and requirements[0].get("grounding_kind") == "QUESTION"
-            )
+            only_question = len(requirements) == 1 and requirements[0].get("grounding_kind") == "QUESTION"
             candidate = (
                 {"answer": answer, "support_ref": support_ref}
-                if answer
-                and re.fullmatch(r"\$seed[0-2]", support_ref)
-                and only_question
+                if answer and re.fullmatch(r"\$seed[0-2]", support_ref) and only_question
                 else None
             )
 
         self._last_requirement_normalization_actions = list(actions)
         self._last_orphan_derived_ids = sorted(drop_ids)
         repaired = any(
-            action.get("action")
-            in {"DROP", "REPAIR", "DROP_RELATION", "DROP_ORPHAN_DERIVED"}
+            action.get("action") in {"DROP", "REPAIR", "DROP_RELATION", "DROP_ORPHAN_DERIVED"}
             for action in actions
         )
         return {
@@ -540,9 +495,7 @@ class ReadRequirementContractMixin:
             "relations": relations[:8],
             "candidate": candidate,
             "visible_options": dict(options),
-            "normalization_status": (
-                "DEGRADED" if degraded else "REPAIRED" if repaired else "VALID"
-            ),
+            "normalization_status": "DEGRADED" if degraded else "REPAIRED" if repaired else "VALID",
             "normalization_actions": deepcopy(actions),
             "graph_validation": graph_validation,
         }
@@ -559,26 +512,14 @@ class ReadRequirementContractMixin:
         slot["retrieval_target"] = target
         slot["degraded"] = bool(requirement.get("degraded"))
         slot["proof_anchor"] = focus if kind == "QUESTION" and focus else target
-        slot["description"] = (
-            str(requirement.get("retrieval_hint") or "").strip()
-            or target
-            or "participant evidence"
-        )
-        slot["resolved_keys"] = self._rc_resolve_target_keys(
-            target, str(slot.get("subject_id") or "")
-        )
+        slot["description"] = str(requirement.get("retrieval_hint") or "").strip() or target or "participant evidence"
+        slot["resolved_keys"] = self._rc_resolve_target_keys(target, str(slot.get("subject_id") or ""))
         return slot
 
     def _controller_plan(self, ir, question, frame):
         plan = super()._controller_plan(ir, question, frame)
-        plan.setdefault("query_spec", {})[
-            "semantic_ir_version"
-        ] = "minimal-v2-evidence-lookup"
-        for key in (
-            "normalization_status",
-            "normalization_actions",
-            "graph_validation",
-        ):
+        plan.setdefault("query_spec", {})["semantic_ir_version"] = "minimal-v2-evidence-lookup"
+        for key in ("normalization_status", "normalization_actions", "graph_validation"):
             plan[key] = deepcopy(ir.get(key))
             plan["semantic_ir"][key] = deepcopy(ir.get(key))
         if ir.get("normalization_status") == "DEGRADED":
@@ -594,20 +535,13 @@ class ReadRequirementContractMixin:
         return ""
 
     def prepare_batch_query(self, question, system_message=None, **kwargs):
-        prepared = super().prepare_batch_query(
-            question, system_message=system_message, **kwargs
-        )
+        prepared = super().prepare_batch_query(question, system_message=system_message, **kwargs)
         extra = prepared.setdefault("extra", {})
         extra["read_contract_version"] = "minimal-ir-v3-evidence-lookup-requirements"
         extra["requirement_normalization_actions"] = list(
             getattr(self, "_last_requirement_normalization_actions", []) or []
         )
         controller = extra.get("semantic_controller") or {}
-        for key in (
-            "controller_raw_ir",
-            "normalized_ir",
-            "normalization_status",
-            "normalization_actions",
-        ):
+        for key in ("controller_raw_ir", "normalized_ir", "normalization_status", "normalization_actions"):
             extra[key] = deepcopy(controller.get(key))
         return prepared
