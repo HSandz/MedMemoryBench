@@ -481,6 +481,23 @@ def test_query_config_is_inferred_from_one_completed_memory_run(tmp_path: Path):
     assert inferred["dataset_config_snapshot"]["raw_config"]["dataset_name"] == "medmemorybench"
 
 
+def test_query_config_is_inferred_from_compact_v2_memory_run(tmp_path: Path):
+    run_dir = _write_memory_run(tmp_path, "20260813_143538")
+    config_path = run_dir / "run_config.json"
+    config = json.loads(config_path.read_text())
+    config.update({
+        "version": 2,
+        "source_revision": {"commit_sha": "test", "dirty": False, "branch": "main"},
+        "judge_configuration": {"provider": "openai", "model": "test-model"},
+    })
+    config_path.write_text(json.dumps(config))
+
+    inferred = cli.infer_query_config_from_memory_run(tmp_path, run_dir.name)
+
+    assert inferred["run_dir"] == run_dir
+    assert inferred["method_config_name"] == "persona_1/amem_test"
+
+
 def test_query_config_is_inferred_from_completed_locomo_v2_memory_run(tmp_path: Path):
     run_dir = _write_memory_run(
         tmp_path,

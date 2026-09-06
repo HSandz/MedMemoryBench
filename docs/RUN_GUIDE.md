@@ -39,6 +39,8 @@ the source YAML (`raw_config`), resolved configuration, judge settings, source
 revision, execution options, and invocation history. Scores, answers, build
 telemetry, broad provider credentials/settings, and duplicate command/output
 paths belong to their dedicated artifacts and are not copied into it.
+Query-stage memory-run inference accepts both legacy version-1 and compact
+version-2 run configurations.
 
 For staged query runs, `memory_source.json` is a version-2 source-selection
 pointer. It records the selected manifest path, source run, selection reason,

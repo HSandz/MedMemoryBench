@@ -200,7 +200,7 @@ def infer_query_config_from_memory_run(
             continue
         if (
             run_config.get("format") != "medmemorybench.run_config"
-            or run_config.get("version") != 1
+            or run_config.get("version") not in {1, 2}
         ):
             rejected.append(f"{run_dir}: unsupported run_config.json")
             continue
