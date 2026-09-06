@@ -864,6 +864,7 @@ class QueryMixin:
                 "replan": replan,
                 "fast_gate": gate,
                 "semantic_controller": controller,
+                "post_retrieval_closure": run.get("atomic_closure"),
                 "world_knowledge_bridge_allowed": world_knowledge_bridge_allowed,
                 "raw_evidence_requested": need_evidence,
                 "fast_gate_skipped": bool(gate.get("skip_reason")),
@@ -935,7 +936,16 @@ class QueryMixin:
         prepared = self.prepare_batch_query(
             question, system_message=system_message, **kwargs
         )
-        if prepared.get("precomputed_answer"):
+        return self.generate_prepared_batch_answer(prepared)
+
+    def generate_prepared_batch_answer(self, prepared: Dict[str, Any]) -> AgentResponse:
+        """Consume a fresh or restored request without regenerating terminal answers."""
+        extra = prepared.setdefault("extra", {})
+        terminal = prepared.get("precomputed_answer") not in (None, "")
+        extra["precomputed_answer_present"] = terminal
+        extra["answer_llm_called"] = False
+        extra["direct_generation_violation"] = False
+        if terminal:
             result = self.finalize_batch_query(
                 prepared, str(prepared["precomputed_answer"])
             )
@@ -948,6 +958,7 @@ class QueryMixin:
         started = time.time()
         # Query evaluation must be reproducible; write-time creativity is
         # configured separately and is already frozen in the memory snapshot.
+        extra["answer_llm_called"] = True
         response = self._llm_client.chat(
             prepared["messages"], temperature=0.0, max_tokens=1024
         )
@@ -974,8 +985,14 @@ class QueryMixin:
     def finalize_batch_query(
         self, prepared: Dict[str, Any], content: str
     ) -> AgentResponse:
-        if prepared.get("precomputed_answer"):
+        if prepared.get("precomputed_answer") not in (None, ""):
             content = str(prepared["precomputed_answer"])
+        extra = prepared.setdefault("extra", {})
+        extra["precomputed_answer_present"] = prepared.get("precomputed_answer") not in (None, "")
+        extra.setdefault("answer_llm_called", False)
+        extra["direct_generation_violation"] = bool(
+            extra["precomputed_answer_present"] and extra["answer_llm_called"]
+        )
         return AgentResponse(
             output=content,
             query_time=0.0,
@@ -994,6 +1011,10 @@ class QueryMixin:
         answer_tokens = int(input_tokens or 0) + int(output_tokens or 0)
         tokens["answer"] = answer_tokens
         tokens["total"] = QueryMixin._total_query_tokens(tokens)
+        response.extra["answer_llm_called"] = bool(answer_tokens) or not response.extra.get("precomputed_answer_present")
+        response.extra["direct_generation_violation"] = bool(
+            response.extra.get("precomputed_answer_present") and answer_tokens
+        )
 
     def reset(self) -> None:
         super().reset()

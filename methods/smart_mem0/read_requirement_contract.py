@@ -50,6 +50,17 @@ For EVERY requirement:
 focus_span is QUESTION provenance, not the retrieval query. target says WHAT evidence is
 needed. retrieval_hint says HOW to search for it.
 
+Optional proof_spec is an exact ledger-field certificate, not a text span or similarity score.
+Use {"match":{"subject_id":"...","scope":"...","state_key":"...","stance":"AFFIRM"},
+"answer_field":"value"} only when those canonical fields express the question's actual
+obligation. Match may also specify object_anchor or semantic_role. Never invent a taxonomy,
+translate a claim into a missing predicate, or treat an allergy as an explicit avoid instruction.
+If canonical fields are unavailable or insufficient, omit proof_spec; retrieved context can
+still support the final answer model. No word overlap constitutes a certificate.
+answer_field may be value, verbatim_value, object_anchor, or the requested temporal axis.
+Use it ONLY for literal atomic extraction, not advice, synthesis, option choice, or inference.
+Use answer_field="" when the fields identify evidence but a final answer still needs reasoning.
+
 TEMPORAL SEMANTICS:
 - document_time = when something was documented, recorded, noted, charted, or mentioned.
 - event_time = when the participant event/state actually happened.
@@ -93,6 +104,8 @@ participant facts must be combined with a general-domain rule to produce the ans
 POSSIBLE_CAUSE is only for a genuine causal question, not merely an action/recommendation.
 For POSSIBLE_CAUSE, INFER, and CAUSES, bridge_goal is a short reasoning obligation and must
 not encode unstored participant history.
+Describe the missing reasoning operation or general mechanism, not a restatement of QUESTION.
+Mechanisms are general knowledge bridges, never invented participant events or measurements.
 If a DERIVED variable mediates a causal/inferential path, route the graph THROUGH that
 variable instead of bypassing it with a direct endpoint edge. Every DERIVED node must
 participate in at least one relation used by answer reasoning.
@@ -104,6 +117,7 @@ one seed directly contains the answer. Code independently authorizes it.
 REQUIREMENT_SCHEMA = """Return JSON only:
 {{"answer_type":"ENTITY|VALUE|DATE|RELATIVE_TIME|OPTION_SET|TEXT","subject_span":"exact contiguous subject span from QUESTION or empty","requirements":[{{"id":"r1","grounding_kind":"QUESTION|DERIVED","focus_span":"exact QUESTION span for QUESTION nodes, otherwise empty","target":"concise participant-memory evidence variable","retrieval_hint":"soft semantic retrieval expansion","time_constraint":{{"axis":"event_time|document_time|origin_document_time|effective_event_time|","relation":"LOCATE|EXACT|EARLIEST|LATEST|BEFORE|AFTER|BETWEEN|","anchor":"","end":""}}}}],"relations":[{{"type":"COMPARE|CAUSES|POSSIBLE_CAUSE|DEPENDS_ON|TEMPORAL_ORDER|INFER|CURRENT|VERIFY_SOURCE","from":"r1","to":"r2|ANSWER|","relation":"BEFORE|AFTER|OVERLAPS|","bridge_goal":"short reasoning obligation or empty"}}],"candidate":null}}
 When candidate exists use: {{"candidate":{{"answer":"exact answer value","support_ref":"$seed0"}}}}
+Each requirement may optionally include proof_spec as defined above; omit it when no exact ledger certificate is available.
 QUESTION:
 {question}
 VISIBLE OPTIONS:

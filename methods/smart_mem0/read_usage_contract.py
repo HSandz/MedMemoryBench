@@ -51,7 +51,11 @@ class ReadUsageContractMixin:
         # At this point all output-contract handling has already run. A
         # surviving precomputed answer therefore really skips the final model;
         # otherwise one final answer generation is required.
-        answer_calls = 0 if str(prepared.get("precomputed_answer") or "").strip() else 1
+        answer_calls = 0 if prepared.get("precomputed_answer") not in (None, "") else 1
+        extra["precomputed_answer_present"] = prepared.get("precomputed_answer") not in (None, "")
+        extra["answer_llm_called"] = False
+        extra["direct_generation_violation"] = False
+        extra["answer_llm_planned"] = bool(answer_calls)
         total_calls = controller_calls + middle_calls + answer_calls
         two_stage_active = bool(controller_calls)
         budget_violation = bool(

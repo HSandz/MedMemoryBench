@@ -141,7 +141,7 @@ def install_smart_mem0_batch_integration(evaluator_cls) -> None:
             # staged request. Re-submitting that request would add an unused
             # second generation and can semantically damage an already-grounded
             # controller answer. Only non-terminal restored requests are replayed.
-            if str(prepared.get("precomputed_answer") or "").strip():
+            if prepared.get("precomputed_answer") not in (None, ""):
                 local_precomputed.add(request_id)
             elif saved_request is not None:
                 requests.append(saved_request)

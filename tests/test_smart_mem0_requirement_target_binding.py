@@ -562,7 +562,7 @@ def test_graph_dependency_direction_and_orphan_diagnostics_do_not_invent_edges()
     assert len(relations) == 3  # Reachability does not manufacture a mediator/causal edge.
 
 
-def test_question_proof_anchor_does_not_replace_broader_search_target():
+def test_structured_certificate_does_not_replace_broader_search_target():
     agent = _agent()
     question = "When was the antibody strongly positive result documented?"
     ir = agent._rc_normalize_ir({
@@ -570,14 +570,19 @@ def test_question_proof_anchor_does_not_replace_broader_search_target():
         "requirements": [{
             "id": "r1", "focus_span": "antibody strongly positive",
             "target": "antibody strongly positive test timestamp documentation record",
+            "proof_spec": {"match": {"subject_id": "primary_user", "scope": "measurement",
+                                      "state_key": "antibody_result", "stance": "AFFIRM"},
+                           "answer_field": "document_time"},
             "time_constraint": {"axis": "document_time", "relation": "LOCATE"},
         }],
     }, question, QueryFrame())
     slot = agent._controller_plan(ir, question, QueryFrame())["required_slots"][0]
-    assert slot["proof_anchor"] == "antibody strongly positive"
+    assert "proof_anchor" not in slot
+    assert slot["focus_span"] == "antibody strongly positive"
     assert slot["retrieval_target"] in agent._rc_search_query(slot, question)
     memory = _memory("m1", "Antibody strongly positive result", ">2000", event_time="2024-03-20")
     memory["document_time"] = "2024-03-23"
+    memory.update(scope="measurement", state_key="antibody_result", evidence_ids=["ev1"])
     assert agent._slot_covered(slot, ["m1"], [memory], [])
     memory["document_time"] = ""
     assert not agent._slot_covered(slot, ["m1"], [memory], [])

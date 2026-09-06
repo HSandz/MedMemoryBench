@@ -405,6 +405,10 @@ class ReadExecutionContractMixin:
         }
 
     def _slot_covered(self, slot, support_ids, selected, relations):
+        return self._slot_structure_covered(slot, support_ids, selected, relations)
+
+    def _slot_structure_covered(self, slot, support_ids, selected, relations):
+        """Typed fields and selectors, independent of a semantic certificate."""
         support_set = set(support_ids)
         memories = [memory for memory in selected if memory.get("id") in support_set]
         if not memories:
@@ -807,8 +811,6 @@ class ReadExecutionContractMixin:
         prepared["extra"]["option_probe_coverage"] = dict(
             getattr(self, "_last_option_probe_coverage", {}) or {}
         )
-        # A caller-supplied system contract still requires the final formatter;
-        # without one, the direct controller answer remains a true one-call path.
-        if system_message and prepared.get("precomputed_answer"):
-            prepared["precomputed_answer"] = ""
+        # A terminal answer must survive consumer preparation, including callers
+        # that supply a generic benchmark system message.
         return prepared

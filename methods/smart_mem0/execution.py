@@ -518,6 +518,7 @@ class ExecutionMixin:
             }
 
         assess_retrieval()
+        closure = None
         trace: List[Dict[str, Any]] = []
         answer_operations = sum(
             operation.get("op") not in {"LOCATE_ANCHOR", "VERIFY_EVIDENCE"}
@@ -669,6 +670,14 @@ class ExecutionMixin:
                     selected.setdefault(memory["id"], self._snapshot(memory))
 
             assess_retrieval()
+            closure_gate = getattr(self, "_post_retrieval_closure", None)
+            if callable(closure_gate) and bounded_operation["op"] not in {"LOCATE_ANCHOR", "VERIFY_EVIDENCE"}:
+                candidates = {m["id"]: m for output in outputs for m in output}
+                closure = closure_gate(plan, list(candidates.values()), frame, current_relations)
+                if closure:
+                    selected = {mid: self._snapshot(candidates[mid]) for mid in closure["support_ids"]}
+                    slot_support[closure["slot_id"]] = list(closure["support_ids"])
+                    assess_retrieval()
             trace.append(
                 {
                     "retrieval_round": round_offset + index + 1,
@@ -705,8 +714,11 @@ class ExecutionMixin:
                     "requirement_status_after": dict(requirement_status),
                     "relation_status_before": relation_before,
                     "relation_status_after": dict(relation_status),
+                    "atomic_closure": bool(closure),
                 }
             )
+            if closure:
+                break
 
         return {
             "selected": beliefs,
@@ -724,6 +736,7 @@ class ExecutionMixin:
             "slot_validation": slot_validation,
             "slot_validation_tokens": 0,
             "slot_validation_latency": 0.0,
+            "atomic_closure": closure,
         }
 
     @staticmethod
@@ -779,6 +792,7 @@ class ExecutionMixin:
         planner_called = False
         replan_called = False
         deterministic_recovery_called = False
+        atomic_closure = None
         trace: List[Dict[str, Any]] = []
         slot_validation: List[Dict[str, Any]] = []
         operation_output_ids = set()
@@ -839,6 +853,7 @@ class ExecutionMixin:
                 plan, planned_seed_set, frame=frame, question=question
             )
             beliefs = execution["selected"]
+            atomic_closure = execution.get("atomic_closure")
             relations = execution["relations"]
             evidence_refs.extend(execution["evidence_refs"])
             slot_support = self._snapshot(execution["slot_support"])
@@ -1029,7 +1044,8 @@ class ExecutionMixin:
             "query_latency": query_latency,
             "controller": controller,
             "fast_supports": fast_supports,
-            "precomputed_answer": str(controller.get("answer") or ""),
+            "precomputed_answer": str((atomic_closure or {}).get("answer") or controller.get("answer") or ""),
+            "atomic_closure": atomic_closure,
             "seed_gate": getattr(self, "_seed_gate_telemetry", {}),
             "plan": plan,
             "replan": replan,

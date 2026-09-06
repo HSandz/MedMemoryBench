@@ -79,7 +79,7 @@ def test_documented_date_repairs_axis_to_document_time():
     assert constraint["relation"] == "LOCATE"
 
 
-def test_question_proof_anchor_is_separate_from_retrieval_target():
+def test_question_provenance_is_not_used_as_a_lexical_certificate():
     agent = _agent()
     question = "When was it documented that the patient's GADA antibody was strongly positive?"
     ir = agent._rc_normalize_ir(
@@ -102,7 +102,9 @@ def test_question_proof_anchor_is_separate_from_retrieval_target():
     plan = agent._controller_plan(ir, question, QueryFrame())
     slot = plan["required_slots"][0]
     assert slot["target_surface"] == "GADA antibody strongly positive test date and documentation"
-    assert slot["proof_anchor"] == "GADA antibody was strongly positive"
+    assert slot["focus_span"] == "GADA antibody was strongly positive"
+    assert "proof_anchor" not in slot
+    assert slot["proof_spec"]["status"] == "UNSPECIFIED"
 
 
 def test_invalid_question_target_repairs_from_non_interrogative_focus_only():

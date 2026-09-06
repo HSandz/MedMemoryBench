@@ -1059,6 +1059,22 @@ def test_supplementary_packing_preserves_slot_provenance_across_recovery(packing
     assert not prepared["extra"]["arbitration_expansion_violation"]
 
 
+def test_generic_system_message_preserves_terminal_answer(packing_query_case):
+    agent, run = packing_query_case
+    agent.subject_aliases = {}
+    run["precomputed_answer"] = "recorded value"
+    run["controller"] = {"called": True, "route": "DIRECT", "answer": "recorded value"}
+    run["fast_supports"] = [run["beliefs"][0]]
+    prepared = agent.prepare_batch_query("What value?", system_message="Return only the answer.")
+    assert prepared["precomputed_answer"] == "recorded value"
+    assert prepared["extra"]["method_llm_calls"]["answer"] == 0
+    assert prepared["extra"]["method_llm_calls"]["total"] == 1
+    agent._llm_client = SimpleNamespace(chat=lambda *_a, **_k: pytest.fail("terminal generation"))
+    response = agent.generate_prepared_batch_answer(prepared)
+    assert response.output == "recorded value"
+    assert not response.extra["answer_llm_called"]
+
+
 def test_final_telemetry_and_reasoning_keep_full_graph_after_partial_recovery(packing_query_case):
     agent, run = packing_query_case
     agent.subject_aliases = {}

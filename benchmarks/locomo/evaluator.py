@@ -495,6 +495,7 @@ class LoCoMoEvaluator:
 
     def _evaluate_batch_queries(self, unit: EvaluationUnit) -> List[MetricResult]:
         prepared_by_id: Dict[str, tuple[LoCoMoQuery, Dict[str, Any]]] = {}
+        local_precomputed = set()
         requests: List[BatchChatRequest] = []
         stage = f"query-unit-{unit.unit_id}"
         batch_client = self._get_batch_client()
@@ -523,7 +524,9 @@ class LoCoMoEvaluator:
                     batch_request_time=batch_request_time,
                 )
 
-            if saved_request is not None:
+            if prepared.get("precomputed_answer") not in (None, ""):
+                local_precomputed.add(request_id)
+            elif saved_request is not None:
                 requests.append(saved_request)
             else:
                 requests.append(
@@ -546,9 +549,15 @@ class LoCoMoEvaluator:
                 )
             prepared_by_id[request_id] = (query, prepared)
 
-        responses = batch_client.run_stage(stage, requests)
+        responses = batch_client.run_stage(stage, requests) if requests else {}
         results: List[MetricResult] = []
         for request_id, (query, prepared) in prepared_by_id.items():
+            if request_id in local_precomputed:
+                response = self.agent_manager.finalize_batch_query(
+                    prepared, "", input_tokens=0, output_tokens=0,
+                )
+                results.append(self._score_agent_response(query, response))
+                continue
             batch_response = responses.get(request_id)
             if batch_response is None or batch_response.status:
                 error = batch_response.status if batch_response else "No output row returned"

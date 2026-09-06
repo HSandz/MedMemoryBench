@@ -83,6 +83,9 @@ class BatchChatRequest:
 
     def to_vertex_request(self) -> Dict[str, Any]:
         """Convert chat messages to one documented GenerateContent request."""
+        prepared = self.metadata.get(PREPARED_QUERY_METADATA_KEY) or {}
+        if isinstance(prepared, dict) and prepared.get("precomputed_answer") not in (None, ""):
+            raise VertexBatchError("A precomputed answer must be finalized locally, not submitted for generation")
         system_messages: List[str] = []
         contents: List[Dict[str, Any]] = []
 
