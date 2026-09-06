@@ -8,6 +8,8 @@ from .execution import ExecutionMixin
 from .planning import PlanningMixin
 from .proof_context_contract import ProofContextContractMixin
 from .query import QueryMixin
+from .read_answerability_contract import ReadAnswerabilityContractMixin
+from .read_terminal_answer_contract import ReadTerminalAnswerContractMixin
 from .read_answer_or_plan_contract import ReadAnswerOrPlanContractMixin
 from .read_certificate_contract import ReadCertificateContractMixin
 from .read_controller import ReadContractMixin
@@ -22,6 +24,8 @@ from .write import WriteLifecycleMixin
 
 
 class SmartMem0Agent(
+    ReadAnswerabilityContractMixin,
+    ReadTerminalAnswerContractMixin,
     ReadCertificateContractMixin,
     ReadAnswerOrPlanContractMixin,
     ReadRequirementContractMixin,
