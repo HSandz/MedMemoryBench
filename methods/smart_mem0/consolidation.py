@@ -508,7 +508,11 @@ class ConsolidationMixin:
                     continue
             if (
                 relation_type == "SUPERSEDE"
-                and not self._explicit_state_replacement(source, target)
+                and not (
+                    self._exact_capture_replacement(source, target)
+                    if relation.get("provenance_kind") == "EXACT_FAMILY_RECONCILIATION"
+                    else self._explicit_state_replacement(source, target)
+                )
             ):
                 # Legacy snapshots may contain an identity-valid but
                 # semantically unsupported replacement edge. Drop it before
@@ -1011,6 +1015,56 @@ class ConsolidationMixin:
                 existing_pairs.add(pair)
         return output
 
+    def _exact_capture_replacement(self, source, target):
+        source_time = self._parse_date(source.get("event_time", ""))
+        target_time = self._parse_date(target.get("event_time", ""))
+        return bool(
+            source.get("kind") == target.get("kind") == "STATE"
+            and state_identity(source) and state_identity(source) == state_identity(target)
+            and source.get("assertion_mode") == target.get("assertion_mode") == "DIRECT"
+            and source.get("facets", {}) == target.get("facets", {})
+            and source_time and target_time and source_time > target_time
+        )
+
+    def _conservative_capture_relations(self, memories, turn_map):
+        """Reconcile only identical families/facets with explicit event chronology."""
+        families = defaultdict(list)
+        for old in self._memories:
+            if old.get("kind") == "STATE" and state_identity(old):
+                families[state_identity(old)].append(old)
+        relations = []
+        for index, memory in enumerate(memories):
+            identity = state_identity(memory)
+            if memory.get("kind") != "STATE" or not identity:
+                continue
+            source_id = f"new_{index}"
+            prior = families[identity]
+            if memory.get("assertion_mode") == "DIRECT" and memory.get("stance") in {"AFFIRM", "DENY"}:
+                for old in reversed(prior):
+                    if (old.get("assertion_mode") != "DIRECT"
+                            or old.get("facets", {}) != memory.get("facets", {})
+                            or self._belief_status.get(old.get("id")) == "superseded"):
+                        continue
+                    new_value, old_value = self._normalised_value(memory), self._normalised_value(old)
+                    if not new_value or not old_value:
+                        continue
+                    source_time = self._parse_date(memory.get("event_time", ""))
+                    target_time = self._parse_date(old.get("event_time", ""))
+                    same = new_value == old_value and memory.get("stance") == old.get("stance")
+                    relation_type = "SUPPORT" if same else "CONFLICT"
+                    if not same and source_time and target_time and source_time > target_time:
+                        relation_type = "SUPERSEDE"
+                    elif not same and source_time and target_time and source_time < target_time:
+                        continue
+                    relations.append({
+                        "source_id": source_id, "target_id": old["id"], "type": relation_type,
+                        "confidence": 1.0, "provenance_kind": "EXACT_FAMILY_RECONCILIATION",
+                        "provenance_evidence_ids": [turn_map[t] for t in memory.get("source_turns", []) if t in turn_map],
+                    })
+                    break
+            prior.append({**memory, "id": source_id})
+        return relations
+
     def _add_memories(
         self,
         new_memories: List[Dict[str, Any]],
@@ -1018,113 +1072,31 @@ class ConsolidationMixin:
         document_time: str,
         turn_map: Dict[int, str],
     ) -> List[Dict[str, Any]]:
-        nearby = self._nearby_old_memories(new_memories)
+        # Capture owns semantics. Reconciliation cannot re-extract, rename a
+        # family by similarity, or discard an atom because it recalls history.
         evidence_by_id = {evidence["id"]: evidence for evidence in self._evidence}
-        # Recap detection must precede state standardization. Otherwise an old
-        # value restated today can inherit a current identity and look like a new
-        # state transition before its provenance is recognized.
-        for memory in new_memories:
-            source_text = "\n".join(
-                evidence_by_id[turn_map[turn_idx]]["raw_text"]
-                for turn_idx in memory.get("source_turns", [])
-                if turn_idx in turn_map and turn_map[turn_idx] in evidence_by_id
-            )
-            if not self._contains_recap_reference(source_text):
-                continue
-            origin = self._best_prior_origin(memory, nearby)
-            if origin and not self._has_explicit_value_change(memory, origin):
-                memory["assertion_mode"] = "RECAP"
-                memory["origin_memory_id"] = origin["id"]
-        standardization_stats = self._standardize_state_updates(new_memories)
-        # Scope/key inheritance may expose better exact-identity neighbours.
-        nearby = self._nearby_old_memories(new_memories)
-        consolidation = self._consolidation_relations(
-            new_memories, nearby, turn_map, document_time
-        )
-        old_by_id = {item["id"]: item for item in nearby}
-        self._reuse_nearby_state_keys(new_memories, nearby)
-        consolidation = self._sanitize_state_relations(
-            new_memories, old_by_id, consolidation
-        )
-        consolidation = self._deterministic_state_relations(
-            new_memories,
-            nearby,
-            consolidation,
-            document_time,
-        )
-        relations_by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for relation in consolidation:
-            relations_by_source[relation["source_id"]].append(relation)
-
-        skipped_recaps: Dict[int, str] = {}
-        for index, memory in enumerate(new_memories):
-            if memory.get("assertion_mode") != "RECAP":
-                continue
-            target_id = memory.get("origin_memory_id", "")
-            if target_id not in old_by_id:
-                support = next(
-                    (
-                        relation
-                        for relation in relations_by_source.get(f"new_{index}", [])
-                        if relation["type"] == "SUPPORT"
-                        and relation["target_id"] in old_by_id
-                    ),
-                    None,
-                )
-                target_id = support["target_id"] if support else ""
-            source_text = "\n".join(
-                evidence_by_id[turn_map[turn_idx]]["raw_text"]
-                for turn_idx in memory.get("source_turns", [])
-                if turn_idx in turn_map and turn_map[turn_idx] in evidence_by_id
-            )
-            # Ordinary duplicate recaps remain suppressed. A recap carrying an
-            # explicit frequency, measurement, date, or transition is retained
-            # as a RECAP card because it represents a distinct document event
-            # and may be the only evidence for a document-time query.
-            retain_answer_bearing_recap = self._recap_has_answer_bearing_detail(
-                memory, source_text
-            )
-            if target_id in old_by_id and not retain_answer_bearing_recap:
-                skipped_recaps[index] = target_id
-
+        old_by_id = {item["id"]: item for item in self._memories}
+        consolidation = self._conservative_capture_relations(new_memories, turn_map)
+        standardization_stats = {}
+        skipped_recaps = {}
         local_ids, added = {}, []
         for index, memory in enumerate(new_memories):
-            if index in skipped_recaps:
-                local_ids[f"new_{index}"] = skipped_recaps[index]
-                continue
-            refinement = next(
-                (
-                    relation
-                    for relation in sorted(
-                        relations_by_source.get(f"new_{index}", []),
-                        key=lambda item: item["confidence"],
-                        reverse=True,
-                    )
-                    if relation["type"] == "REFINE"
-                    and relation["target_id"] in old_by_id
-                ),
-                None,
-            )
             origin_document_time = document_time
-            # SUPPORT does not make the old source the origin of a new claim.
-            # REFINE inherits lineage only for the same explicitly dated event.
-            if refinement:
-                ancestor = old_by_id[refinement["target_id"]]
-                source_event = self._parse_date(
-                    self._resolve_event_time(memory, document_time)
-                )
-                target_event = self._parse_date(ancestor.get("event_time", ""))
-                if source_event and target_event and source_event == target_event:
-                    origin_document_time = (
-                        ancestor.get("origin_document_time")
-                        or ancestor.get("document_time")
-                        or document_time
-                    )
+            if memory.get("assertion_mode") == "RECAP":
+                origin_document_time = ""
+                ancestor = old_by_id.get(memory.get("origin_memory_id"))
+                if (ancestor and state_identity(memory)
+                        and state_identity(memory) == state_identity(ancestor)
+                        and self._normalised_value(memory) == self._normalised_value(ancestor)):
+                    origin_document_time = ancestor.get("origin_document_time", "")
             self._memory_seq += 1
             memory_id = f"m_{self._memory_seq}"
             local_ids[f"new_{index}"] = memory_id
             card = {
                 "id": memory_id,
+                "atom_id": memory.get("atom_id", f"s{self._session_seq}:a{index}"),
+                "evidence_family": memory.get("evidence_family", ""),
+                "facets": self._snapshot(memory.get("facets") or {}),
                 "claim": memory["claim"],
                 "kind": memory["kind"],
                 "semantic_role": memory.get("semantic_role", "OBSERVATION"),
@@ -1220,6 +1192,7 @@ class ConsolidationMixin:
         self._last_write_stats = {
             "skipped_recaps": len(skipped_recaps),
             "committed_memories": len(added),
+            "reconciliation_llm_calls": 0,
             **standardization_stats,
         }
         return added

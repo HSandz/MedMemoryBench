@@ -1,5 +1,32 @@
 # SmartMem0 Module Map
 
+## Lean Migration: Capture Retention
+
+Write schema 10 retains every provenance-valid captured atom in the HOT semantic
+ledger, including recalled and temporary observations. Exact turns remain in the
+COLD evidence archive. `facets` preserve timing, conditions and modality without
+changing state identity; `atom_id` links capture to durable `atom_dispositions`.
+Rejected capture items have an explicit reason rather than silently disappearing.
+This guarantees retention of valid extracted atoms, not lossless LLM extraction.
+
+Capture is the only write-model call per bounded window. Reconciliation no longer
+calls a second LLM, guesses recap status from English source phrases, inherits
+families by similarity, or suppresses recalled atoms. Only matching state identities
+and facets can be versioned, and SUPERSEDE requires explicit event chronology.
+Unknown chronology preserves competing values instead of substituting document time.
+Explicit captured causal links retain the existing source-pointer validation.
+
+Schema 9 snapshots are not a fresh-build evaluation of this contract. Schema 10
+automatically creates a new snapshot generation. Reuse those same new snapshots
+for subsequent query-only comparisons. Disposition auditing is transactional and
+does not participate in query retrieval.
+
+The lean roadmap is gated: compare identical query/session sets and models before
+claiming Pareto improvements; evaluate retention and rebuild variance before removing
+further compatibility layers. Current offline tests do not establish accuracy,
+latency or stochastic rebuild-variance gains. The remaining controller, CandidateSet,
+viability/terminal and context-owner migrations must be evaluated separately.
+
 `methods.smart_mem0_agent` remains the compatibility import used by the benchmark.
 
 ## Evaluation memory snapshots

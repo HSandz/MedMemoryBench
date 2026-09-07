@@ -24,6 +24,7 @@ class WriteLifecycleMixin:
             "capsules": self._snapshot(self._capsules),
             "relations": self._snapshot(self._relations),
             "evidence": self._snapshot(self._evidence),
+            "atom_dispositions": self._snapshot(getattr(self, "_atom_dispositions", [])),
             "memory_seq": int(self._memory_seq),
             "capsule_seq": int(getattr(self, "_capsule_seq", 0)),
             "evidence_seq": int(self._evidence_seq),
@@ -77,6 +78,9 @@ class WriteLifecycleMixin:
             self._memories.append(
                 {
                     "id": str(raw.get("id") or f"m_{index}"),
+                    "atom_id": str(raw.get("atom_id") or ""),
+                    "evidence_family": str(raw.get("evidence_family") or ""),
+                    "facets": self._snapshot(raw.get("facets") or raw.get("qualifiers") or {}),
                     "claim": str(raw.get("claim") or ""),
                     "kind": str(raw.get("kind") or "FACT"),
                     "semantic_role": str(raw.get("semantic_role") or "OBSERVATION"),
@@ -96,7 +100,7 @@ class WriteLifecycleMixin:
                     "event_time": str(raw.get("event_time") or "UNKNOWN"),
                     "time_expression": str(raw.get("time_expression") or ""),
                     "document_time": str(raw.get("document_time") or raw.get("timestamp") or ""),
-                    "origin_document_time": str(raw.get("origin_document_time") or raw.get("document_time") or raw.get("timestamp") or ""),
+                    "origin_document_time": str(raw.get("origin_document_time", raw.get("document_time") or raw.get("timestamp") or "") or ""),
                     "assertion_mode": str(raw.get("assertion_mode") or "DIRECT").upper(),
                     "origin_memory_id": str(raw.get("origin_memory_id") or ""),
                     "planning_tags": list(raw.get("planning_tags") or []),
@@ -119,6 +123,7 @@ class WriteLifecycleMixin:
             )
             self._relations.append(relation)
         self._evidence = list(data.get("evidence") or [])
+        self._atom_dispositions = self._snapshot(data.get("atom_dispositions") or [])
         self._memory_seq, self._evidence_seq = len(self._memories), len(self._evidence)
         self._session_seq = max(
             [int(memory.get("session_idx", 0)) for memory in self._memories]
@@ -217,6 +222,7 @@ class WriteLifecycleMixin:
         windows = self._split_write_windows(turns)
         context = MemoryWriteContext()
         self._write_context = context
+        self._capture_dispositions = []
         self._capture_parse_stats = {
             "malformed_windows": 0,
             "salvaged_items": 0,
@@ -293,6 +299,10 @@ class WriteLifecycleMixin:
                         document_time,
                         turn_map,
                     )
+                    stored_ids = {m.get("atom_id") for m in added}
+                    if any(item["disposition"] == "PENDING" and item["atom_id"] not in stored_ids
+                           for item in self._capture_dispositions):
+                        raise AssertionError("Captured atom disappeared during commit")
                     
                     if not hasattr(self, "_capsules"):
                         self._capsules = []
@@ -358,6 +368,11 @@ class WriteLifecycleMixin:
             context.clear()
             self._write_context = None
 
+        stored_atoms = {m.get("atom_id"): m["id"] for m in added if m.get("atom_id")}
+        for item in self._capture_dispositions:
+            if item["disposition"] == "PENDING":
+                item.update(disposition="STORED", target_id=stored_atoms[item["atom_id"]], reason="ADD_ONLY_COMMIT")
+        self._atom_dispositions = [*getattr(self, "_atom_dispositions", []), *self._snapshot(self._capture_dispositions)]
         self._memory_chunks.append(session_content)
         self._is_initialized = True
         extraction_result = (
@@ -399,6 +414,8 @@ class WriteLifecycleMixin:
                     "reused_state_identities", 0
                 ),
                 "capture_parse": self._snapshot(self._capture_parse_stats),
+                "atom_dispositions": self._snapshot(self._capture_dispositions),
+                "reconciliation_llm_calls": 0,
                 "effective_runtime_config": self._effective_runtime_config(),
                 "memory_health": self._memory_health_stats(),
             },

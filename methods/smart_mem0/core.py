@@ -777,10 +777,7 @@ class CoreMemoryMixin:
         origin_memory_id = str(item.get("origin_memory_id") or "").strip()
         if assertion_mode != "RECAP":
             origin_memory_id = ""
-        elif not origin_memory_id:
-            # A recap without a linked origin is not auditable. Keep the claim
-            # usable, but do not let it receive recap-specific temporal rules.
-            assertion_mode = "DIRECT"
+        # Unknown origin does not turn reported history into a new observation.
         entities = item.get("entities") or []
         if isinstance(entities, str):
             entities = [entities]

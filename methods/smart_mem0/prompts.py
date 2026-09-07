@@ -13,9 +13,10 @@ including a broader class-level restriction when the source states one.
 Merge details describing the same event or state. Never invent information.
 Point each memory to its smallest supporting focal turn set.
 
-Extract only propositions whose value could plausibly affect a future answer. DO NOT extract
-general assistant recommendations, generic advice, or potential plans unless the subject
-explicitly agreed to or started them. Do not extract transient states.
+Extract participant-specific facts, events, observations, instructions and plans, including
+temporary observations that locate an event in time. Preserve proposed versus performed
+actions as different modalities in facets; do not turn recommendations into actions.
+Omit general knowledge that does not describe a participant or a specific episode.
 
 DOCUMENT TIME: {document_time}
 
@@ -51,7 +52,7 @@ Return JSON only:
     "assertion_mode": "DIRECT|RECAP|INFERRED",
     "source_turns": [0],
     "confidence": 0.0,
-    "qualifiers": {{"severity": "severe", "timing": "nighttime"}} 
+    "facets": {{"modality": "observed|proposed|prescribed|performed", "timing": "source timing qualifier"}}
   }}],
   "causal_links": [
     {{"cause_index": 0, "effect_index": 1, "source_turns": [0], "confidence": 0.0}}
@@ -66,7 +67,9 @@ Rules:
 - INFERRED is allowed only for an unavoidable implication directly supported by focal turns.
 - For each focal speaker, preserve unique named entities, exact results, explicit changes, durable concerns, and commitments.
 - Each memory must describe one focal event or one versioned state.
-- state_key should be a canonical predicate (subject + predicate). Put variations (e.g., nighttime, severity) into the qualifiers object.
+- state_key should be a stable predicate, not a value. Preserve truth-changing qualifiers
+  (condition, timing, severity, frequency, modality) in facets and in the claim.
+- RECAP remains RECAP when its original date or earlier memory ID is unknown.
 """
 
 CONSOLIDATION_PROMPT = """Compare NEW MEMORIES with nearby OLD MEMORIES.

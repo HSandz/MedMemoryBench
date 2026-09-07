@@ -1019,6 +1019,7 @@ class QueryMixin:
     def reset(self) -> None:
         super().reset()
         self._memories, self._evidence, self._relations = [], [], []
+        self._atom_dispositions, self._capture_dispositions = [], []
         self._state_spine = {}
         self._subject_postings = {}
         self._object_postings = {}

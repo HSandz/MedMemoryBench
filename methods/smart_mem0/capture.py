@@ -362,56 +362,35 @@ class CaptureMixin:
         }
 
         for raw_index, raw in enumerate(parsed.get("memories") or []):
+            atom_id = f"s{session_idx}:w{window_idx}:a{raw_index}"
+            disposition = {"atom_id": atom_id, "disposition": "DISCARDED", "target_id": ""}
+            self._capture_dispositions = getattr(self, "_capture_dispositions", [])
+            self._capture_dispositions.append(disposition)
             if not isinstance(raw, dict):
+                disposition["reason"] = "NOT_AN_OBJECT"
                 continue
             normalized = self._normalise_memory(raw)
             if not normalized:
+                disposition["reason"] = "EMPTY_CLAIM"
                 continue
             source_turns = set(normalized["source_turns"])
             if not source_turns or not source_turns.issubset(focal_ids):
+                disposition["reason"] = "INVALID_FOCAL_PROVENANCE"
                 continue
-            source_text = "\n".join(
-                focal_by_id[index]["raw_text"] for index in sorted(source_turns)
-            )
-            if normalized["assertion_mode"] == "RECAP" or self._contains_recap_reference(source_text):
-                normalized["assertion_mode"] = "RECAP"
-            else:
-                normalized["assertion_mode"] = "DIRECT"
-            normalized["origin_memory_id"] = ""
-            
-            # P0B Semantic Promotion
-            semantic_role = str(normalized.get("semantic_role", "")).upper()
-            kind = str(normalized.get("kind", "")).upper()
-            value = str(normalized.get("value", ""))
-            entities = normalized.get("entities", [])
-            
-            hot_roles = {"SAFETY_CONSTRAINT", "MEASUREMENT", "ACCEPTED_POLICY", "PREFERENCE", "IDENTITY"}
-            
-            is_hot = False
-            if semantic_role in hot_roles:
-                is_hot = True
-            elif kind == "STATE":
-                is_hot = True
-            elif any(c.isdigit() for c in value) or any(any(c.isdigit() for c in ent) for ent in entities):
-                is_hot = True
-                
-            normalized["memory_tier"] = "HOT" if is_hot else "COLD"
+            normalized["atom_id"] = atom_id
+            normalized["evidence_family"] = str(raw.get("evidence_family") or raw.get("state_key") or "")
+            normalized["facets"] = self._snapshot(raw.get("facets") or raw.get("qualifiers") or {})
+            if not isinstance(normalized["facets"], dict):
+                normalized["facets"] = {}
+            normalized["memory_tier"] = "HOT"
             normalized["capsule_id"] = capsule_id
+            disposition.update(disposition="PENDING", reason="AWAITING_TRANSACTION_COMMIT")
             
             raw_to_accepted[raw_index] = len(accepted)
             accepted.append(normalized)
 
-        # Keep a compact pointer when a source turn contains an exact
-        # quantitative/temporal observation that the model's extraction
-        # accidentally skipped. This is especially important for later
-        # document-time queries over clinician recaps.
-        accepted.extend(
-            self._recover_unrepresented_quantified_evidence(
-                focal_turns,
-                accepted,
-                [],  # no prior beliefs in V2 during extraction
-            )
-        )
+        # Exact turns already live in the COLD archive. Do not manufacture
+        # semantic atoms with language/domain-specific sentence heuristics.
 
         links = []
         for link in parsed.get("causal_links") or []:
