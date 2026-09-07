@@ -3,6 +3,7 @@
 from methods.smart_mem0.agent import SmartMem0Agent
 from methods.smart_mem0.contracts import QueryFrame
 from methods.smart_mem0.proof_context_contract import ProofContextContractMixin
+from methods.smart_mem0.read_answer_or_plan_contract import ANSWER_OR_PLAN_PRIORITY
 
 
 def _agent():
@@ -13,6 +14,7 @@ def _agent():
     agent._relations = []
     agent.subject_aliases = {"patient": "primary_user"}
     agent._last_option_probe_coverage = {}
+    agent._last_option_probe_relations = {}
     agent._last_requirement_normalization_actions = []
     return agent
 
@@ -72,7 +74,7 @@ def test_unicode_surface_similarity_does_not_depend_on_english_stopwords():
 
 def test_raw_grounded_candidate_is_not_erased_by_degraded_plan_fields():
     agent = _agent()
-    ir = agent._rc_normalize_ir({"candidate": {"answer": "7.28", "support_ref": "$seed0"}}, "What was the exact blood pH value measured in the emergency department on 2024-03-20?", QueryFrame(dates=("2024-03-20",)))
+    ir = agent._rc_normalize_ir({"answer_mode": "EXTRACT", "candidate": {"answer": "7.28", "support_ref": "$seed0"}}, "What was the exact blood pH value measured in the emergency department on 2024-03-20?", QueryFrame(dates=("2024-03-20",)))
     assert ir["normalization_status"] == "DEGRADED"
     assert ir["candidate"] == {"answer": "7.28", "support_ref": "$seed0"}
 
@@ -118,19 +120,35 @@ def test_comparand_is_a_semantic_context_slot_not_legacy_context():
     assert not ProofContextContractMixin._semantic_context_slot({"evidence_role": "OPTION_CONTEXT"})
 
 
-def test_direct_gate_is_canonical_ir_driven_not_english_keyword_driven():
+def test_semantic_context_eligibility_does_not_require_lexical_target_proof():
     agent = _agent()
-    ir = {"answer_type": "TEXT", "visible_options": {}, "relations": []}
-    assert agent._aop_direct_surface_allowed("Why should I do this?", ir)
-    assert agent._aop_direct_surface_allowed("Tại sao tôi nên làm vậy?", ir)
-    ir["relations"] = [{"type": "INFER", "from": "r1", "to": "ANSWER"}]
-    assert not agent._aop_direct_surface_allowed("Why should I do this?", ir)
+    memory = {"id": "m1", "subject_id": "primary_user", "value": "16.5 mmol/L", "event_time": "2024-04-03", "claim": "Post-dinner glucose rose sharply.", "_status": "active"}
+    slot = {"evidence_role": "COMPARAND", "subject_id": "primary_user", "required_fields": ["event_time"], "target_surface": "April 3 postprandial blood glucose value"}
+    assert agent._context_candidate_eligible(slot, memory)
+    assert not agent._requirement_target_proof(slot, memory)
 
 
-def test_relative_time_never_direct_even_if_candidate_text_is_grounded():
+def test_direct_gate_requires_canonical_extract_mode_not_language_keywords():
     agent = _agent()
-    ir = {"answer_type": "RELATIVE_TIME", "visible_options": {}, "relations": []}
+    extract_ir = {"answer_mode": "EXTRACT", "answer_type": "TEXT", "visible_options": {}, "relations": []}
+    assert agent._aop_direct_surface_allowed("Why should I do this?", extract_ir)
+    assert agent._aop_direct_surface_allowed("Tại sao tôi nên làm vậy?", extract_ir)
+    infer_ir = dict(extract_ir, answer_mode="INFER")
+    assert not agent._aop_direct_surface_allowed("Could this be caused by that?", infer_ir)
+    missing_mode = {"answer_type": "TEXT", "visible_options": {}, "relations": []}
+    assert not agent._aop_direct_surface_allowed("Anything", missing_mode)
+
+
+def test_relative_time_never_direct_even_if_extract_mode_is_emitted():
+    agent = _agent()
+    ir = {"answer_mode": "EXTRACT", "answer_type": "RELATIVE_TIME", "visible_options": {}, "relations": []}
     assert not agent._aop_direct_surface_allowed("Uống cà phê sữa sau bữa ăn bao lâu?", ir)
+
+
+def test_retrieval_hint_contract_is_search_only_and_selector_neutral():
+    assert "SEARCH-ONLY semantic projection" in ANSWER_OR_PLAN_PRIORITY
+    assert "selector-neutral" in ANSWER_OR_PLAN_PRIORITY
+    assert "answer_mode as exactly one of" in ANSWER_OR_PLAN_PRIORITY
 
 
 def test_option_zero_memory_hit_is_not_a_false_verdict():
@@ -138,8 +156,16 @@ def test_option_zero_memory_hit_is_not_a_false_verdict():
     agent._last_option_probe_coverage = {"A": [], "B": ["m1"], "C": [], "D": []}
     slot = {"evidence_role": "OPTION_CONTEXT", "option_labels": ["A", "B", "C", "D"]}
     assert agent._slot_covered(slot, ["m1"], [{"id": "m1"}], [])
-    # Empty A/C/D views are allowed; they mean no personal-memory support found.
     assert set(agent._last_option_probe_coverage) == {"A", "B", "C", "D"}
+
+
+def test_option_relation_confidence_is_not_a_correctness_probability():
+    agent = _agent()
+    memory = {"id": "m1", "claim": "Patient has a documented allergy to cefuroxime.", "value": "cefuroxime", "verbatim_value": "cefuroxime", "semantic_role": "SAFETY_CONSTRAINT", "scope": "allergy", "state_key": "", "object_anchor": "cefuroxime", "entities": ["cefuroxime"], "scope_entities": []}
+    relation = agent._option_memory_relation("Cefuroxime", memory, 0)
+    assert relation["relation"] == "SAFETY_CONSTRAINT_ON_OPTION"
+    assert relation["confidence"] == 1.0
+    assert "verdict" not in relation
 
 
 def test_query_type_remains_behaviorally_inert():
