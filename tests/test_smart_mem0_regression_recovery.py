@@ -112,6 +112,36 @@ def test_strict_positive_signal_may_promote_but_weak_scores_do_not_resort_views(
     assert ordered == ["certified", "recovery_top", "initial_top"]
 
 
+def test_comparand_is_a_semantic_context_slot_not_legacy_context():
+    assert ProofContextContractMixin._semantic_context_slot({"evidence_role": "COMPARAND"})
+    assert ProofContextContractMixin._semantic_context_slot({"evidence_role": "REQUIREMENT"})
+    assert not ProofContextContractMixin._semantic_context_slot({"evidence_role": "OPTION_CONTEXT"})
+
+
+def test_direct_gate_is_canonical_ir_driven_not_english_keyword_driven():
+    agent = _agent()
+    ir = {"answer_type": "TEXT", "visible_options": {}, "relations": []}
+    assert agent._aop_direct_surface_allowed("Why should I do this?", ir)
+    assert agent._aop_direct_surface_allowed("Tại sao tôi nên làm vậy?", ir)
+    ir["relations"] = [{"type": "INFER", "from": "r1", "to": "ANSWER"}]
+    assert not agent._aop_direct_surface_allowed("Why should I do this?", ir)
+
+
+def test_relative_time_never_direct_even_if_candidate_text_is_grounded():
+    agent = _agent()
+    ir = {"answer_type": "RELATIVE_TIME", "visible_options": {}, "relations": []}
+    assert not agent._aop_direct_surface_allowed("Uống cà phê sữa sau bữa ăn bao lâu?", ir)
+
+
+def test_option_zero_memory_hit_is_not_a_false_verdict():
+    agent = _agent()
+    agent._last_option_probe_coverage = {"A": [], "B": ["m1"], "C": [], "D": []}
+    slot = {"evidence_role": "OPTION_CONTEXT", "option_labels": ["A", "B", "C", "D"]}
+    assert agent._slot_covered(slot, ["m1"], [{"id": "m1"}], [])
+    # Empty A/C/D views are allowed; they mean no personal-memory support found.
+    assert set(agent._last_option_probe_coverage) == {"A", "B", "C", "D"}
+
+
 def test_query_type_remains_behaviorally_inert():
     agent = _agent()
     assert agent._compact_reasoning_output_instruction("multi_hop_clinical_deduction") == ""

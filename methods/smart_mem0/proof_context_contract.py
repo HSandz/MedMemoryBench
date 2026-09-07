@@ -1,25 +1,19 @@
-"""Deterministic requirement proof and bounded answer-context selection.
+"""Deterministic proof and bounded answer-context selection.
 
-Proof and context are deliberately separate decisions:
-- proof is conservative and never derives from retrieval score, benchmark labels, or
-  language-specific keyword lists;
-- context packing is recall-oriented and preserves the ranked evidence views produced by
-  retrieval instead of globally re-scoring incomparable searches.
-
-The packing rule is benchmark-agnostic:
-1. hard eligibility removes structurally invalid candidates;
-2. strict certificate / exact canonical-key agreement may promote a candidate;
-3. otherwise each retrieval view keeps its own rank and views are interleaved so no
-   initial/recovery/temporal view can monopolize the bounded final context.
+Proof and context are separate decisions. Context packing is organized by semantic
+obligation, not by compiler role names or globally incomparable retrieval scores.
 """
 
 from typing import Any, Dict, List, Sequence
 
 
 class ProofContextContractMixin:
-    """Keep proof strict while packing evidence by retrieval-view diversity."""
-
     CONTEXT_POOL_KEY = "__answer_context_candidates__"
+    SEMANTIC_CONTEXT_ROLES = frozenset({"REQUIREMENT", "COMPARAND"})
+
+    @classmethod
+    def _semantic_context_slot(cls, slot: Dict[str, Any]) -> bool:
+        return str(slot.get("evidence_role") or "").upper() in cls.SEMANTIC_CONTEXT_ROLES
 
     def _rc_memory_matches_target(self, slot, memory):
         target = str(slot.get("proof_anchor") or slot.get("target_surface") or "").strip()
@@ -29,21 +23,18 @@ class ProofContextContractMixin:
         if self._rc_token_sequence_present(target, text):
             return True
         similarity = getattr(self, "_rq_surface_similarity", None)
-        if callable(similarity):
-            return similarity(target, text) >= 0.86
-        return False
+        return bool(callable(similarity) and similarity(target, text) >= 0.86)
 
     def _requirement_target_proof(self, slot, memory):
-        if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
+        if not self._semantic_context_slot(slot):
             return True
         if slot.get("degraded"):
             return False
         return self._rc_memory_matches_target(slot, memory)
 
     def _slot_covered(self, slot, support_ids, selected, relations):
-        role = str(slot.get("evidence_role") or "").upper()
         slot_type = str(slot.get("type") or "DIRECT").upper()
-        if role != "REQUIREMENT" or slot_type not in {"DIRECT", "TEMPORAL", "CURRENT_STATE"}:
+        if not self._semantic_context_slot(slot) or slot_type not in {"DIRECT", "TEMPORAL", "CURRENT_STATE"}:
             return super()._slot_covered(slot, support_ids, selected, relations)
         support_set = set(support_ids or [])
         proof_ids = [memory["id"] for memory in selected if memory.get("id") in support_set and self._requirement_target_proof(slot, memory)]
@@ -55,7 +46,7 @@ class ProofContextContractMixin:
         selected_by_id = {memory.get("id"): memory for memory in selected}
         filtered_support = {str(slot_id): list(memory_ids or []) for slot_id, memory_ids in (slot_support or {}).items()}
         for slot in plan.get("required_slots") or []:
-            if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT":
+            if not self._semantic_context_slot(slot):
                 continue
             slot_id = str(slot.get("id") or "")
             filtered_support[slot_id] = [memory_id for memory_id in filtered_support.get(slot_id, []) if memory_id in selected_by_id and self._requirement_target_proof(slot, selected_by_id[memory_id])]
@@ -76,10 +67,7 @@ class ProofContextContractMixin:
         if not wanted:
             return False
         surfaces_fn = getattr(self, "_rq_memory_concept_surfaces", None)
-        if callable(surfaces_fn):
-            actual = {self._rc_text(key) for key in surfaces_fn(memory) if str(key or "").strip()}
-        else:
-            actual = {self._rc_text(key) for key in self._rc_memory_concept_keys(memory) if str(key or "").strip()}
+        actual = {self._rc_text(key) for key in (surfaces_fn(memory) if callable(surfaces_fn) else self._rc_memory_concept_keys(memory)) if str(key or "").strip()}
         return bool(wanted & actual)
 
     def _context_surface_match(self, slot, memory) -> bool:
@@ -175,8 +163,8 @@ class ProofContextContractMixin:
             run["reserved_seed_context"] = []
             return run
         plan = run.get("plan") or {}
-        requirement_slots = [slot for slot in self._unique_slots(plan.get("required_slots") or []) if str(slot.get("evidence_role") or "").upper() == "REQUIREMENT"]
-        if not requirement_slots:
+        semantic_slots = [slot for slot in self._unique_slots(plan.get("required_slots") or []) if self._semantic_context_slot(slot)]
+        if not semantic_slots:
             run["requirement_proof_support"] = {}
             run["requirement_context_candidates"] = {}
             run["requirement_context_views"] = {}
@@ -191,15 +179,13 @@ class ProofContextContractMixin:
         slot_support = run.setdefault("slot_support", {})
         original_support = {str(slot_id): list(memory_ids or []) for slot_id, memory_ids in slot_support.items()}
         relations = run.get("relations") or []
-        proof_support: Dict[str, List[str]] = {}
-        context_candidates: Dict[str, List[str]] = {}
-        context_views: Dict[str, List[List[str]]] = {}
-        for slot in requirement_slots:
+        proof_support, context_candidates, context_views = {}, {}, {}
+        for slot in semantic_slots:
             slot_id = str(slot.get("id") or "")
             views = self._slot_trace_views(slot, trace, candidate_by_id, operation_output_ids)
             support_view = [memory_id for memory_id in original_support.get(slot_id, []) if memory_id in candidate_by_id and self._context_candidate_eligible(slot, candidate_by_id[memory_id])]
             seed_view = [memory.get("id") for memory in initial_seeds or [] if memory.get("id") in candidate_by_id and self._context_candidate_eligible(slot, memory)]
-            ordered = self._unique_ids([memory_id for view in views for memory_id in view] + list(support_view) + list(seed_view))
+            ordered = self._unique_ids([memory_id for view in views for memory_id in view] + support_view + seed_view)
             self._rank_context_candidates(slot, ordered, candidate_by_id, relations, views=views)
             context_candidates[slot_id] = ordered
             context_views[slot_id] = [list(view) for view in views]
@@ -213,16 +199,13 @@ class ProofContextContractMixin:
             proof_support[slot_id] = certified
             slot_support[slot_id] = list(certified)
         pool = []
-        for slot in requirement_slots:
+        for slot in semantic_slots:
             for memory_id in context_candidates.get(str(slot.get("id") or ""), []):
                 if memory_id not in pool:
                     pool.append(memory_id)
         slot_support[self.CONTEXT_POOL_KEY] = pool
         certified_ids = {memory_id for values in proof_support.values() for memory_id in values}
-        for memory in run.get("operation_candidates") or []:
-            if memory.get("id") in pool and memory.get("id") not in certified_ids:
-                memory["_supplementary_context"] = True
-        for memory in run.get("planning_seeds") or []:
+        for memory in [*(run.get("operation_candidates") or []), *(run.get("planning_seeds") or [])]:
             if memory.get("id") in pool and memory.get("id") not in certified_ids:
                 memory["_supplementary_context"] = True
         self._last_requirement_proof_support = proof_support
@@ -245,11 +228,10 @@ class ProofContextContractMixin:
         bounded_limit = max(0, int(limit))
         if not bounded_limit:
             return []
-        requirement_slots = [slot for slot in self._unique_slots(slots) if str(slot.get("evidence_role") or "").upper() == "REQUIREMENT"]
-        if not requirement_slots or not getattr(self, "_last_requirement_context_candidates", None):
+        semantic_slots = [slot for slot in self._unique_slots(slots) if self._semantic_context_slot(slot)]
+        if not semantic_slots or not getattr(self, "_last_requirement_context_candidates", None):
             return super()._role_aware_support_ids(slots, slot_support, candidate_order, bounded_limit)
-        allowed = set(candidate_order)
-        selected: List[str] = []
+        allowed, selected = set(candidate_order), []
         def add(memory_id: str) -> bool:
             if memory_id and memory_id in allowed and memory_id not in selected and len(selected) < bounded_limit:
                 selected.append(memory_id)
@@ -258,25 +240,18 @@ class ProofContextContractMixin:
         candidates = getattr(self, "_last_requirement_context_candidates", {}) or {}
         proofs = getattr(self, "_last_requirement_proof_support", {}) or {}
         statuses = getattr(self, "_last_requirement_status", {}) or {}
-        for slot in requirement_slots:
+        for slot in semantic_slots:
             slot_id = str(slot.get("id") or "")
-            if statuses.get(slot_id) == "FOUND":
-                proof_id = next((memory_id for memory_id in proofs.get(slot_id, []) if memory_id in allowed), "")
-                if proof_id:
-                    add(proof_id)
-                    continue
-            candidate_id = next((memory_id for memory_id in candidates.get(slot_id, []) if memory_id in allowed), "")
-            add(candidate_id)
-        non_requirement_ids = {memory_id for slot in self._unique_slots(slots) if str(slot.get("evidence_role") or "").upper() != "REQUIREMENT" for memory_id in slot_support.get(str(slot.get("id") or ""), [])}
+            proof_id = next((memory_id for memory_id in proofs.get(slot_id, []) if memory_id in allowed), "") if statuses.get(slot_id) == "FOUND" else ""
+            if proof_id:
+                add(proof_id)
+            else:
+                add(next((memory_id for memory_id in candidates.get(slot_id, []) if memory_id in allowed), ""))
         legacy = super()._role_aware_support_ids(slots, {key: value for key, value in slot_support.items() if key != self.CONTEXT_POOL_KEY}, candidate_order, bounded_limit)
-        for memory_id in legacy:
-            if memory_id in non_requirement_ids:
-                add(memory_id)
         while len(selected) < bounded_limit:
             progressed = False
-            for slot in requirement_slots:
-                slot_id = str(slot.get("id") or "")
-                values = [memory_id for memory_id in candidates.get(slot_id, []) if memory_id in allowed and memory_id not in selected]
+            for slot in semantic_slots:
+                values = [memory_id for memory_id in candidates.get(str(slot.get("id") or ""), []) if memory_id in allowed and memory_id not in selected]
                 if values and add(values[0]):
                     progressed = True
             if not progressed:
@@ -290,17 +265,12 @@ class ProofContextContractMixin:
         semantic_ir = (plan or {}).get("semantic_ir") or {}
         requirements = semantic_ir.get("requirements") or []
         relations = semantic_ir.get("relations") or (plan or {}).get("semantic_relations") or []
-        if not requirements and not relations:
-            return []
         lines = []
         for requirement in requirements:
             lines.append("- requirement " + str(requirement.get("id") or "?") + " [" + str(requirement.get("grounding_kind") or "QUESTION") + "]: " + str(requirement.get("retrieval_hint") or requirement.get("evidence_target") or requirement.get("focus_span") or "evidence"))
         for relation in relations:
-            relation_type = str(relation.get("type") or "")
-            source = str(relation.get("from") or "")
-            target = str(relation.get("to") or "")
+            line = f"- bridge {relation.get('from','')} -[{relation.get('type','')}]-> {relation.get('to','')}"
             goal = str(relation.get("bridge_goal") or "").strip()
-            line = f"- bridge {source} -[{relation_type}]-> {target}"
             if goal:
                 line += f": {goal}"
             lines.append(line)
@@ -316,7 +286,7 @@ class ProofContextContractMixin:
         extra["requirement_context_candidates"] = context_candidates
         extra["requirement_context_views"] = context_views
         extra["reserved_seed_context"] = []
-        extra["read_contract_version"] = "minimal-ir-v3-view-aware-context"
+        extra["read_contract_version"] = "minimal-ir-v4-semantic-slot-context"
         final_ids = set(extra.get("final_memory_ids") or [])
         certified_ids = {memory_id for values in proof_support.values() for memory_id in values}
         assigned_ids = {memory_id for values in context_candidates.values() for memory_id in values}
@@ -327,18 +297,17 @@ class ProofContextContractMixin:
         extra["candidate_lifecycle"] = [{"slot_id": slot_id, "memory_id": memory_id, "context_rank": rank + 1, "selected": memory_id in final_ids, "drop_reason": "" if memory_id in final_ids else "CONTEXT_BUDGET_OR_ARBITRATION"} for slot_id, values in context_candidates.items() for rank, memory_id in enumerate(values)]
         for item in extra.get("retrieval_provenance") or []:
             item["slot_ids"] = [slot_id for slot_id in item.get("slot_ids") or [] if slot_id != self.CONTEXT_POOL_KEY]
-        plan = extra.get("replan") or extra.get("plan") or {}
-        source_plan = extra.get("plan") or plan
+        source_plan = extra.get("plan") or extra.get("replan") or {}
         extra["graph_validation"] = source_plan.get("graph_validation") or {}
         slots = source_plan.get("required_slots") or []
-        extra["requirement_diagnostics"] = {str(slot["id"]): {"focus_span": slot.get("focus_span", ""), "retrieval_target": slot.get("retrieval_target", slot.get("target_surface", "")), "proof_anchor": slot.get("proof_anchor", slot.get("target_surface", "")), "resolved_keys": list(slot.get("resolved_keys") or []), "proof_result": bool(proof_support.get(str(slot["id"]))), "proof_miss_reason": "" if proof_support.get(str(slot["id"])) else "DEGRADED_TARGET" if slot.get("degraded") else "NO_CANDIDATE" if not context_candidates.get(str(slot["id"])) else "NO_CONSERVATIVE_TARGET_PROOF"} for slot in slots if slot.get("evidence_role") == "REQUIREMENT"}
+        extra["requirement_diagnostics"] = {str(slot["id"]): {"focus_span": slot.get("focus_span", ""), "retrieval_target": slot.get("retrieval_target", slot.get("target_surface", "")), "proof_anchor": slot.get("proof_anchor", slot.get("target_surface", "")), "resolved_keys": list(slot.get("resolved_keys") or []), "proof_result": bool(proof_support.get(str(slot["id"]))), "proof_miss_reason": "" if proof_support.get(str(slot["id"])) else "DEGRADED_TARGET" if slot.get("degraded") else "NO_CANDIDATE" if not context_candidates.get(str(slot["id"])) else "NO_CONSERVATIVE_TARGET_PROOF"} for slot in slots if self._semantic_context_slot(slot)}
         options = source_plan.get("visible_options") or {}
         probed = getattr(self, "_last_option_probe_coverage", {}) or {}
         extra["option_probe_complete"] = bool(options) and set(options).issubset(probed)
         extra["retrieval_complete_semantics"] = "OPTION_EXPLORATION" if options else "DETERMINISTIC_EVIDENCE_CONTRACT"
         obligation_lines = self._reasoning_obligation_lines(source_plan)
         if obligation_lines:
-            addendum = "\n\n=== SEMANTIC EVIDENCE GRAPH ===\n" + "\n".join(obligation_lines) + "\nTarget proof controls retrieval state only; it does not guarantee that one memory is the final answer. Evaluate all authorized memories. resolved_keys are optional schema hints, not proof. DEPENDS_ON means the target is a prerequisite for the source, not a causal edge. Use grounded DERIVED values where reasoning depends on them and never invent participant facts to repair a missing edge."
+            addendum = "\n\n=== SEMANTIC EVIDENCE GRAPH ===\n" + "\n".join(obligation_lines) + "\nTarget proof controls retrieval state only; it does not guarantee that one memory is the final answer. Evaluate all authorized memories. resolved_keys are optional schema hints, not proof. Compiler evidence-role names do not change semantic obligation priority. DEPENDS_ON means the target is a prerequisite for the source, not a causal edge."
             graph = extra["graph_validation"]
             if graph.get("orphan_requirements"):
                 addendum += "\nINCOMPLETE CONTROLLER GRAPH: unconnected requirements " + ", ".join(graph["orphan_requirements"]) + ". Keep them as evidence candidates; do not manufacture a relation."
