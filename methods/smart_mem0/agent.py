@@ -18,6 +18,7 @@ from .read_plan_contract import ReadPlanContractMixin
 from .read_requirement_contract import ReadRequirementContractMixin
 from .read_reasoning_bridge import ReadReasoningBridgeMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
+from .read_evidence_policy import ReadEvidencePolicyMixin
 from .read_runtime_support import ReadRuntimeSupportMixin
 from .read_unified_retrieval import UnifiedRetrievalExecutorMixin
 from .read_proof_context import UnifiedProofContextMixin
@@ -28,6 +29,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadEvidencePolicyMixin,
     ReadAnswerabilityContractMixin,
     ReadTerminalAnswerContractMixin,
     ReadCertificateContractMixin,
