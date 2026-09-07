@@ -30,6 +30,7 @@ from utils.json_artifacts import dump_json_artifact
 MANIFEST_VERSION = 2
 PREPARED_QUERY_METADATA_KEY = "prepared_query"
 DEFAULT_MIN_BATCH_REQUESTS = 6
+CORRELATION_LABEL_KEY = "medmemorybench-request"
 TERMINAL_STATES = {
     "JOB_STATE_SUCCEEDED",
     "JOB_STATE_FAILED",
@@ -87,6 +88,15 @@ class BatchChatRequest:
     response_format: Optional[Dict[str, Any]] = None
     phase: str = "query"
     metadata: Dict[str, Any] = field(default_factory=dict)
+    correlation_label: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.correlation_label is None:
+            # Vertex echoes request labels in batch output.  Keep this separate
+            # from model-visible content so identical prompts remain valid.
+            self.correlation_label = "r-" + hashlib.sha256(
+                self.request_id.encode("utf-8")
+            ).hexdigest()
 
     def to_vertex_request(
         self,
@@ -165,6 +175,8 @@ class BatchChatRequest:
             "contents": contents,
             "generationConfig": generation_config,
         }
+        if self.correlation_label:
+            request["labels"] = {CORRELATION_LABEL_KEY: self.correlation_label}
         if system_messages:
             request["systemInstruction"] = {
                 "parts": [{"text": "\n\n".join(system_messages)}]
@@ -188,7 +200,12 @@ class BatchChatRequest:
         }
 
     def to_manifest_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        # Preserve the fingerprint of manifests written before correlation
+        # labels were introduced so their submitted jobs remain resumable.
+        if not payload["correlation_label"]:
+            payload.pop("correlation_label")
+        return payload
 
     @classmethod
     def from_manifest_dict(cls, data: Dict[str, Any]) -> "BatchChatRequest":
@@ -201,6 +218,7 @@ class BatchChatRequest:
             response_format=data.get("response_format"),
             phase=data.get("phase", "query"),
             metadata=data.get("metadata", {}),
+            correlation_label=data.get("correlation_label", ""),
         )
 
 
@@ -801,7 +819,7 @@ class VertexBatchClient:
 
     @staticmethod
     def _request_correlation_key(request: Dict[str, Any]) -> str:
-        """Return the stable text-message shape echoed by Vertex GCS output."""
+        """Return the content and opaque label echoed by Vertex GCS output."""
         contents = request.get("contents")
         if not isinstance(contents, list):
             raise VertexBatchError("Vertex batch output row does not contain request.contents.")
@@ -825,15 +843,30 @@ class VertexBatchClient:
                 text_parts.append(text)
             messages.append({"role": content.get("role", ""), "parts": text_parts})
 
-        return json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        label = None
+        labels = request.get("labels")
+        if labels is not None:
+            if not isinstance(labels, dict):
+                raise VertexBatchError("Vertex batch output contains invalid request labels.")
+            label = labels.get(CORRELATION_LABEL_KEY)
+            if label is not None and not isinstance(label, str):
+                raise VertexBatchError("Vertex batch output contains an invalid correlation label.")
+
+        return json.dumps(
+            {"contents": messages, "correlation_label": label},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @classmethod
     def _validate_request_correlation(cls, requests: List[BatchChatRequest]) -> Dict[str, str]:
         """Map echoed request content to one local ID before a job is submitted.
 
         Cloud Storage output does not include an application-defined request ID.
-        Identical message content would therefore be ambiguous if output order
-        changes, so fail before submitting rather than misassigning results.
+        Each new request therefore carries a documented, model-neutral Vertex
+        label that is echoed with its request. Legacy submitted requests retain
+        content-only correlation for backward-compatible collection.
         """
         request_ids_by_key: Dict[str, str] = {}
         for request in requests:

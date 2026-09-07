@@ -69,6 +69,39 @@ def test_locomo_memory_resume_accepts_v2_manifest(tmp_path: Path):
     assert evaluator._memory_snapshot_dir_path == memory_dir
 
 
+def test_locomo_query_accepts_a_full_building_event_state_manifest(tmp_path: Path, monkeypatch):
+    loader = ConfigLoader()
+    method_config = loader.load_method_config("event_state_gemini")
+    dataset_config = loader.load_dataset_config("locomo_1")
+    manifest = {
+        "format": "locomo.event_state_memory_manifest",
+        "version": 2,
+        "status": "building",
+        "sample_ids": ["conv-1"],
+        "snapshots": [{"sample_id": "conv-1", "path": "sample.json"}],
+        "retrieval_config_hash": "test-query-hash",
+    }
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.memory_source_run_dir = tmp_path
+    evaluator.output_dir = tmp_path
+    evaluator.method_config = method_config
+    evaluator.dataset_config = dataset_config
+    monkeypatch.setattr(
+        "benchmarks.locomo.evaluator.is_manifest_query_compatible",
+        lambda *args: True,
+    )
+
+    evaluator._load_memory_snapshot_manifest([
+        SimpleNamespace(context_id="conv-1"),
+    ])
+
+    assert evaluator._memory_snapshot_manifest == manifest
+
+
 def test_selected_session_and_answer_visible_turn_metrics_are_distinct():
     evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
     query = LoCoMoQuery(

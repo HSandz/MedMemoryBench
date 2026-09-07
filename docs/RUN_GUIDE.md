@@ -319,6 +319,21 @@ answers recorded in the query checkpoint. Current LoCoMo memory manifests use
 schema version 2; staged query and memory-resume workflows also accept legacy
 version-1 LoCoMo manifests. MedMemoryBench memory manifests remain version 1.
 
+If a full Event-State/LoCoMo run fails after memory construction but before its
+final-answer batch is submitted, reuse its snapshots with a query-only child:
+
+```bash
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS --batch-api --workers 4
+```
+
+This is safe when the source `memory/manifest.json` is still `building` but
+lists every selected sample snapshot. The query stage validates the complete
+sample list and each snapshot before restoring it; it does not modify or rebuild
+the source memory. Do not add `--resume` on this first query-only attempt. Use
+the identical command with `--resume` only to continue that child after a
+submitted or interrupted query batch. A source with a missing or invalid
+snapshot remains ineligible and must be completed with its original memory run.
+
 ### LoCoMo Reporting
 
 LoCoMo reports official token/stem `mean_f1` as the primary score. Each

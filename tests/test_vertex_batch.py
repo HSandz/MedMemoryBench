@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -69,7 +70,7 @@ def _success_row(request: dict, content: str = "answer") -> dict:
     """Match Vertex's documented GCS output: request/status/response, no ID."""
     return {
         "status": "",
-        "request": {"contents": request["contents"]},
+        "request": request,
         "response": {
             "candidates": [{"content": {"parts": [{"text": content}]}}],
             "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3},
@@ -490,16 +491,34 @@ def test_partial_output_retries_only_missing_request(tmp_path):
     assert manifest["jobs"]["query-unit-1"]["missing_request_ids"] == []
 
 
-def test_duplicate_message_content_is_rejected_before_submission(tmp_path):
+def test_duplicate_message_content_uses_request_labels_for_correlation(tmp_path):
     storage = _Storage()
     batches = _Batches(storage)
     client = _client(tmp_path, batches, storage)
 
-    with pytest.raises(VertexBatchError, match="duplicate message content"):
-        client.run_stage("query-unit-1", [_request("one", "same"), _request("two", "same")])
+    responses = client.run_stage(
+        "query-unit-1", [_request("one", "same"), _request("two", "same")]
+    )
 
-    assert batches.created == []
-    assert storage.uploads == {}
+    assert set(responses) == {"one", "two"}
+    uploaded = [json.loads(line) for line in next(iter(storage.uploads.values())).splitlines()]
+    assert [row["request"]["labels"] for row in uploaded] == [
+        {"medmemorybench-request": "r-" + hashlib.sha256(b"one").hexdigest()},
+        {"medmemorybench-request": "r-" + hashlib.sha256(b"two").hexdigest()},
+    ]
+
+
+def test_legacy_batch_manifest_request_preserves_content_only_correlation():
+    request = BatchChatRequest.from_manifest_dict({
+        "request_id": "legacy",
+        "messages": [{"role": "user", "content": "old prompt"}],
+        "temperature": 0.2,
+        "max_tokens": 55,
+    })
+
+    assert request.correlation_label == ""
+    assert "labels" not in request.to_vertex_request()
+    assert "correlation_label" not in request.to_manifest_dict()
 
 
 def test_scoped_manifest_path_isolates_configs_and_reuses_matching_legacy_file(tmp_path):

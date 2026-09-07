@@ -319,6 +319,13 @@ python main.py -m event_state_gemini -d locomo --stage memory
 python main.py --stage query --memory-run <memory-run-directory>
 ```
 
+For a LoCoMo run that fails after all snapshots are written but before final
+answers are submitted, run the query stage against that memory run with
+`--batch-api` (and the desired `--workers` value). This creates a separate
+query child and leaves the source snapshots unchanged. The query stage accepts
+a `building` LoCoMo manifest only after confirming that it lists every selected
+sample; an incomplete or invalid snapshot set is rejected.
+
 ### Parallel memory construction
 
 Use the existing global worker option, for example `--workers 4`, with Event-State.

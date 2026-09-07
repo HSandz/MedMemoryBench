@@ -299,7 +299,9 @@ class LoCoMoEvaluator:
         if (
             manifest.get("format") != "locomo.event_state_memory_manifest"
             or manifest.get("version") not in {1, 2}
-            or manifest.get("status") != "complete"
+            # A full snapshot set can be safely queried after an answer-stage
+            # failure, before the source memory run reaches its final marker.
+            or manifest.get("status") not in {"complete", "building"}
             or manifest.get("sample_ids") != [str(unit.context_id) for unit in units]
             or not is_manifest_query_compatible(manifest, self.method_config, self.dataset_config, manifest_path)
         ):

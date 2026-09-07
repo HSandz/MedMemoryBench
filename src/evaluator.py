@@ -319,9 +319,18 @@ class Evaluator:
                 manifest_path,
             )
 
+        allow_building_event_state_query = (
+            self.execution_stage == "query"
+            and self.method_config.method_name.lower() == "event_state"
+            and self.dataset_config.dataset_name.lower() == "locomo"
+        )
         compatible = (
             is_supported_memory_manifest(manifest)
-            and manifest.get("status") in ({"complete", "building"} if self.append else {"complete"})
+            and manifest.get("status") in (
+                {"complete", "building"}
+                if self.append or allow_building_event_state_query
+                else {"complete"}
+            )
             and manifest.get("method_name") == self.method_config.method_name
             and config_compatible
         )

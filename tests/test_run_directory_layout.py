@@ -399,7 +399,7 @@ def test_explicit_query_runs_are_nested_under_the_memory_run(tmp_path: Path):
     assert config["execution"]["memory_source_run_dir"] == str(source_run.resolve())
 
 
-def test_explicit_query_accepts_locomo_v2_memory_manifest(tmp_path: Path):
+def test_explicit_query_accepts_full_building_locomo_v2_memory_manifest(tmp_path: Path):
     method = MethodConfig(
         method_name="event_state",
         method_type="agentic_memory",
@@ -421,6 +421,7 @@ def test_explicit_query_accepts_locomo_v2_memory_manifest(tmp_path: Path):
         stored_method_name="event_state",
         manifest_method_name="event_state",
         dataset_config_name="locomo",
+        status="building",
         config_hash=compute_config_hash(method, dataset),
         manifest_updates={
             "format": "locomo.event_state_memory_manifest",
@@ -517,6 +518,32 @@ def test_query_config_is_inferred_from_completed_locomo_v2_memory_run(tmp_path: 
 
     assert inferred["run_dir"] == run_dir
     assert inferred["memory_manifest"]["version"] == 2
+
+
+def test_query_config_inference_accepts_building_locomo_event_state_source(tmp_path: Path):
+    run_dir = _write_memory_run(
+        tmp_path,
+        "20260905_182953",
+        experiment="event_state_test-model",
+        method_config_name="event_state_gemini",
+        dataset_config_name="locomo_full",
+        stored_method_name="event_state",
+        manifest_method_name="event_state",
+        status="building",
+        manifest_updates={
+            "format": "locomo.event_state_memory_manifest",
+            "version": 2,
+        },
+    )
+
+    inferred = cli.infer_query_config_from_memory_run(
+        tmp_path,
+        run_dir.name,
+        allow_event_state_query_building=True,
+    )
+
+    assert inferred["run_dir"] == run_dir
+    assert inferred["memory_manifest"]["status"] == "building"
 
 
 @pytest.mark.parametrize(

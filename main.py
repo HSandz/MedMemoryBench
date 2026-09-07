@@ -51,8 +51,8 @@ def parse_args() -> argparse.Namespace:
         choices=("all", "memory", "query"),
         default="all",
         help=(
-            "Run the full evaluation, build AMem snapshots only, or answer/score "
-            "from existing AMem snapshots"
+            "Run the full evaluation, build supported memory snapshots only, or "
+            "answer/score from existing snapshots"
         ),
     )
     parser.add_argument(
@@ -159,6 +159,7 @@ def infer_query_config_from_memory_run(
     memory_run: str,
     *,
     allow_incomplete: bool = False,
+    allow_event_state_query_building: bool = False,
 ) -> Dict[str, Any]:
     """Load identity and effective config snapshots from one memory run."""
     if memory_run == "legacy":
@@ -204,13 +205,6 @@ def infer_query_config_from_memory_run(
         ):
             rejected.append(f"{run_dir}: unsupported run_config.json")
             continue
-        allowed_statuses = {"complete", "building"} if allow_incomplete else {"complete"}
-        if manifest.get("status") not in allowed_statuses:
-            rejected.append(
-                f"{run_dir}: memory status is {manifest.get('status')!r}, not 'complete'"
-            )
-            continue
-
         method_config_name = run_config.get("method_config_name")
         dataset_config_name = run_config.get("dataset_config_name")
         if not isinstance(method_config_name, str) or not method_config_name:
@@ -235,6 +229,20 @@ def infer_query_config_from_memory_run(
             continue
         if stored_model_name and stored_model_name != manifest.get("model_name"):
             rejected.append(f"{run_dir}: model identity disagrees with its manifest")
+            continue
+
+        is_event_state_locomo = (
+            manifest.get("format") == "locomo.event_state_memory_manifest"
+            and manifest.get("method_name") == "event_state"
+        )
+        allowed_statuses = {"complete", "building"} if (
+            allow_incomplete
+            or (allow_event_state_query_building and is_event_state_locomo)
+        ) else {"complete"}
+        if manifest.get("status") not in allowed_statuses:
+            rejected.append(
+                f"{run_dir}: memory status is {manifest.get('status')!r}, not 'complete'"
+            )
             continue
 
         stored_dataset = run_config.get("dataset_config")
@@ -469,6 +477,7 @@ def main() -> int:
                 Path(args.output_dir),
                 args.memory_run,
                 allow_incomplete=args.append,
+                allow_event_state_query_building=args.stage == "query",
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"Memory run inference failed: {truncate_error_message(exc)}")
