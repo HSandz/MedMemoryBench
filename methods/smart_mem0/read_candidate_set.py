@@ -1,15 +1,18 @@
 """Generic CandidateSet contract for SmartMem0 READ.
 
 Visible multiple-choice options are only one producer. Any caller may provide a structured
-candidate_set mapping. CandidateSet stores propositions, the shared question-owned
-predicate, and retrieval evidence views. Empty evidence is UNKNOWN, never false.
+candidate_set mapping. CandidateSet owns bounded per-candidate recall, propositions, the
+shared question-owned predicate, and retrieval evidence views. Empty evidence is UNKNOWN,
+never false.
 """
 
 from copy import deepcopy
 
+from .read_option_contract import ReadOptionContractMixin
 
-class ReadCandidateSetMixin:
-    CANDIDATE_SET_VERSION = "candidate-set-v2"
+
+class ReadCandidateSetMixin(ReadOptionContractMixin):
+    CANDIDATE_SET_VERSION = "candidate-set-v3-single-owner"
 
     @staticmethod
     def _candidate_shared_predicate(question, stemmer=None):
@@ -19,14 +22,16 @@ class ReadCandidateSetMixin:
             value = question
         return " ".join(str(value or "").split()).strip()
 
-    def _semantic_controller(self, question, seeds, frame, context_map=None):
+    def _question_options(self, question):
+        """Treat an external CandidateSet as the same generic proposition surface."""
         supplied = dict(
             getattr(self, "_active_candidate_set_input", {}) or {}
         )
         if supplied:
-            merged = dict(context_map or {}) if isinstance(context_map, dict) else {}
-            merged["candidate_set"] = supplied
-            context_map = merged
+            return supplied
+        return super()._question_options(question)
+
+    def _semantic_controller(self, question, seeds, frame, context_map=None):
         return super()._semantic_controller(
             question, seeds, frame, context_map=context_map
         )
@@ -60,11 +65,10 @@ class ReadCandidateSetMixin:
         return plan
 
     def prepare_batch_query(self, question, system_message=None, **kwargs):
-        normalize = getattr(self, "_normalize_candidate_propositions", None)
         supplied = kwargs.pop("candidate_set", None)
         self._active_candidate_set_input = (
-            normalize(supplied)
-            if callable(normalize) and supplied is not None
+            self._normalize_candidate_propositions(supplied)
+            if supplied is not None
             else {}
         )
         try:
@@ -100,4 +104,5 @@ class ReadCandidateSetMixin:
             },
             "empty_evidence_semantics": "UNKNOWN_NOT_FALSE",
         }
+        extra["candidate_set_single_owner"] = True
         return prepared

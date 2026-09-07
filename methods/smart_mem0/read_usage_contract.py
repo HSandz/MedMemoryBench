@@ -1,13 +1,14 @@
-"""Method-local LLM accounting for SmartMem0 reads.
+"""Two-stage-only LLM accounting for SmartMem0 READ.
 
-Benchmark-level trackers also count evaluator judges. This telemetry records
-only calls implied by the SmartMem0 prepared query so resource claims can be
-audited without subtracting benchmark infrastructure calls afterward.
+The active architecture permits exactly one semantic-controller call and, unless a strict
+terminal certificate closes the query, one final answer call. Legacy gate/planner/replan
+activity is a contract violation rather than an alternative accounting branch.
 """
 
 
 class ReadUsageContractMixin:
     TWO_STAGE_MAX_LLM_CALLS = 2
+    MIDDLE_TOKEN_STAGES = ("fast_gate", "planner", "slot_validation", "replan")
 
     def prepare_batch_query(self, question, system_message=None, **kwargs):
         prepared = super().prepare_batch_query(
@@ -17,73 +18,46 @@ class ReadUsageContractMixin:
         controller = extra.get("semantic_controller") or {}
         query_tokens = extra.get("query_tokens") or {}
         controller_calls = int(bool(controller.get("called")))
+        terminal = prepared.get("precomputed_answer") not in (None, "")
+        answer_calls = 0 if terminal else 1
 
-        # Count any middle-stage LLM activity explicitly. It should be zero in
-        # the active two-stage architecture, but keeping it visible prevents a
-        # future flag/config regression from being hidden by accounting.
+        middle_tokens = {
+            stage: int(query_tokens.get(stage, 0) or 0)
+            for stage in self.MIDDLE_TOKEN_STAGES
+        }
         validation_events = extra.get("slot_validation") or []
-        slot_validation_calls = sum(
+        validation_calls = sum(
             1
             for item in validation_events
             if isinstance(item, dict)
             and item.get("called")
             and not item.get("cache_hit")
         )
-        legacy_gate_calls = int(
-            not controller_calls and bool((extra.get("fast_gate") or {}).get("called"))
-        )
-        legacy_planner_calls = int(
-            not controller_calls
-            and bool(extra.get("planner_called"))
-            and int(query_tokens.get("planner", 0) or 0) > 0
-        )
-        legacy_replan_calls = int(
-            bool(extra.get("replan_called"))
-            and int(query_tokens.get("replan", 0) or 0) > 0
-        )
-        middle_calls = (
-            slot_validation_calls
-            + legacy_gate_calls
-            + legacy_planner_calls
-            + legacy_replan_calls
-        )
-
-        # At this point all output-contract handling has already run. A
-        # surviving precomputed answer therefore really skips the final model;
-        # otherwise one final answer generation is required.
-        answer_calls = 0 if prepared.get("precomputed_answer") not in (None, "") else 1
-        extra["precomputed_answer_present"] = prepared.get("precomputed_answer") not in (None, "")
-        extra["answer_llm_called"] = False
-        extra["direct_generation_violation"] = False
-        extra["answer_llm_planned"] = bool(answer_calls)
-        total_calls = controller_calls + middle_calls + answer_calls
-        two_stage_active = bool(controller_calls)
+        middle_activity = bool(any(middle_tokens.values()) or validation_calls)
+        total_calls = controller_calls + answer_calls + validation_calls
         budget_violation = bool(
-            two_stage_active
-            and (middle_calls > 0 or total_calls > self.TWO_STAGE_MAX_LLM_CALLS)
+            controller_calls != 1
+            or middle_activity
+            or total_calls > self.TWO_STAGE_MAX_LLM_CALLS
         )
 
-        # planner_called is retained for historical telemetry compatibility: in
-        # the two-stage path it means a deterministic plan was compiled, not an
-        # LLM planner call. Expose that distinction explicitly.
-        extra["deterministic_plan_compiled"] = bool(
-            controller_calls and extra.get("planner_called")
-        )
-        extra["planner_llm_called"] = bool(legacy_planner_calls)
+        extra["precomputed_answer_present"] = terminal
+        extra["answer_llm_called"] = False
+        extra["answer_llm_planned"] = bool(answer_calls)
+        extra["direct_generation_violation"] = False
+        extra["deterministic_plan_compiled"] = bool(extra.get("planner_called"))
+        extra["planner_llm_called"] = False
         extra["two_stage_llm_budget"] = {
             "max_calls_per_query": self.TWO_STAGE_MAX_LLM_CALLS,
             "violation": budget_violation,
         }
         extra["method_llm_calls"] = {
             "controller": controller_calls,
-            "middle": middle_calls,
-            "slot_validation": slot_validation_calls,
-            "legacy_gate": legacy_gate_calls,
-            "legacy_planner": legacy_planner_calls,
-            "legacy_replan": legacy_replan_calls,
+            "middle": validation_calls,
             "answer": answer_calls,
             "total": total_calls,
             "two_stage_budget_violation": budget_violation,
+            "middle_token_stages": middle_tokens,
             "excludes_evaluator_judges": True,
         }
         return prepared
