@@ -318,8 +318,14 @@ python main.py -m event_state_gemini -d locomo --stage memory --workers 4
 python main.py --stage query --memory-run YYYYMMDD_HHMMSS --workers 4
 ```
 
-LoCoMo snapshots retain original session and turn provenance. Query-stage
-workers restore independent Event-State instances; `--resume` reuses completed
+LoCoMo snapshots retain original session and turn provenance. Event-State
+schema-6 snapshots store canonical semantic state in JSON and the episode,
+immutable-turn, claim, and claim-slot dense indexes in adjacent
+content-addressed NumPy sidecars. Query-stage loading validates each sidecar's
+safe local path, SHA-256, dtype, shape, and ordered ID mapping before restoring
+the exact vectors; it does not re-embed them. Schema-5 inline Event-State
+snapshots remain supported. Query-stage workers restore independent Event-State
+instances; `--resume` reuses completed
 sample snapshots, rebuilds only a sample without a valid snapshot, and skips
 answers recorded in the query checkpoint. Current LoCoMo memory manifests use
 schema version 2; staged query and memory-resume workflows also accept legacy
@@ -410,9 +416,10 @@ python main.py -m event_state_gemini -d locomo_1 --stage query \
   --memory-run YYYYMMDD_HHMMSS --batch-api
 ```
 
-### Incremental A-MEM Append
+### Incremental Snapshot Append
 
-Append from a completed or interrupted A-MEM memory run when only part of the benchmark has been built:
+Append from a completed or interrupted A-MEM or Event-State memory run when
+only part of the benchmark has been built:
 
 ```bash
 # Extend memory through the requested target and export snapshots only
@@ -426,7 +433,7 @@ python main.py --memory-run SOURCE_RUN --append \
 
 `--persona` identifies the persona and `--unit` is the dataset's global evaluation-unit ID. The target is inclusive. The method and dataset configurations are reconstructed from the source run's `run_config.json`; do not supply a different configuration. If the exact target snapshot already exists, the command exits without creating another run. An interrupted append can be continued with the same command plus `--resume`.
 
-Each append is a new run under `SOURCE_RUN/query_runs/`, with its own `run_config.json`, `memory/manifest.json`, snapshots, and (for the default/all form) query reports. A completed append can itself be used as `SOURCE_RUN` for another append, so memory can be extended in multiple increments. A partial append can also be queried with the normal staged command:
+Each append is a new run under `SOURCE_RUN/query_runs/`, with its own `run_config.json`, `memory/manifest.json`, snapshots, and (for the default/all form) query reports. A completed append can itself be used as `SOURCE_RUN` for another append, so memory can be extended in multiple increments. Event-State snapshot copies republish their dense sidecars in the child memory directory and validate them before reuse. A partial append can also be queried with the normal staged command:
 
 ```bash
 python main.py --stage query --memory-run APPEND_RUN
@@ -511,6 +518,16 @@ judge provider:
 ```bash
 python main.py -m METHOD -d DATASET --batch-api --workers 4
 ```
+
+After a batch answer stage completes, LoCoMo shows a `Finalizing batch answers`
+bar and MedMemoryBench continues its run-wide `Query progress` bar while local
+results are scored and committed. Both resumable query checkpoints are
+atomically flushed every 25 answers and again at normal completion or before
+propagating an error. This avoids rewriting a large checkpoint after every
+response while leaving at most 24 finalized answers unflushed in the resume
+checkpoint. If interrupted, resume the same query child with the original
+command plus `--resume --batch-api`; saved Vertex outputs are reused and only
+checkpoint-missing answers are finalized again.
 
 Choose `N` within the provider's rate and concurrency limits. `N` must be at
 least `1`.

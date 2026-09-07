@@ -7,6 +7,8 @@ import json
 from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from .schemas import Claim, Episode, StateOperation, claim_from_dict, episode_from_dict
 from .validation import normalize_state_slot
 
@@ -14,8 +16,16 @@ from .validation import normalize_state_slot
 class EventStateStore:
     """Keeps raw episodes immutable while allowing state metadata to evolve."""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
     SEMANTIC_VERSION = "2.9"
+    LEGACY_INLINE_SCHEMA_VERSIONS = frozenset({4, 5})
+    EMBEDDING_ARTIFACT_NAMES = (
+        "episode_embeddings",
+        "turn_embeddings",
+        "claim_embeddings",
+        "claim_slot_embeddings",
+    )
+    EMBEDDING_ARTIFACT_DTYPE = np.dtype(np.float64)
 
     def __init__(self, context_id: Optional[Any] = None) -> None:
         self.context_id = context_id
@@ -238,19 +248,207 @@ class EventStateStore:
             ),
         }
 
+    @classmethod
+    def _embedding_artifact_metadata(
+        cls,
+        name: str,
+        embeddings: Dict[str, List[float]],
+    ) -> Dict[str, Any]:
+        """Describe a deterministic dense index without materializing its matrix."""
+        if any(not isinstance(identifier, str) for identifier in embeddings):
+            raise ValueError(f"Event-State {name} has a non-string embedding ID")
+        ids = sorted(embeddings)
+        if not ids:
+            return {
+                "ids": ids,
+                "dtype": str(cls.EMBEDDING_ARTIFACT_DTYPE),
+                "shape": [0, 0],
+            }
+
+        width: Optional[int] = None
+        for identifier in ids:
+            try:
+                vector = np.asarray(
+                    embeddings[identifier], dtype=cls.EMBEDDING_ARTIFACT_DTYPE
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Event-State {name} cannot be represented as a dense matrix"
+                ) from exc
+            if vector.ndim != 1:
+                raise ValueError(
+                    f"Event-State {name} cannot be represented as a dense matrix"
+                )
+            if width is None:
+                width = vector.shape[0]
+            elif vector.shape[0] != width:
+                raise ValueError(
+                    f"Event-State {name} cannot be represented as a dense matrix"
+                )
+        return {
+            "ids": ids,
+            "dtype": str(cls.EMBEDDING_ARTIFACT_DTYPE),
+            "shape": [len(ids), width or 0],
+        }
+
+    @classmethod
+    def _embedding_artifact_matrix(
+        cls,
+        name: str,
+        embeddings: Dict[str, List[float]],
+    ) -> Dict[str, Any]:
+        """Return one dense index with a deterministic matrix and row mapping."""
+        metadata = cls._embedding_artifact_metadata(name, embeddings)
+        ids = metadata["ids"]
+        if ids:
+            values = np.asarray(
+                [embeddings[identifier] for identifier in ids],
+                dtype=cls.EMBEDDING_ARTIFACT_DTYPE,
+            )
+        else:
+            values = np.empty(tuple(metadata["shape"]), dtype=cls.EMBEDDING_ARTIFACT_DTYPE)
+        return {**metadata, "values": values}
+
+    def export_embedding_artifacts(self) -> Dict[str, Dict[str, Any]]:
+        """Export derived dense indexes separately from canonical JSON state."""
+        return {
+            "episode_embeddings": self._embedding_artifact_matrix(
+                "episode_embeddings", self.episode_embeddings
+            ),
+            "turn_embeddings": self._embedding_artifact_matrix(
+                "turn_embeddings", self.turn_embeddings
+            ),
+            "claim_embeddings": self._embedding_artifact_matrix(
+                "claim_embeddings", self.claim_embeddings
+            ),
+            "claim_slot_embeddings": self._embedding_artifact_matrix(
+                "claim_slot_embeddings", self.claim_slot_embeddings
+            ),
+        }
+
     def export(self) -> Dict[str, Any]:
-        return {"schema_version": self.SCHEMA_VERSION, "semantic_version": self.SEMANTIC_VERSION, "method": "event_state", "context_id": self.context_id, "episodes": [asdict(item) for item in self.episodes.values()], "claims": [asdict(item) for item in self.claims.values()], "state_operations": [asdict(item) for item in self.operations], "edges": self.edges, "episode_embeddings": self.episode_embeddings, "turn_embeddings": self.turn_embeddings, "turn_metadata": self.turn_metadata, "claim_embeddings": self.claim_embeddings, "claim_slot_embeddings": self.claim_slot_embeddings}
+        """Export canonical Event-State memory without inline dense vectors."""
+        artifact_metadata = {
+            "episode_embeddings": self._embedding_artifact_metadata(
+                "episode_embeddings", self.episode_embeddings
+            ),
+            "turn_embeddings": self._embedding_artifact_metadata(
+                "turn_embeddings", self.turn_embeddings
+            ),
+            "claim_embeddings": self._embedding_artifact_metadata(
+                "claim_embeddings", self.claim_embeddings
+            ),
+            "claim_slot_embeddings": self._embedding_artifact_metadata(
+                "claim_slot_embeddings", self.claim_slot_embeddings
+            ),
+        }
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "semantic_version": self.SEMANTIC_VERSION,
+            "method": "event_state",
+            "context_id": self.context_id,
+            "episodes": [asdict(item) for item in self.episodes.values()],
+            "claims": [asdict(item) for item in self.claims.values()],
+            "state_operations": [asdict(item) for item in self.operations],
+            "edges": self.edges,
+            "turn_metadata": self.turn_metadata,
+            "embedding_artifacts": {
+                name: {
+                    "ids": descriptor["ids"],
+                    "dtype": descriptor["dtype"],
+                    "shape": descriptor["shape"],
+                }
+                for name, descriptor in artifact_metadata.items()
+            },
+        }
+
+    @classmethod
+    def _restore_embedding_artifacts(
+        cls,
+        store: "EventStateStore",
+        state: Dict[str, Any],
+    ) -> None:
+        """Restore schema-v6 dense indexes after sidecars have been validated."""
+        artifacts = state.get("embedding_artifacts")
+        if not isinstance(artifacts, dict) or set(artifacts) != set(
+            cls.EMBEDDING_ARTIFACT_NAMES
+        ):
+            raise ValueError("Event-State schema v6 embedding artifact metadata is incomplete")
+
+        expected_ids = {
+            "episode_embeddings": set(store.episodes),
+            "turn_embeddings": set(store.turn_metadata),
+            "claim_embeddings": set(store.claims),
+            "claim_slot_embeddings": {
+                claim_id
+                for claim_id, claim in store.claims.items()
+                if claim.persistence == "state"
+            },
+        }
+        restored: Dict[str, Dict[str, List[float]]] = {}
+        for name in cls.EMBEDDING_ARTIFACT_NAMES:
+            descriptor = artifacts.get(name)
+            if not isinstance(descriptor, dict):
+                raise ValueError(
+                    f"Event-State schema v6 embedding artifact {name} is invalid"
+                )
+            ids = descriptor.get("ids")
+            values = descriptor.get("values")
+            if (
+                not isinstance(ids, list)
+                or any(not isinstance(identifier, str) for identifier in ids)
+                or len(set(ids)) != len(ids)
+                or ids != sorted(ids)
+                or values is None
+            ):
+                raise ValueError(
+                    f"Event-State schema v6 embedding artifact {name} is invalid"
+                )
+            try:
+                matrix = np.asarray(values)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Event-State schema v6 embedding artifact {name} is invalid"
+                ) from exc
+            if (
+                matrix.ndim != 2
+                or matrix.dtype != cls.EMBEDDING_ARTIFACT_DTYPE
+                or descriptor.get("dtype") != str(cls.EMBEDDING_ARTIFACT_DTYPE)
+                or str(matrix.dtype) != descriptor.get("dtype")
+                or list(matrix.shape) != descriptor.get("shape")
+                or matrix.shape[0] != len(ids)
+                or set(ids) != expected_ids[name]
+            ):
+                raise ValueError(
+                    f"Event-State schema v6 embedding artifact {name} is inconsistent"
+                )
+            restored[name] = {
+                identifier: list(matrix[row].tolist())
+                for row, identifier in enumerate(ids)
+            }
+
+        store.episode_embeddings = restored["episode_embeddings"]
+        store.turn_embeddings = restored["turn_embeddings"]
+        store.claim_embeddings = restored["claim_embeddings"]
+        store.claim_slot_embeddings = restored["claim_slot_embeddings"]
 
     @classmethod
     def from_export(cls, state: Dict[str, Any]) -> "EventStateStore":
         if state.get("method") != "event_state":
             raise ValueError("Not an Event-State Hybrid Memory snapshot")
-        if state.get("schema_version") not in {4, cls.SCHEMA_VERSION}:
+        schema_version = state.get("schema_version")
+        if schema_version not in {*cls.LEGACY_INLINE_SCHEMA_VERSIONS, cls.SCHEMA_VERSION}:
             raise ValueError(
                 f"Event-State snapshot schema v{state.get('schema_version')} is incompatible with schema v{cls.SCHEMA_VERSION}; rebuild the memory snapshot."
             )
         if state.get("semantic_version") != cls.SEMANTIC_VERSION:
             raise ValueError("Event-State snapshot semantic version is incompatible; rebuild the memory snapshot.")
+        if schema_version == cls.SCHEMA_VERSION and any(
+            name in state for name in cls.EMBEDDING_ARTIFACT_NAMES
+        ):
+            raise ValueError(
+                "Event-State schema v6 snapshots must not include inline embedding maps"
+            )
         store = cls(state.get("context_id"))
         store.episodes = {item["episode_id"]: episode_from_dict(item) for item in state.get("episodes", [])}
         store.claims = {item["claim_id"]: claim_from_dict(item) for item in state.get("claims", [])}
@@ -263,6 +461,9 @@ class EventStateStore:
             if isinstance(value, dict)
         }
         store.rebuild_turn_metadata()
-        store.claim_embeddings = {key: list(value) for key, value in state.get("claim_embeddings", {}).items()}
-        store.claim_slot_embeddings = {key: list(value) for key, value in state.get("claim_slot_embeddings", {}).items()}
+        if schema_version == cls.SCHEMA_VERSION:
+            cls._restore_embedding_artifacts(store, state)
+        else:
+            store.claim_embeddings = {key: list(value) for key, value in state.get("claim_embeddings", {}).items()}
+            store.claim_slot_embeddings = {key: list(value) for key, value in state.get("claim_slot_embeddings", {}).items()}
         return store

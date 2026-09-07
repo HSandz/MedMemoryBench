@@ -167,6 +167,60 @@ def test_evaluate_persists_memory_build_before_reraising_later_failure():
     assert len(persisted) == 1
 
 
+def test_locomo_query_checkpoint_flushes_in_bounded_batches(tmp_path: Path):
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.output_dir = tmp_path
+    evaluator.method_config = SimpleNamespace(method_name="event_state")
+    evaluator.dataset_config = SimpleNamespace()
+    evaluator._query_checkpoint = {"results": {}}
+    evaluator._query_checkpoint_pending_writes = 0
+
+    write_calls = []
+    original_write = LoCoMoEvaluator._write_json_atomic
+
+    def count_writes(path, payload):
+        write_calls.append(path)
+        original_write(path, payload)
+
+    evaluator._write_json_atomic = count_writes
+    for index in range(26):
+        evaluator._record_completed_query("conv-1", MetricResult(
+            query_id=f"q-{index}", query_type="single_hop", score=1.0,
+            is_correct=True, model_output="answer", expected_answer="answer",
+            question="question",
+        ))
+
+    assert len(write_calls) == 1
+    evaluator._flush_query_checkpoint(force=True)
+    assert len(write_calls) == 2
+
+    payload = json.loads((tmp_path / "locomo_query_checkpoint.json").read_text())
+    assert len(payload["results"]["conv-1"]) == 26
+    assert payload["integrity_hash"] == evaluator._snapshot_integrity_hash(payload)
+
+
+def test_evaluate_flushes_dirty_query_checkpoint_before_reraising():
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator.method_config = SimpleNamespace(method_name="event_state")
+    evaluator.dry_run = False
+    evaluator.dataset = SimpleNamespace(get_evaluation_units=lambda: [])
+    evaluator._init_dataset = lambda: None
+    evaluator._load_query_checkpoint = lambda: None
+    evaluator._start_memory_snapshot_manifest = lambda units: None
+    evaluator._run_evaluation_loop = lambda units: (_ for _ in ()).throw(RuntimeError("query failed"))
+    evaluator._complete_memory_snapshot_manifest = lambda: None
+    evaluator._persist_memory_build_checkpoint = lambda started_at: None
+    evaluator._log = lambda *args, **kwargs: None
+    flush_calls = []
+    evaluator._flush_query_checkpoint = lambda *, force: flush_calls.append(force)
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        evaluator.evaluate()
+
+    assert flush_calls == [True]
+
+
 def test_selected_session_and_answer_visible_turn_metrics_are_distinct():
     evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
     query = LoCoMoQuery(

@@ -17,18 +17,68 @@ def claim(store, episode, value, subject="Alice", predicate="dose"):
     return Claim(store.stable_id("C", [episode, value, subject]), subject, subject.casefold(), predicate, value, evidence=[EvidenceRef(episode, episode, [1])])
 
 
+def _state_with_transient_artifacts(store):
+    state = store.export()
+    state["embedding_artifacts"] = store.export_embedding_artifacts()
+    return state
+
+
 def test_stable_ids_and_snapshot_round_trip_preserve_vectors():
     store = EventStateStore("patient")
     assert store.stable_id("E", [1, "x"]) == store.stable_id("E", [1, "x"])
     c = claim(store, "s1", "500 mg")
     c.state_slot = "medication_dose"
     store.add_claim(c, [1.0, 0.0], [0.0, 1.0])
-    restored = EventStateStore.from_export(store.export())
+    restored = EventStateStore.from_export(_state_with_transient_artifacts(store))
     assert restored.context_id == "patient"
     assert restored.claims[c.claim_id].value == "500 mg"
     assert restored.claim_embeddings[c.claim_id] == [1.0, 0.0]
     assert restored.claims[c.claim_id].state_slot == "medication_dose"
     assert restored.claim_slot_embeddings[c.claim_id] == [0.0, 1.0]
+
+
+def test_schema_v5_inline_snapshot_remains_readable():
+    store = EventStateStore("patient")
+    episode = Episode(
+        "E1",
+        "patient",
+        "source-1",
+        0,
+        None,
+        None,
+        ["Alice"],
+        "primary_user",
+        "",
+        "summary",
+        [TurnEvidence("t1", "Alice", "user", "source text")],
+    )
+    store.add_episode(episode, [0.125, -0.25], [[0.5, 0.75]])
+    store.add_claim(
+        Claim(
+            "C1",
+            "Alice",
+            "alice",
+            "dose",
+            "500 mg",
+            evidence=[EvidenceRef("E1", "source-1", ["t1"])],
+        ),
+        [0.25, -0.5],
+        [-0.75, 0.125],
+    )
+    artifacts = store.export_embedding_artifacts()
+    legacy = store.export()
+    legacy["schema_version"] = 5
+    legacy.pop("embedding_artifacts")
+    for name, descriptor in artifacts.items():
+        legacy[name] = {
+            identifier: descriptor["values"][row].tolist()
+            for row, identifier in enumerate(descriptor["ids"])
+        }
+
+    restored = EventStateStore.from_export(legacy)
+
+    for name in EventStateStore.EMBEDDING_ARTIFACT_NAMES:
+        assert getattr(restored, name) == getattr(store, name)
 
 
 def test_episode_store_rejects_reused_method_source_uid():
@@ -57,7 +107,7 @@ def test_history_claim_bypasses_state_compilation_and_slot_storage():
     assert compiler.state_candidate_no_match_count == 0
     assert compiler.update_llm_calls == 0
     assert not calls
-    restored = EventStateStore.from_export(store.export())
+    restored = EventStateStore.from_export(_state_with_transient_artifacts(store))
     assert restored.claims["HISTORY"].state_slot is None
     assert "HISTORY" not in restored.claim_slot_embeddings
 

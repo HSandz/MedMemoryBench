@@ -16,6 +16,10 @@ MEMORY_MANIFEST_VERSIONS = {
     "locomo.event_state_memory_manifest": {1, 2},
 }
 
+# Result payloads can include detailed retrieval diagnostics. Bound full
+# checkpoint serialization while preserving immediate memory-build markers.
+QUERY_CHECKPOINT_FLUSH_INTERVAL = 25
+
 
 def is_supported_memory_manifest(manifest: Dict[str, Any]) -> bool:
     """Return whether a staged-memory manifest uses a supported schema."""
@@ -112,6 +116,22 @@ class MedMemoryBenchCheckpointManager:
         self.config_hash = config_hash
         self._checkpoint: Optional[MedMemoryBenchCheckpoint] = None
         self.recovered_from_backup = False
+        self._pending_query_writes = 0
+        self._completed_query_ids: Dict[str, set[str]] = {}
+
+    def _rebuild_completed_query_ids(self) -> None:
+        if self._checkpoint is None:
+            self._completed_query_ids = {}
+            return
+        self._completed_query_ids = {
+            persona_key: {
+                str(result.get("query_id"))
+                for result in results
+                if isinstance(result, dict) and result.get("query_id") is not None
+            }
+            for persona_key, results in self._checkpoint.completed_results.items()
+            if isinstance(results, list)
+        }
 
     @property
     def checkpoint_path(self) -> Path:
@@ -147,6 +167,7 @@ class MedMemoryBenchCheckpointManager:
                 self._checkpoint = MedMemoryBenchCheckpoint.from_dict(data)
             except (TypeError, ValueError):
                 continue
+            self._rebuild_completed_query_ids()
             if is_backup:
                 self.recovered_from_backup = True
                 self._write_payload_atomic(self.checkpoint_path, data)
@@ -168,6 +189,15 @@ class MedMemoryBenchCheckpointManager:
         if current_payload is not None:
             self._write_payload_atomic(self.backup_path, current_payload)
         self._write_payload_atomic(self.checkpoint_path, payload)
+        self._pending_query_writes = 0
+
+    def flush_query_progress(self, *, force: bool = False) -> None:
+        """Durably save a bounded batch of completed query results."""
+        if not self._pending_query_writes or (
+            not force and self._pending_query_writes < QUERY_CHECKPOINT_FLUSH_INTERVAL
+        ):
+            return
+        self.save()
 
     @staticmethod
     def _compute_integrity_hash(payload: Dict[str, Any]) -> str:
@@ -248,6 +278,7 @@ class MedMemoryBenchCheckpointManager:
             total_personas=total_personas,
             total_queries=total_queries,
         )
+        self._rebuild_completed_query_ids()
         self.save()
         return self._checkpoint
 
@@ -352,13 +383,10 @@ class MedMemoryBenchCheckpointManager:
             return
 
         persona_key = str(persona_id)
-        existing_ids = [
-            result.get("query_id")
-            for result in self._checkpoint.completed_results.get(persona_key, [])
-        ]
-
-        if query_id not in existing_ids:
-            self._checkpoint.completed_query_count += 1
+        completed_ids = self._completed_query_ids.setdefault(persona_key, set())
+        if query_id in completed_ids:
+            return
+        self._checkpoint.completed_query_count += 1
 
         if (
             persona_id == self._checkpoint.current_persona_id
@@ -369,10 +397,10 @@ class MedMemoryBenchCheckpointManager:
         if persona_key not in self._checkpoint.completed_results:
             self._checkpoint.completed_results[persona_key] = []
 
-        if query_id not in existing_ids:
-            self._checkpoint.completed_results[persona_key].append(result_dict)
-
-        self.save()
+        self._checkpoint.completed_results[persona_key].append(result_dict)
+        completed_ids.add(query_id)
+        self._pending_query_writes += 1
+        self.flush_query_progress()
 
     def complete_persona(self, persona_id: int) -> None:
         if self._checkpoint is None:
@@ -413,10 +441,7 @@ class MedMemoryBenchCheckpointManager:
         if self._checkpoint is None:
             return False
         if persona_id is not None:
-            return any(
-                result.get("query_id") == query_id
-                for result in self._checkpoint.completed_results.get(str(persona_id), [])
-            )
+            return query_id in self._completed_query_ids.get(str(persona_id), set())
         return query_id in self._checkpoint.current_persona_completed_queries
 
     def get_completed_results(self) -> Dict[int, List[Dict[str, Any]]]:
@@ -464,6 +489,8 @@ class MedMemoryBenchCheckpointManager:
         ):
             path.unlink(missing_ok=True)
         self._checkpoint = None
+        self._pending_query_writes = 0
+        self._completed_query_ids = {}
 
 
 def _snapshot_dataset_config(dataset_config) -> Dict[str, Any]:

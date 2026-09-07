@@ -23,6 +23,8 @@ from src.evaluator import create_evaluator
 from src.agent import list_available_methods
 from benchmarks.medmemorybench.rejudge import rejudge_medmemorybench
 from benchmarks.medmemorybench.checkpoint import is_supported_memory_manifest
+from benchmarks.snapshot_artifacts import load_memory_state_embedding_artifacts
+from methods.event_state.store import EventStateStore
 from utils.logger import format_limited_traceback, truncate_error_message
 
 
@@ -344,27 +346,21 @@ def append_target_already_processed(
                     ).encode("utf-8")
                     if expected_integrity != hashlib.sha256(encoded).hexdigest():
                         continue
-                    embedding_state = (
-                        payload.get("memory_state", {})
-                        .get("system_state", {})
-                        .get("retriever", {})
-                        .get("embeddings")
-                    )
-                    if embedding_state is not None:
-                        embedding_name = embedding_state.get("path")
+                    memory_state = payload.get("memory_state")
+                    if not isinstance(memory_state, dict):
+                        continue
+                    try:
+                        load_memory_state_embedding_artifacts(
+                            memory_state, snapshot_path
+                        )
                         if (
-                            embedding_state.get("storage") != "npy"
-                            or not isinstance(embedding_name, str)
-                            or Path(embedding_name).name != embedding_name
+                            memory_state.get("method") == "event_state"
+                            and memory_state.get("schema_version")
+                            == EventStateStore.SCHEMA_VERSION
                         ):
-                            continue
-                        embedding_path = memory_dir / embedding_name
-                        try:
-                            digest = hashlib.sha256(embedding_path.read_bytes()).hexdigest()
-                        except OSError:
-                            continue
-                        if digest != embedding_state.get("sha256"):
-                            continue
+                            EventStateStore.from_export(memory_state)
+                    except ValueError:
+                        continue
                 return True
         except (TypeError, ValueError):
             continue

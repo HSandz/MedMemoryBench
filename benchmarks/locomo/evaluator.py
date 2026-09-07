@@ -5,14 +5,17 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Iterator, List, Optional, Tuple
 import logging
+
+from tqdm.auto import tqdm
 
 from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
@@ -20,7 +23,15 @@ from src.agent import AgentManager
 from src.result import EvaluationReport, ResultCollector
 from benchmarks.locomo.dataset import LoCoMoDataset, LoCoMoQuery, LoCoMoSession
 from benchmarks.base import EvaluationUnit
+from benchmarks.snapshot_artifacts import (
+    cleanup_memory_state_embedding_artifacts,
+    fsync_directory,
+    load_memory_state_embedding_artifacts,
+    memory_state_embedding_artifact_paths,
+    publish_memory_state_embedding_artifacts,
+)
 from methods.base import MemoryBuildResult
+from methods.event_state.store import EventStateStore
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.retrieval_quality import compute_session_retrieval_quality
 from utils.templates import get_prompt_manager
@@ -49,6 +60,10 @@ from benchmarks.medmemorybench.checkpoint import (
 # Default chunk size for memory injection (in characters)
 # ~32K chars ≈ 8K tokens, safe for GPT-5.1/Qwen3-235B (128K context)
 DEFAULT_MEMORY_CHUNK_SIZE = 32000
+
+# A LoCoMo result can retain substantial retrieval diagnostics. Writing the
+# entire resumable checkpoint for every completed answer is needlessly costly.
+LOCOMO_QUERY_CHECKPOINT_FLUSH_INTERVAL = 25
 
 
 class LoCoMoEvaluator:
@@ -124,6 +139,7 @@ class LoCoMoEvaluator:
         self._memory_snapshot_manifest: Optional[Dict[str, Any]] = None
         self._memory_snapshot_dir_path: Optional[Path] = None
         self._query_checkpoint: Dict[str, Any] = {"results": {}}
+        self._query_checkpoint_pending_writes = 0
         self._batch_retrieval_preparation_wall_time = 0.0
         self._memory_build_checkpoint_saved = False
 
@@ -223,6 +239,19 @@ class LoCoMoEvaluator:
             and self.agent_manager.supports_memory_snapshots()
         )
 
+    @staticmethod
+    def _export_event_state_for_transfer(manager, context_id: Any) -> Dict[str, Any]:
+        """Keep derived vectors available when cloning an in-process store."""
+        state = manager.export_memory_state(context_id=context_id)
+        binary_artifact_exporter = getattr(
+            manager, "export_memory_binary_artifacts", None
+        )
+        if callable(binary_artifact_exporter):
+            binary_artifacts = binary_artifact_exporter(context_id=context_id)
+            if binary_artifacts:
+                state["embedding_artifacts"] = binary_artifacts
+        return state
+
     def _memory_snapshot_root(self) -> Path:
         if self.memory_source_run_dir is not None:
             return self.memory_source_run_dir / "memory"
@@ -244,12 +273,43 @@ class LoCoMoEvaluator:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+        fsync_directory(path.parent)
 
     def _snapshot_path(self, unit: EvaluationUnit) -> Path:
         if self._memory_snapshot_dir_path is None:
             raise RuntimeError("LoCoMo memory snapshot run has not been selected")
         safe_sample = str(unit.context_id).replace("/", "-").replace("\\", "-")
         return self._memory_snapshot_dir_path / f"sample_{unit.unit_id}_{safe_sample}.json"
+
+    @staticmethod
+    def _measure_snapshot_memory_size(
+        payload: Dict[str, Any],
+        snapshot_path: Path,
+    ) -> Dict[str, Any]:
+        """Measure one Event-State JSON state plus its dense sidecars."""
+        memory_state = payload.get("memory_state") or {}
+        if not isinstance(memory_state, dict):
+            raise ValueError("LoCoMo snapshot memory state is invalid")
+        json_bytes = len(json.dumps(
+            memory_state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+        embedding_bytes = sum(
+            artifact_path.stat().st_size
+            for artifact_path in memory_state_embedding_artifact_paths(
+                memory_state, snapshot_path
+            )
+            if artifact_path.is_file()
+        )
+        total_bytes = json_bytes + embedding_bytes
+        return {
+            "measurement": "serialized_memory_state",
+            "bytes": total_bytes,
+            "mib": round(total_bytes / (1024 ** 2), 6),
+            "json_bytes": json_bytes,
+            "embedding_bytes": embedding_bytes,
+        }
 
     def _start_memory_snapshot_manifest(self, units: List[EvaluationUnit]) -> None:
         path = self._memory_snapshot_root()
@@ -315,6 +375,14 @@ class LoCoMoEvaluator:
 
     def _write_memory_snapshot(self, unit: EvaluationUnit, build_time: float, build_metrics: Dict[str, Any]) -> Path:
         path = self._snapshot_path(unit)
+        memory_state = self.agent_manager.export_memory_state(context_id=unit.context_id)
+        binary_artifact_exporter = getattr(
+            self.agent_manager, "export_memory_binary_artifacts", None
+        )
+        if callable(binary_artifact_exporter):
+            binary_artifacts = binary_artifact_exporter(context_id=unit.context_id)
+            if binary_artifacts:
+                memory_state["embedding_artifacts"] = binary_artifacts
         payload = {
             "format": "locomo.event_state_memory_snapshot",
             "version": 2,
@@ -326,20 +394,31 @@ class LoCoMoEvaluator:
             "memory_build_time": build_time,
             "memory_build_metrics": build_metrics,
             "created_at": datetime.now().isoformat(),
-            "memory_state": self.agent_manager.export_memory_state(context_id=unit.context_id),
+            "memory_state": memory_state,
         }
+        publish_memory_state_embedding_artifacts(memory_state, path)
+        payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
         payload["integrity_hash"] = self._snapshot_integrity_hash(payload)
         self._write_json_atomic(path, payload)
+        cleanup_memory_state_embedding_artifacts(memory_state, path)
         record = {
             "sample_id": str(unit.context_id), "unit_id": unit.unit_id,
             "path": path.name, "integrity_hash": payload["integrity_hash"],
             "session_count": len(unit.sessions_to_inject), "memory_build_time": build_time,
             "memory_build_metrics": build_metrics,
+            "memory_size": payload["memory_size"],
         }
         records = self._memory_snapshot_manifest["snapshots"]
         records[:] = [item for item in records if str(item.get("sample_id")) != str(unit.context_id)]
         records.append(record)
         records.sort(key=lambda item: item["unit_id"])
+        for log in reversed(getattr(self, "_memory_build_logs", [])):
+            if (
+                log.get("unit_id") == unit.unit_id
+                and log.get("context_id") == unit.context_id
+            ):
+                log["memory_size"] = dict(payload["memory_size"])
+                break
         self._write_json_atomic(self._memory_snapshot_dir_path / "manifest.json", self._memory_snapshot_manifest)
         return path
 
@@ -360,6 +439,13 @@ class LoCoMoEvaluator:
             or payload.get("integrity_hash") != self._snapshot_integrity_hash(payload)
         ):
             raise ValueError(f"LoCoMo snapshot integrity or identity check failed: {path}")
+        payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
+        memory_state = payload.get("memory_state")
+        if not isinstance(memory_state, dict):
+            raise ValueError(f"LoCoMo snapshot state is invalid: {path}")
+        load_memory_state_embedding_artifacts(memory_state, path)
+        if memory_state.get("schema_version") == EventStateStore.SCHEMA_VERSION:
+            EventStateStore.from_export(memory_state)
         return payload
 
     def _complete_memory_snapshot_manifest(self) -> None:
@@ -407,6 +493,18 @@ class LoCoMoEvaluator:
         if result.query_id in results:
             return
         results[result.query_id] = result.to_dict()
+        self._query_checkpoint_pending_writes = (
+            getattr(self, "_query_checkpoint_pending_writes", 0) + 1
+        )
+        self._flush_query_checkpoint()
+
+    def _flush_query_checkpoint(self, *, force: bool = False) -> None:
+        """Durably save newly completed queries in bounded batches."""
+        pending_writes = getattr(self, "_query_checkpoint_pending_writes", 0)
+        if not pending_writes or (
+            not force and pending_writes < LOCOMO_QUERY_CHECKPOINT_FLUSH_INTERVAL
+        ):
+            return
         self._query_checkpoint.update({
             "format": "locomo.query_checkpoint",
             "version": 1,
@@ -414,6 +512,7 @@ class LoCoMoEvaluator:
         })
         self._query_checkpoint["integrity_hash"] = self._snapshot_integrity_hash(self._query_checkpoint)
         self._write_json_atomic(self._query_checkpoint_path(), self._query_checkpoint)
+        self._query_checkpoint_pending_writes = 0
 
     def evaluate(self) -> EvaluationReport:
         start_time = datetime.now()
@@ -433,6 +532,7 @@ class LoCoMoEvaluator:
                     self._start_memory_snapshot_manifest(units)
 
             self._run_evaluation_loop(units)
+            self._flush_query_checkpoint(force=True)
             if (
                 self.method_config.method_name.lower() == "event_state"
                 and not self.dry_run
@@ -440,6 +540,14 @@ class LoCoMoEvaluator:
             ):
                 self._complete_memory_snapshot_manifest()
         except BaseException:
+            try:
+                self._flush_query_checkpoint(force=True)
+            except Exception as checkpoint_error:
+                self._log(
+                    "Unable to save LoCoMo query checkpoint: "
+                    f"{truncate_error_message(checkpoint_error)}",
+                    level="WARNING",
+                )
             try:
                 self._persist_memory_build_checkpoint(start_time)
             except Exception as checkpoint_error:
@@ -824,6 +932,7 @@ class LoCoMoEvaluator:
                 "final_store": self._event_state_store_diagnostics(
                     snapshot_state, len(unit.sessions_to_inject)
                 ), "restored_from_snapshot": True,
+                "memory_size": dict(existing.get("memory_size") or {}),
             })
         else:
             started = time.time()
@@ -926,7 +1035,7 @@ class LoCoMoEvaluator:
         if getattr(getattr(self, "method_config", None), "method_name", "").lower() == "event_state":
             # Event-State retrieval is logically read-only, but separate stores
             # make that guarantee explicit and keep future adapter changes safe.
-            state = manager.export_memory_state(context_id=context_id)
+            state = self._export_event_state_for_transfer(manager, context_id)
 
             def evaluate_isolated(query: LoCoMoQuery) -> MetricResult:
                 isolated = AgentManager(
@@ -1090,7 +1199,9 @@ class LoCoMoEvaluator:
             getattr(self.method_config, "method_name", "").lower() == "event_state"
             and self.agent_manager is not None
         ):
-            event_state_snapshot = self.agent_manager.export_memory_state(unit.context_id)
+            event_state_snapshot = self._export_event_state_for_transfer(
+                self.agent_manager, unit.context_id
+            )
 
         def prepare_item(item):
             query, _, _, batch_request_time, prepared = item
@@ -1168,10 +1279,10 @@ class LoCoMoEvaluator:
 
         return prepared_count
 
-    def _complete_combined_batch_queries(self) -> List[Dict[str, Any]]:
-        """Submit all LoCoMo final-answer prompts as one Vertex stage."""
+    def _complete_combined_batch_queries(self) -> Iterator[Dict[str, Any]]:
+        """Submit one Vertex stage and stream local finalization results."""
         if not self._pending_batch_queries:
-            return []
+            return
 
         stage = "query-final"
         batch_client = self._get_batch_client()
@@ -1184,41 +1295,55 @@ class LoCoMoEvaluator:
             "final-answer request(s) from all prepared samples."
         )
         responses = batch_client.run_stage(stage, requests)
-        finalized: List[Dict[str, Any]] = []
-
-        for item in self._pending_batch_queries:
-            request = item["request"]
-            query = item["query"]
-            batch_response = responses.get(request.request_id)
-            if batch_response is None or batch_response.status:
-                error = batch_response.status if batch_response else "No output row returned"
-                result = self._api_error_result(
-                    query,
-                    f"Batch request failed: {truncate_error_message(error)}",
-                )
-            else:
-                response = self.agent_manager.finalize_batch_query(
-                    item["prepared"],
-                    batch_response.content,
-                    input_tokens=batch_response.input_tokens,
-                    output_tokens=batch_response.output_tokens,
-                )
-                result = self._score_agent_response(query, response)
-                if hasattr(result, "details"):
-                    result.details.setdefault("execution_usage", {})["answer"] = {
-                        "transport": "batch",
-                        "input_tokens": batch_response.input_tokens,
-                        "output_tokens": batch_response.output_tokens,
-                    }
-
-            result.memory_construction_time = item["memory_time_per_query"]
-            finalized.append({
-                "sample_id": item["sample_id"],
-                "result": result,
-            })
-
+        pending_items = self._pending_batch_queries
         self._pending_batch_queries = []
-        return finalized
+        self._log(
+            f"[Vertex] Stage '{stage}': finalizing {len(pending_items):,} response(s) "
+            f"locally; checkpoint flush interval is "
+            f"{LOCOMO_QUERY_CHECKPOINT_FLUSH_INTERVAL:,} answer(s)."
+        )
+        progress = tqdm(
+            total=len(pending_items),
+            desc="Finalizing batch answers",
+            unit="answer",
+            dynamic_ncols=True,
+            file=sys.stdout,
+            disable=not getattr(self, "verbose", True),
+        )
+        try:
+            for item in pending_items:
+                request = item["request"]
+                query = item["query"]
+                batch_response = responses.get(request.request_id)
+                if batch_response is None or batch_response.status:
+                    error = batch_response.status if batch_response else "No output row returned"
+                    result = self._api_error_result(
+                        query,
+                        f"Batch request failed: {truncate_error_message(error)}",
+                    )
+                else:
+                    response = self.agent_manager.finalize_batch_query(
+                        item["prepared"],
+                        batch_response.content,
+                        input_tokens=batch_response.input_tokens,
+                        output_tokens=batch_response.output_tokens,
+                    )
+                    result = self._score_agent_response(query, response)
+                    if hasattr(result, "details"):
+                        result.details.setdefault("execution_usage", {})["answer"] = {
+                            "transport": "batch",
+                            "input_tokens": batch_response.input_tokens,
+                            "output_tokens": batch_response.output_tokens,
+                        }
+
+                result.memory_construction_time = item["memory_time_per_query"]
+                progress.update(1)
+                yield {
+                    "sample_id": item["sample_id"],
+                    "result": result,
+                }
+        finally:
+            progress.close()
 
     def _evaluate_query(
         self,
@@ -1877,24 +2002,57 @@ class LoCoMoEvaluator:
         })
         return summary
 
-    def _event_state_memory_size(self) -> Dict[str, int]:
-        """Report compact final-store cardinalities for Event-State LoCoMo runs."""
+    def _event_state_memory_size(self) -> Dict[str, Any]:
+        """Report final-store cardinalities and latest persisted snapshot bytes."""
         totals = {
             "final_episode_count": 0,
             "final_claim_count": 0,
             "final_memory_object_count": 0,
         }
         found_diagnostics = False
+        latest_serialized_sizes: Dict[str, Dict[str, Any]] = {}
         for log in self._memory_build_logs:
             diagnostics = log.get("final_store") or log.get("build_metrics")
-            if not isinstance(diagnostics, dict):
-                continue
-            if not any(field in diagnostics for field in totals):
-                continue
-            found_diagnostics = True
-            for field in totals:
-                totals[field] += int(diagnostics.get(field, 0) or 0)
-        return totals if found_diagnostics else {}
+            if isinstance(diagnostics, dict) and any(
+                field in diagnostics for field in totals
+            ):
+                found_diagnostics = True
+                for field in totals:
+                    totals[field] += int(diagnostics.get(field, 0) or 0)
+            serialized_size = log.get("memory_size")
+            if (
+                isinstance(serialized_size, dict)
+                and serialized_size.get("measurement") == "serialized_memory_state"
+            ):
+                latest_serialized_sizes[str(log.get("context_id"))] = serialized_size
+
+        if not found_diagnostics and not latest_serialized_sizes:
+            return {}
+        result: Dict[str, Any] = totals if found_diagnostics else {}
+        if latest_serialized_sizes:
+            result.update({
+                "serialized_memory_bytes": sum(
+                    int(item.get("bytes", 0) or 0)
+                    for item in latest_serialized_sizes.values()
+                ),
+                "serialized_memory_json_bytes": sum(
+                    int(item.get("json_bytes", 0) or 0)
+                    for item in latest_serialized_sizes.values()
+                ),
+                "serialized_memory_embedding_bytes": sum(
+                    int(item.get("embedding_bytes", 0) or 0)
+                    for item in latest_serialized_sizes.values()
+                ),
+                "serialized_memory_mib": round(
+                    sum(
+                        int(item.get("bytes", 0) or 0)
+                        for item in latest_serialized_sizes.values()
+                    ) / (1024 ** 2),
+                    6,
+                ),
+                "serialized_memory_context_count": len(latest_serialized_sizes),
+            })
+        return result
 
     def _event_state_feature_configuration(self) -> Dict[str, Any]:
         """Expose the compact effective settings needed to interpret an artifact."""

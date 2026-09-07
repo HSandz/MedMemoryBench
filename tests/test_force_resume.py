@@ -180,6 +180,37 @@ def test_integrity_mismatch_recovers_previous_good_checkpoint(tmp_path: Path):
     assert recovered.get_resume_info()["completed_queries"] == 0
 
 
+def test_query_results_flush_in_bounded_batches(tmp_path: Path):
+    manager = _manager(tmp_path, "hash")
+    manager.create(total_personas=1, total_queries=26, evaluation_mode="independent")
+    manager.start_persona(1)
+
+    save_calls = []
+    original_save = manager.save
+
+    def count_saves():
+        save_calls.append(True)
+        original_save()
+
+    manager.save = count_saves
+    for index in range(26):
+        manager.mark_query_completed(
+            f"q-{index}", {"query_id": f"q-{index}"}, persona_id=1,
+        )
+
+    assert len(save_calls) == 1
+    assert manager.is_query_completed("q-25", persona_id=1) is True
+    payload = json.loads(manager.checkpoint_path.read_text(encoding="utf-8"))
+    assert len(payload["completed_results"]["1"]) == 25
+
+    manager.flush_query_progress(force=True)
+    assert len(save_calls) == 2
+    resumed = _manager(tmp_path, "hash")
+    assert resumed.load() is not None
+    assert resumed.get_resume_info()["completed_queries"] == 26
+    assert resumed.is_query_completed("q-25", persona_id=1) is True
+
+
 def test_unfinished_session_marker_is_rolled_back_for_retry(tmp_path: Path):
     manager = _manager(tmp_path, "hash")
     manager.create(total_personas=1, total_queries=2, evaluation_mode="independent")

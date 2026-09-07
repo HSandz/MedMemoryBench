@@ -20,10 +20,19 @@ from tqdm.auto import tqdm
 from src.config import MethodConfig, DatasetConfig, PROJECT_ROOT, get_api_config
 from src.evaluator import register_evaluator
 from src.agent import AgentManager, AgentResponse, MemoryBuildResult
+from methods.event_state.store import EventStateStore
 from methods.event_state.subjects import normalize_scope
 from src.result import EvaluationReport, ResultCollector
 from benchmarks.medmemorybench.dataset import MedMemoryBenchDataset, MedQuery, MedSession
 from benchmarks.base import EvaluationUnit
+from benchmarks.snapshot_artifacts import (
+    cleanup_memory_state_embedding_artifacts,
+    file_sha256,
+    fsync_directory,
+    load_memory_state_embedding_artifacts,
+    memory_state_embedding_artifact_paths,
+    publish_memory_state_embedding_artifacts,
+)
 from metrics import MetricsCalculator, MetricsAggregator, MetricResult
 from metrics.retrieval_quality import (
     RETRIEVAL_QUALITY_GROUP,
@@ -1533,11 +1542,7 @@ class MedMemoryBenchEvaluator:
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        return file_sha256(path)
 
     def _write_memory_snapshot_manifest(self) -> None:
         if self._memory_snapshot_manifest is None:
@@ -1555,16 +1560,7 @@ class MedMemoryBenchEvaluator:
     @staticmethod
     def _fsync_directory(path: Path) -> None:
         """Make a completed atomic replacement durable on supported filesystems."""
-        try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            pass
-        finally:
-            os.close(descriptor)
+        fsync_directory(path)
 
     @staticmethod
     def _new_memory_run_name() -> str:
@@ -2035,17 +2031,13 @@ class MedMemoryBenchEvaluator:
             separators=(",", ":"),
         ).encode("utf-8"))
         system_state = memory_state.get("system_state") or {}
-        embedding_state = (system_state.get("retriever") or {}).get("embeddings")
-        embedding_bytes = 0
-        if isinstance(embedding_state, dict):
-            embedding_name = embedding_state.get("path")
-            if (
-                isinstance(embedding_name, str)
-                and Path(embedding_name).name == embedding_name
-            ):
-                embedding_path = snapshot_path.parent / embedding_name
-                if embedding_path.is_file():
-                    embedding_bytes = embedding_path.stat().st_size
+        embedding_bytes = sum(
+            artifact_path.stat().st_size
+            for artifact_path in memory_state_embedding_artifact_paths(
+                memory_state, snapshot_path
+            )
+            if artifact_path.is_file()
+        )
         memory_entries = system_state.get("memories") or []
         memory_chunks = (memory_state.get("agent_state") or {}).get(
             "memory_chunks"
@@ -2068,34 +2060,10 @@ class MedMemoryBenchEvaluator:
     ) -> Dict[str, Any]:
         """Publish a snapshot without invalidating the previous generation."""
         payload = copy.deepcopy(payload)
-        embedding_state = (
-            payload.get("memory_state", {})
-            .get("system_state", {})
-            .get("retriever", {})
-            .get("embeddings")
-        )
-        published_embedding_path: Optional[Path] = None
-        if embedding_state is not None:
-            embedding_values = np.asarray(embedding_state.pop("values"))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_embedding_path = path.parent / (
-                f".{path.stem}.embeddings.{uuid.uuid4().hex}.tmp"
-            )
-            with temporary_embedding_path.open("wb") as handle:
-                np.save(handle, embedding_values, allow_pickle=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            embedding_sha256 = self._file_sha256(temporary_embedding_path)
-            published_embedding_path = path.parent / (
-                f"{path.stem}.embeddings.{embedding_sha256}.npy"
-            )
-            os.replace(temporary_embedding_path, published_embedding_path)
-            self._fsync_directory(path.parent)
-            embedding_state.update({
-                "storage": "npy",
-                "path": published_embedding_path.name,
-                "sha256": embedding_sha256,
-            })
+        memory_state = payload.get("memory_state")
+        if not isinstance(memory_state, dict):
+            raise ValueError("Memory snapshot state is invalid")
+        publish_memory_state_embedding_artifacts(memory_state, path)
 
         payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
         payload["integrity_hash"] = self._snapshot_integrity_hash(payload)
@@ -2107,19 +2075,7 @@ class MedMemoryBenchEvaluator:
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
         self._fsync_directory(path.parent)
-
-        referenced_embedding = (
-            published_embedding_path.name
-            if published_embedding_path is not None
-            else None
-        )
-        embedding_candidates = list(
-            path.parent.glob(f"{path.stem}.embeddings.*.npy")
-        )
-        embedding_candidates.append(path.with_suffix(".embeddings.npy"))
-        for candidate in embedding_candidates:
-            if candidate.name != referenced_embedding:
-                candidate.unlink(missing_ok=True)
+        cleanup_memory_state_embedding_artifacts(memory_state, path)
         return payload
 
     def _read_snapshot_payload(
@@ -2194,34 +2150,17 @@ class MedMemoryBenchEvaluator:
                 f"{self._memory_method_label()} snapshot payload query configuration does not match: {path}"
             )
         payload["memory_size"] = self._measure_snapshot_memory_size(payload, path)
-        embedding_state = (
-            payload.get("memory_state", {})
-            .get("system_state", {})
-            .get("retriever", {})
-            .get("embeddings")
-        )
-        if embedding_state is not None:
-            if embedding_state.get("storage") != "npy":
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot metadata is invalid: {path}"
-                )
-            embedding_path = path.parent / embedding_state["path"]
-            if (
-                not embedding_path.exists()
-                or self._file_sha256(embedding_path) != embedding_state.get("sha256")
-            ):
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot integrity check failed: {embedding_path}"
-                )
-            embedding_values = np.load(embedding_path, allow_pickle=False)
-            if (
-                str(embedding_values.dtype) != embedding_state.get("dtype")
-                or list(embedding_values.shape) != embedding_state.get("shape")
-            ):
-                raise ValueError(
-                    f"{self._memory_method_label()} embedding snapshot shape or dtype is invalid: {embedding_path}"
-                )
-            embedding_state["values"] = embedding_values
+        memory_state = payload.get("memory_state")
+        if not isinstance(memory_state, dict):
+            raise ValueError(f"{self._memory_method_label()} snapshot state is invalid: {path}")
+        load_memory_state_embedding_artifacts(memory_state, path)
+        if (
+            memory_state.get("method") == "event_state"
+            and memory_state.get("schema_version") == EventStateStore.SCHEMA_VERSION
+        ):
+            # Validate Event-State's semantic ID mappings before append/resume
+            # can copy an otherwise syntactically valid sidecar set.
+            EventStateStore.from_export(memory_state)
         return payload
 
     def _write_memory_snapshot(
@@ -2233,6 +2172,13 @@ class MedMemoryBenchEvaluator:
         """Persist the exact post-build state, then atomically publish it."""
         path = self._memory_snapshot_path(unit)
         state = self.agent_manager.export_memory_state(context_id=unit.context_id)
+        binary_artifact_exporter = getattr(
+            self.agent_manager, "export_memory_binary_artifacts", None
+        )
+        if callable(binary_artifact_exporter):
+            binary_artifacts = binary_artifact_exporter(context_id=unit.context_id)
+            if binary_artifacts:
+                state["embedding_artifacts"] = binary_artifacts
         payload = {
             "format": "medmemorybench.memory_snapshot",
             "version": 1,
@@ -2459,6 +2405,13 @@ class MedMemoryBenchEvaluator:
             for item in getattr(self, "_deferred_judges", [])
         )
 
+    def _flush_query_checkpoint(self) -> None:
+        """Flush supported checkpoint managers without constraining test adapters."""
+        checkpoint_manager = getattr(self, "_checkpoint_manager", None)
+        flush = getattr(checkpoint_manager, "flush_query_progress", None)
+        if callable(flush):
+            flush(force=True)
+
     def evaluate(self) -> EvaluationReport:
         start_time = datetime.now()
 
@@ -2502,6 +2455,8 @@ class MedMemoryBenchEvaluator:
             finally:
                 self._finish_query_progress()
 
+            self._flush_query_checkpoint()
+
             if (
                 self.execution_stage in {"all", "memory"}
                 and not self.dry_run
@@ -2517,6 +2472,15 @@ class MedMemoryBenchEvaluator:
                 self._checkpoint_manager.delete()
                 self._log("Memory build completed, checkpoint deleted")
         except BaseException:
+            try:
+                self._flush_query_checkpoint()
+            except Exception as checkpoint_error:
+                self._log(
+                    "Unable to save MedMemoryBench query checkpoint: "
+                    f"{truncate_error_message(checkpoint_error)}",
+                    level="WARNING",
+                    terminal=False,
+                )
             try:
                 self._persist_memory_build_checkpoint(start_time)
             except Exception as checkpoint_error:

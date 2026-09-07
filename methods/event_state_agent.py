@@ -1307,17 +1307,25 @@ class EventStateAgent(BaseAgent):
     def export_memory_state(self, context_id=None):
         return self._store(context_id).export()
 
+    def export_memory_binary_artifacts(self, context_id=None):
+        """Return derived dense indexes for snapshot-sidecar publication."""
+        return self._store(context_id).export_embedding_artifacts()
+
     def import_memory_state(self, state, context_id=None):
         stored_context = state.get("context_id")
         key = context_id if context_id is not None else (self._context_id if self._context_id is not None else stored_context)
         restored = EventStateStore.from_export(state)
-        missing_turn_keys = [
-            key for key in restored.turn_metadata
-            if key not in restored.turn_embeddings
-        ]
+        missing_turn_keys = (
+            [
+                turn_key for turn_key in restored.turn_metadata
+                if turn_key not in restored.turn_embeddings
+            ]
+            if state.get("schema_version") == 4
+            else []
+        )
         if missing_turn_keys:
-            # Older snapshots retain immutable evidence but predate the turn
-            # vectors. Reconstruct only this derived query index on restore.
+            # Schema v4 retains immutable evidence but predates the turn-vector
+            # index. Schema v6 must always load its persisted sidecars instead.
             texts = []
             valid_keys = []
             for key in missing_turn_keys:

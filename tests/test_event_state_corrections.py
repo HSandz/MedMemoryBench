@@ -185,6 +185,7 @@ def test_schema_v1_is_rejected_and_context_fallback_uses_stored_id():
         EventStateStore.from_export({"method": "event_state", "schema_version": 2})
     agent = EventStateAgent(llm_client=SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(content="ok")), memory_llm_client=SimpleNamespace(chat=lambda messages, **kwargs: SimpleNamespace(content="ok")), embedding_client=Embedder())
     state = store.export()
+    state["embedding_artifacts"] = store.export_embedding_artifacts()
     agent.import_memory_state(state)
     assert agent._context_id == "stored"
 

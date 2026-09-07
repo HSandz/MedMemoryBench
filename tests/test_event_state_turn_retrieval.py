@@ -133,7 +133,14 @@ def test_global_turn_index_recovers_late_unclaimed_turn_and_snapshot_restore():
     assert prepared["extra"]["selected_raw_turn_count"] == 1
 
     legacy_state = agent.export_memory_state()
+    artifacts = agent.export_memory_binary_artifacts()
     legacy_state["schema_version"] = 4
+    legacy_state.pop("embedding_artifacts")
+    for name, descriptor in artifacts.items():
+        legacy_state[name] = {
+            identifier: descriptor["values"][row].tolist()
+            for row, identifier in enumerate(descriptor["ids"])
+        }
     legacy_state.pop("turn_embeddings")
     legacy_state.pop("turn_metadata")
     restored = EventStateAgent(

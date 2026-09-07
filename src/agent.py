@@ -944,6 +944,25 @@ class AgentManager:
             self.set_context_id(context_id)
         return self._agent.export_memory_state(context_id=context_id)
 
+    def export_memory_binary_artifacts(
+        self,
+        context_id: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return optional named binary artifacts for snapshot publication."""
+        if not self.supports_memory_snapshots():
+            raise RuntimeError(f"{self.method_name} does not support memory snapshots")
+        exporter = getattr(self._agent, "export_memory_binary_artifacts", None)
+        if not callable(exporter):
+            return {}
+        if context_id is not None:
+            self.set_context_id(context_id)
+        artifacts = exporter(context_id=context_id)
+        if artifacts is None:
+            return {}
+        if not isinstance(artifacts, dict):
+            raise ValueError(f"{self.method_name} binary snapshot artifacts are invalid")
+        return artifacts
+
     def import_memory_state(
         self,
         state: Dict[str, Any],

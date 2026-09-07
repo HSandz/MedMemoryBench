@@ -147,8 +147,25 @@ def test_combined_batch_progress_completes_before_deferred_judging():
     assert progress.updates == [1, 1]
 
 
-def test_locomo_combines_samples_into_one_final_answer_stage():
+def test_locomo_combines_samples_into_one_final_answer_stage(monkeypatch):
+    class Progress:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.updates = []
+            self.closed = False
+            self.instances.append(self)
+
+        def update(self, count):
+            self.updates.append(count)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("benchmarks.locomo.evaluator.tqdm", Progress)
     evaluator = _evaluator_state(LoCoMoEvaluator.__new__(LoCoMoEvaluator))
+    evaluator.verbose = True
     evaluator._score_agent_response = lambda query, response: SimpleNamespace(
         query_id=query.query_id,
         query_type=query.query_type,
@@ -165,12 +182,15 @@ def test_locomo_combines_samples_into_one_final_answer_stage():
         EvaluationUnit(1, [], [_query("q1")], context_id="sample-b"),
         memory_time_per_query=4.0,
     )
-    finalized = evaluator._complete_combined_batch_queries()
+    finalized = list(evaluator._complete_combined_batch_queries())
 
     assert len(evaluator._batch_client.calls) == 1
     assert evaluator._batch_client.calls[0][0] == "query-final"
     assert [item["sample_id"] for item in finalized] == ["sample-a", "sample-b"]
     assert [item["result"].memory_construction_time for item in finalized] == [3.0, 4.0]
+    assert Progress.instances[0].kwargs["total"] == 2
+    assert Progress.instances[0].updates == [1, 1]
+    assert Progress.instances[0].closed is True
 
 
 def test_checkpoint_tracks_combined_results_by_persona(tmp_path: Path):

@@ -16,8 +16,12 @@ import pytest
 
 from benchmarks.base import EvaluationUnit
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from benchmarks.snapshot_artifacts import file_sha256
 from methods.amem_agent import AMemAgent
 from methods.amem_test_agent import AMemTestAgent
+from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
+from methods.event_state.store import EventStateStore
+from methods.event_state_agent import EventStateAgent
 from src.result import EvaluationReport, ResultCollector
 
 
@@ -321,6 +325,9 @@ class _StageManager:
     def supports_memory_snapshots(self):
         return True
 
+    def supports_staged_queries(self):
+        return True
+
     def set_context_id(self, context_id):
         self.context_id = context_id
 
@@ -414,6 +421,8 @@ def _staged_evaluator(tmp_path: Path, manager: _StageManager):
 def _unit(unit_id: int, session_id: int, content: str, query_id: str):
     session = SimpleNamespace(
         session_id=session_id,
+        source_uid=None,
+        conversation_scope="primary_user",
         timestamp=None,
         metadata={},
         to_memory_text=lambda: content,
@@ -430,6 +439,100 @@ def _unit(unit_id: int, session_id: int, content: str, query_id: str):
         queries_to_evaluate=[query],
         metadata={"eval_session_id": session_id},
     )
+
+
+class _NoReembedder:
+    def __init__(self):
+        self.document_calls = []
+
+    def embed_documents(self, texts):
+        self.document_calls.append(list(texts))
+        raise AssertionError("schema-v6 sidecars must restore without re-embedding")
+
+    def embed_query(self, text):
+        return [1.0, 0.0]
+
+
+def _event_state_snapshot_agent(context_id=1):
+    embedder = _NoReembedder()
+    llm = SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="ok"))
+    agent = EventStateAgent(
+        llm_client=llm,
+        memory_llm_client=llm,
+        embedding_client=embedder,
+    )
+    agent.set_context_id(context_id)
+    store = agent._store(context_id)
+    episode = Episode(
+        "E-snapshot",
+        context_id,
+        "source-1",
+        0,
+        None,
+        "2024-01-01",
+        ["User"],
+        "primary_user",
+        "raw episode",
+        "episode summary",
+        [
+            TurnEvidence("t1", "User", "user", "first source turn"),
+            TurnEvidence("t2", "User", "user", "second source turn"),
+        ],
+    )
+    store.add_episode(
+        episode,
+        [0.125, -0.75],
+        [[0.5, 0.25], [-0.125, 0.875]],
+    )
+    state_claim = Claim(
+        "C-state",
+        "User",
+        "primary_user",
+        "medication",
+        "dose 5 mg",
+        evidence=[EvidenceRef(episode.episode_id, "source-1", ["t1"])],
+    )
+    history_claim = Claim(
+        "C-history",
+        "User",
+        "primary_user",
+        "former_medication",
+        "dose 2 mg",
+        persistence="history",
+        evidence=[EvidenceRef(episode.episode_id, "source-1", ["t2"])],
+    )
+    store.add_claim(state_claim, [0.25, -0.5], [-0.625, 0.375])
+    store.add_claim(history_claim, [-0.875, 0.125])
+    return agent, store, embedder
+
+
+def _event_state_snapshot_evaluator(tmp_path: Path):
+    agent, store, embedder = _event_state_snapshot_agent()
+    manager = SimpleNamespace(
+        supports_memory_snapshots=lambda: True,
+        export_memory_state=agent.export_memory_state,
+        export_memory_binary_artifacts=agent.export_memory_binary_artifacts,
+        import_memory_state=agent.import_memory_state,
+    )
+    evaluator = _staged_evaluator(tmp_path, manager)
+    evaluator.method_config.method_name = "event_state"
+    evaluator.method_config.raw_config = {"method": "event_state"}
+    evaluator._memory_snapshot_manifest.update({
+        "method_name": "event_state",
+        "config_hash": evaluator._batch_config_hash(),
+        "build_config_hash": evaluator._batch_config_hash(),
+    })
+    return evaluator, agent, store, embedder
+
+
+def _event_state_embedding_maps(store):
+    return {
+        name: {
+            identifier: list(vector)
+            for identifier, vector in getattr(store, name).items()
+        }
+        for name in EventStateStore.EMBEDDING_ARTIFACT_NAMES
+    }
 
 
 def test_evaluator_orders_build_save_load_retrieve_answer_and_isolates_units(tmp_path: Path):
@@ -466,7 +569,7 @@ def test_evaluator_orders_build_save_load_retrieve_answer_and_isolates_units(tmp
     assert evaluator._memory_build_logs[1]["memory_snapshot"].endswith("persona_1_unit_1.json")
 
 
-def test_medmemorybench_passes_source_ids_only_to_amem_test(tmp_path: Path):
+def test_medmemorybench_passes_source_ids_to_memory_adapters(tmp_path: Path):
     class _SourceManager(_StageManager):
         def __init__(self):
             super().__init__()
@@ -480,6 +583,8 @@ def test_medmemorybench_passes_source_ids_only_to_amem_test(tmp_path: Path):
 
     session = SimpleNamespace(
         session_id=12,
+        source_uid=None,
+        conversation_scope="primary_user",
         timestamp="2024-04-03",
         metadata={"event_id": "event-12", "messages": []},
         to_memory_text=lambda: "memory",
@@ -507,9 +612,9 @@ def test_medmemorybench_passes_source_ids_only_to_amem_test(tmp_path: Path):
     baseline._evaluate_unit_with_checkpoint(unit)
 
     baseline_kwargs = baseline_manager.memorize_kwargs[0]
-    assert "source_session_id" not in baseline_kwargs
-    assert "source_session_index" not in baseline_kwargs
-    assert "source_event_id" not in baseline_kwargs
+    assert baseline_kwargs["source_session_id"] == 12
+    assert baseline_kwargs["source_session_index"] == 0
+    assert baseline_kwargs["source_event_id"] == "event-12"
 
 
 def test_evaluator_stores_embedding_matrix_as_exact_npy_sidecar(tmp_path: Path):
@@ -571,6 +676,109 @@ def test_evaluator_stores_embedding_matrix_as_exact_npy_sidecar(tmp_path: Path):
     )
     assert loaded["memory_build_time"] == 1.5
     assert loaded["memory_build_metrics"] == build_metrics
+
+
+def test_event_state_snapshot_writes_and_restores_exact_dense_sidecars(tmp_path: Path):
+    evaluator, agent, store, embedder = _event_state_snapshot_evaluator(tmp_path)
+    expected_maps = _event_state_embedding_maps(store)
+    unit = _unit(0, 10, "unit-one", "q1")
+
+    path = evaluator._write_memory_snapshot(unit)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    memory_state = payload["memory_state"]
+
+    assert memory_state["schema_version"] == EventStateStore.SCHEMA_VERSION == 6
+    assert memory_state["semantic_version"] == "2.9"
+    assert not (
+        set(EventStateStore.EMBEDDING_ARTIFACT_NAMES) & set(memory_state)
+    )
+    artifacts = memory_state["embedding_artifacts"]
+    assert list(artifacts) == sorted(EventStateStore.EMBEDDING_ARTIFACT_NAMES)
+    sidecar_bytes = 0
+    for name in EventStateStore.EMBEDDING_ARTIFACT_NAMES:
+        descriptor = artifacts[name]
+        sidecar = path.parent / descriptor["path"]
+        assert descriptor["storage"] == "npy"
+        assert descriptor["ids"] == sorted(descriptor["ids"])
+        assert descriptor["dtype"] == "float64"
+        assert isinstance(descriptor["shape"], list)
+        assert len(descriptor["sha256"]) == 64
+        assert sidecar.name == descriptor["path"]
+        assert sidecar.is_file()
+        assert file_sha256(sidecar) == descriptor["sha256"]
+        matrix = np.load(sidecar, allow_pickle=False)
+        assert str(matrix.dtype) == descriptor["dtype"]
+        assert list(matrix.shape) == descriptor["shape"]
+        assert matrix.shape[0] == len(descriptor["ids"])
+        sidecar_bytes += sidecar.stat().st_size
+
+    json_bytes = len(json.dumps(
+        memory_state,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    assert payload["memory_size"]["json_bytes"] == json_bytes
+    assert payload["memory_size"]["embedding_bytes"] == sidecar_bytes
+    assert payload["memory_size"]["bytes"] == json_bytes + sidecar_bytes
+
+    evaluator._restore_memory_snapshot(unit)
+    restored = agent._store(unit.context_id)
+    assert embedder.document_calls == []
+    for name, expected in expected_maps.items():
+        actual = getattr(restored, name)
+        assert set(actual) == set(expected)
+        for identifier, vector in expected.items():
+            np.testing.assert_array_equal(
+                np.asarray(actual[identifier]),
+                np.asarray(vector, dtype=np.float64),
+            )
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("missing", "sidecar is missing"),
+        ("corrupt", "SHA-256 check failed"),
+        ("dtype", "sidecar dtype is invalid"),
+        ("shape", "sidecar shape is invalid"),
+        ("ids", "ID mapping is invalid"),
+        ("unsafe_path", "path metadata is invalid"),
+    ],
+)
+def test_event_state_snapshot_rejects_invalid_dense_sidecars(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+):
+    evaluator, _agent, _store, _embedder = _event_state_snapshot_evaluator(tmp_path)
+    unit = _unit(0, 10, "unit-one", "q1")
+    path = evaluator._write_memory_snapshot(unit)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    descriptor = payload["memory_state"]["embedding_artifacts"][
+        "episode_embeddings"
+    ]
+    sidecar = path.parent / descriptor["path"]
+
+    if failure == "missing":
+        sidecar.unlink()
+    elif failure == "corrupt":
+        sidecar.write_bytes(sidecar.read_bytes() + b"corrupt")
+    elif failure == "dtype":
+        descriptor["dtype"] = "float32"
+    elif failure == "shape":
+        descriptor["shape"][0] += 1
+    elif failure == "ids":
+        descriptor["ids"] = descriptor["ids"][:-1]
+    elif failure == "unsafe_path":
+        descriptor["path"] = "../outside.npy"
+    else:
+        raise AssertionError(f"Unknown sidecar failure case: {failure}")
+
+    payload["integrity_hash"] = evaluator._snapshot_integrity_hash(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        evaluator._read_memory_snapshot(unit)
+
 
 def test_interrupted_snapshot_replacement_keeps_previous_generation_readable(
     tmp_path: Path,

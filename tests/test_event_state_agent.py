@@ -81,6 +81,7 @@ def test_agent_build_query_snapshot_and_provenance(monkeypatch):
     assert prepared["retrieved_memories"]
     assert prepared["retrieved_memories"][0].get("source_session_id") == 7
     state = agent.export_memory_state()
+    state["embedding_artifacts"] = agent.export_memory_binary_artifacts()
     clone = EventStateAgent(model="query", memory_model="build", embedding_client=FakeEmbedder())
     clone.import_memory_state(state, context_id="sample")
     assert clone.prepare_batch_query("What dose?")["retrieved_memories"] == prepared["retrieved_memories"]

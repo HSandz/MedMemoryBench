@@ -121,7 +121,7 @@ so late-session information is not silently discarded. Build telemetry separates
 fragment salvage, structural repair, recovery extraction, and semantic-unavailable
 counts; malformed outputs also retain bounded previews and SHA-256 diagnostics.
 
-Snapshots use schema version 5 plus the Event-State build semantic version.
+Snapshots use storage schema version 6 plus the Event-State build semantic version.
 Semantic version `2.9` adds extraction recovery and temporal-ingress validation
 to the `2.8` non-exact state-value relation semantics: equivalent observations
 corroborate an active claim across sessions (or are
@@ -146,6 +146,26 @@ canonical `recorded_at` alongside an immutable `recorded_at_raw` display value.
 Event-State uses the canonical record time for its existing generic temporal
 helpers and preserves the raw value in episode metadata. This does not infer
 claim valid time or introduce dataset-specific retrieval behavior.
+
+### Snapshot storage
+
+Schema-6 snapshots keep canonical semantic memory in JSON: context identity,
+episodes, claims, state operations, graph edges, and immutable-turn metadata.
+The four derived dense indexes are stored beside the JSON snapshot as
+content-addressed NumPy `.npy` sidecars: episode embeddings, immutable-turn
+embeddings, claim semantic embeddings, and claim-slot/compiler embeddings.
+Each JSON artifact descriptor records a basename-only path, SHA-256 digest,
+dtype, shape, and deterministic ordered row IDs. The JSON integrity hash covers
+that descriptor; the sidecar digest independently protects the array bytes.
+
+Event-State currently writes `float64` sidecars because its runtime indexes are
+Python float lists, so this preserves their exact stored values. Query-only and
+resume restores validate every sidecar (path, digest, dtype, shape, and ID
+mapping) and load the persisted vectors without embedding again. A missing or
+inconsistent schema-6 sidecar is rejected rather than rebuilt. Schema-5
+snapshots with inline embedding maps remain readable; schema-4 snapshots retain
+their existing one-time immutable-turn-index reconstruction. Query-time PPR and
+other ephemeral retrieval state are not persisted.
 
 ## Configuration
 
@@ -388,9 +408,10 @@ retrieval can make a turn answer-visible without this diagnostic being true.
 Answer-visible gold turns also carry additive route diagnostics for
 `claim_provenance`, `episode_excerpt`, and `direct_immutable_turn`; their union
 is the existing answer-visible exact-turn metric. Retrieval-record schema version
-3 adds effective-selection telemetry and delivery routes. Snapshot schema 5 is
-unchanged; schema-4 snapshots remain loadable, and their archived turns are
-embedded once during restore to reconstruct the derived turn index.
+3 adds effective-selection telemetry and delivery routes. Snapshot schema 6
+stores dense indexes in validated adjacent NumPy sidecars; schema-5 inline
+snapshots remain loadable, and schema-4 snapshots embed archived turns once
+during restore to reconstruct their derived turn index.
 When enabled, claim source expansion scores every immutable turn cited by every
 claim EvidenceRef with the query embedding, ranks each reference by its best
 cited-turn cosine score, and keeps at most `max_source_excerpts_per_claim`

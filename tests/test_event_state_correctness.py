@@ -118,6 +118,7 @@ def test_parse_json_ignores_reasoning_blocks_and_selects_structured_payload():
 def test_pre_fix_snapshot_semantic_version_is_rejected():
     store = EventStateStore("p")
     snapshot = store.export()
+    snapshot["embedding_artifacts"] = store.export_embedding_artifacts()
     snapshot["schema_version"] = 3
     with pytest.raises(ValueError):
         EventStateStore.from_export(snapshot)
@@ -130,7 +131,9 @@ def test_pre_fix_snapshot_semantic_version_is_rejected():
             assert "semantic version" in str(exc)
         else:
             raise AssertionError("pre-fix snapshot was accepted")
-    assert EventStateStore.from_export(store.export()).export()["semantic_version"] == "2.9"
+    current = store.export()
+    current["embedding_artifacts"] = store.export_embedding_artifacts()
+    assert EventStateStore.from_export(current).export()["semantic_version"] == "2.9"
 
 
 @pytest.mark.parametrize(
