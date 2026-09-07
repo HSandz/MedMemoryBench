@@ -441,6 +441,12 @@ class Evaluator:
             "dataset_config_name": self.dataset_config_name,
             "method_config": self._method_config_snapshot(),
             "dataset_config": dataset_snapshot,
+            "prompt_protocol": getattr(
+                self.dataset_config, "prompt_protocol", "type_aware"
+            ),
+            "query_type_aware_prompting": getattr(
+                self.dataset_config, "prompt_protocol", "type_aware"
+            ) == "type_aware",
             "source_revision": {
                 "commit_sha": git_metadata["git_commit_sha"],
                 "dirty": git_metadata["git_dirty"],

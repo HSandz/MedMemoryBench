@@ -59,6 +59,30 @@ Set only the credentials required by the selected method. Keep `.env`, `service-
 
 Method configs are YAML files under `configs/method_config/`; dataset configs are under `configs/dataset_config/`. A persona-specific config uses a path such as `persona_1/amem_fix_gemini`.
 
+### Answer Prompt Protocol
+
+Both `locomo.yaml` and `medmemorybench.yaml` define
+`evaluation.prompt_protocol`. Allowed values are `type_aware` (the default) and
+`neutral`.
+
+- `type_aware` reproduces the existing AQ-MedAI / MedMemoryBench harness:
+  the answer prompt is specialized by the benchmark query type for upstream
+  comparability.
+- `neutral` uses one dataset-appropriate generic answer prompt for every query
+  type. The answer model is not given the hidden benchmark category; query type
+  remains available only to post-hoc scoring and reporting, making this an
+  architecture-neutral evaluation.
+
+To run the neutral protocol, change only this dataset setting:
+
+```yaml
+evaluation:
+  prompt_protocol: neutral
+```
+
+The resolved protocol and whether answer prompting was query-type aware are
+recorded in `run_config.json`, result, query-answer, and memory-build artifacts.
+
 Common environment settings include:
 
 ```env

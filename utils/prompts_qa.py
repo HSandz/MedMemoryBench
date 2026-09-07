@@ -4,6 +4,31 @@ from typing import Dict
 
 QA_TEMPLATES: Dict[str, str] = {
 
+    # Architecture-neutral prompts do not reveal benchmark query categories.
+    "medmemorybench_neutral_qa": """请根据{memory_source}回答以下问题，并使用患者已记忆的病史信息。
+
+问题：{question}
+
+请准确且简洁地回答。患者相关的陈述应以已记忆的病史为依据；可以使用医学知识从已记忆的患者信息进行推理，但不要编造缺失的患者事实。如果现有记忆不足，请明确说明。
+
+回答：""",
+
+    "medmemorybench_en_neutral_qa": """Based on {memory_source}, answer the following question using the patient's remembered medical history.
+
+Question: {question}
+
+Answer accurately and concisely. Ground patient-specific statements in the remembered history. Use medical knowledge only to reason from remembered patient information, and do not invent missing patient facts. If the available memory is insufficient, state that clearly.
+
+Answer:""",
+
+    "locomo_neutral_qa": """Based on {memory_source}, answer the following question using the remembered conversation information.
+
+Question: {question}
+
+Answer concisely and faithfully. Use information supported by the remembered conversation. If the requested information is not supported by the available memory, say that the information is unavailable rather than guessing.
+
+Answer:""",
+
     # MedMemoryBench - Entity Exact Match
     "medmemorybench_entity_exact_match_qa": """Please answer the following questions accurately based on {memory_source}.
 

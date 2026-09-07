@@ -345,6 +345,9 @@ class ResultCollector:
             "run_metadata": report.metadata.get("run_metadata", {}),
             "artifact_references": artifact_references,
         }
+        for key in ("prompt_protocol", "query_type_aware_prompting"):
+            if key in report.metadata:
+                result_data[key] = report.metadata[key]
         for key in ("dataset_coverage", "input_modality"):
             if key in report.metadata:
                 result_data[key] = report.metadata[key]
@@ -582,6 +585,9 @@ class ResultCollector:
             "artifact_references": artifact_references,
             "units": processed_units,
         }
+        for key in ("prompt_protocol", "query_type_aware_prompting"):
+            if key in report.metadata:
+                memory_build_data[key] = report.metadata[key]
 
         with open(filepath, "w", encoding="utf-8") as f:
             dump_json_artifact(memory_build_data, f)
@@ -801,6 +807,9 @@ class ResultCollector:
             "by_context": by_context,
             "queries": query_details,
         }
+        for key in ("prompt_protocol", "query_type_aware_prompting"):
+            if key in report.metadata:
+                query_answer_data[key] = report.metadata[key]
 
         with open(filepath, "w", encoding="utf-8") as f:
             dump_json_artifact(query_answer_data, f)

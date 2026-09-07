@@ -659,6 +659,9 @@ def compute_query_config_hash(method_config, dataset_config) -> str:
             "query_relevant_build_config": _query_relevant_build_config(
                 method_config
             ),
+            # This changes answer construction, so query work cannot be
+            # resumed across protocols. It does not affect memory snapshots.
+            "prompt_protocol": getattr(dataset_config, "prompt_protocol", "type_aware"),
             "dataset": _snapshot_query_dataset_config(dataset_config),
         }, sort_keys=True, default=str)
         return hashlib.md5(content.encode()).hexdigest()[:16]

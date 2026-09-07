@@ -17,6 +17,19 @@ except ImportError:
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
+PROMPT_PROTOCOLS = frozenset({"type_aware", "neutral"})
+
+
+def resolve_prompt_protocol(value: Any) -> str:
+    """Validate the answer-prompt protocol selected by a dataset config."""
+    if not isinstance(value, str) or value not in PROMPT_PROTOCOLS:
+        allowed = ", ".join(sorted(PROMPT_PROTOCOLS))
+        raise ValueError(
+            "evaluation.prompt_protocol must be one of "
+            f"{allowed}; got {value!r}"
+        )
+    return value
+
 AMEM_BUILD_CONFIG_KEYS = {
     "amem_backend", "amem_model", "amem_embedding_model", "amem_evo_threshold",
     "amem_max_tokens", "amem_chunk_size_tokens", "amem_original_evolution",
@@ -559,6 +572,7 @@ class DatasetConfig:
     max_sessions_per_persona: Optional[int] = None
     evaluation_interval: int = 10
     inject_noise: bool = True
+    prompt_protocol: str = "type_aware"
 
     # Query types
     query_types: List[QueryTypeConfig] = field(default_factory=list)
@@ -569,6 +583,9 @@ class DatasetConfig:
 
     # Raw config
     raw_config: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.prompt_protocol = resolve_prompt_protocol(self.prompt_protocol)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DatasetConfig":
@@ -598,6 +615,9 @@ class DatasetConfig:
             max_sessions_per_persona=eval_cfg.get("max_sessions_per_persona"),
             evaluation_interval=eval_cfg.get("evaluation_interval", 10),
             inject_noise=eval_cfg.get("inject_noise", True),
+            prompt_protocol=resolve_prompt_protocol(
+                eval_cfg.get("prompt_protocol", "type_aware")
+            ),
             query_types=query_types,
             save_intermediate=output_cfg.get("save_intermediate", True),
             save_retrieved_context=output_cfg.get("save_retrieved_context", True),
@@ -679,11 +699,15 @@ def dataset_config_from_snapshot(snapshot: Dict[str, Any]) -> DatasetConfig:
         "max_sessions_per_persona",
         "evaluation_interval",
         "inject_noise",
+        "prompt_protocol",
         "save_intermediate",
         "save_retrieved_context",
     ):
         if field_name in snapshot:
-            setattr(config, field_name, snapshot[field_name])
+            value = snapshot[field_name]
+            if field_name == "prompt_protocol":
+                value = resolve_prompt_protocol(value)
+            setattr(config, field_name, value)
 
     stored_query_types = snapshot.get("query_types")
     if isinstance(stored_query_types, list):

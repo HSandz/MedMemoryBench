@@ -85,7 +85,32 @@ class PromptManager:
 
         return template.format(**params)
 
-    def format_query(self, question: str, query_type: str) -> str:
+    def format_query(
+        self,
+        question: str,
+        query_type: Optional[str] = None,
+        prompt_protocol: str = "type_aware",
+    ) -> str:
+        """Format an answer-facing query without changing retrieval inputs."""
+        if prompt_protocol not in {"type_aware", "neutral"}:
+            raise ValueError(
+                "prompt_protocol must be one of neutral, type_aware; "
+                f"got {prompt_protocol!r}"
+            )
+
+        if prompt_protocol == "neutral":
+            key = f"{self._template_prefix}_neutral_qa"
+            template = QA_TEMPLATES.get(key)
+            if not template:
+                key = f"{self.dataset}_neutral_qa"
+                template = QA_TEMPLATES.get(key)
+            if not template:
+                raise ValueError(f"No neutral QA template found for {self.dataset}")
+            return template.format(
+                question=question,
+                memory_source=self._memory_source_description(),
+            )
+
         key = f"{self._template_prefix}_{query_type}_qa"
         template = QA_TEMPLATES.get(key)
 
@@ -102,13 +127,17 @@ class PromptManager:
             key = f"{self.dataset}_default_qa"
             template = QA_TEMPLATES.get(key, "Question: {question}\n\nAnswer:")
 
-        memory_source = MEMORY_SOURCE_DESCRIPTIONS.get(self._template_prefix, {}).get(
+        return template.format(
+            question=question,
+            memory_source=self._memory_source_description(),
+        )
+
+    def _memory_source_description(self) -> str:
+        return MEMORY_SOURCE_DESCRIPTIONS.get(self._template_prefix, {}).get(
             self.method_type, MEMORY_SOURCE_DESCRIPTIONS.get(self.dataset, {}).get(
                 self.method_type, "the relevant memories"
             )
         )
-
-        return template.format(question=question, memory_source=memory_source)
 
     def format_judge(
         self,

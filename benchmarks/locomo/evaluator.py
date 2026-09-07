@@ -113,6 +113,7 @@ class LoCoMoEvaluator:
             dataset=dataset_config.dataset_name,
             method=method_config.method_name,
         )
+        self.prompt_protocol = dataset_config.prompt_protocol
 
         self.agent_manager: Optional[AgentManager] = None
         self.dataset: Optional[LoCoMoDataset] = None
@@ -156,6 +157,13 @@ class LoCoMoEvaluator:
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+    def _answer_query_kwargs(self, query: LoCoMoQuery) -> Dict[str, Any]:
+        """Keep benchmark type metadata out of neutral agent-facing requests."""
+        kwargs: Dict[str, Any] = {"raw_question": query.question}
+        if getattr(self, "prompt_protocol", "type_aware") == "type_aware":
+            kwargs["query_type"] = query.query_type
+        return kwargs
 
     def _log(self, message: str, level: str = "INFO") -> None:
         if level.upper() in {"ERROR", "WARNING"}:
@@ -1106,14 +1114,14 @@ class LoCoMoEvaluator:
                 formatted_question = self.prompt_manager.format_query(
                     question=query.question,
                     query_type=query.query_type,
+                    prompt_protocol=self.prompt_protocol,
                 )
                 prepared = self.agent_manager.prepare_batch_query(
                     formatted_question,
                     query_id=query.query_id,
                     context_id=unit.context_id,
                     batch_request_time=batch_request_time,
-                    raw_question=query.question,
-                    query_type=query.query_type,
+                    **self._answer_query_kwargs(query),
                 )
 
             if saved_request is not None:
@@ -1208,7 +1216,9 @@ class LoCoMoEvaluator:
             if prepared is not None:
                 return prepared
             formatted_question = self.prompt_manager.format_query(
-                question=query.question, query_type=query.query_type
+                question=query.question,
+                query_type=query.query_type,
+                prompt_protocol=self.prompt_protocol,
             )
             manager = self.agent_manager
             if event_state_snapshot is not None:
@@ -1228,8 +1238,7 @@ class LoCoMoEvaluator:
                 query_id=query.query_id,
                 context_id=unit.context_id,
                 batch_request_time=batch_request_time,
-                raw_question=query.question,
-                query_type=query.query_type,
+                **self._answer_query_kwargs(query),
             )
 
         worker_count = getattr(self, "workers", 1)
@@ -1366,14 +1375,14 @@ class LoCoMoEvaluator:
         formatted_question = self.prompt_manager.format_query(
             question=query.question,
             query_type=query.query_type,
+            prompt_protocol=getattr(self, "prompt_protocol", "type_aware"),
         )
 
         response = (manager or self.agent_manager).send_message(
             message=formatted_question,
             memorizing=False,
             context_id=context_id,
-            raw_question=query.question,
-            query_type=query.query_type,
+            **self._answer_query_kwargs(query),
         )
 
         return self._score_agent_response(query, response)
@@ -1661,6 +1670,7 @@ class LoCoMoEvaluator:
                     ),
                 },
                 "dry_run": self.dry_run,
+                "prompt_protocol": self.prompt_protocol,
                 "locomo_scoring": {
                     "primary_metric": "official_token_stem_f1",
                     "official_locomo": "canonical_score",
@@ -1669,6 +1679,8 @@ class LoCoMoEvaluator:
                 },
             },
             metadata={
+                "prompt_protocol": self.prompt_protocol,
+                "query_type_aware_prompting": self.prompt_protocol == "type_aware",
                 "run_metadata": self._git_metadata(),
                 "dataset_coverage": {
                     "available_sample_count": self.dataset.get_available_sample_count(),

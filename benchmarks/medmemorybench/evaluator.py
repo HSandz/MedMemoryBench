@@ -133,6 +133,7 @@ class MedMemoryBenchEvaluator:
             method=method_config.method_name,
             language=dataset_config.language,
         )
+        self.prompt_protocol = dataset_config.prompt_protocol
 
         self.agent_manager: Optional[AgentManager] = None
         self.dataset: Optional[MedMemoryBenchDataset] = None
@@ -1198,6 +1199,13 @@ class MedMemoryBenchEvaluator:
         if getattr(self, "execution_stage", "all") == "query":
             return compute_query_config_hash(self.method_config, self.dataset_config)
         return compute_config_hash(self.method_config, self.dataset_config)
+
+    def _answer_query_kwargs(self, query: MedQuery) -> Dict[str, Any]:
+        """Keep benchmark type metadata out of neutral agent-facing requests."""
+        kwargs: Dict[str, Any] = {"raw_question": query.question}
+        if getattr(self, "prompt_protocol", "type_aware") == "type_aware":
+            kwargs["query_type"] = query.query_type
+        return kwargs
 
     def _judge_batch_config_hash(self) -> str:
         """Include `.env` judge settings in judge submit/resume identity."""
@@ -3472,6 +3480,7 @@ class MedMemoryBenchEvaluator:
                 formatted_question = self.prompt_manager.format_query(
                     question=query.question,
                     query_type=query.query_type,
+                    prompt_protocol=self.prompt_protocol,
                 )
                 try:
                     prepared = self._run_api_call(
@@ -3480,8 +3489,7 @@ class MedMemoryBenchEvaluator:
                         query_id=query.query_id,
                         context_id=unit.context_id,
                         batch_request_time=batch_request_time,
-                        raw_question=query.question,
-                        query_type=query.query_type,
+                        **self._answer_query_kwargs(query),
                     )
                 except LLMAPIError as e:
                     self._log(
@@ -3663,7 +3671,9 @@ class MedMemoryBenchEvaluator:
             if prepared is not None:
                 return prepared, None
             formatted_question = self.prompt_manager.format_query(
-                question=query.question, query_type=query.query_type
+                question=query.question,
+                query_type=query.query_type,
+                prompt_protocol=self.prompt_protocol,
             )
             try:
                 return self._run_api_call(
@@ -3672,8 +3682,7 @@ class MedMemoryBenchEvaluator:
                     query_id=query.query_id,
                     context_id=unit.context_id,
                     batch_request_time=batch_request_time,
-                    raw_question=query.question,
-                    query_type=query.query_type,
+                    **self._answer_query_kwargs(query),
                 ), None
             except LLMAPIError as exc:
                 return None, exc
@@ -3865,6 +3874,7 @@ class MedMemoryBenchEvaluator:
         formatted_question = self.prompt_manager.format_query(
             question=query.question,
             query_type=query.query_type,
+            prompt_protocol=getattr(self, "prompt_protocol", "type_aware"),
         )
 
         try:
@@ -3874,8 +3884,7 @@ class MedMemoryBenchEvaluator:
                 memorizing=False,
                 query_id=query.query_id,
                 context_id=context_id,
-                raw_question=query.question,
-                query_type=query.query_type,
+                **self._answer_query_kwargs(query),
             )
         except LLMAPIError as e:
             self._log(
@@ -3934,6 +3943,7 @@ class MedMemoryBenchEvaluator:
         formatted_question = self.prompt_manager.format_query(
             question=query.question,
             query_type=query.query_type,
+            prompt_protocol=getattr(self, "prompt_protocol", "type_aware"),
         )
         try:
             staged_query = self._run_api_call(
@@ -3941,8 +3951,7 @@ class MedMemoryBenchEvaluator:
                 message=formatted_question,
                 query_id=query.query_id,
                 context_id=context_id,
-                raw_question=query.question,
-                query_type=query.query_type,
+                **self._answer_query_kwargs(query),
             )
             response = self._run_api_call(
                 self.agent_manager.answer_prepared_query,
@@ -4384,8 +4393,11 @@ class MedMemoryBenchEvaluator:
                     ),
                 },
                 "dry_run": self.dry_run,
+                "prompt_protocol": self.prompt_protocol,
             },
             metadata={
+                "prompt_protocol": self.prompt_protocol,
+                "query_type_aware_prompting": self.prompt_protocol == "type_aware",
                 "evaluation_mode": self.dataset_config.evaluation_mode,
                 "evaluation_interval": self.dataset_config.evaluation_interval,
                 "total_personas": len(self.result_collector.get_context_ids()),
