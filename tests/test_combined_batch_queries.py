@@ -71,8 +71,9 @@ def _evaluator_state(evaluator):
         ),
     )
     evaluator.prompt_manager = SimpleNamespace(
-        format_query=lambda question, query_type: question
+        format_query=lambda question, query_type, **kwargs: question
     )
+    evaluator.prompt_protocol = "type_aware"
     evaluator.agent_manager = _AgentManager()
     evaluator._batch_client = _BatchClient()
     evaluator._pending_batch_queries = []

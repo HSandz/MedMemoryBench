@@ -10,6 +10,7 @@ from benchmarks.base import EvaluationUnit
 from benchmarks.medmemorybench.checkpoint import MedMemoryBenchCheckpointManager
 from benchmarks.medmemorybench.dataset import MedSession
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
+from benchmarks.locomo.evaluator import LoCoMoEvaluator, LOCOMO_RESULT_JOURNAL_VERSION
 from methods.base import MemoryBuildResult
 
 
@@ -201,7 +202,10 @@ def test_query_results_flush_in_bounded_batches(tmp_path: Path):
     assert len(save_calls) == 1
     assert manager.is_query_completed("q-25", persona_id=1) is True
     payload = json.loads(manager.checkpoint_path.read_text(encoding="utf-8"))
-    assert len(payload["completed_results"]["1"]) == 25
+    assert payload["completed_results"] == {}
+    journal_records = [json.loads(line) for line in manager.result_journal_path.read_text().splitlines()]
+    assert len(journal_records) == 25
+    assert all(record["digest"] for record in journal_records)
 
     manager.flush_query_progress(force=True)
     assert len(save_calls) == 2
@@ -209,6 +213,48 @@ def test_query_results_flush_in_bounded_batches(tmp_path: Path):
     assert resumed.load() is not None
     assert resumed.get_resume_info()["completed_queries"] == 26
     assert resumed.is_query_completed("q-25", persona_id=1) is True
+
+    with manager.result_journal_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"incomplete":')
+    recovered = _manager(tmp_path, "hash")
+    assert recovered.load() is not None
+    assert recovered.get_resume_info()["completed_queries"] == 26
+
+
+def test_locomo_query_journal_restores_completed_results(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        "benchmarks.locomo.evaluator.compute_query_config_hash", lambda *_: "hash",
+    )
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.output_dir = tmp_path
+    evaluator.method_config = SimpleNamespace()
+    evaluator.dataset_config = SimpleNamespace()
+    evaluator.resume = False
+    evaluator._query_checkpoint = {
+        "results": {},
+        "result_journal": {
+            "version": LOCOMO_RESULT_JOURNAL_VERSION,
+            "path": "locomo_query_results.jsonl",
+        },
+    }
+    evaluator._query_checkpoint_pending_writes = 0
+    evaluator._query_checkpoint_pending_records = []
+
+    result = SimpleNamespace(query_id="q-1", to_dict=lambda: {"query_id": "q-1", "score": 1.0})
+    evaluator._record_completed_query("sample-1", result)
+    evaluator._flush_query_checkpoint(force=True)
+
+    resumed = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    resumed.output_dir = tmp_path
+    resumed.method_config = SimpleNamespace()
+    resumed.dataset_config = SimpleNamespace()
+    resumed.resume = True
+    resumed._query_checkpoint = {"results": {}}
+    resumed._query_checkpoint_pending_writes = 0
+    resumed._query_checkpoint_pending_records = []
+    resumed._load_query_checkpoint()
+
+    assert resumed._query_checkpoint["results"]["sample-1"]["q-1"] == result.to_dict()
 
 
 def test_unfinished_session_marker_is_rolled_back_for_retry(tmp_path: Path):

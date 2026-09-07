@@ -704,6 +704,15 @@ def test_memory_run_accepts_underscore_cli_alias(monkeypatch):
     assert args.memory_run == "20260813_143538"
 
 
+def test_query_workers_cli_default_and_validation(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    assert cli.parse_args().query_workers == 5
+
+    monkeypatch.setattr(sys, "argv", ["main.py", "--query-workers", "0"])
+    with pytest.raises(SystemExit):
+        cli.parse_args()
+
+
 def test_batch_wait_defaults_to_true_and_can_be_disabled(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["main.py"])
     assert cli.parse_args().batch_wait is True

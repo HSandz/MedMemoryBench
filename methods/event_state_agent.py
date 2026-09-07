@@ -11,7 +11,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from methods.base import AgentResponse, BaseAgent, MemoryBuildResult
 from utils.llm_client import BaseLLMClient, LLMAPIError, create_llm_client, format_messages, get_usage_tracker
@@ -901,6 +901,7 @@ class EventStateAgent(BaseAgent):
         selected: List[Dict[str, Any]] = []
         selected_claim_evidence: Dict[str, Any] = {}
         claimed_turns = set()
+        turn_vector_cache = self._persisted_turn_vector_cache(store)
         considered_turn_ids: List[str] = []
         deduplicated_turn_ids: List[str] = []
         considered_count = 0
@@ -944,6 +945,7 @@ class EventStateAgent(BaseAgent):
                 query_vectors[0],
                 self._embedder,
                 self.max_source_excerpts_per_claim,
+                turn_vector_cache=turn_vector_cache,
                 query_vectors=query_vectors,
             )
             selected_claim_evidence[claim.claim_id] = selections
@@ -976,6 +978,25 @@ class EventStateAgent(BaseAgent):
     def supports_staged_queries(self) -> bool:
         return self.planner_rounds == 0
 
+    @staticmethod
+    def _persisted_turn_vector_cache(store: EventStateStore) -> Dict[Tuple[str, Any], Sequence[float]]:
+        """Expose persisted immutable-turn vectors under evidence-selection keys."""
+        vectors: Dict[Tuple[str, Any], Sequence[float]] = {}
+        for store_key, metadata in store.turn_metadata.items():
+            vector = store.turn_embeddings.get(store_key)
+            episode_id = metadata.get("episode_id") if isinstance(metadata, dict) else None
+            turn_index = metadata.get("source_turn_index") if isinstance(metadata, dict) else None
+            episode = store.episodes.get(episode_id)
+            if (
+                vector is None
+                or episode is None
+                or not isinstance(turn_index, int)
+                or not 0 <= turn_index < len(episode.turn_evidence)
+            ):
+                continue
+            vectors[(episode_id, episode.turn_evidence[turn_index].turn_id)] = vector
+        return vectors
+
     def _compile_query_context(self, question, system_message, store, selected, retrieval_extra, query_vectors):
         query_vector = query_vectors[0]
         selected_memory_items = [item for item in selected if item["type"] != "turn"]
@@ -983,8 +1004,10 @@ class EventStateAgent(BaseAgent):
         selected_claims = [store.claims[item["id"]] for item in selected_memory_items if item["type"] == "state_claim"]
         selected_claim_evidence = dict(retrieval_extra.pop("selected_claim_evidence", {}))
         claimed_turns = set()
+        # Immutable-turn vectors are persisted with the store.  Key them by the
+        # renderer's source identity so evidence selection avoids re-embedding.
+        turn_vector_cache = self._persisted_turn_vector_cache(store)
         if self.inject_source_evidence:
-            turn_vector_cache = {}
             for claim in selected_claims:
                 selections = selected_claim_evidence.get(claim.claim_id)
                 if selections is None:
@@ -1022,6 +1045,7 @@ class EventStateAgent(BaseAgent):
             self.max_episode_source_excerpts_total,
             claimed_turns | indexed_turn_keys,
             query_vectors=query_vectors,
+            turn_vector_cache=turn_vector_cache,
         )
         records = [
             self._record(store, item, episode_evidence_by_id.get(item["id"]))

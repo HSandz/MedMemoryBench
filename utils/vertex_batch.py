@@ -396,6 +396,8 @@ class VertexBatchClient:
         self._storage_client = storage_client
         self._credential_client = credential_client
         self._progress_callback = progress_callback
+        self._manifest_cache: Optional[Dict[str, Any]] = None
+        self._manifest_request_index: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     @classmethod
     def from_gemini_client(
@@ -527,8 +529,10 @@ class VertexBatchClient:
         return self._genai_client
 
     def _load_manifest(self) -> Dict[str, Any]:
+        if self._manifest_cache is not None:
+            return self._manifest_cache
         if not self.manifest_path.exists():
-            return {
+            manifest = {
                 "version": MANIFEST_VERSION,
                 "created_at": _utc_now(),
                 "model": self.model,
@@ -541,6 +545,8 @@ class VertexBatchClient:
                 "run_id": uuid.uuid4().hex,
                 "jobs": {},
             }
+            self._set_manifest_cache(manifest)
+            return manifest
         with self.manifest_path.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         if manifest.get("version") != MANIFEST_VERSION:
@@ -556,7 +562,21 @@ class VertexBatchClient:
                 "Batch manifest does not match this evaluator configuration. "
                 "Use the original configuration to resume it or choose a new output directory."
             )
+        self._set_manifest_cache(manifest)
         return manifest
+
+    def _set_manifest_cache(self, manifest: Dict[str, Any]) -> None:
+        """Cache a validated manifest and its stable request-ID lookup table."""
+        self._manifest_cache = manifest
+        self._manifest_request_index = {
+            str(stage): {
+                str(request["request_id"]): request
+                for request in entry.get("requests", [])
+                if isinstance(request, dict) and request.get("request_id") is not None
+            }
+            for stage, entry in manifest.get("jobs", {}).items()
+            if isinstance(entry, dict)
+        }
 
     def get_saved_request(
         self,
@@ -571,13 +591,8 @@ class VertexBatchClient:
         retaining the normal fingerprint protection for all other fields.
         """
         manifest = self._load_manifest()
-        job_entry = manifest.get("jobs", {}).get(stage)
-        if not isinstance(job_entry, dict):
-            return None
-        for request in job_entry.get("requests", []):
-            if request.get("request_id") == request_id:
-                return BatchChatRequest.from_manifest_dict(request)
-        return None
+        request = self._manifest_request_index.get(stage, {}).get(request_id)
+        return BatchChatRequest.from_manifest_dict(request) if request is not None else None
 
     def get_saved_requests(self, stage: str) -> List[BatchChatRequest]:
         """Return every request already bound to a submitted stage."""
@@ -600,6 +615,7 @@ class VertexBatchClient:
         manifest["updated_at"] = _utc_now()
         with self.manifest_path.open("w", encoding="utf-8") as handle:
             dump_json_artifact(manifest, handle)
+        self._set_manifest_cache(manifest)
 
     def _stage_paths(self, stage: str, run_id: str) -> Tuple[str, str]:
         stage_id = re.sub(r"[^a-zA-Z0-9_.-]", "-", stage)

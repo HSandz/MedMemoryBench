@@ -341,7 +341,7 @@ python main.py --stage query --memory-run <memory-run-directory>
 
 For a LoCoMo or MedMemoryBench run that fails after all snapshots are written
 but before final answers are submitted, run the query stage against that memory
-run with `--batch-api` (and the desired `--workers` value). This creates a
+run with `--batch-api` (and the desired `--query-workers` value). This creates a
 separate query child and leaves the source snapshots unchanged. The query stage
 accepts a `building` Event-State manifest only after confirming that it lists
 every selected LoCoMo sample or MedMemoryBench unit; an incomplete or invalid
@@ -349,7 +349,7 @@ snapshot set is rejected.
 
 ### Parallel memory construction
 
-Use the existing global worker option, for example `--workers 4`, with Event-State.
+Use `--workers 4`, for example, with Event-State memory construction.
 Each source session performs extraction, repair/validation, episode construction,
 subject resolution, and episode/claim embedding in a bounded preparation pool.
 Conversation scope is resolved independently from each source session's turns (or
@@ -368,9 +368,11 @@ turn IDs are persisted. Event-State snapshots are written per LoCoMo sample;
 `--stage query` restores those exact stores without rebuilding memory. Query
 workers use isolated restored stores, and batch preparation likewise freezes
 each sample's retrieval result before the run-wide `query-final` batch stage.
+Use `--query-workers 5` (the default) to bound that local retrieval and prompt
+preparation; it does not change remote Batch API execution.
 MedMemoryBench unit build telemetry reports wall-clock preparation plus ordered
 commit time (parallel worker durations are not summed).
-Worker count is an execution setting and is not included in snapshot or config
+Worker counts are execution settings and are not included in snapshot or config
 identity hashes.
 
 To compare PPR policies on the same build, use a query-stage YAML override

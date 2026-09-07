@@ -64,6 +64,7 @@ DEFAULT_MEMORY_CHUNK_SIZE = 32000
 # A LoCoMo result can retain substantial retrieval diagnostics. Writing the
 # entire resumable checkpoint for every completed answer is needlessly costly.
 LOCOMO_QUERY_CHECKPOINT_FLUSH_INTERVAL = 25
+LOCOMO_RESULT_JOURNAL_VERSION = 1
 
 
 class LoCoMoEvaluator:
@@ -85,6 +86,7 @@ class LoCoMoEvaluator:
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
         workers: int = 1,
+        query_workers: int = 5,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -107,7 +109,10 @@ class LoCoMoEvaluator:
         self.batch_wait = batch_wait
         if workers < 1:
             raise ValueError("workers must be at least 1")
+        if query_workers < 1:
+            raise ValueError("query_workers must be at least 1")
         self.workers = workers
+        self.query_workers = query_workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -139,8 +144,15 @@ class LoCoMoEvaluator:
         self._pending_batch_queries: List[Dict[str, Any]] = []
         self._memory_snapshot_manifest: Optional[Dict[str, Any]] = None
         self._memory_snapshot_dir_path: Optional[Path] = None
-        self._query_checkpoint: Dict[str, Any] = {"results": {}}
+        self._query_checkpoint: Dict[str, Any] = {
+            "results": {},
+            "result_journal": {
+                "version": LOCOMO_RESULT_JOURNAL_VERSION,
+                "path": "locomo_query_results.jsonl",
+            },
+        }
         self._query_checkpoint_pending_writes = 0
+        self._query_checkpoint_pending_records: List[Dict[str, Any]] = []
         self._batch_retrieval_preparation_wall_time = 0.0
         self._memory_build_checkpoint_saved = False
 
@@ -148,6 +160,10 @@ class LoCoMoEvaluator:
         # Get from dataset config or use default
         eval_config = dataset_config.raw_config.get("evaluation", {})
         self.memory_chunk_size = eval_config.get("memory_chunk_size", DEFAULT_MEMORY_CHUNK_SIZE)
+
+    def _query_worker_count(self) -> int:
+        """Use the query-specific limit, retaining compatibility with test fixtures."""
+        return max(1, int(getattr(self, "query_workers", getattr(self, "workers", 1))))
 
     def _batch_config_hash(self) -> str:
         """Bind a resumable batch manifest to the evaluated configuration."""
@@ -468,6 +484,66 @@ class LoCoMoEvaluator:
     def _query_checkpoint_path(self) -> Path:
         return self.output_dir / "locomo_query_checkpoint.json"
 
+    def _query_result_journal_path(self) -> Path:
+        return self.output_dir / "locomo_query_results.jsonl"
+
+    @staticmethod
+    def _query_result_journal_digest(sample_id: str, result: Dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"sample_id": sample_id, "result": result},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _uses_query_result_journal(self) -> bool:
+        journal = self._query_checkpoint.get("result_journal", {})
+        return isinstance(journal, dict) and journal.get("version") == LOCOMO_RESULT_JOURNAL_VERSION
+
+    def _append_query_result_journal(self) -> None:
+        records = getattr(self, "_query_checkpoint_pending_records", [])
+        if not records:
+            return
+        path = self._query_result_journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._query_checkpoint_pending_records = []
+
+    def _restore_query_result_journal(self) -> None:
+        if not self._uses_query_result_journal():
+            return
+        path = self._query_result_journal_path()
+        if not path.exists():
+            return
+        results = self._query_checkpoint.setdefault("results", {})
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                        sample_id = str(record["sample_id"])
+                        result = record["result"]
+                        if (
+                            not isinstance(result, dict)
+                            or record.get("digest") != self._query_result_journal_digest(sample_id, result)
+                        ):
+                            break
+                        query_id = result.get("query_id")
+                        if query_id is None:
+                            break
+                    except (KeyError, TypeError, json.JSONDecodeError):
+                        # Preserve all complete fsynced JSONL entries before a torn tail.
+                        break
+                    results.setdefault(sample_id, {}).setdefault(str(query_id), result)
+        except OSError:
+            return
+
     def _load_query_checkpoint(self) -> None:
         if not self.resume or not self._query_checkpoint_path().exists():
             return
@@ -477,13 +553,14 @@ class LoCoMoEvaluator:
             raise ValueError("Cannot read the LoCoMo query resume checkpoint") from exc
         if (
             payload.get("format") != "locomo.query_checkpoint"
-            or payload.get("version") != 1
+            or payload.get("version") not in {1, 2}
             or payload.get("query_config_hash") != compute_query_config_hash(self.method_config, self.dataset_config)
             or payload.get("integrity_hash") != self._snapshot_integrity_hash(payload)
             or not isinstance(payload.get("results"), dict)
         ):
             raise ValueError("LoCoMo query resume checkpoint is incompatible or corrupt")
         self._query_checkpoint = payload
+        self._restore_query_result_journal()
 
     def _completed_query_results(self, unit: EvaluationUnit) -> List[MetricResult]:
         saved = self._query_checkpoint.get("results", {}).get(str(unit.context_id), {})
@@ -501,6 +578,14 @@ class LoCoMoEvaluator:
         if result.query_id in results:
             return
         results[result.query_id] = result.to_dict()
+        if self._uses_query_result_journal():
+            result_dict = results[result.query_id]
+            sample_key = str(sample_id)
+            self._query_checkpoint_pending_records.append({
+                "sample_id": sample_key,
+                "result": result_dict,
+                "digest": self._query_result_journal_digest(sample_key, result_dict),
+            })
         self._query_checkpoint_pending_writes = (
             getattr(self, "_query_checkpoint_pending_writes", 0) + 1
         )
@@ -513,13 +598,18 @@ class LoCoMoEvaluator:
             not force and pending_writes < LOCOMO_QUERY_CHECKPOINT_FLUSH_INTERVAL
         ):
             return
+        self._append_query_result_journal()
         self._query_checkpoint.update({
             "format": "locomo.query_checkpoint",
-            "version": 1,
+            "version": 2,
             "query_config_hash": compute_query_config_hash(self.method_config, self.dataset_config),
         })
-        self._query_checkpoint["integrity_hash"] = self._snapshot_integrity_hash(self._query_checkpoint)
-        self._write_json_atomic(self._query_checkpoint_path(), self._query_checkpoint)
+        payload = dict(self._query_checkpoint)
+        if self._uses_query_result_journal():
+            payload["results"] = {}
+        payload["integrity_hash"] = self._snapshot_integrity_hash(payload)
+        self._query_checkpoint["integrity_hash"] = payload["integrity_hash"]
+        self._write_json_atomic(self._query_checkpoint_path(), payload)
         self._query_checkpoint_pending_writes = 0
 
     def evaluate(self) -> EvaluationReport:
@@ -654,8 +744,9 @@ class LoCoMoEvaluator:
             self.aggregator.add_result(result)
             self.result_collector.add_result(result, sample_id)
 
-        if self.workers > 1 and len(pending_units) > 1:
-            with ThreadPoolExecutor(max_workers=min(self.workers, len(pending_units))) as executor:
+        query_workers = self._query_worker_count()
+        if query_workers > 1 and len(pending_units) > 1:
+            with ThreadPoolExecutor(max_workers=min(query_workers, len(pending_units))) as executor:
                 completed = list(executor.map(query_sample, pending_units))
         else:
             completed = [query_sample(unit) for unit in pending_units]
@@ -1033,12 +1124,13 @@ class LoCoMoEvaluator:
         """Run independent real-time query evaluations with bounded concurrency."""
         explicit_manager = manager is not None
         manager = manager or getattr(self, "agent_manager", None)
-        if len(queries) < 2 or self.workers == 1:
+        query_workers = self._query_worker_count()
+        if len(queries) < 2 or query_workers == 1:
             if not explicit_manager:
                 return [self._evaluate_query(query, context_id) for query in queries]
             return [self._evaluate_query(query, context_id, manager=manager) for query in queries]
 
-        worker_count = min(self.workers, len(queries))
+        worker_count = min(query_workers, len(queries))
         self._log(f"  [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
         if getattr(getattr(self, "method_config", None), "method_name", "").lower() == "event_state":
             # Event-State retrieval is logically read-only, but separate stores
@@ -1241,7 +1333,7 @@ class LoCoMoEvaluator:
                 **self._answer_query_kwargs(query),
             )
 
-        worker_count = getattr(self, "workers", 1)
+        worker_count = self._query_worker_count()
         preparation_started = time.perf_counter()
         if worker_count > 1 and len(query_items) > 1:
             with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
@@ -2136,6 +2228,7 @@ def evaluate_locomo(
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
     workers: int = 1,
+    query_workers: int = 5,
     **kwargs
 ) -> EvaluationReport:
     evaluator = LoCoMoEvaluator(
@@ -2154,5 +2247,6 @@ def evaluate_locomo(
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
         workers=workers,
+        query_workers=query_workers,
     )
     return evaluator.evaluate()

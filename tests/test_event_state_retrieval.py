@@ -1,14 +1,219 @@
+from copy import deepcopy
 from types import SimpleNamespace
 
+from methods.event_state import retrieval as retrieval_module
 from methods.event_state.retrieval import EventStateRetriever
-from methods.event_state.schemas import Claim, Episode, EvidenceRef
+from methods.event_state.context import episode_turn_embedding_text, select_claim_evidence, select_global_episode_evidence
+from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
 from methods.event_state.temporal import parse_temporal_query
+from methods.event_state_agent import EventStateAgent
 
 
 class Embedder:
     def embed_query(self, text):
         return [1.0, 0.0]
+
+
+class DeterministicEmbedder:
+    def embed_query(self, text):
+        values = [float((sum(map(ord, text)) + index * 17) % 31 + 1) for index in range(8)]
+        magnitude = sum(value * value for value in values) ** 0.5
+        return [value / magnitude for value in values]
+
+    def embed_documents(self, texts):
+        return [self.embed_query(text) for text in texts]
+
+
+class CountingEmbedder(DeterministicEmbedder):
+    def __init__(self):
+        self.document_batches = []
+
+    def embed_documents(self, texts):
+        self.document_batches.append(list(texts))
+        return super().embed_documents(texts)
+
+
+def _original_select(retriever, candidates, count):
+    """The pre-optimization selector, retained only as an equivalence oracle."""
+    mode, selected = retriever.config.get("selector_mode", "state_mmr"), []
+    remaining = list(candidates)
+    if remaining and all(item.get("_planner_merged_final_score") for item in remaining):
+        relevance = [float(item["final_score"]) for item in remaining]
+    else:
+        relevance = retrieval_module.normalize_scores(
+            [float(item.get("final_score", item.get("score", 0.0))) for item in remaining]
+        )
+    relevance_by_id = {item["id"]: value for item, value in zip(remaining, relevance)}
+    while remaining and len(selected) < count:
+        semantic_remaining = [item for item in remaining if item["type"] != "turn"]
+        choices = semantic_remaining if semantic_remaining and not selected else remaining
+        if mode == "topk":
+            choice, choice_score = max(
+                ((item, item.get("final_score", item.get("score", 0.0))) for item in choices),
+                key=lambda pair: (pair[1], pair[0]["id"]),
+            )
+        else:
+            weight = float(retriever.config.get("mmr_lambda", 0.7))
+
+            def score(item):
+                vector = retriever._vector(item["id"], item["type"])
+                redundancy = max(
+                    (
+                        retrieval_module.cosine(
+                            vector, retriever._vector(other["id"], other["type"])
+                        )
+                        for other in selected
+                    ),
+                    default=0.0,
+                )
+                value = weight * relevance_by_id[item["id"]] - (1 - weight) * redundancy
+                if mode == "state_mmr" and selected:
+                    if any(
+                        edge["source_id"] == item["id"] and edge["target_id"] == other["id"]
+                        or edge["target_id"] == item["id"] and edge["source_id"] == other["id"]
+                        for edge in retriever.store.edges
+                        for other in selected
+                    ):
+                        value += float(retriever.config.get("state_relation_bonus", 0.05))
+                    if item["type"] != selected[-1]["type"]:
+                        value += float(retriever.config.get("representation_balance_bonus", 0.02))
+                    if retriever._source_ids(item) - set().union(
+                        *(retriever._source_ids(other) for other in selected)
+                    ):
+                        value += float(retriever.config.get("source_diversity_bonus", 0.02))
+                return value
+
+            choice = max(choices, key=lambda item: (score(item), item["id"]))
+            choice_score = score(choice)
+        choice["selection_score"] = choice_score
+        selected.append(choice)
+        remaining.remove(choice)
+    for rank, item in enumerate(selected, 1):
+        item["selected_rank"] = rank
+    return selected
+
+
+def _selector_store(item_count=24):
+    store = EventStateStore("ctx")
+    embedder = DeterministicEmbedder()
+    for index in range(item_count):
+        episode_id = f"E{index:02d}"
+        turn = TurnEvidence(f"T{index:02d}", "User", "user", f"turn evidence {index}")
+        episode = Episode(
+            episode_id,
+            "ctx",
+            f"session-{index}",
+            index,
+            None,
+            f"2025-01-{index % 28 + 1:02d}",
+            ["User"],
+            "primary_user",
+            "",
+            f"episode {index}",
+            [turn],
+        )
+        vector = embedder.embed_query(episode_id)
+        store.add_episode(episode, vector, [embedder.embed_query(episode_turn_embedding_text(turn))])
+        claim = Claim(
+            f"C{index:02d}",
+            "User",
+            "primary_user",
+            "preference",
+            f"value {index}",
+            evidence=[EvidenceRef(episode_id, episode.source_session_id, [])],
+        )
+        store.add_claim(claim, embedder.embed_query(claim.claim_id))
+    for index in range(item_count - 1):
+        store.add_edge(f"C{index:02d}", f"C{index + 1:02d}", "REFINES")
+    return store
+
+
+def test_state_mmr_cache_preserves_selection_prompt_and_final_response(monkeypatch):
+    store = _selector_store()
+    retriever = EventStateRetriever(
+        store,
+        DeterministicEmbedder(),
+        selector_mode="state_mmr",
+        evidence_count=12,
+        candidate_count=50,
+    )
+    candidates = [
+        {"id": f"C{index:02d}", "type": "state_claim", "score": 1.0 - index / 100}
+        for index in range(24)
+    ]
+
+    original_cosine = retrieval_module.cosine
+    calls = {"count": 0}
+
+    def counted_cosine(left, right):
+        calls["count"] += 1
+        return original_cosine(left, right)
+
+    monkeypatch.setattr(retrieval_module, "cosine", counted_cosine)
+    expected = _original_select(retriever, deepcopy(candidates), 12)
+    original_calls = calls["count"]
+    calls["count"] = 0
+    actual = retriever._select_impl(deepcopy(candidates), 12)
+
+    assert actual == expected
+    assert calls["count"] * 3 < original_calls
+
+    agent = EventStateAgent(
+        llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="fixed answer")),
+        memory_llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="fixed answer")),
+        embedding_client=DeterministicEmbedder(),
+        selector_mode="state_mmr",
+        evidence_count=12,
+        candidate_count=50,
+        max_context_tokens=120000,
+    )
+    agent.set_context_id("ctx")
+    agent._stores["ctx"] = store
+
+    with monkeypatch.context() as legacy_patch:
+        legacy_patch.setattr(EventStateRetriever, "_select_impl", _original_select)
+        expected_prepared = agent.prepare_batch_query(
+            "What preference did the user mention?", system_message="Answer exactly."
+        )
+    actual_prepared = agent.prepare_batch_query(
+        "What preference did the user mention?", system_message="Answer exactly."
+    )
+
+    assert actual_prepared == expected_prepared
+    assert agent.finalize_batch_query(actual_prepared, "fixed answer").to_dict() == (
+        agent.finalize_batch_query(expected_prepared, "fixed answer").to_dict()
+    )
+
+
+def test_persisted_turn_vectors_preserve_evidence_selection_without_reembedding():
+    store = _selector_store(2)
+    embedder = CountingEmbedder()
+    claim = store.claims["C00"]
+    query_vector = embedder.embed_query("question")
+
+    expected = select_claim_evidence(
+        claim, store.episodes, query_vector, embedder, ref_limit=1,
+    )
+    expected_global = select_global_episode_evidence(
+        [(0, store.episodes["E00"])], query_vector, embedder, limit=1,
+    )
+    assert embedder.document_batches
+
+    embedder.document_batches.clear()
+    cached_vectors = EventStateAgent._persisted_turn_vector_cache(store)
+    actual = select_claim_evidence(
+        claim, store.episodes, query_vector, embedder, ref_limit=1,
+        turn_vector_cache=cached_vectors,
+    )
+    actual_global = select_global_episode_evidence(
+        [(0, store.episodes["E00"])], query_vector, embedder, limit=1,
+        turn_vector_cache=cached_vectors,
+    )
+
+    assert actual == expected
+    assert actual_global == expected_global
+    assert embedder.document_batches == []
 
 
 def _episode(identifier, recorded_at, vector):

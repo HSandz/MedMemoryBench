@@ -339,7 +339,7 @@ complete conversation sample rather than a persona/evaluation unit:
 
 ```bash
 python main.py -m event_state_gemini -d locomo --stage memory --workers 4
-python main.py --stage query --memory-run YYYYMMDD_HHMMSS --workers 4
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS --query-workers 5
 ```
 
 LoCoMo snapshots retain original session and turn provenance. Event-State
@@ -359,7 +359,7 @@ If a full Event-State run fails after memory construction but before its
 final-answer batch is submitted, reuse its snapshots with a query-only child:
 
 ```bash
-python main.py --stage query --memory-run YYYYMMDD_HHMMSS --batch-api --workers 4
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS --batch-api --query-workers 5
 ```
 
 This is safe when the source `memory/manifest.json` is still `building` but
@@ -503,11 +503,12 @@ its chat-completions shape and correlates results by `custom_id`. See the
 
 ## Parallel Query Workers
 
-Use `--workers N` to run up to `N` independent real-time query evaluations at
-once. The default is `1`, which preserves sequential execution:
+`--workers N` controls memory-construction preparation and defaults to `1`.
+Use `--query-workers N` to run up to `N` local query retrieval and prompt
+preparation tasks at once; it defaults to `5`:
 
 ```bash
-python main.py -m METHOD -d DATASET --workers 4
+python main.py -m METHOD -d DATASET --workers 4 --query-workers 5
 ```
 
 Each worker owns one question until its answer and real-time metric scoring are
@@ -515,7 +516,8 @@ complete, then takes another question. This keeps a question's answer and
 judge calls together while bounding concurrent provider requests. Memory
 construction, result collection, and checkpoint writes remain coordinated by the
 main evaluator; completed reports retain dataset order. In Batch API mode,
-query rewriting and read-only retrieval preparation are also worker-bounded.
+the same `--query-workers` limit applies only to local rewriting, retrieval,
+and prompt preparation. It does not change remote Batch API execution.
 
 The evaluator displays one run-wide `Query progress` bar only when query-answer
 work starts, and closes it before a separate LLM-judge batch begins. It advances
@@ -528,28 +530,28 @@ entire memory build is finished.
 
 When running `--stage query` against completed A-MEM or LoCoMo Event-State snapshots, independent
 unit contexts can initialize without waiting for earlier units. Each unit uses
-an isolated agent/memory context, while `N` remains a single global cap across
-all real-time queries, not a per-unit cap. Result, batch, deferred-judge, and
+an isolated agent/memory context, while `--query-workers N` remains a single
+global cap across all real-time queries, not a per-unit cap. Result, batch, deferred-judge, and
 checkpoint commits retain dataset order. This optimization requires query-stage
 snapshots and does not change serial behavior for `N = 1`.
 
 `--batch-api` takes precedence for every eligible query-answer or judge stage.
 When both options are supplied, eligible stages use their provider's Batch API;
-real-time stages use the configured workers instead. For example, this uses
-workers for an unsupported answer provider while still batching an eligible
+real-time stages use the configured query workers instead. For example, this uses
+query workers for an unsupported answer provider while still batching an eligible
 judge provider:
 
 ```bash
-python main.py -m METHOD -d DATASET --batch-api --workers 4
+python main.py -m METHOD -d DATASET --batch-api --query-workers 5
 ```
 
 After a batch answer stage completes, LoCoMo shows a `Finalizing batch answers`
 bar and MedMemoryBench continues its run-wide `Query progress` bar while local
-results are scored and committed. Both resumable query checkpoints are
-atomically flushed every 25 answers and again at normal completion or before
-propagating an error. This avoids rewriting a large checkpoint after every
-response while leaving at most 24 finalized answers unflushed in the resume
-checkpoint. If interrupted, resume the same query child with the original
+results are scored and committed. Both resumable query checkpoints fsync an
+append-only result journal and atomically update compact checkpoint metadata
+every 25 answers and again at normal completion or before propagating an error.
+This avoids rewriting a large checkpoint after every response while leaving at
+most 24 finalized answers unflushed in the resume state. If interrupted, resume the same query child with the original
 command plus `--resume --batch-api`; saved Vertex outputs are reused and only
 checkpoint-missing answers are finalized again.
 

@@ -127,8 +127,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         metavar="N",
         help=(
-            "Maximum concurrent workers for independent query/build preparation "
-            "tasks (default: 1)"
+            "Maximum concurrent workers for memory construction tasks "
+            "(default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--query-workers",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "Maximum concurrent workers for local query retrieval and prompt "
+            "preparation (default: 5)"
         ),
     )
 
@@ -153,6 +163,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--persona and --unit require --append")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.query_workers < 1:
+        parser.error("--query-workers must be at least 1")
     return args
 
 
@@ -569,6 +581,7 @@ def main() -> int:
             batch_gcs_uri=args.batch_gcs_uri,
             batch_wait=args.batch_wait,
             workers=args.workers,
+            query_workers=args.query_workers,
         )
     except FileNotFoundError as e:
         print(f"Error: {truncate_error_message(e)}")

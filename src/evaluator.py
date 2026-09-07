@@ -71,6 +71,7 @@ class Evaluator:
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
         workers: int = 1,
+        query_workers: int = 5,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -126,7 +127,10 @@ class Evaluator:
         self.batch_wait = batch_wait if self.batch_api else False
         if workers < 1:
             raise ValueError("workers must be at least 1")
+        if query_workers < 1:
+            raise ValueError("query_workers must be at least 1")
         self.workers = workers
+        self.query_workers = query_workers
 
         self.base_output_dir = output_dir or (PROJECT_ROOT / "outputs")
         self.base_output_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +480,7 @@ class Evaluator:
                 "batch_gcs_uri": self.batch_gcs_uri,
                 "batch_wait": self.batch_wait,
                 "workers": self.workers,
+                "query_workers": self.query_workers,
             },
         }
         if self.config_inference:
@@ -594,7 +599,8 @@ class Evaluator:
         self._log(
             f"Options | stage={self.execution_stage} | dry_run={self.dry_run} | "
             f"resume={self.resume} | force_resume={self.force_resume} | "
-            f"batch_api={self.batch_api} | workers={self.workers}"
+            f"batch_api={self.batch_api} | memory_workers={self.workers} | "
+            f"query_workers={self.query_workers}"
         )
         if self.memory_run:
             self._log(f"  Memory Run: {self.memory_run}")
@@ -648,6 +654,7 @@ class Evaluator:
                 batch_gcs_uri=self.batch_gcs_uri,
                 batch_wait=self.batch_wait,
                 workers=self.workers,
+                query_workers=self.query_workers,
             )
         except VertexBatchPending as exc:
             self._write_run_config(

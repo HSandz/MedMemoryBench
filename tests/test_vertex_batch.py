@@ -27,6 +27,7 @@ from utils.vertex_batch import (
     scoped_manifest_path,
     snapshot_prepared_query,
 )
+from utils import vertex_batch as vertex_batch_module
 
 
 class _Blob:
@@ -272,6 +273,29 @@ def test_json_schema_mapping_and_saved_request_restore(tmp_path):
     assert restored.metadata == request.metadata
     assert client.has_stage("concepts") is True
     assert [item.request_id for item in client.get_saved_requests("concepts")] == ["structured"]
+
+
+def test_saved_request_lookups_load_and_index_manifest_once(tmp_path, monkeypatch):
+    storage = _Storage()
+    batches = _Batches(storage)
+    client = _client(tmp_path, batches, storage)
+    requests = [_request(f"request-{index}") for index in range(3)]
+    client.run_stage("query", requests)
+
+    client._manifest_cache = None
+    client._manifest_request_index = {}
+    load_calls = []
+    original_load = vertex_batch_module.json.load
+
+    def count_load(*args, **kwargs):
+        load_calls.append(True)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(vertex_batch_module.json, "load", count_load)
+    assert [client.get_saved_request("query", request.request_id).request_id for request in requests] == [
+        request.request_id for request in requests
+    ]
+    assert len(load_calls) == 1
 
 
 def test_progress_callback_reports_submission_and_collection(tmp_path):

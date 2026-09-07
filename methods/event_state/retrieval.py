@@ -395,6 +395,37 @@ class EventStateRetriever:
         else:
             relevance = normalize_scores([float(item.get("final_score", item.get("score", 0.0))) for item in remaining])
         relevance_by_id = {item["id"]: value for item, value in zip(remaining, relevance)}
+
+        # Selection is read-only. Cache only values that the original scoring
+        # expression recomputed for every remaining candidate and MMR round.
+        vector_cache: Dict[int, Sequence[float]] = {}
+        similarity_cache: Dict[Tuple[int, int], float] = {}
+        source_ids_cache: Dict[int, set[Any]] = {}
+        related_ids: Dict[str, set[str]] | None = None
+        selected_ids: set[str] = set()
+        selected_source_ids: set[Any] = set()
+        selected_sources_ready = False
+
+        def vector(item: Dict[str, Any]) -> Sequence[float]:
+            key = id(item)
+            if key not in vector_cache:
+                vector_cache[key] = self._vector(item["id"], item["type"])
+            return vector_cache[key]
+
+        def similarity(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+            key = (id(left), id(right))
+            if key not in similarity_cache:
+                # Keep the existing cosine implementation and operand order so
+                # cached values are bit-for-bit the original score values.
+                similarity_cache[key] = cosine(vector(left), vector(right))
+            return similarity_cache[key]
+
+        def source_ids(item: Dict[str, Any]) -> set[Any]:
+            key = id(item)
+            if key not in source_ids_cache:
+                source_ids_cache[key] = self._source_ids(item)
+            return source_ids_cache[key]
+
         while remaining and len(selected) < count:
             # Preserve the established semantic/episode evidence path when it
             # exists; immutable turns complement it rather than replacing the
@@ -405,23 +436,39 @@ class EventStateRetriever:
                 choice, choice_score = max(((item, item.get("final_score", item.get("score", 0.0))) for item in choices), key=lambda pair: (pair[1], pair[0]["id"] ))
             else:
                 weight = float(self.config.get("mmr_lambda", .7))
+
+                if mode == "state_mmr" and selected and related_ids is None:
+                    related_ids = {}
+                    for edge in self.store.edges:
+                        source_id, target_id = edge["source_id"], edge["target_id"]
+                        related_ids.setdefault(source_id, set()).add(target_id)
+                        related_ids.setdefault(target_id, set()).add(source_id)
+                if mode == "state_mmr" and selected and not selected_sources_ready:
+                    for prior in selected:
+                        selected_source_ids.update(source_ids(prior))
+                    selected_sources_ready = True
+
                 def score(item: Dict[str, Any]) -> float:
-                    vector = self._vector(item["id"], item["type"])
-                    redundancy = max((cosine(vector, self._vector(other["id"], other["type"])) for other in selected), default=0.0)
+                    redundancy = max((similarity(item, other) for other in selected), default=0.0)
                     value = weight * relevance_by_id[item["id"]] - (1 - weight) * redundancy
                     if mode == "state_mmr" and selected:
-                        if any(edge["source_id"] == item["id"] and edge["target_id"] == other["id"] or edge["target_id"] == item["id"] and edge["source_id"] == other["id"] for edge in self.store.edges for other in selected):
+                        if related_ids and related_ids.get(item["id"], set()) & selected_ids:
                             value += float(self.config.get("state_relation_bonus", .05))
                         if item["type"] != selected[-1]["type"]:
                             value += float(self.config.get("representation_balance_bonus", .02))
-                        if self._source_ids(item) - set().union(*(self._source_ids(other) for other in selected)):
+                        if source_ids(item) - selected_source_ids:
                             value += float(self.config.get("source_diversity_bonus", .02))
                     return value
-                choice = max(choices, key=lambda item: (score(item), item["id"]))
-                choice_score = score(choice)
+
+                scores = {id(item): score(item) for item in choices}
+                choice = max(choices, key=lambda item: (scores[id(item)], item["id"]))
+                choice_score = scores[id(choice)]
             choice["selection_score"] = choice_score
             selected.append(choice)
             remaining.remove(choice)
+            selected_ids.add(choice["id"])
+            if mode == "state_mmr" and selected_sources_ready:
+                selected_source_ids.update(source_ids(choice))
         for rank, item in enumerate(selected, 1):
             item["selected_rank"] = rank
         return selected

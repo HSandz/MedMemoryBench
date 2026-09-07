@@ -231,14 +231,21 @@ def render_selected_claim_evidence(
     return rendered
 
 
-def select_episode_evidence(episode: Episode, query_vector: Sequence[float], embedder: Any, limit: int = 2) -> List[Any]:
+def select_episode_evidence(
+    episode: Episode,
+    query_vector: Sequence[float],
+    embedder: Any,
+    limit: int = 2,
+    turn_vector_cache: Dict[Tuple[str, Any], Sequence[float]] | None = None,
+) -> List[Any]:
     """Select query-relevant turns from one episode in source order.
 
     This compatibility helper is deliberately local; query assembly uses the
     global selector below so its source-excerpt budget is not per episode.
     """
     selected, _, _ = select_global_episode_evidence(
-        [(0, episode)], query_vector, embedder, limit
+        [(0, episode)], query_vector, embedder, limit,
+        turn_vector_cache=turn_vector_cache,
     )
     return selected.get(episode.episode_id, [])
 
@@ -250,6 +257,7 @@ def select_global_episode_evidence(
     limit: int = 2,
     excluded_turns: set[Tuple[str, Any]] | None = None,
     query_vectors: Sequence[Sequence[float]] | None = None,
+    turn_vector_cache: Dict[Tuple[str, Any], Sequence[float]] | None = None,
 ) -> Tuple[Dict[str, List[Any]], int, int]:
     """Select a small non-duplicate source-evidence set across episodes.
 
@@ -267,11 +275,22 @@ def select_global_episode_evidence(
             candidates.append((episode_rank, episode, turn_index, turn))
     if limit <= 0 or not candidates:
         return {}, len(candidates), deduplicated
-    texts = [episode_turn_embedding_text(turn) for _, _, _, turn in candidates]
-    try:
-        vectors = embedder.embed_documents(texts)
-    except AttributeError:
-        vectors = [embedder.embed_query(text) for text in texts]
+    vectors_by_key = turn_vector_cache if turn_vector_cache is not None else {}
+    missing: List[Tuple[Tuple[str, Any], Any]] = []
+    for _, episode, _, turn in candidates:
+        key = (episode.episode_id, turn.turn_id)
+        if key not in vectors_by_key:
+            vectors_by_key[key] = ()
+            missing.append((key, turn))
+    if missing:
+        texts = [episode_turn_embedding_text(turn) for _, turn in missing]
+        try:
+            embedded = embedder.embed_documents(texts)
+        except AttributeError:
+            embedded = [embedder.embed_query(text) for text in texts]
+        for (key, _), vector in zip(missing, embedded):
+            vectors_by_key[key] = vector
+    vectors = [vectors_by_key[(episode.episode_id, turn.turn_id)] for _, episode, _, turn in candidates]
     query_vectors = [list(vector) for vector in (query_vectors or [query_vector])]
     scored = sorted(
         (

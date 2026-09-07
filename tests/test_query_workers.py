@@ -128,6 +128,35 @@ def test_locomo_workers_bound_real_time_query_concurrency_and_keep_order():
     assert completed == ["q0", "q1", "q2", "q3"]
 
 
+def test_query_workers_override_memory_workers_for_query_concurrency():
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.workers = 1
+    evaluator.query_workers = 3
+    evaluator._log = lambda *args, **kwargs: None
+
+    active_workers = 0
+    max_active_workers = 0
+    lock = threading.Lock()
+
+    def evaluate_query(query, context_id):
+        nonlocal active_workers, max_active_workers
+        with lock:
+            active_workers += 1
+            max_active_workers = max(max_active_workers, active_workers)
+        time.sleep(0.02)
+        with lock:
+            active_workers -= 1
+        return query.query_id
+
+    evaluator._evaluate_query = evaluate_query
+    queries = [SimpleNamespace(query_id=f"q{index}") for index in range(4)]
+
+    completed = evaluator._evaluate_realtime_queries(queries, context_id="sample")
+
+    assert max_active_workers == 3
+    assert completed == ["q0", "q1", "q2", "q3"]
+
+
 def test_medmemorybench_batch_path_does_not_dispatch_real_time_workers():
     evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
     evaluator.batch_api = True

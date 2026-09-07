@@ -19,6 +19,7 @@ MEMORY_MANIFEST_VERSIONS = {
 # Result payloads can include detailed retrieval diagnostics. Bound full
 # checkpoint serialization while preserving immediate memory-build markers.
 QUERY_CHECKPOINT_FLUSH_INTERVAL = 25
+RESULT_JOURNAL_VERSION = 1
 
 
 def is_supported_memory_manifest(manifest: Dict[str, Any]) -> bool:
@@ -41,7 +42,7 @@ class MedMemoryBenchCheckpoint:
     model_name: str
     dataset_name: str = "medmemorybench"
     config_hash: str = ""
-    checkpoint_version: int = 2
+    checkpoint_version: int = 3
     integrity_hash: str = ""
     # Keeps each fresh batch run separate while allowing its resume to find it.
     batch_manifest_scope: str = ""
@@ -58,6 +59,7 @@ class MedMemoryBenchCheckpoint:
     active_session_started_at: Optional[str] = None
 
     completed_results: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    result_journal: Dict[str, Any] = field(default_factory=dict)
 
     total_personas: int = 0
     total_queries: int = 0
@@ -91,6 +93,7 @@ class MedMemoryBenchCheckpoint:
             "active_session_id": None,
             "active_session_started_at": None,
             "completed_results": {},
+            "result_journal": {},
             "total_personas": 0,
             "total_queries": 0,
             "completed_query_count": 0,
@@ -118,6 +121,7 @@ class MedMemoryBenchCheckpointManager:
         self.recovered_from_backup = False
         self._pending_query_writes = 0
         self._completed_query_ids: Dict[str, set[str]] = {}
+        self._pending_journal_records: List[Dict[str, Any]] = []
 
     def _rebuild_completed_query_ids(self) -> None:
         if self._checkpoint is None:
@@ -148,6 +152,75 @@ class MedMemoryBenchCheckpointManager:
     def temporary_path(self) -> Path:
         return self.checkpoint_path.with_name(f"{self.checkpoint_path.name}.tmp")
 
+    @property
+    def result_journal_path(self) -> Path:
+        return self.checkpoint_path.with_name("results.jsonl")
+
+    def _uses_result_journal(self) -> bool:
+        return bool(
+            self._checkpoint
+            and self._checkpoint.result_journal.get("version") == RESULT_JOURNAL_VERSION
+        )
+
+    @staticmethod
+    def _journal_digest(persona_id: str, result: Dict[str, Any]) -> str:
+        content = json.dumps(
+            {"persona_id": persona_id, "result": result},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _append_result_journal(self) -> None:
+        if not self._pending_journal_records:
+            return
+        self.result_journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.result_journal_path.open("a", encoding="utf-8") as handle:
+            for record in self._pending_journal_records:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._pending_journal_records = []
+
+    def _restore_result_journal(self) -> None:
+        if self._checkpoint is None or not self._uses_result_journal():
+            return
+        if not self.result_journal_path.exists():
+            return
+        results = self._checkpoint.completed_results
+        seen = {
+            (persona_id, str(result.get("query_id")))
+            for persona_id, items in results.items()
+            if isinstance(items, list)
+            for result in items
+            if isinstance(result, dict) and result.get("query_id") is not None
+        }
+        try:
+            with self.result_journal_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                        persona_id = str(record["persona_id"])
+                        result = record["result"]
+                        if (
+                            not isinstance(result, dict)
+                            or record.get("digest") != self._journal_digest(persona_id, result)
+                        ):
+                            break
+                        query_id = result.get("query_id")
+                        if query_id is None or (persona_id, str(query_id)) in seen:
+                            continue
+                    except (KeyError, TypeError, json.JSONDecodeError):
+                        # An interrupted final JSONL write cannot invalidate prior records.
+                        break
+                    results.setdefault(persona_id, []).append(result)
+                    seen.add((persona_id, str(query_id)))
+        except OSError:
+            return
+        self._checkpoint.completed_query_count = sum(len(items) for items in results.values())
+
     def exists(self) -> bool:
         return self.checkpoint_path.exists() or self.backup_path.exists()
 
@@ -167,6 +240,7 @@ class MedMemoryBenchCheckpointManager:
                 self._checkpoint = MedMemoryBenchCheckpoint.from_dict(data)
             except (TypeError, ValueError):
                 continue
+            self._restore_result_journal()
             self._rebuild_completed_query_ids()
             if is_backup:
                 self.recovered_from_backup = True
@@ -178,10 +252,14 @@ class MedMemoryBenchCheckpointManager:
         if self._checkpoint is None:
             return
 
+        self._append_result_journal()
         self._checkpoint.updated_at = datetime.now().isoformat()
-        self._checkpoint.checkpoint_version = 2
+        self._checkpoint.checkpoint_version = 3
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         payload = self._checkpoint.to_dict()
+        if self._uses_result_journal():
+            # Detailed result payloads live in the fsynced append-only journal.
+            payload["completed_results"] = {}
         payload["integrity_hash"] = self._compute_integrity_hash(payload)
         self._checkpoint.integrity_hash = payload["integrity_hash"]
 
@@ -277,6 +355,10 @@ class MedMemoryBenchCheckpointManager:
             evaluation_mode=evaluation_mode,
             total_personas=total_personas,
             total_queries=total_queries,
+            result_journal={
+                "version": RESULT_JOURNAL_VERSION,
+                "path": self.result_journal_path.name,
+            },
         )
         self._rebuild_completed_query_ids()
         self.save()
@@ -398,6 +480,12 @@ class MedMemoryBenchCheckpointManager:
             self._checkpoint.completed_results[persona_key] = []
 
         self._checkpoint.completed_results[persona_key].append(result_dict)
+        if self._uses_result_journal():
+            self._pending_journal_records.append({
+                "persona_id": persona_key,
+                "result": result_dict,
+                "digest": self._journal_digest(persona_key, result_dict),
+            })
         completed_ids.add(query_id)
         self._pending_query_writes += 1
         self.flush_query_progress()
@@ -486,10 +574,12 @@ class MedMemoryBenchCheckpointManager:
             self.backup_path,
             self.temporary_path,
             self.backup_path.with_name(f"{self.backup_path.name}.tmp"),
+            self.result_journal_path,
         ):
             path.unlink(missing_ok=True)
         self._checkpoint = None
         self._pending_query_writes = 0
+        self._pending_journal_records = []
         self._completed_query_ids = {}
 
 

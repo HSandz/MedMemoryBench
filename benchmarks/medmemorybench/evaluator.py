@@ -98,6 +98,7 @@ class MedMemoryBenchEvaluator:
         batch_gcs_uri: Optional[str] = None,
         batch_wait: bool = False,
         workers: int = 1,
+        query_workers: int = 5,
     ):
         self.method_config = method_config
         self.dataset_config = dataset_config
@@ -126,7 +127,10 @@ class MedMemoryBenchEvaluator:
         self.batch_wait = batch_wait
         if workers < 1:
             raise ValueError("workers must be at least 1")
+        if query_workers < 1:
+            raise ValueError("query_workers must be at least 1")
         self.workers = workers
+        self.query_workers = query_workers
 
         self.prompt_manager = get_prompt_manager(
             dataset=dataset_config.dataset_name,
@@ -189,6 +193,10 @@ class MedMemoryBenchEvaluator:
 
         if self._should_enable_checkpoint():
             self._init_checkpoint_manager()
+
+    def _query_worker_count(self) -> int:
+        """Use the query-specific limit, retaining compatibility with test fixtures."""
+        return max(1, int(getattr(self, "query_workers", getattr(self, "workers", 1))))
 
     def _log(
         self,
@@ -2518,7 +2526,7 @@ class MedMemoryBenchEvaluator:
 
         self._configure_query_progress(units)
 
-        if self.execution_stage == "query" and getattr(self, "workers", 1) > 1 and len(units) > 1:
+        if self.execution_stage == "query" and self._query_worker_count() > 1 and len(units) > 1:
             try:
                 self._start_query_progress()
                 self._run_query_stage_parallel(units)
@@ -2710,6 +2718,7 @@ class MedMemoryBenchEvaluator:
             # The outer executor owns the complete worker budget. Never let an
             # isolated unit create a nested per-query executor.
             worker.workers = 1
+            worker.query_workers = 1
             worker.agent_manager = AgentManager(
                 method_config=self.method_config,
                 dataset_config=self.dataset_config,
@@ -2745,7 +2754,7 @@ class MedMemoryBenchEvaluator:
                 "results": [],
             }
 
-        context_worker_count = min(self.workers, len(pending_units))
+        context_worker_count = min(self._query_worker_count(), len(pending_units))
         self._log(
             f"[Workers] Initializing {len(pending_units):,} isolated query-unit "
             f"contexts with up to {context_worker_count} workers."
@@ -2777,7 +2786,7 @@ class MedMemoryBenchEvaluator:
                     for item in worker_results
                     for query in item["unit"].queries_to_evaluate
                 ]
-                query_worker_count = min(self.workers, len(query_jobs))
+                query_worker_count = min(self._query_worker_count(), len(query_jobs))
                 self._log(
                     f"[Workers] Running {len(query_jobs):,} real-time queries across "
                     f"{len(worker_results):,} query units with {query_worker_count} "
@@ -3385,10 +3394,11 @@ class MedMemoryBenchEvaluator:
                     context_id=context_id,
                 )
 
-        if len(queries) < 2 or self.workers == 1:
+        query_workers = self._query_worker_count()
+        if len(queries) < 2 or query_workers == 1:
             return [evaluate_one(query) for query in queries]
 
-        worker_count = min(self.workers, len(queries))
+        worker_count = min(query_workers, len(queries))
         self._log(f"    [Workers] Running {len(queries):,} real-time queries with {worker_count} workers.")
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             # executor.map preserves dataset order for deterministic reports/checkpoints.
@@ -3687,7 +3697,7 @@ class MedMemoryBenchEvaluator:
             except LLMAPIError as exc:
                 return None, exc
 
-        worker_count = getattr(self, "workers", 1)
+        worker_count = self._query_worker_count()
         if worker_count > 1 and len(query_items) > 1:
             with ThreadPoolExecutor(max_workers=min(worker_count, len(query_items))) as executor:
                 prepared_items = list(executor.map(prepare_item, query_items))
@@ -4577,6 +4587,7 @@ def evaluate_medmemorybench(
     batch_gcs_uri: Optional[str] = None,
     batch_wait: bool = False,
     workers: int = 1,
+    query_workers: int = 5,
     **kwargs
 ) -> EvaluationReport:
     """MedMemoryBench evaluation entry point."""
@@ -4601,5 +4612,6 @@ def evaluate_medmemorybench(
         batch_gcs_uri=batch_gcs_uri,
         batch_wait=batch_wait,
         workers=workers,
+        query_workers=query_workers,
     )
     return evaluator.evaluate()
