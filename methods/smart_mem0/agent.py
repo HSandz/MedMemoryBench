@@ -6,7 +6,6 @@ from .consolidation import ConsolidationMixin
 from .core import CoreMemoryMixin
 from .execution import ExecutionMixin
 from .planning import PlanningMixin
-from .proof_context_contract import ProofContextContractMixin
 from .query import QueryMixin
 from .read_answerability_contract import ReadAnswerabilityContractMixin
 from .read_terminal_answer_contract import ReadTerminalAnswerContractMixin
@@ -17,23 +16,22 @@ from .read_temporal_contract import ReadTemporalContractMixin
 from .read_option_contract import ReadOptionContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
 from .read_plan_contract import ReadPlanContractMixin
-from .read_proof_context_owner_contract import ReadProofContextOwnerContractMixin
 from .read_requirement_contract import ReadRequirementContractMixin
 from .read_retrieval_executor import ReadRetrievalExecutorMixin
 from .read_lean_execution_adapter import ReadLeanExecutionAdapterMixin
+from .read_proof_context import UnifiedProofContextMixin
 from .read_usage_contract import ReadUsageContractMixin
 from .retrieval import RetrievalOperationsMixin
 from .write import WriteLifecycleMixin
 
 
 class SmartMem0Agent(
-    ReadProofContextOwnerContractMixin,
     ReadAnswerabilityContractMixin,
     ReadTerminalAnswerContractMixin,
     ReadCertificateContractMixin,
     ReadAnswerOrPlanContractMixin,
     ReadRequirementContractMixin,
-    ProofContextContractMixin,
+    UnifiedProofContextMixin,
     ReadLeanExecutionAdapterMixin,
     ReadRetrievalExecutorMixin,
     ReadContractMixin,
