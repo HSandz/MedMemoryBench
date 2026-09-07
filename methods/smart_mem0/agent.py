@@ -9,8 +9,10 @@ from .query import QueryMixin
 from .read_answerability_contract import ReadAnswerabilityContractMixin
 from .read_terminal_answer_contract import ReadTerminalAnswerContractMixin
 from .read_answer_or_plan_contract import ReadAnswerOrPlanContractMixin
+from .read_answer_sensitive_controller import ReadAnswerSensitiveControllerMixin
 from .read_candidate_set import ReadCandidateSetMixin
 from .read_certificate_contract import ReadCertificateContractMixin
+from .read_contrastive_candidate_policy import ReadContrastiveCandidatePolicyMixin
 from .read_controller import ReadContractMixin
 from .read_temporal_contract import ReadTemporalContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
@@ -29,6 +31,8 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadAnswerSensitiveControllerMixin,
+    ReadContrastiveCandidatePolicyMixin,
     ReadEvidencePolicyMixin,
     ReadAnswerabilityContractMixin,
     ReadTerminalAnswerContractMixin,
