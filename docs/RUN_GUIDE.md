@@ -73,9 +73,11 @@ Both `locomo.yaml` and `medmemorybench.yaml` define
   memory source label and visible question. The answer model is not given the
   hidden benchmark category; query type remains available only to post-hoc
   scoring and reporting, making this an architecture-neutral evaluation.
-  Neutral answers are grounded, minimal, time-faithful, and use `Unknown` when
-  the remembered information is insufficient. Event-State still retrieves from
-  the raw visible question, not the formatted answer prompt.
+  Neutral answers are grounded, shortest-complete, time-faithful, and use
+  `Unknown` when neither a proposition nor its negation is supported. They may
+  make concise inferences requested by the visible question when remembered
+  facts support them. Event-State still retrieves from the raw visible question,
+  not the formatted answer prompt.
 
 To run the neutral protocol, change only this dataset setting:
 

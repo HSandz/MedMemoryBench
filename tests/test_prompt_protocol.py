@@ -71,6 +71,10 @@ FORBIDDEN_NEUTRAL_LABELS = (
     "multiple_choice",
     "inference_generation",
     "multi_hop_clinical_deduction",
+    "query_type",
+    "category",
+    "gold answer",
+    "gold evidence",
     "category 1",
     "category 2",
     "category 3",
@@ -198,19 +202,31 @@ def test_neutral_system_prompts_define_the_output_contract_without_benchmark_lea
     med_zh = NEUTRAL_QUERY_SYSTEM_PROMPTS["medmemorybench"]
 
     for prompt in (locomo, med_en):
-        assert "minimal final answer" in prompt
+        assert "shortest complete final answer" in prompt
         assert "restate the question" in prompt
-        assert "mention retrieval, memory, evidence, records, or context" in prompt
-        assert "unless the question explicitly asks" in prompt
-        assert "several items" in prompt
-        assert 'only "Yes" or "No"' in prompt
-        assert "date, time, duration" in prompt
-        assert "Respect identity" in prompt
+        assert "mention retrieval or evidence" in prompt
+        assert "all supported items needed for a complete answer" in prompt
+        assert 'answer "Yes" only when the proposition is supported' in prompt
+        assert '"No" only when its negation is supported' in prompt
+        assert 'answer "Unknown"' in prompt
+        assert "best concise" in prompt
+        assert "most specific supported expression" in prompt
+        assert "requested person-event-attribute relation" in prompt
+        assert "resolve relative expressions" in prompt
+        assert "human-readable dates" in prompt
         assert "Unknown" in prompt
         assert all(label not in prompt.lower() for label in FORBIDDEN_NEUTRAL_LABELS)
-    assert "只输出回答问题所必需的最简最终答案" in med_zh
+    assert "最短但完整的最终答案" in med_zh
     assert "重述问题" in med_zh
-    assert "严格区分人物、时间顺序和状态变化" in med_zh
+    assert "全部已支持项目" in med_zh
+    assert "支持命题为真时回答“是”" in med_zh
+    assert "支持命题为假时回答“否”" in med_zh
+    assert "推断、可能性、预测、建议或含义" in med_zh
+    assert "最具体且有支持的表达" in med_zh
+    assert "人物、事件与属性之间的关系" in med_zh
+    assert "相对时间换算为对应的绝对时间" in med_zh
+    assert "不要使用 ISO 格式" in med_zh
+    assert all(label not in med_zh.lower() for label in FORBIDDEN_NEUTRAL_LABELS)
     assert med_zh.endswith("Unknown")
 
 
