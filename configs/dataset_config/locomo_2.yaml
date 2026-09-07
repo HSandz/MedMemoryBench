@@ -8,11 +8,10 @@ data:
 
 evaluation:
   mode: "independent"
-  prompt_protocol: "type_aware" # neutral / type_aware
-  sample_ids: null
-  max_samples: null
+  sample_ids: [conv-30]
+  max_samples: 1
   include_images: true
-  category_filter: null
+  category_filter: [1, 2, 3, 4]
   # Memory chunk size in characters for chunked injection
   # ~32K chars ≈ 8K tokens, safe for GPT-5.1/Qwen3-235B (128K context)
   # Each chunk contains multiple sessions until reaching this limit

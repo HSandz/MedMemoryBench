@@ -44,7 +44,7 @@ retrieval_config:
   claim_top_k: 30
   episode_top_k: 20
   turn_top_k: 8
-  candidate_count: 40
+  candidate_count: 50
   fusion_mode: rrf
   rrf_k: 60.0
   claim_retrieval_weight: 1.0
@@ -64,7 +64,7 @@ retrieval_config:
   ppr_expand_hops: 2
   ppr_mix_weight: 0.35
   selector_mode: state_mmr
-  evidence_count: 10
+  evidence_count: 12
   mmr_lambda: 0.7
   state_relation_bonus: 0.05
   source_diversity_bonus: 0.02
