@@ -1,10 +1,9 @@
-"""Candidate-proposition evidence for the two-stage read path.
+"""Generic CandidateSet retrieval for SmartMem0 READ.
 
-Visible options are only one producer of candidate propositions. The generic primitive is
-a bounded proposition->memory candidate packet plus LLM #1 semantic annotations. Retrieval
-neighbors are never deterministic support. LLM #1 proposes SUPPORTS / CONTRADICTS /
-CONTEXT_FOR / UNKNOWN with confidence that the relation label itself is correct; low
-confidence abstains to UNKNOWN. LLM #2 remains the final proposition/option judge.
+CandidateSet is structural: candidates are propositions to evaluate, never memory facts.
+This layer provides bounded per-candidate recall and coverage lineage only. It does not ask
+LLM #1 to label SUPPORTS/CONTRADICTS, attach confidence, or choose a final candidate.
+LLM #2 evaluates candidates against the raw evidence that survives ProofContext.
 """
 
 from copy import deepcopy
@@ -14,13 +13,10 @@ from .contracts import QueryFrame
 
 
 class ReadOptionContractMixin:
+    """Compatibility-named mixin implementing the generic CandidateSet primitive."""
+
     PROPOSITION_PACK_PER_CANDIDATE = 2
     PROPOSITION_PACK_GLOBAL_CAP = 8
-    PROPOSITION_MIN_RELATION_CONFIDENCE = 0.50
-    PROPOSITION_STRONG_RELATION_CONFIDENCE = 0.70
-    VALID_PROPOSITION_RELATIONS = frozenset(
-        {"SUPPORTS", "CONTRADICTS", "CONTEXT_FOR", "UNKNOWN"}
-    )
 
     @classmethod
     def _normalize_candidate_propositions(cls, values: Any) -> Dict[str, str]:
@@ -37,6 +33,7 @@ class ReadOptionContractMixin:
     def _candidate_propositions_from_visible_options(
         self, options: Dict[str, Any]
     ) -> Dict[str, str]:
+        """Visible options are only one adapter into the generic CandidateSet."""
         return self._normalize_candidate_propositions(options)
 
     def _candidate_proposition_memory_payload(
@@ -49,10 +46,7 @@ class ReadOptionContractMixin:
             "kind": memory.get("kind"),
             "claim": str(memory.get("claim") or "")[:260],
             "value": str(self._memory_value(memory) or "")[:140],
-            "semantic_role": str(memory.get("semantic_role") or ""),
-            "stance": str(memory.get("stance") or "AFFIRM"),
-            "assertion_mode": str(memory.get("assertion_mode") or "DIRECT"),
-            "object_anchor": str(memory.get("object_anchor") or ""),
+            "object_anchor": str(memory.get("object_anchor") or "")[:120],
             "event_time": memory.get("event_time"),
             "document_time": memory.get("document_time"),
             "status": memory.get(
@@ -67,6 +61,7 @@ class ReadOptionContractMixin:
         seeds=None,
         question: str = "",
     ) -> Dict[str, Any]:
+        """Bounded structural recall. Packet memories are never sent to LLM #1."""
         del question
         propositions = self._normalize_candidate_propositions(propositions)
         self._last_candidate_propositions = dict(propositions)
@@ -96,32 +91,31 @@ class ReadOptionContractMixin:
             and self._query_visible_memory(memory)
         }
 
-        per_proposition_hits: Dict[str, List[Dict[str, Any]]] = {}
+        per_candidate_hits: Dict[str, List[Dict[str, Any]]] = {}
         for proposition_id, proposition_text in propositions.items():
             if not eligible_ids:
-                per_proposition_hits[proposition_id] = []
+                per_candidate_hits[proposition_id] = []
                 continue
             hits = self._hybrid_search(
                 proposition_text,
                 top_k=min(
-                    self.PROPOSITION_PACK_PER_CANDIDATE + 1, len(eligible_ids)
+                    self.PROPOSITION_PACK_PER_CANDIDATE + 1,
+                    len(eligible_ids),
                 ),
                 candidate_ids=eligible_ids,
             )
-            per_proposition_hits[proposition_id] = list(
+            per_candidate_hits[proposition_id] = list(
                 hits[: self.PROPOSITION_PACK_PER_CANDIDATE]
             )
 
         selected_by_id: Dict[str, Dict[str, Any]] = {}
         ref_by_memory_id: Dict[str, str] = {}
-        proposition_refs = {proposition_id: [] for proposition_id in propositions}
-        proposition_memory_ids = {
-            proposition_id: [] for proposition_id in propositions
-        }
+        candidate_refs = {candidate_id: [] for candidate_id in propositions}
+        coverage = {candidate_id: [] for candidate_id in propositions}
 
         for depth in range(self.PROPOSITION_PACK_PER_CANDIDATE):
-            for proposition_id in propositions:
-                hits = per_proposition_hits.get(proposition_id, [])
+            for candidate_id in propositions:
+                hits = per_candidate_hits.get(candidate_id, [])
                 if depth >= len(hits):
                     continue
                 memory = hits[depth]
@@ -135,35 +129,37 @@ class ReadOptionContractMixin:
                     ref_by_memory_id[memory_id] = ref
                     selected_by_id[memory_id] = memory
                 ref = ref_by_memory_id[memory_id]
-                if ref not in proposition_refs[proposition_id]:
-                    proposition_refs[proposition_id].append(ref)
-                if memory_id not in proposition_memory_ids[proposition_id]:
-                    proposition_memory_ids[proposition_id].append(memory_id)
+                if ref not in candidate_refs[candidate_id]:
+                    candidate_refs[candidate_id].append(ref)
+                if memory_id not in coverage[candidate_id]:
+                    coverage[candidate_id].append(memory_id)
 
-        proposition_ids_by_memory: Dict[str, List[str]] = {}
-        for proposition_id, memory_ids in proposition_memory_ids.items():
+        candidate_ids_by_memory: Dict[str, List[str]] = {}
+        for candidate_id, memory_ids in coverage.items():
             for memory_id in memory_ids:
-                proposition_ids_by_memory.setdefault(memory_id, []).append(
-                    proposition_id
-                )
+                candidate_ids_by_memory.setdefault(memory_id, []).append(candidate_id)
 
         candidates = [
             self._candidate_proposition_memory_payload(
                 selected_by_id[memory_id],
                 ref_by_memory_id[memory_id],
-                proposition_ids_by_memory.get(memory_id, []),
+                candidate_ids_by_memory.get(memory_id, []),
             )
             for memory_id in ref_by_memory_id
         ]
         pack = {
-            "version": "candidate-proposition-pack-v1",
+            "version": "candidate-set-recall-v1",
+            "candidate_set": dict(propositions),
             "propositions": dict(propositions),
             "candidate_refs": {
-                proposition_id: list(refs)
-                for proposition_id, refs in proposition_refs.items()
+                candidate_id: list(refs)
+                for candidate_id, refs in candidate_refs.items()
             },
+            # Keep the historical packet key as a structural retrieval-view alias.
             "candidates": candidates,
+            "retrieval_views": candidates,
             "limits": {
+                "top_per_candidate": self.PROPOSITION_PACK_PER_CANDIDATE,
                 "top_per_proposition": self.PROPOSITION_PACK_PER_CANDIDATE,
                 "global_cap": self.PROPOSITION_PACK_GLOBAL_CAP,
                 "seed_budget": 3,
@@ -171,182 +167,10 @@ class ReadOptionContractMixin:
         }
         self._last_candidate_proposition_pack = deepcopy(pack)
         self._last_proposition_probe_coverage = {
-            proposition_id: list(memory_ids)
-            for proposition_id, memory_ids in proposition_memory_ids.items()
+            candidate_id: list(memory_ids)
+            for candidate_id, memory_ids in coverage.items()
         }
         return pack
-
-    @staticmethod
-    def _bounded_confidence(value: Any) -> float:
-        try:
-            confidence = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        return max(0.0, min(1.0, confidence))
-
-    def _normalize_candidate_proposition_evidence(
-        self,
-        raw_evidence: Any,
-        pack: Dict[str, Any],
-        seeds,
-        propositions: Dict[str, Any],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        propositions = self._normalize_candidate_propositions(propositions)
-        raw_evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
-
-        ref_to_memory_id = {}
-        refs_by_proposition = {
-            proposition_id: set()
-            for proposition_id in propositions
-        }
-        for candidate in (pack or {}).get("candidates") or []:
-            ref = str(candidate.get("ref") or "")
-            memory_id = str(candidate.get("memory_id") or "")
-            if ref and memory_id:
-                ref_to_memory_id[ref] = memory_id
-        for proposition_id, refs in ((pack or {}).get("candidate_refs") or {}).items():
-            if proposition_id in refs_by_proposition:
-                refs_by_proposition[proposition_id].update(
-                    str(ref) for ref in (refs or []) if str(ref)
-                )
-
-        seed_refs = {}
-        for index, memory in enumerate((seeds or [])[:3]):
-            memory_id = str(memory.get("id") or "")
-            if memory_id:
-                seed_refs[f"$seed{index}"] = memory_id
-        ref_to_memory_id.update(seed_refs)
-
-        normalized: Dict[str, List[Dict[str, Any]]] = {
-            proposition_id: [] for proposition_id in propositions
-        }
-        for proposition_id in propositions:
-            entries = raw_evidence.get(proposition_id)
-            if not isinstance(entries, list):
-                continue
-            seen_refs = set()
-            for raw in entries[:8]:
-                if not isinstance(raw, dict):
-                    continue
-                memory_ref = str(
-                    raw.get("memory_ref") or raw.get("ref") or ""
-                ).strip()
-                if not memory_ref or memory_ref in seen_refs:
-                    continue
-                if memory_ref not in ref_to_memory_id:
-                    continue
-                if (
-                    memory_ref not in seed_refs
-                    and memory_ref not in refs_by_proposition.get(proposition_id, set())
-                ):
-                    continue
-                seen_refs.add(memory_ref)
-
-                proposed = str(raw.get("relation") or "UNKNOWN").upper()
-                if proposed not in self.VALID_PROPOSITION_RELATIONS:
-                    proposed = "UNKNOWN"
-                confidence = self._bounded_confidence(raw.get("confidence"))
-
-                relation = proposed
-                accepted = False
-                if proposed == "UNKNOWN":
-                    relation = "UNKNOWN"
-                    status = "ABSTAIN_UNKNOWN"
-                elif confidence < self.PROPOSITION_MIN_RELATION_CONFIDENCE:
-                    relation = "UNKNOWN"
-                    status = "ABSTAIN_LOW_CONFIDENCE"
-                elif (
-                    proposed in {"SUPPORTS", "CONTRADICTS"}
-                    and confidence < self.PROPOSITION_STRONG_RELATION_CONFIDENCE
-                ):
-                    relation = "UNKNOWN"
-                    status = "ABSTAIN_TENTATIVE_STRONG_RELATION"
-                else:
-                    relation = proposed
-                    accepted = True
-                    status = "ACCEPTED"
-
-                normalized[proposition_id].append(
-                    {
-                        "memory_ref": memory_ref,
-                        "memory_id": ref_to_memory_id[memory_ref],
-                        "proposed_relation": proposed,
-                        "relation": relation,
-                        "confidence": round(confidence, 3),
-                        "accepted": accepted,
-                        "status": status,
-                    }
-                )
-        return normalized
-
-    def _activate_candidate_proposition_evidence(
-        self,
-        propositions: Dict[str, Any],
-        evidence: Dict[str, List[Dict[str, Any]]],
-        *,
-        visible_options: bool = False,
-        predicate: str = "",
-    ) -> None:
-        propositions = self._normalize_candidate_propositions(propositions)
-        evidence = {
-            proposition_id: [dict(item) for item in (evidence.get(proposition_id) or [])]
-            for proposition_id in propositions
-        }
-        self._last_candidate_propositions = dict(propositions)
-        self._last_proposition_relation_views = deepcopy(evidence)
-        self._last_proposition_support_views = {
-            proposition_id: [
-                dict(item)
-                for item in items
-                if item.get("relation") == "SUPPORTS" and item.get("accepted")
-            ]
-            for proposition_id, items in evidence.items()
-        }
-        self._last_proposition_contradict_views = {
-            proposition_id: [
-                dict(item)
-                for item in items
-                if item.get("relation") == "CONTRADICTS" and item.get("accepted")
-            ]
-            for proposition_id, items in evidence.items()
-        }
-        self._last_proposition_context_views = {
-            proposition_id: [
-                dict(item)
-                for item in items
-                if item.get("relation") == "CONTEXT_FOR" and item.get("accepted")
-            ]
-            for proposition_id, items in evidence.items()
-        }
-        self._last_proposition_unknown_views = {
-            proposition_id: [
-                dict(item)
-                for item in items
-                if item.get("relation") == "UNKNOWN"
-            ]
-            for proposition_id, items in evidence.items()
-        }
-        self._last_proposition_semantics = {"predicate": str(predicate or "").strip()}
-
-        if visible_options:
-            self._last_option_probe_relations = deepcopy(
-                self._last_proposition_relation_views
-            )
-            self._last_option_support_views = deepcopy(
-                self._last_proposition_support_views
-            )
-            self._last_option_contradict_views = deepcopy(
-                self._last_proposition_contradict_views
-            )
-            self._last_option_semantics = deepcopy(self._last_proposition_semantics)
-            self._last_option_probe_coverage = {
-                proposition_id: list(
-                    (getattr(self, "_last_proposition_probe_coverage", {}) or {}).get(
-                        proposition_id, []
-                    )
-                )
-                for proposition_id in propositions
-            }
 
     def _option_memory_relation(
         self,
@@ -355,35 +179,13 @@ class ReadOptionContractMixin:
         rank: int = 0,
         semantics: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        """Compatibility lookup: never infer evidence stance deterministically."""
-        del rank, semantics
-        proposition_id = next(
-            (
-                key
-                for key, text in (
-                    getattr(self, "_last_candidate_propositions", {}) or {}
-                ).items()
-                if self._rc_text(text) == self._rc_text(option_text)
-            ),
-            "",
-        )
-        memory_id = str(memory.get("id") or "")
-        for item in (
-            (getattr(self, "_last_proposition_relation_views", {}) or {}).get(
-                proposition_id, []
-            )
-            if proposition_id
-            else []
-        ):
-            if str(item.get("memory_id") or "") == memory_id:
-                return dict(item)
+        """Legacy compatibility: retrieval proximity never implies evidence stance."""
+        del option_text, rank, semantics
         return {
-            "memory_id": memory_id,
-            "proposed_relation": "UNKNOWN",
-            "relation": "UNKNOWN",
-            "confidence": 0.0,
+            "memory_id": str(memory.get("id") or ""),
+            "relation": "UNJUDGED",
             "accepted": False,
-            "status": "UNANNOTATED",
+            "status": "CANDIDATESET_RETRIEVAL_ONLY",
         }
 
     @staticmethod
@@ -423,6 +225,7 @@ class ReadOptionContractMixin:
                 propositions[label] = text
         propositions = self._normalize_candidate_propositions(propositions)
         labels = list(propositions)
+
         eligible_ids = {
             memory["id"]
             for memory in getattr(self, "_memories", []) or []
@@ -432,7 +235,6 @@ class ReadOptionContractMixin:
             )
             and self._query_visible_memory(memory)
         }
-
         precoverage = getattr(self, "_last_proposition_probe_coverage", {}) or {}
         coverage = {
             label: list(precoverage.get(label, []))
@@ -440,6 +242,7 @@ class ReadOptionContractMixin:
         }
         if not eligible_ids:
             self._last_option_probe_coverage = coverage
+            self._last_proposition_probe_coverage = deepcopy(coverage)
             return []
 
         base = self._hybrid_search(
@@ -448,8 +251,9 @@ class ReadOptionContractMixin:
             candidate_ids=eligible_ids,
         )
         representatives: List[Dict[str, Any]] = []
-        option_hits: List[Dict[str, Any]] = []
+        candidate_hits: List[Dict[str, Any]] = []
         representative_ids = set()
+
         for label, proposition_text in propositions.items():
             hits = self._hybrid_search(
                 proposition_text,
@@ -461,7 +265,7 @@ class ReadOptionContractMixin:
                 if memory.get("id") and memory["id"] not in current_ids:
                     current_ids.append(memory["id"])
             coverage[label] = current_ids
-            option_hits.extend(hits)
+            candidate_hits.extend(hits)
             representative = next(
                 (
                     memory
@@ -474,44 +278,35 @@ class ReadOptionContractMixin:
                 representatives.append(representative)
                 representative_ids.add(representative["id"])
 
-        self._last_option_probe_coverage = coverage
-        strong_ids = self._evidence_memory_ids(
-            getattr(self, "_last_proposition_support_views", {}) or {},
-            getattr(self, "_last_proposition_contradict_views", {}) or {},
-        )
-        context_ids = self._evidence_memory_ids(
-            getattr(self, "_last_proposition_context_views", {}) or {}
-        )
+        self._last_option_probe_coverage = deepcopy(coverage)
+        self._last_proposition_probe_coverage = deepcopy(coverage)
+
         packet_ids = [
             str(item.get("memory_id") or "")
             for item in (
                 (getattr(self, "_last_candidate_proposition_pack", {}) or {}).get(
-                    "candidates"
+                    "retrieval_views"
                 )
                 or []
             )
             if str(item.get("memory_id") or "")
         ]
-
         by_id = {
             memory["id"]: memory
             for memory in getattr(self, "_memories", []) or []
             if memory.get("id")
         }
+
         selected, selected_ids = [], set()
         ordered = [
-            *(by_id[memory_id] for memory_id in strong_ids if memory_id in by_id),
-            *(by_id[memory_id] for memory_id in context_ids if memory_id in by_id),
             *(by_id[memory_id] for memory_id in packet_ids if memory_id in by_id),
             *representatives,
             *base,
-            *option_hits,
+            *candidate_hits,
         ]
         for memory in ordered:
             memory_id = str(memory.get("id") or "")
-            if not memory_id or memory_id in selected_ids:
-                continue
-            if memory_id not in eligible_ids:
+            if not memory_id or memory_id in selected_ids or memory_id not in eligible_ids:
                 continue
             selected.append(self._snapshot(memory))
             selected_ids.add(memory_id)
@@ -558,20 +353,13 @@ class ReadOptionContractMixin:
         if str(slot.get("evidence_role") or "").upper() != "OPTION_CONTEXT":
             return super()._operation_slot_support(slot, result, relations)
         ordered, seen = [], set()
-        priority_ids = self._evidence_memory_ids(
-            getattr(self, "_last_proposition_support_views", {}) or {},
-            getattr(self, "_last_proposition_contradict_views", {}) or {},
-            getattr(self, "_last_proposition_context_views", {}) or {},
-        )
-        by_id = {memory.get("id"): memory for memory in (result or []) if memory.get("id")}
-        for memory_id in priority_ids:
-            memory = by_id.get(memory_id)
-            if memory and self._rc_owner_match(slot, memory):
-                ordered.append(memory)
-                seen.add(memory_id)
         for memory in result or []:
             memory_id = str(memory.get("id") or "")
-            if memory_id in seen or not self._rc_owner_match(slot, memory):
+            if (
+                not memory_id
+                or memory_id in seen
+                or not self._rc_owner_match(slot, memory)
+            ):
                 continue
             if not self._rc_option_probe_labels_for_memory(memory_id):
                 continue
@@ -587,33 +375,29 @@ class ReadOptionContractMixin:
         propositions = dict(
             getattr(self, "_last_candidate_propositions", {}) or {}
         )
-        pack = deepcopy(getattr(self, "_last_candidate_proposition_pack", {}) or {})
-        relations = deepcopy(
-            getattr(self, "_last_proposition_relation_views", {}) or {}
+        pack = deepcopy(
+            getattr(self, "_last_candidate_proposition_pack", {}) or {}
         )
-        supports = deepcopy(
-            getattr(self, "_last_proposition_support_views", {}) or {}
+        coverage = deepcopy(
+            getattr(self, "_last_proposition_probe_coverage", {}) or {}
         )
-        contradictions = deepcopy(
-            getattr(self, "_last_proposition_contradict_views", {}) or {}
-        )
-        contexts = deepcopy(
-            getattr(self, "_last_proposition_context_views", {}) or {}
-        )
-        unknowns = deepcopy(
-            getattr(self, "_last_proposition_unknown_views", {}) or {}
-        )
-        semantics = dict(
-            getattr(self, "_last_proposition_semantics", {}) or {}
-        )
+
+        candidate_set = {
+            "version": "candidate-set-v1",
+            "candidates": propositions,
+            "coverage": coverage,
+            "coverage_semantics": "retrieval_only_not_verdict",
+        }
+        extra["candidate_set"] = deepcopy(candidate_set)
+        # Historical telemetry aliases; semantic relation views are intentionally empty.
         extra["candidate_propositions"] = propositions
         extra["candidate_proposition_pack"] = pack
-        extra["proposition_relation_views"] = relations
-        extra["proposition_support_views"] = supports
-        extra["proposition_contradict_views"] = contradictions
-        extra["proposition_context_views"] = contexts
-        extra["proposition_unknown_views"] = unknowns
-        extra["proposition_semantics"] = semantics
+        extra["proposition_relation_views"] = {}
+        extra["proposition_support_views"] = {}
+        extra["proposition_contradict_views"] = {}
+        extra["proposition_context_views"] = {}
+        extra["proposition_unknown_views"] = {}
+        extra["proposition_semantics"] = {}
 
         if self._question_options(question) or {}:
             extra["option_evidence_views"] = {
@@ -622,56 +406,32 @@ class ReadOptionContractMixin:
                     getattr(self, "_last_option_probe_coverage", {}) or {}
                 ).items()
             }
-            extra["option_relation_views"] = deepcopy(relations)
-            extra["option_support_views"] = deepcopy(supports)
-            extra["option_contradict_views"] = deepcopy(contradictions)
-            extra["option_semantics"] = dict(semantics)
+            extra["option_relation_views"] = {}
+            extra["option_support_views"] = {}
+            extra["option_contradict_views"] = {}
+            extra["option_semantics"] = {}
 
         if not propositions:
             return prepared
 
         final_ids = set(extra.get("final_memory_ids") or [])
-        predicate = str(semantics.get("predicate") or "").strip()
         lines = [
-            "\n=== CANDIDATE PROPOSITION EVIDENCE ===",
+            "\n=== CANDIDATE SET ===",
             (
-                f"Normalized selection predicate: {predicate}"
-                if predicate
-                else "Normalized selection predicate: unspecified."
+                "Candidates are propositions to evaluate against the QUESTION predicate. "
+                "retrieved_memory_ids are retrieval coverage only, never support/"
+                "contradiction labels. Empty coverage does not make a candidate false. "
+                "Evaluate every candidate from the raw evidence that follows."
             ),
-            "These relations were proposed by semantic controller LLM #1 from the "
-            "bounded candidate packet and Top-3 seeds. Confidence is P(the relation "
-            "label is correct), NOT P(the proposition is correct). SUPPORTS and "
-            "CONTRADICTS are accepted only at high confidence; lower-confidence strong "
-            "claims abstain to UNKNOWN. Re-check every annotation against the raw memory. "
-            "CONTEXT_FOR/UNKNOWN and an empty support list are not verdicts, and no "
-            "personal-memory support does NOT mean a proposition is false.",
         ]
-        for proposition_id, proposition_text in propositions.items():
-            items = relations.get(proposition_id) or []
+        for candidate_id, proposition_text in propositions.items():
+            ids = list(coverage.get(candidate_id, []))
             if final_ids:
-                items = [
-                    item
-                    for item in items
-                    if str(item.get("memory_id") or "") in final_ids
-                ]
-            rendered = ", ".join(
-                (
-                    f"{item.get('memory_id','') or '-'}:"
-                    f"{item.get('relation','UNKNOWN')}"
-                    f"@{float(item.get('confidence', 0.0)):.2f}"
-                    + (
-                        f"(proposed={item.get('proposed_relation')})"
-                        if item.get("proposed_relation") != item.get("relation")
-                        else ""
-                    )
-                )
-                for item in items
-            ) or "[]"
+                ids = [memory_id for memory_id in ids if memory_id in final_ids]
             lines.append(
-                f"- {proposition_id} ({proposition_text}): evidence=[{rendered}]"
+                f"- {candidate_id} ({proposition_text}): "
+                f"retrieved_memory_ids={ids}"
             )
-
         addendum = "\n".join(lines)
         for message in prepared.get("messages") or []:
             if message.get("role") == "system":

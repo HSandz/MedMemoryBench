@@ -1,8 +1,12 @@
-"""Candidate-proposition regressions for SmartMem0 READ."""
+"""CandidateSet regressions for SmartMem0 READ."""
 
 from methods.smart_mem0.agent import SmartMem0Agent
 from methods.smart_mem0.contracts import QueryFrame
-from methods.smart_mem0.read_answer_or_plan_contract import ANSWER_OR_PLAN_PRIORITY
+from methods.smart_mem0.read_answer_or_plan_contract import (
+    ANSWER_OR_PLAN_PRIORITY,
+    MINIMAL_CONTROLLER_POLICY,
+    MINIMAL_CONTROLLER_SCHEMA,
+)
 
 
 def _agent():
@@ -29,16 +33,31 @@ def _agent():
     return agent
 
 
-def test_candidate_proposition_pack_is_generic_and_keeps_seed_budget_at_three():
+def _memory(memory_id, claim, value):
+    return {
+        "id": memory_id,
+        "subject_id": "primary_user",
+        "claim": claim,
+        "value": value,
+        "kind": "FACT",
+        "object_anchor": "",
+        "event_time": "",
+        "document_time": "",
+    }
+
+
+def test_candidate_set_recall_is_generic_and_keeps_seed_budget_at_three():
     agent = _agent()
     agent._memories = [
-        {"id": "seed-memory", "subject_id": "primary_user", "claim": "Alpha evidence already in a seed.", "value": "alpha"},
-        {"id": "m1", "subject_id": "primary_user", "claim": "Alpha candidate evidence one.", "value": "alpha one"},
-        {"id": "m2", "subject_id": "primary_user", "claim": "Alpha candidate evidence two.", "value": "alpha two"},
-        {"id": "m3", "subject_id": "primary_user", "claim": "Beta candidate evidence one.", "value": "beta one"},
-        {"id": "m4", "subject_id": "primary_user", "claim": "Beta candidate evidence two.", "value": "beta two"},
+        _memory("seed-memory", "Alpha evidence already in a seed.", "alpha"),
+        _memory("m1", "Alpha candidate evidence one.", "alpha one"),
+        _memory("m2", "Alpha candidate evidence two.", "alpha two"),
+        _memory("m3", "Beta candidate evidence one.", "beta one"),
+        _memory("m4", "Beta candidate evidence two.", "beta two"),
     ]
-    agent._memory_satisfies_frame = lambda memory, frame, include_entities=False: True
+    agent._memory_satisfies_frame = (
+        lambda memory, frame, include_entities=False: True
+    )
     agent._query_visible_memory = lambda memory: True
 
     def hybrid(query, top_k, candidate_ids=None):
@@ -47,140 +66,172 @@ def test_candidate_proposition_pack_is_generic_and_keeps_seed_budget_at_three():
             memory
             for memory in agent._memories
             if memory["id"] in set(candidate_ids or [])
-            and (("alpha" in words and "alpha" in memory["claim"].casefold()) or ("beta" in words and "beta" in memory["claim"].casefold()))
+            and (
+                ("alpha" in words and "alpha" in memory["claim"].casefold())
+                or ("beta" in words and "beta" in memory["claim"].casefold())
+            )
         ]
         return ranked[:top_k]
 
     agent._hybrid_search = hybrid
-    propositions = {"hypothesis_alpha": "alpha", "hypothesis_beta": "beta"}
+    propositions = {
+        "hypothesis_alpha": "alpha",
+        "hypothesis_beta": "beta",
+    }
     pack = agent._build_candidate_proposition_pack(
         propositions,
         frame=QueryFrame(),
         seeds=[{"id": "seed-memory"}, {"id": "s2"}, {"id": "s3"}],
     )
-    assert pack["version"] == "candidate-proposition-pack-v1"
+
+    assert pack["version"] == "candidate-set-recall-v1"
     assert pack["limits"]["seed_budget"] == 3
-    assert pack["limits"]["top_per_proposition"] == 2
-    assert len(pack["candidates"]) <= 4
-    assert all(item["memory_id"] != "seed-memory" for item in pack["candidates"])
-    assert set(pack["candidate_refs"]) == {"hypothesis_alpha", "hypothesis_beta"}
-
-
-def test_low_confidence_relation_abstains_instead_of_becoming_support():
-    agent = _agent()
-    pack = {"candidate_refs": {"A": ["$prop0"]}, "candidates": [{"ref": "$prop0", "memory_id": "m1"}]}
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {"A": [{"memory_ref": "$prop0", "relation": "SUPPORTS", "confidence": 0.49}]},
-        pack,
-        [],
-        {"A": "candidate A"},
+    assert pack["limits"]["top_per_candidate"] == 2
+    assert len(pack["retrieval_views"]) <= 4
+    assert all(
+        item["memory_id"] != "seed-memory"
+        for item in pack["retrieval_views"]
     )
-    item = normalized["A"][0]
-    assert item["proposed_relation"] == "SUPPORTS"
-    assert item["relation"] == "UNKNOWN"
-    assert item["status"] == "ABSTAIN_LOW_CONFIDENCE"
-    assert not item["accepted"]
-
-
-def test_tentative_strong_relation_abstains_below_strong_threshold():
-    agent = _agent()
-    pack = {"candidate_refs": {"A": ["$prop0"]}, "candidates": [{"ref": "$prop0", "memory_id": "m1"}]}
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {"A": [{"memory_ref": "$prop0", "relation": "CONTRADICTS", "confidence": 0.65}]},
-        pack,
-        [],
-        {"A": "candidate A"},
-    )
-    item = normalized["A"][0]
-    assert item["proposed_relation"] == "CONTRADICTS"
-    assert item["relation"] == "UNKNOWN"
-    assert item["status"] == "ABSTAIN_TENTATIVE_STRONG_RELATION"
-
-
-def test_high_confidence_support_is_accepted_but_is_not_a_final_verdict():
-    agent = _agent()
-    pack = {"candidate_refs": {"A": ["$prop0"]}, "candidates": [{"ref": "$prop0", "memory_id": "m1"}]}
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {"A": [{"memory_ref": "$prop0", "relation": "SUPPORTS", "confidence": 0.88}]},
-        pack,
-        [],
-        {"A": "candidate A"},
-    )
-    agent._activate_candidate_proposition_evidence(
-        {"A": "candidate A"},
-        normalized,
-        visible_options=True,
-        predicate="candidate satisfies the requested condition",
-    )
-    assert agent._last_proposition_support_views["A"][0]["memory_id"] == "m1"
-    assert agent._last_proposition_support_views["A"][0]["confidence"] == 0.88
-    assert "verdict" not in agent._last_proposition_support_views["A"][0]
-
-
-def test_context_relation_can_survive_without_becoming_support():
-    agent = _agent()
-    pack = {"candidate_refs": {"A": ["$prop0"]}, "candidates": [{"ref": "$prop0", "memory_id": "m1"}]}
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {"A": [{"memory_ref": "$prop0", "relation": "CONTEXT_FOR", "confidence": 0.58}]},
-        pack,
-        [],
-        {"A": "candidate A"},
-    )
-    agent._activate_candidate_proposition_evidence({"A": "candidate A"}, normalized)
-    assert agent._last_proposition_context_views["A"][0]["memory_id"] == "m1"
-    assert agent._last_proposition_support_views["A"] == []
-
-
-def test_packet_reference_cannot_be_reassigned_to_another_proposition():
-    agent = _agent()
-    pack = {
-        "candidate_refs": {"A": ["$prop0"], "B": ["$prop1"]},
-        "candidates": [{"ref": "$prop0", "memory_id": "m1"}, {"ref": "$prop1", "memory_id": "m2"}],
+    assert set(pack["candidate_refs"]) == {
+        "hypothesis_alpha",
+        "hypothesis_beta",
     }
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {"B": [{"memory_ref": "$prop0", "relation": "SUPPORTS", "confidence": 0.95}]},
-        pack,
-        [],
-        {"A": "candidate A", "B": "candidate B"},
-    )
-    assert normalized["B"] == []
 
 
-def test_top_three_seed_refs_remain_global_for_proposition_annotation():
+def test_visible_options_are_only_an_adapter_to_candidate_set():
     agent = _agent()
-    pack = {"candidate_refs": {"A": []}, "candidates": []}
-    seeds = [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}, {"id": "m4"}]
-    normalized = agent._normalize_candidate_proposition_evidence(
-        {
-            "A": [
-                {"memory_ref": "$seed2", "relation": "SUPPORTS", "confidence": 0.90},
-                {"memory_ref": "$seed3", "relation": "SUPPORTS", "confidence": 0.99},
-            ]
-        },
-        pack,
-        seeds,
-        {"A": "candidate A"},
+    propositions = agent._candidate_propositions_from_visible_options(
+        {"A": "choice one", "B": "choice two"}
     )
-    assert [item["memory_id"] for item in normalized["A"]] == ["m3"]
-
-
-def test_visible_options_are_only_an_adapter_to_candidate_propositions():
-    agent = _agent()
-    propositions = agent._candidate_propositions_from_visible_options({"A": "choice one", "B": "choice two"})
     assert propositions == {"A": "choice one", "B": "choice two"}
-    generic = agent._normalize_candidate_propositions({"hypothesis": "candidate explanation"})
+    generic = agent._normalize_candidate_propositions(
+        {"hypothesis": "candidate explanation"}
+    )
     assert generic == {"hypothesis": "candidate explanation"}
 
 
-def test_controller_policy_keeps_llm1_annotation_distinct_from_final_selection():
-    assert "Candidate-proposition pack entries are additional bounded retrieval candidates, NOT extra seeds" in ANSWER_OR_PLAN_PRIORITY
-    assert "confidence means P(the memory↔proposition RELATION LABEL is correct)" in ANSWER_OR_PLAN_PRIORITY
-    assert "Do NOT choose final proposition labels in LLM #1" in ANSWER_OR_PLAN_PRIORITY
+def test_llm1_schema_has_no_candidate_verdict_or_confidence_surface():
+    assert ANSWER_OR_PLAN_PRIORITY == MINIMAL_CONTROLLER_POLICY
+    for forbidden in (
+        "proposition_evidence",
+        "option_semantics",
+        "support_roles",
+        "contradict_roles",
+        '"answer_mode"',
+        '"requires_inference"',
+        '"route"',
+        '"operations"',
+    ):
+        assert forbidden not in MINIMAL_CONTROLLER_SCHEMA
+    assert "$prop" not in MINIMAL_CONTROLLER_SCHEMA
+
+
+def test_candidate_packet_is_not_part_of_controller_seed_payload():
+    agent = _agent()
+    seeds = [
+        {
+            "id": "m1",
+            "claim": "A compact claim",
+            "value": "v",
+            "kind": "FACT",
+            "subject_id": "primary_user",
+            "object_anchor": "object",
+            "evidence_family": "family",
+            "event_time": "2024-01-01",
+            "document_time": "2024-01-02",
+            "origin_document_time": "2023-12-31",
+            "state_identity": "legacy-heavy-field",
+            "_status": "active",
+        }
+    ]
+    payload = agent._controller_seed_payload(seeds)
+    assert len(payload) == 1
+    assert payload[0]["ref"] == "$seed0"
+    assert "origin_document_time" not in payload[0]
+    assert "state_identity" not in payload[0]
+    assert "status" not in payload[0]
+    assert "proposition_ids" not in payload[0]
+
+
+def test_shared_candidate_search_updates_generic_coverage_without_verdicts():
+    agent = _agent()
+    agent._memories = [
+        _memory("m1", "Alpha evidence", "alpha"),
+        _memory("m2", "Beta evidence", "beta"),
+        _memory("m3", "General context", "context"),
+    ]
+    agent._memory_satisfies_frame = (
+        lambda memory, frame, include_entities=False: True
+    )
+    agent._query_visible_memory = lambda memory: True
+    agent._snapshot = lambda memory: dict(memory)
+
+    def hybrid(query, top_k, candidate_ids=None):
+        eligible = [
+            memory
+            for memory in agent._memories
+            if memory["id"] in set(candidate_ids or [])
+        ]
+        lowered = query.casefold()
+        if "alpha" in lowered:
+            eligible = [
+                memory
+                for memory in eligible
+                if "alpha" in memory["claim"].casefold()
+            ]
+        elif "beta" in lowered:
+            eligible = [
+                memory
+                for memory in eligible
+                if "beta" in memory["claim"].casefold()
+            ]
+        return eligible[:top_k]
+
+    agent._hybrid_search = hybrid
+    result = agent._semantic_operation_search(
+        "shared evidence",
+        4,
+        "SHARED_OPTIONS",
+        frame=QueryFrame(),
+        option_queries=[
+            {"label": "A", "query": "alpha"},
+            {"label": "B", "query": "beta"},
+        ],
+    )
+
+    assert result
+    assert agent._last_option_probe_coverage["A"] == ["m1"]
+    assert agent._last_option_probe_coverage["B"] == ["m2"]
+    assert agent._last_proposition_probe_coverage == (
+        agent._last_option_probe_coverage
+    )
+    assert agent._last_proposition_relation_views == {}
 
 
 def test_option_zero_memory_hit_is_not_a_false_verdict():
     agent = _agent()
-    agent._last_option_probe_coverage = {"A": [], "B": ["m1"], "C": [], "D": []}
-    slot = {"evidence_role": "OPTION_CONTEXT", "option_labels": ["A", "B", "C", "D"]}
+    agent._last_option_probe_coverage = {
+        "A": [],
+        "B": ["m1"],
+        "C": [],
+        "D": [],
+    }
+    slot = {
+        "evidence_role": "OPTION_CONTEXT",
+        "option_labels": ["A", "B", "C", "D"],
+    }
     assert agent._slot_covered(slot, ["m1"], [{"id": "m1"}], [])
     assert set(agent._last_option_probe_coverage) == {"A", "B", "C", "D"}
+
+
+def test_legacy_option_relation_lookup_never_infers_stance():
+    agent = _agent()
+    relation = agent._option_memory_relation(
+        "candidate A", {"id": "m1"}, rank=0, semantics={}
+    )
+    assert relation == {
+        "memory_id": "m1",
+        "relation": "UNJUDGED",
+        "accepted": False,
+        "status": "CANDIDATESET_RETRIEVAL_ONLY",
+    }

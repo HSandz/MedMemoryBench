@@ -1,4 +1,4 @@
-"""Regressions for SmartMem0's answer-or-plan read invariant."""
+"""Regressions for SmartMem0's requirement-first answer-or-plan invariant."""
 
 from types import SimpleNamespace
 
@@ -48,25 +48,23 @@ def test_connected_derived_obligation_cannot_be_hidden_by_direct_projection():
     question = "Which antibiotic was the patient instructed to avoid?"
     ir = agent._rc_normalize_ir(
         {
-            "answer_type": "ENTITY",
+            "requested_projection": "ENTITY",
             "subject_span": "patient",
             "requirements": [
                 {
                     "id": "r1",
                     "grounding_kind": "QUESTION",
-                    "focus_span": "antibiotic",
-                    "target": "antibiotic instructed to avoid",
-                    "retrieval_hint": "antibiotic warning or instruction",
+                    "answer_obligation": "antibiotic",
+                    "evidence_family": "antibiotic warning or instruction",
                 },
                 {
                     "id": "r2",
                     "grounding_kind": "DERIVED",
-                    "focus_span": "",
-                    "target": "medication contraindications",
-                    "retrieval_hint": "drug contraindications",
+                    "answer_obligation": "medication contraindications",
+                    "evidence_family": "drug contraindications",
                 },
             ],
-            "relations": [
+            "bridges": [
                 {"type": "DEPENDS_ON", "from": "r1", "to": "r2"}
             ],
             "candidate": {"answer": "cefuroxime", "support_ref": "$seed0"},
@@ -80,27 +78,70 @@ def test_connected_derived_obligation_cannot_be_hidden_by_direct_projection():
     assert agent._aop_direct_projection(ir, question) is None
 
 
-def test_advice_question_never_uses_direct_candidate_shortcut():
+def test_requirement_vnext_keeps_family_selector_and_proof_obligation_separate():
     agent = _agent()
-    question = "My neck feels sore. Can I take some painkillers?"
+    question = "Which antibiotic was the patient instructed to avoid?"
     ir = agent._rc_normalize_ir(
         {
-            "answer_type": "TEXT",
+            "requested_projection": "ENTITY",
+            "subject_span": "patient",
             "requirements": [
                 {
                     "id": "r1",
                     "grounding_kind": "QUESTION",
-                    "focus_span": "My neck feels sore",
-                    "target": "current neck soreness",
+                    "answer_obligation": "antibiotic",
+                    "evidence_family": "antibiotic avoidance instruction",
+                    "selector": {
+                        "axis": "",
+                        "relation": "",
+                        "anchor": "",
+                        "end": "",
+                    },
+                    "constraints": ["patient-specific instruction"],
                 }
             ],
-            "candidate": {"answer": "yes", "support_ref": "$seed0"},
+            "bridges": [],
         },
         question,
         QueryFrame(),
     )
-    assert ir["candidate"] is None
-    assert agent._aop_direct_projection(ir, question) is None
+    requirement = ir["requirements"][0]
+    assert requirement["answer_obligation"] == "antibiotic"
+    assert requirement["evidence_family"] == "antibiotic avoidance instruction"
+    assert requirement["constraints"] == ["patient-specific instruction"]
+
+    slot = agent._requirement_slot(requirement, ir, "DIRECT")
+    assert slot["target_surface"] == "antibiotic"
+    assert slot["proof_anchor"] == "antibiotic"
+    assert slot["retrieval_hint"] == "antibiotic avoidance instruction"
+    assert slot["selector"] == requirement["time_constraint"]
+
+
+def test_legacy_answer_mode_cannot_force_direct_or_plan():
+    agent = _agent()
+    question = "Which antibiotic was the patient instructed to avoid?"
+    base = {
+        "requested_projection": "ENTITY",
+        "requirements": [
+            {
+                "id": "r1",
+                "grounding_kind": "QUESTION",
+                "answer_obligation": "antibiotic",
+                "evidence_family": "antibiotic avoidance instruction",
+            }
+        ],
+        "candidate": {"answer": "cefuroxime", "support_ref": "$seed0"},
+    }
+
+    extract = agent._rc_normalize_ir(
+        {**base, "answer_mode": "EXTRACT"}, question, QueryFrame()
+    )
+    advise = agent._rc_normalize_ir(
+        {**base, "answer_mode": "ADVISE"}, question, QueryFrame()
+    )
+    assert extract["candidate"] == advise["candidate"]
+    assert "answer_mode" not in extract
+    assert "answer_mode" not in advise
 
 
 def test_document_date_candidate_can_finish_from_one_grounded_seed():
@@ -116,14 +157,14 @@ def test_document_date_candidate_can_finish_from_one_grounded_seed():
     question = "When was it documented that the patient's GADA antibody was strongly positive?"
     ir = agent._rc_normalize_ir(
         {
-            "answer_type": "DATE",
+            "requested_projection": "DATE",
             "requirements": [
                 {
                     "id": "r1",
                     "grounding_kind": "QUESTION",
-                    "focus_span": "GADA antibody was strongly positive",
-                    "target": "GADA strongly positive result",
-                    "time_constraint": {
+                    "answer_obligation": "GADA antibody was strongly positive",
+                    "evidence_family": "GADA strongly positive result",
+                    "selector": {
                         "axis": "document_time",
                         "relation": "LOCATE",
                     },
