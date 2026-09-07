@@ -20,6 +20,7 @@ from .event_state.compiler import StateCompiler, parse_json
 from .event_state.context import evidence_identity, episode_turn_embedding_text, fit_context, render_claim, render_episode, render_episode_evidence, render_selected_claim_evidence, select_claim_evidence, selected_claim_evidence_turn_keys, select_global_episode_evidence
 from .event_state.embeddings import DenseEmbedder
 from .event_state.prompts import (
+    ANSWER_DATA_BOUNDARY_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
     QUERY_PLANNER_SYSTEM_PROMPT,
@@ -997,7 +998,16 @@ class EventStateAgent(BaseAgent):
             vectors[(episode_id, episode.turn_evidence[turn_index].turn_id)] = vector
         return vectors
 
-    def _compile_query_context(self, question, system_message, store, selected, retrieval_extra, query_vectors):
+    def _compile_query_context(
+        self,
+        question,
+        system_message,
+        store,
+        selected,
+        retrieval_extra,
+        query_vectors,
+        neutral_answer_contract=False,
+    ):
         query_vector = query_vectors[0]
         selected_memory_items = [item for item in selected if item["type"] != "turn"]
         selected_turn_items = [item for item in selected if item["type"] == "turn"]
@@ -1082,8 +1092,13 @@ class EventStateAgent(BaseAgent):
                 + (f" [Shared image: {turn.image_caption}]" if turn.image_caption else "")
             )
             blocks.append({"text": text, "kind": "source", "record_id": item["id"]})
-        instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
-        answer_system = "\n\n".join(item for item in (ANSWER_SYSTEM_PROMPT, (system_message or "").strip()) if item)
+        if neutral_answer_contract:
+            instruction = "Retrieved conversational evidence:"
+            answer_base_system = ANSWER_DATA_BOUNDARY_SYSTEM_PROMPT
+        else:
+            instruction = "The retrieved memory contains conversational evidence. Ground personalized facts in it; use general domain knowledge only for reasoning, and say when personalized evidence is insufficient."
+            answer_base_system = ANSWER_SYSTEM_PROMPT
+        answer_system = "\n\n".join(item for item in (answer_base_system, (system_message or "").strip()) if item)
         included_blocks, included_tokens = fit_context(blocks, answer_system, instruction, question, self.max_context_tokens, self.max_tokens, self.count_tokens, self.truncate_to_tokens)
         included_counts = Counter(included_blocks)
         included_ids = []
@@ -1177,7 +1192,9 @@ class EventStateAgent(BaseAgent):
                     store, selection_order, [query_vector],
                 )
                 retrieval_extra.update(effective_extra)
-        return self._compile_query_context(question, system_message, store, selected, retrieval_extra, [query_vector]), retriever, store, [ranked] if self.planner_rounds else None, query_vector
+        neutral_answer_contract = "answer_system_prompt" in kwargs
+        answer_system_prompt = kwargs.get("answer_system_prompt", system_message)
+        return self._compile_query_context(question, answer_system_prompt, store, selected, retrieval_extra, [query_vector], neutral_answer_contract=neutral_answer_contract), retriever, store, [ranked] if self.planner_rounds else None, query_vector
 
     def prepare_batch_query(self, question: str, system_message: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         if self.planner_rounds:
@@ -1196,6 +1213,8 @@ class EventStateAgent(BaseAgent):
             response = self._llm_client.chat(prepared["messages"])
             return self.finalize_batch_query(prepared, response.content)
         prepared, retriever, store, channels, query_vector = self._initial_query_context(question, system_message, **kwargs)
+        answer_system_prompt = kwargs.get("answer_system_prompt", system_message)
+        neutral_answer_contract = "answer_system_prompt" in kwargs
         query_vectors = [query_vector]
         base_selected_ids = [item["id"] for item in prepared["retrieved_memories"]]
         telemetry = {"planner_rounds_configured": self.planner_rounds, "planner_rounds_used": 0, "planner_decision_call_count": 0, "planner_retrieval_round_count": 0, "planner_request_count": 0, "planner_valid_request_count": 0, "planner_invalid_request_count": 0, "planner_duplicate_request_count": 0, "planner_parse_failure_count": 0, "planner_early_answer": False, "planner_forced_final_answer": False, "planner_requests": [], "planner_invalid_output_previews": [], "planner_invalid_output_sha256": [], "base_selected_ids": base_selected_ids}
@@ -1275,7 +1294,7 @@ class EventStateAgent(BaseAgent):
             base_selected_id_set = set(base_selected_ids)
             for item in selected:
                 item["planner_added_to_final"] = item["id"] not in base_selected_id_set
-            prepared = self._compile_query_context(question, system_message, store, selected, {**retrieval_extra, "planner_expanded": True}, query_vectors)
+            prepared = self._compile_query_context(question, answer_system_prompt, store, selected, {**retrieval_extra, "planner_expanded": True}, query_vectors, neutral_answer_contract=neutral_answer_contract)
         telemetry["planner_forced_final_answer"] = True
         with get_usage_tracker().scope("event_state.final_answer"):
             final_response = self._llm_client.chat(prepared["messages"])

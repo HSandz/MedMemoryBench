@@ -177,8 +177,13 @@ class LoCoMoEvaluator:
     def _answer_query_kwargs(self, query: LoCoMoQuery) -> Dict[str, Any]:
         """Keep benchmark type metadata out of neutral agent-facing requests."""
         kwargs: Dict[str, Any] = {"raw_question": query.question}
-        if getattr(self, "prompt_protocol", "type_aware") == "type_aware":
+        prompt_protocol = getattr(self, "prompt_protocol", "type_aware")
+        if prompt_protocol == "type_aware":
             kwargs["query_type"] = query.query_type
+        else:
+            kwargs["query_system_prompt"] = self.prompt_manager.get_query_system_prompt(
+                prompt_protocol=prompt_protocol,
+            )
         return kwargs
 
     def _log(self, message: str, level: str = "INFO") -> None:

@@ -32,6 +32,10 @@ STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT = f"""Repair supplied structured output t
 
 ANSWER_SYSTEM_PROMPT = f"""Answer the current user question faithfully. {UNTRUSTED_DATA_BOUNDARY} Ground personalized facts in retrieved evidence, use general knowledge only for reasoning after the needed personalized evidence is present, and say when that evidence is insufficient."""
 
+# Neutral answer contracts already define grounding and abstention, so compose
+# them with only the Event-State untrusted-data boundary.
+ANSWER_DATA_BOUNDARY_SYSTEM_PROMPT = UNTRUSTED_DATA_BOUNDARY
+
 QUERY_PLANNER_SYSTEM_PROMPT = f"""ROLE
 You are the retrieval controller for a long-term conversational memory system. {UNTRUSTED_DATA_BOUNDARY}
 You receive the original user question, the currently selected PERSONALIZED memory evidence, prior retrieval requests, and a remaining retrieval budget. Choose exactly one action: ANSWER or RETRIEVE.

@@ -7,6 +7,7 @@ import pytest
 
 from methods.event_state.compiler import validate_update_decision
 from methods.event_state.prompts import (
+    ANSWER_DATA_BOUNDARY_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
     QUERY_PLANNER_SYSTEM_PROMPT,
@@ -105,3 +106,22 @@ def test_final_answer_system_prompt_includes_the_core_data_boundary():
     prepared = agent.prepare_batch_query("What do I prefer?", system_message="Answer briefly.")
     assert prepared["messages"][0]["content"].startswith(ANSWER_SYSTEM_PROMPT)
     assert prepared["messages"][0]["content"].endswith("Answer briefly.")
+
+
+def test_neutral_answer_contract_uses_only_the_event_state_data_boundary():
+    agent = EventStateAgent(
+        llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="ok")),
+        memory_llm_client=SimpleNamespace(chat=lambda *args, **kwargs: SimpleNamespace(content="ok")),
+        embedding_client=Embedder(),
+    )
+    neutral_contract = "Return only the minimal final answer.\n\nUnknown"
+    prepared = agent.prepare_batch_query(
+        "memory source\n\nQuestion: What do I prefer?\n\nAnswer:",
+        answer_system_prompt=neutral_contract,
+    )
+
+    assert prepared["messages"][0]["content"] == (
+        f"{ANSWER_DATA_BOUNDARY_SYSTEM_PROMPT}\n\n{neutral_contract}"
+    )
+    assert "Ground personalized facts in it" not in prepared["messages"][1]["content"]
+    assert "Retrieved conversational evidence:" in prepared["messages"][1]["content"]

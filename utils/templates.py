@@ -4,7 +4,7 @@ from typing import Dict, Optional
 import re
 
 from .prompts_memorize import MEMORIZE_TEMPLATES
-from .prompts_qa import QA_TEMPLATES
+from .prompts_qa import NEUTRAL_QUERY_SYSTEM_PROMPTS, QA_TEMPLATES
 from .prompts_judge import JUDGE_TEMPLATES
 
 
@@ -66,6 +66,22 @@ class PromptManager:
 
     def get_system_message(self) -> str:
         return SYSTEM_MESSAGES.get(self._template_prefix, "")
+
+    def get_query_system_prompt(self, prompt_protocol: str = "type_aware") -> Optional[str]:
+        """Return the neutral answer contract without consulting query metadata."""
+        if prompt_protocol not in {"type_aware", "neutral"}:
+            raise ValueError(
+                "prompt_protocol must be one of neutral, type_aware; "
+                f"got {prompt_protocol!r}"
+            )
+        if prompt_protocol == "type_aware":
+            return None
+        prompt = NEUTRAL_QUERY_SYSTEM_PROMPTS.get(self._template_prefix)
+        if prompt is None:
+            prompt = NEUTRAL_QUERY_SYSTEM_PROMPTS.get(self.dataset)
+        if prompt is None:
+            raise ValueError(f"No neutral query system prompt found for {self.dataset}")
+        return prompt
 
     def format_memorize(self, context: str, timestamp: Optional[str] = None) -> str:
         key = f"{self._template_prefix}_{self.method_type}_memorize"

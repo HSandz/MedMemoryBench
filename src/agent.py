@@ -988,6 +988,10 @@ class AgentManager:
         """Prepare local retrieval and an immutable final-answer request."""
         if not self.supports_batch_queries():
             raise RuntimeError(f"{self.method_name} does not support batch queries")
+        query_system_prompt = kwargs.pop("query_system_prompt", None)
+        if query_system_prompt is not None and self._matched_method_key(self.method_name) == "event_state":
+            kwargs["answer_system_prompt"] = query_system_prompt
+            query_system_prompt = None
         context_id = kwargs.pop("context_id", None)
         if context_id is not None and context_id != self._context_id:
             self._context_id = context_id
@@ -995,7 +999,11 @@ class AgentManager:
         tracker = get_usage_tracker()
         tracker.set_phase("query")
         with tracker.scope("query.retrieval_preparation"):
-            return self._agent.prepare_batch_query(message, **kwargs)
+            return self._agent.prepare_batch_query(
+                message,
+                system_message=query_system_prompt,
+                **kwargs,
+            )
 
     def supports_staged_queries(self) -> bool:
         """Return whether retrieval and final generation can run separately."""
@@ -1012,19 +1020,24 @@ class AgentManager:
         """Run retrieval and freeze the exact final-answer request."""
         if not self.supports_staged_queries():
             raise RuntimeError(f"{self.method_name} does not support staged queries")
+        query_system_prompt = kwargs.pop("query_system_prompt", None)
         context_id = kwargs.pop("context_id", None)
         if context_id is not None and context_id != self._context_id:
             self.set_context_id(context_id)
         tracker = get_usage_tracker()
         tracker.set_phase("query")
-        from utils.templates import get_template_manager
-        template_manager = get_template_manager(self.dataset_config.dataset_name)
-        system_message = template_manager.get_system_message()
+        if query_system_prompt is None or self._matched_method_key(self.method_name) == "event_state":
+            from utils.templates import get_template_manager
+            template_manager = get_template_manager(self.dataset_config.dataset_name)
+            default_system_message = template_manager.get_system_message()
+            if query_system_prompt is not None:
+                kwargs["answer_system_prompt"] = query_system_prompt
+            query_system_prompt = default_system_message
         started_at = time.time()
         with tracker.scope("query.retrieval_preparation"):
             prepared = self._agent.prepare_batch_query(
                 message,
-                system_message=system_message,
+                system_message=query_system_prompt,
                 **kwargs,
             )
         return {"prepared": prepared, "started_at": started_at}
@@ -1140,16 +1153,21 @@ class AgentManager:
 
     def _handle_query(self, message: str, **kwargs) -> Dict[str, Any]:
         get_usage_tracker().set_phase("query")
-        from utils.templates import get_template_manager
-        template_manager = get_template_manager(self.dataset_config.dataset_name)
-        system_message = template_manager.get_system_message()
+        query_system_prompt = kwargs.pop("query_system_prompt", None)
+        if query_system_prompt is None or self._matched_method_key(self.method_name) == "event_state":
+            from utils.templates import get_template_manager
+            template_manager = get_template_manager(self.dataset_config.dataset_name)
+            default_system_message = template_manager.get_system_message()
+            if query_system_prompt is not None:
+                kwargs["answer_system_prompt"] = query_system_prompt
+            query_system_prompt = default_system_message
 
         start_time = time.time()
 
         with get_usage_tracker().scope("query.answer_realtime"):
             response = self._agent.query(
                 message,
-                system_message=system_message,
+                system_message=query_system_prompt,
                 **kwargs,
             )
 

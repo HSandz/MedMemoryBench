@@ -68,10 +68,14 @@ Both `locomo.yaml` and `medmemorybench.yaml` define
 - `type_aware` reproduces the existing AQ-MedAI / MedMemoryBench harness:
   the answer prompt is specialized by the benchmark query type for upstream
   comparability.
-- `neutral` uses one dataset-appropriate generic answer prompt for every query
-  type. The answer model is not given the hidden benchmark category; query type
-  remains available only to post-hoc scoring and reporting, making this an
-  architecture-neutral evaluation.
+- `neutral` uses one dataset-appropriate answer contract for every query type.
+  The contract is sent as a system message; the user message contains only the
+  memory source label and visible question. The answer model is not given the
+  hidden benchmark category; query type remains available only to post-hoc
+  scoring and reporting, making this an architecture-neutral evaluation.
+  Neutral answers are grounded, minimal, time-faithful, and use `Unknown` when
+  the remembered information is insufficient. Event-State still retrieves from
+  the raw visible question, not the formatted answer prompt.
 
 To run the neutral protocol, change only this dataset setting:
 
