@@ -1,10 +1,9 @@
 """Answer-sensitive semantic controller policy for SmartMem0 READ.
 
-This layer changes only what LLM #1 is asked to normalize.  It keeps the same
-Requirement-vNext schema, deterministic compiler, retrieval executor, ProofContext and
-two-call budget.  The policy is dataset-, mode- and language-neutral: it asks for
-participant-memory variables whose values can change the answer, rather than treating the
-requested conclusion itself as a memory lookup.
+LLM #1 still owns semantic normalization only. This policy tightens two invariants exposed
+by frozen-read telemetry: a requirement must be a participant-memory variable, and a temporal
+selector must be necessary to choose the answer-bearing member of that variable. The policy
+is dataset-, mode- and language-neutral and does not add another model call.
 """
 
 import json
@@ -15,75 +14,89 @@ from .read_answer_or_plan_contract import MINIMAL_CONTROLLER_SCHEMA
 ANSWER_SENSITIVE_CONTROLLER_POLICY = """
 You are the single semantic controller for an evidence-grounded memory system.
 
-Your only job is to answer: WHAT participant-specific evidence must be retrieved before
-QUESTION can be answered correctly? Understand meaning in any language. Never route by
-language-specific keywords. Inspect exactly the Top-3 SEEDS; they are planning hints, not proof.
-
 Return only requested_projection, the smallest sufficient participant-memory requirements,
-answer-relevant bridges, and an optional one-seed complete candidate. Do NOT emit route,
-query class, answer_mode, requires_inference, difficulty, budget, retrieval operations,
-proof status, or final-context decisions. Runtime derives them.
+answer-relevant bridges, and an optional one-seed complete candidate. Understand meaning in
+any language. Inspect exactly the Top-3 SEEDS as planning hints, never as proof. Do NOT emit
+route, query class, answer_mode, difficulty, budget, retrieval operations, proof status, or
+final-context decisions.
 
-EVIDENCE REQUIREMENTS
-- Usually 1-3, never more than 4. Every requirement must be MEMORY-VALUED and ANSWER-SENSITIVE:
-  participant memory can supply a concrete value, and changing that value could change the answer.
-- grounding_kind=QUESTION only when answer_obligation is the shortest useful contiguous span
-  from QUESTION that itself names participant evidence. A requested decision/conclusion such as
-  whether to act, recommend, diagnose, explain, continue, stop, increase, reduce, or choose is the
-  ANSWER, not a memory requirement, unless QUESTION explicitly asks what prior guidance said.
-- grounding_kind=DERIVED is an unmentioned participant-memory variable needed to answer. Its
-  answer_obligation is a concise variable name, never an invented value or general-domain rule.
-- evidence_family is selector-neutral semantic recall. selector owns temporal selection.
-  constraints narrow recall but are never proof.
-- General mechanisms and domain rules are not participant-memory requirements.
+REQUIREMENTS
+- Usually 1-3, never more than 4.
+- Every requirement must be MEMORY-VALUED: participant memory can contain its concrete value.
+- Every requirement must be ANSWER-SENSITIVE: changing its value could change the answer.
+- QUESTION is the shortest useful contiguous question span that itself names participant
+  evidence. A requested decision/conclusion (whether to act, choose, recommend, diagnose,
+  explain, continue, stop, increase or reduce) is the ANSWER, not a memory variable, unless
+  the question explicitly asks what prior guidance said.
+- DERIVED is an unmentioned participant-memory variable needed for the answer. Never use
+  generic labels such as recommendation, suitability, assessment, explanation or risk
+  assessment when the memory value actually needed is a concrete state, trajectory, prior
+  instruction, contraindication, regimen, exposure, response, preference or measurement.
+- evidence_family is selector-neutral recall. constraints narrow recall but are never proof.
+- General-domain mechanisms/rules are not participant-memory requirements.
+
+TEMPORAL SELECTOR DISCIPLINE
+- Default selector is empty. Time metadata existing on memories is not a reason to select.
+- Use EARLIEST/LATEST only when the question semantically asks for first/onset/earliest or
+  latest/most-recent evidence. Interpret that meaning in any language.
+- Use EXACT only with an explicit temporal anchor from the question/structural hints.
+- Use LOCATE when the answer asks when an event/fact was documented/occurred, or when the
+  question explicitly pins the evidence to a time while asking for its content.
+- Words meaning past, previous, recent or ongoing are scope cues, not automatic LATEST.
+- A DERIVED safety constraint, prior policy, contraindication, regimen or preference normally
+  has an empty selector unless the answer truly depends on a particular temporal version.
+- CURRENT is the state-resolution bridge when current-state identity itself matters; do not
+  approximate CURRENT by attaching LATEST everywhere.
 
 DECISION-CHANGING DECOMPOSITION
-When QUESTION asks for an action, recommendation, suitability, monitoring decision, or choice,
-retrieve the minimal participant facts that could change that decision rather than a generic
-"advice" or "assessment" family. Depending on the question these may include: the focal current
-state or trajectory; prior constraints/policies/contraindications; current regimen or prior
-action/outcome; and preferences only when they change the choice. Usually 2-3 are enough.
-If applying a general-domain rule is required after those facts are grounded, connect the
-answer-relevant requirement(s) to ANSWER with INFER.
+Retrieve the minimal concrete participant facts that can change the decision. Typical
+variables are focal current state or trajectory, prior constraints/policies/contraindications,
+current regimen or prior action/outcome, and preferences only when they change the choice.
+Do not retrieve the requested decision itself. If a general-domain rule is needed after facts
+are grounded, connect the relevant requirement(s) to ANSWER with INFER.
 
-CAUSAL / EXPLANATORY DECOMPOSITION
-When QUESTION asks whether one participant exposure/event/state could explain another, represent
-the participant cause-side and effect-side as separate requirements and connect them with
-POSSIBLE_CAUSE unless an explicit stored causal relation itself is required, in which case use
-CAUSES. Do not collapse such a question into one generic clinical_assessment/explanation node.
-For longitudinal change, retrieve a prior baseline as a separate requirement when the comparison
-with current state can change the answer.
+CAUSAL / EXPLANATORY
+For whether one participant exposure/event/state could explain another, use separate
+participant cause-side and effect-side requirements and POSSIBLE_CAUSE. Use CAUSES only when
+an explicit stored participant causal relation itself is required. When longitudinal
+progression can change the explanation, include the relevant prior baseline/current
+measurement as memory-valued requirements. Do not collapse such a question into one generic
+clinical assessment or explanation node.
 
 CANDIDATE SET
-CANDIDATE SET contains alternative propositions, not memory facts. Derive the smallest shared or
-discriminative participant evidence variables needed to distinguish the alternatives. Do not
-create a generic recommendation requirement and do not create one requirement per option merely
-because the options are visible. Do not classify candidate-memory stance or choose labels.
+Candidates are propositions, not memories. Return the smallest shared/discriminative
+participant variables needed to evaluate all alternatives. Do not create a generic recommendation requirement
+and do not create one requirement per option merely because options are visible; do not classify
+candidate-memory stance or choose labels.
 
 BRIDGES
 - COMPARE: compare grounded obligations.
-- CAUSES: require an explicit stored participant causal relation.
-- POSSIBLE_CAUSE: grounded participant endpoints plus authorized general-domain knowledge.
-- DEPENDS_ON: one obligation depends on another without asserting causality.
-- TEMPORAL_ORDER: order grounded endpoints; BEFORE/AFTER/OVERLAPS never implies causality.
-- INFER: authorize a general-domain bridge only after referenced participant evidence is grounded.
-- CURRENT: require current-state resolution for one obligation.
-- VERIFY_SOURCE: require exact linked source evidence.
-Use goal only for the remaining reasoning obligation. Every DERIVED requirement must participate
-in an answer-relevant bridge. Seeds may suggest WHAT extra evidence is needed but never pre-fill
-its value.
+- CAUSES: explicit stored participant causal relation required.
+- POSSIBLE_CAUSE: grounded participant endpoints + authorized general-domain mechanism.
+- DEPENDS_ON: one grounded variable depends on another without asserting causality.
+- TEMPORAL_ORDER: BEFORE/AFTER/OVERLAPS between grounded endpoints.
+- INFER: general-domain rule only after referenced participant evidence is grounded.
+- CURRENT: current-state resolution.
+- VERIFY_SOURCE: exact linked source evidence.
+Every DERIVED requirement must participate in an answer-relevant bridge.
+
+FINAL SELF-CHECK BEFORE JSON
+1. Could participant memory contain a concrete value for every requirement?
+2. Would changing each requirement's value potentially change the answer?
+3. Is every non-empty selector actually necessary to choose among temporal members?
+4. Did you avoid turning the requested conclusion into a requirement?
+5. Are general-domain mechanisms bridges rather than fake memories?
 
 DIRECT CANDIDATE
 candidate is allowed only when exactly one QUESTION requirement is sufficient and exactly one
-of $seed0, $seed1, or $seed2 already contains the complete answer. Do not emit candidate for
-CandidateSet selection, advice/action decisions, comparison, source verification, world-knowledge
-inference, cross-memory synthesis, temporal extremum/range selection, or multi-step reasoning.
-Answer length never controls this decision.
+$seed0..2 already contains the complete answer. Never emit candidate for CandidateSet,
+decision/advice, comparison, source verification, inference, cross-memory synthesis, temporal
+extremum/range, or multi-step reasoning.
 """
 
 
 class ReadAnswerSensitiveControllerMixin:
-    """Use the stricter Requirement-vNext semantic policy without another LLM call."""
+    """Use the selector-disciplined Requirement-vNext-2 policy without another LLM call."""
 
     CONTROLLER_SCHEMA_VERSION = "requirement-vnext-2"
     CONTROLLER_MAX_OUTPUT_TOKENS = 512
@@ -198,7 +211,7 @@ class ReadAnswerSensitiveControllerMixin:
                 proposition_pack.get("retrieval_views") or []
             ),
             "controller_schema_version": self.CONTROLLER_SCHEMA_VERSION,
-            "controller_policy": "answer_sensitive_memory_variables",
+            "controller_policy": "answer_sensitive_selector_disciplined",
         }
 
         if supports is not None:
