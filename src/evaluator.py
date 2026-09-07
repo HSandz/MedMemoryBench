@@ -322,7 +322,7 @@ class Evaluator:
         allow_building_event_state_query = (
             self.execution_stage == "query"
             and self.method_config.method_name.lower() == "event_state"
-            and self.dataset_config.dataset_name.lower() == "locomo"
+            and self.dataset_config.dataset_name.lower() in {"locomo", "medmemorybench"}
         )
         compatible = (
             is_supported_memory_manifest(manifest)

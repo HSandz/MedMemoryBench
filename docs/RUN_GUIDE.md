@@ -27,6 +27,12 @@ long records:
   memorization token usage, feature/operation telemetry, and per-unit logs. It
   does not retain query, judge, or evaluation-score fields.
 
+If a later Event-State stage fails after one or more memory builds complete,
+LoCoMo and MedMemoryBench write a build-only checkpoint artifact with
+`artifact_status: "checkpoint"` before propagating the failure. It preserves
+completed build time and memorization telemetry without creating a partial
+result or query-answer file.
+
 `artifact_references` links related files rather than reproducing their
 contents. To migrate an existing run to this ordering and split, use:
 
@@ -319,7 +325,7 @@ answers recorded in the query checkpoint. Current LoCoMo memory manifests use
 schema version 2; staged query and memory-resume workflows also accept legacy
 version-1 LoCoMo manifests. MedMemoryBench memory manifests remain version 1.
 
-If a full Event-State/LoCoMo run fails after memory construction but before its
+If a full Event-State run fails after memory construction but before its
 final-answer batch is submitted, reuse its snapshots with a query-only child:
 
 ```bash
@@ -327,12 +333,13 @@ python main.py --stage query --memory-run YYYYMMDD_HHMMSS --batch-api --workers 
 ```
 
 This is safe when the source `memory/manifest.json` is still `building` but
-lists every selected sample snapshot. The query stage validates the complete
-sample list and each snapshot before restoring it; it does not modify or rebuild
-the source memory. Do not add `--resume` on this first query-only attempt. Use
-the identical command with `--resume` only to continue that child after a
-submitted or interrupted query batch. A source with a missing or invalid
-snapshot remains ineligible and must be completed with its original memory run.
+lists every selected snapshot: one per LoCoMo sample or MedMemoryBench unit.
+The query stage validates that complete list and each snapshot before restoring
+it; it does not modify or rebuild the source memory. Do not add `--resume` on
+this first query-only attempt. Use the identical command with `--resume` only
+to continue that child after a submitted or interrupted query batch. A source
+with a missing or invalid snapshot remains ineligible and must be completed with
+its original memory run.
 
 ### LoCoMo Reporting
 

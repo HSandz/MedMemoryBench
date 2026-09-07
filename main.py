@@ -231,13 +231,16 @@ def infer_query_config_from_memory_run(
             rejected.append(f"{run_dir}: model identity disagrees with its manifest")
             continue
 
-        is_event_state_locomo = (
-            manifest.get("format") == "locomo.event_state_memory_manifest"
+        is_event_state_query_manifest = (
+            manifest.get("format") in {
+                "locomo.event_state_memory_manifest",
+                "medmemorybench.memory_manifest",
+            }
             and manifest.get("method_name") == "event_state"
         )
         allowed_statuses = {"complete", "building"} if (
             allow_incomplete
-            or (allow_event_state_query_building and is_event_state_locomo)
+            or (allow_event_state_query_building and is_event_state_query_manifest)
         ) else {"complete"}
         if manifest.get("status") not in allowed_statuses:
             rejected.append(

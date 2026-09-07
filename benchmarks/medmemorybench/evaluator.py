@@ -159,6 +159,7 @@ class MedMemoryBenchEvaluator:
         self._api_failures: List[Dict[str, Any]] = []
         self._api_failure_duration_seconds = 0.0
         self._api_failure_lock = threading.Lock()
+        self._memory_build_checkpoint_saved = False
 
         self._checkpoint_manager: Optional[MedMemoryBenchCheckpointManager] = None
         self._checkpoint_enabled = False
@@ -1694,6 +1695,7 @@ class MedMemoryBenchEvaluator:
         *,
         require_complete: bool,
         resume_current: bool = False,
+        allow_building: bool = False,
     ) -> Path:
         requested_run = getattr(self, "memory_run", None)
         saved_source = (
@@ -1719,6 +1721,9 @@ class MedMemoryBenchEvaluator:
                     manifest = json.load(handle)
             except (OSError, json.JSONDecodeError):
                 continue
+            accepted_statuses = {"complete"} if require_complete else {"building"}
+            if allow_building:
+                accepted_statuses.add("building")
             if (
                 manifest.get("format") != "medmemorybench.memory_manifest"
                 or manifest.get("version") != 1
@@ -1735,13 +1740,12 @@ class MedMemoryBenchEvaluator:
                     )
                 )
                 or manifest.get("method_name") != self.method_config.method_name
-                or (require_complete and manifest.get("status") != "complete")
-                or (not require_complete and manifest.get("status") != "building")
+                or manifest.get("status") not in accepted_statuses
             ):
                 continue
             self._memory_snapshot_run_dir = run_dir
             self._memory_snapshot_manifest = manifest
-            if require_complete:
+            if require_complete or allow_building:
                 self._write_memory_source(run_dir, manifest)
             return run_dir
 
@@ -1934,7 +1938,14 @@ class MedMemoryBenchEvaluator:
         self._log(f"Created {self._memory_method_label()} memory run: {run_dir}")
 
     def _load_memory_snapshot_manifest(self) -> None:
-        run_dir = self._select_memory_snapshot_run(require_complete=True)
+        allow_building = (
+            self.method_config.method_name.lower() == "event_state"
+            and bool(getattr(self, "memory_run", None))
+        )
+        run_dir = self._select_memory_snapshot_run(
+            require_complete=True,
+            allow_building=allow_building,
+        )
         manifest = self._memory_snapshot_manifest
         expected_unit_ids = [unit.unit_id for unit in self._get_evaluation_units()]
         stored_unit_ids = manifest.get("unit_ids", [])
@@ -2486,24 +2497,36 @@ class MedMemoryBenchEvaluator:
             self._create_new_checkpoint()
 
         try:
-            self._run_evaluation_loop()
-        finally:
-            self._finish_query_progress()
+            try:
+                self._run_evaluation_loop()
+            finally:
+                self._finish_query_progress()
 
-        if (
-            self.execution_stage in {"all", "memory"}
-            and not self.dry_run
-            and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state")
-        ):
-            self._complete_memory_snapshot_manifest()
+            if (
+                self.execution_stage in {"all", "memory"}
+                and not self.dry_run
+                and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state")
+            ):
+                self._complete_memory_snapshot_manifest()
 
-        if self._checkpoint_manager and self.execution_stage in {"all", "query"}:
-            self._checkpoint_manager.mark_completed()
-            self._checkpoint_manager.delete()
-            self._log("Evaluation completed, checkpoint deleted")
-        elif self._checkpoint_manager and self.execution_stage == "memory":
-            self._checkpoint_manager.delete()
-            self._log("Memory build completed, checkpoint deleted")
+            if self._checkpoint_manager and self.execution_stage in {"all", "query"}:
+                self._checkpoint_manager.mark_completed()
+                self._checkpoint_manager.delete()
+                self._log("Evaluation completed, checkpoint deleted")
+            elif self._checkpoint_manager and self.execution_stage == "memory":
+                self._checkpoint_manager.delete()
+                self._log("Memory build completed, checkpoint deleted")
+        except BaseException:
+            try:
+                self._persist_memory_build_checkpoint(start_time)
+            except Exception as checkpoint_error:
+                self._log(
+                    "Unable to save memory build checkpoint: "
+                    f"{truncate_error_message(checkpoint_error)}",
+                    level="WARNING",
+                    terminal=False,
+                )
+            raise
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -4323,7 +4346,7 @@ class MedMemoryBenchEvaluator:
             result.details["planner"] = copy.deepcopy(item["planner"])
         return result
 
-    def _generate_report(
+    def _build_report(
         self,
         start_time: datetime,
         end_time: datetime,
@@ -4414,6 +4437,47 @@ class MedMemoryBenchEvaluator:
             }
         )
 
+        return report
+
+    def _persist_memory_build_checkpoint(self, start_time: datetime) -> None:
+        """Preserve completed memory telemetry when a later stage aborts the run."""
+        build_logs = self._combined_memory_build_logs()
+        if (
+            getattr(self, "_memory_build_checkpoint_saved", False)
+            or self.execution_stage == "query"
+            or not build_logs
+        ):
+            return
+        end_time = datetime.now()
+        report = self._build_report(
+            start_time,
+            end_time,
+            (end_time - start_time).total_seconds(),
+        )
+        report.metadata["memory_build_artifact_status"] = "checkpoint"
+        _, memory_build_path, _ = self.result_collector.save_reports(
+            report=report,
+            output_dir=self.output_dir,
+            memory_build_logs=build_logs,
+            include_result=False,
+            include_memory_build=True,
+            include_query_answer=False,
+            include_api_failures=False,
+            use_method_subdir=not getattr(self, "run_scoped_output", False),
+        )
+        self._memory_build_checkpoint_saved = True
+        self._log(
+            f"Memory build checkpoint saved to: {memory_build_path}",
+            terminal=False,
+        )
+
+    def _generate_report(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        duration: float,
+    ) -> EvaluationReport:
+        report = self._build_report(start_time, end_time, duration)
         execution_stage = getattr(self, "execution_stage", "all")
         result_path, memory_build_path, query_answer_path = self.result_collector.save_reports(
             report=report,

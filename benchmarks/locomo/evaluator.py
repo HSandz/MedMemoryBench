@@ -125,6 +125,7 @@ class LoCoMoEvaluator:
         self._memory_snapshot_dir_path: Optional[Path] = None
         self._query_checkpoint: Dict[str, Any] = {"results": {}}
         self._batch_retrieval_preparation_wall_time = 0.0
+        self._memory_build_checkpoint_saved = False
 
         # Memory chunk configuration
         # Get from dataset config or use default
@@ -419,24 +420,35 @@ class LoCoMoEvaluator:
 
         get_usage_tracker().reset()
 
-        self._init_dataset()
-        self._load_query_checkpoint()
-        units = list(self.dataset.get_evaluation_units())
-        if self.execution_stage != "all" and self.method_config.method_name.lower() != "event_state":
-            raise ValueError("LoCoMo --stage memory/query requires Event-State memory snapshots")
-        if self.method_config.method_name.lower() == "event_state" and not self.dry_run:
-            if self.execution_stage == "query":
-                self._load_memory_snapshot_manifest(units)
-            else:
-                self._start_memory_snapshot_manifest(units)
+        try:
+            self._init_dataset()
+            self._load_query_checkpoint()
+            units = list(self.dataset.get_evaluation_units())
+            if self.execution_stage != "all" and self.method_config.method_name.lower() != "event_state":
+                raise ValueError("LoCoMo --stage memory/query requires Event-State memory snapshots")
+            if self.method_config.method_name.lower() == "event_state" and not self.dry_run:
+                if self.execution_stage == "query":
+                    self._load_memory_snapshot_manifest(units)
+                else:
+                    self._start_memory_snapshot_manifest(units)
 
-        self._run_evaluation_loop(units)
-        if (
-            self.method_config.method_name.lower() == "event_state"
-            and not self.dry_run
-            and self.execution_stage != "query"
-        ):
-            self._complete_memory_snapshot_manifest()
+            self._run_evaluation_loop(units)
+            if (
+                self.method_config.method_name.lower() == "event_state"
+                and not self.dry_run
+                and self.execution_stage != "query"
+            ):
+                self._complete_memory_snapshot_manifest()
+        except BaseException:
+            try:
+                self._persist_memory_build_checkpoint(start_time)
+            except Exception as checkpoint_error:
+                self._log(
+                    "Unable to save memory build checkpoint: "
+                    f"{truncate_error_message(checkpoint_error)}",
+                    level="WARNING",
+                )
+            raise
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -1459,7 +1471,7 @@ class LoCoMoEvaluator:
 
         return result
 
-    def _generate_report(
+    def _build_report(
         self,
         start_time: datetime,
         end_time: datetime,
@@ -1555,6 +1567,43 @@ class LoCoMoEvaluator:
             }
         )
 
+        return report
+
+    def _persist_memory_build_checkpoint(self, start_time: datetime) -> None:
+        """Preserve completed build telemetry when a later stage aborts the run."""
+        if (
+            getattr(self, "_memory_build_checkpoint_saved", False)
+            or self.execution_stage == "query"
+            or not self._memory_build_logs
+        ):
+            return
+        end_time = datetime.now()
+        report = self._build_report(
+            start_time,
+            end_time,
+            (end_time - start_time).total_seconds(),
+        )
+        report.metadata["memory_build_artifact_status"] = "checkpoint"
+        _, memory_build_path, _ = self.result_collector.save_reports(
+            report=report,
+            output_dir=self.output_dir,
+            memory_build_logs=self._memory_build_logs,
+            include_result=False,
+            include_memory_build=True,
+            include_query_answer=False,
+            include_api_failures=False,
+            use_method_subdir=not self.run_scoped_output,
+        )
+        self._memory_build_checkpoint_saved = True
+        self._log(f"Memory build checkpoint saved to: {memory_build_path}")
+
+    def _generate_report(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        duration: float,
+    ) -> EvaluationReport:
+        report = self._build_report(start_time, end_time, duration)
         result_path, memory_build_path, query_answer_path = self.result_collector.save_reports(
             report=report,
             output_dir=self.output_dir,

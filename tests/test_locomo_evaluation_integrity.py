@@ -1,8 +1,11 @@
 """LoCoMo evaluation correctness regressions."""
 
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from benchmarks.locomo.dataset import normalize_locomo_timestamp
 from benchmarks.locomo.dataset import LoCoMoQuery
@@ -100,6 +103,68 @@ def test_locomo_query_accepts_a_full_building_event_state_manifest(tmp_path: Pat
     ])
 
     assert evaluator._memory_snapshot_manifest == manifest
+
+
+def test_memory_build_checkpoint_is_written_without_partial_query_artifacts(tmp_path: Path):
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator._memory_build_checkpoint_saved = False
+    evaluator._memory_build_logs = [{
+        "reporting_kind": "event_state",
+        "unit_id": 0,
+        "context_id": "conv-1",
+        "session_ids": ["D1"],
+        "session_count": 1,
+        "total_time": 12.5,
+        "inserted_record_count": 3,
+        "build_metrics": {"extraction_calls": 2},
+        "final_store": {"final_episode_count": 1},
+    }]
+    evaluator.output_dir = tmp_path
+    evaluator.run_scoped_output = True
+    evaluator.result_collector = ResultCollector()
+    evaluator._log = lambda *args, **kwargs: None
+    evaluator._build_report = lambda *args: EvaluationReport(
+        method_name="event_state",
+        model_name="test-model",
+        dataset_name="locomo",
+        start_time="",
+        end_time="",
+        duration_seconds=12.5,
+        summary={},
+        metadata={"memory_build_summary": {}, "build_metrics": {}},
+    )
+
+    evaluator._persist_memory_build_checkpoint(datetime.now())
+
+    artifacts = list(tmp_path.glob("*_memory_build.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["artifact_status"] == "checkpoint"
+    assert payload["units"][0]["total_time"] == 12.5
+    assert not list(tmp_path.glob("*_result.json"))
+    assert not list(tmp_path.glob("*_query_answer.json"))
+
+
+def test_evaluate_persists_memory_build_before_reraising_later_failure():
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator.method_config = SimpleNamespace(method_name="event_state")
+    evaluator.dry_run = False
+    evaluator.dataset = SimpleNamespace(get_evaluation_units=lambda: [])
+    evaluator._init_dataset = lambda: None
+    evaluator._load_query_checkpoint = lambda: None
+    evaluator._start_memory_snapshot_manifest = lambda units: None
+    evaluator._run_evaluation_loop = lambda units: (_ for _ in ()).throw(RuntimeError("query failed"))
+    evaluator._complete_memory_snapshot_manifest = lambda: None
+    evaluator._log = lambda *args, **kwargs: None
+    persisted = []
+    evaluator._persist_memory_build_checkpoint = lambda started_at: persisted.append(started_at)
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        evaluator.evaluate()
+
+    assert len(persisted) == 1
 
 
 def test_selected_session_and_answer_visible_turn_metrics_are_distinct():

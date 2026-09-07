@@ -573,6 +573,9 @@ class ResultCollector:
             "method_name": report.method_name,
             "model_name": report.model_name,
             "dataset_name": report.dataset_name,
+            "artifact_status": report.metadata.get(
+                "memory_build_artifact_status", "complete"
+            ),
             "build_summary": build_summary,
             "build_metrics": detailed_build_metrics,
             "run_metadata": report.metadata.get("run_metadata", {}),

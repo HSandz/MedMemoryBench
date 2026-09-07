@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -759,6 +760,50 @@ def test_query_only_stage_loads_each_saved_unit_without_rebuilding(tmp_path: Pat
     ]
 
 
+def test_event_state_query_accepts_only_complete_building_memory_manifest(tmp_path: Path):
+    evaluator = _staged_evaluator(tmp_path, _StageManager())
+    evaluator.method_config.method_name = "event_state"
+    evaluator.execution_stage = "query"
+    evaluator.memory_run = "failed-run"
+    units = [EvaluationUnit(0, [], [], context_id=1), EvaluationUnit(1, [], [], context_id=2)]
+    evaluator._get_evaluation_units = lambda: units
+    manifest = {
+        "status": "building",
+        "unit_ids": [0, 1],
+        "snapshots": [{"unit_id": 0}, {"unit_id": 1}],
+    }
+
+    def select_manifest(**kwargs):
+        assert kwargs == {"require_complete": True, "allow_building": True}
+        evaluator._memory_snapshot_manifest = manifest
+        return tmp_path
+
+    evaluator._select_memory_snapshot_run = select_manifest
+    evaluator._load_memory_snapshot_manifest()
+
+    assert evaluator._memory_unit_ids == {0, 1}
+
+
+def test_event_state_query_rejects_incomplete_building_memory_manifest(tmp_path: Path):
+    evaluator = _staged_evaluator(tmp_path, _StageManager())
+    evaluator.method_config.method_name = "event_state"
+    evaluator.execution_stage = "query"
+    evaluator.memory_run = "failed-run"
+    units = [EvaluationUnit(0, [], [], context_id=1), EvaluationUnit(1, [], [], context_id=2)]
+    evaluator._get_evaluation_units = lambda: units
+    evaluator._select_memory_snapshot_run = lambda **kwargs: (
+        setattr(evaluator, "_memory_snapshot_manifest", {
+            "status": "building",
+            "unit_ids": [0, 1],
+            "snapshots": [{"unit_id": 0}],
+        })
+        or tmp_path
+    )
+
+    with pytest.raises(ValueError, match="snapshot list is incomplete"):
+        evaluator._load_memory_snapshot_manifest()
+
+
 def test_query_only_stage_runs_units_in_parallel_with_isolated_agents(
     tmp_path: Path,
     monkeypatch,
@@ -1064,6 +1109,62 @@ def test_memory_stage_writes_only_memory_build_report(tmp_path: Path):
     output_files = {path.name for path in paths[1].parent.iterdir() if path.is_file()}
     assert output_files == {paths[1].name}
     assert collector.last_api_failure_path is None
+
+
+def test_medmemorybench_failure_writes_memory_build_checkpoint_only(tmp_path: Path):
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator._memory_build_checkpoint_saved = False
+    evaluator._source_memory_build_logs = []
+    evaluator._memory_build_logs = [{
+        "unit_id": 0,
+        "context_id": 1,
+        "session_ids": ["s1"],
+        "session_count": 1,
+        "total_time": 12.5,
+        "session_builds": [],
+        "build_metrics": {"usage": {}},
+    }]
+    evaluator.output_dir = tmp_path
+    evaluator.run_scoped_output = True
+    evaluator.result_collector = ResultCollector()
+    evaluator._log = lambda *args, **kwargs: None
+    evaluator._get_evaluation_units = lambda: []
+    evaluator._build_report = lambda *args: _report()
+
+    evaluator._persist_memory_build_checkpoint(datetime.now())
+
+    artifacts = list(tmp_path.glob("*_memory_build.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["artifact_status"] == "checkpoint"
+    assert payload["units"][0]["total_time"] == 12.5
+    assert not list(tmp_path.glob("*_result.json"))
+    assert not list(tmp_path.glob("*_query_answer.json"))
+
+
+def test_medmemorybench_evaluate_persists_memory_build_before_reraising_failure():
+    evaluator = MedMemoryBenchEvaluator.__new__(MedMemoryBenchEvaluator)
+    evaluator.execution_stage = "all"
+    evaluator.method_config = SimpleNamespace(method_name="amem_test")
+    evaluator.dry_run = False
+    evaluator.append = False
+    evaluator.resume = False
+    evaluator.batch_api = False
+    evaluator._checkpoint_enabled = False
+    evaluator._checkpoint_manager = None
+    evaluator._init_dataset = lambda: None
+    evaluator._start_memory_snapshot_manifest = lambda **kwargs: None
+    evaluator._run_evaluation_loop = lambda: (_ for _ in ()).throw(RuntimeError("query failed"))
+    evaluator._finish_query_progress = lambda: None
+    evaluator._log = lambda *args, **kwargs: None
+    persisted = []
+    evaluator._persist_memory_build_checkpoint = lambda started_at: persisted.append(started_at)
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        evaluator.evaluate()
+
+    assert len(persisted) == 1
 
 
 def test_query_stage_writes_result_and_query_answer_without_memory_build(tmp_path: Path):

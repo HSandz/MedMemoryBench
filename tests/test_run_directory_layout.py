@@ -441,6 +441,44 @@ def test_explicit_query_accepts_full_building_locomo_v2_memory_manifest(tmp_path
     assert resolved == source_run.resolve()
 
 
+def test_explicit_query_accepts_full_building_medmemorybench_event_state_manifest(tmp_path: Path):
+    method = MethodConfig(
+        method_name="event_state",
+        method_type="agentic_memory",
+        model=ModelConfig(provider="openai", name="test-model"),
+        raw_config={
+            "method_name": "event_state",
+            "method_type": "agentic_memory",
+            "model": {"provider": "openai", "name": "test-model"},
+        },
+    )
+    dataset = DatasetConfig(
+        dataset_name="medmemorybench",
+        raw_config={"dataset_name": "medmemorybench"},
+    )
+    source_run = _write_memory_run(
+        tmp_path,
+        "20260907_020000",
+        experiment="event_state_test-model",
+        stored_method_name="event_state",
+        manifest_method_name="event_state",
+        dataset_config_name="medmemorybench",
+        status="building",
+        config_hash=compute_config_hash(method, dataset),
+    )
+    evaluator = Evaluator.__new__(Evaluator)
+    evaluator.memory_run = source_run.name
+    evaluator.execution_stage = "query"
+    evaluator.append = False
+    evaluator.experiment_dir = tmp_path / "event_state_test-model"
+    evaluator.method_config = method
+    evaluator.dataset_config = dataset
+
+    resolved = evaluator._resolve_memory_source_run_dir(source_run)
+
+    assert resolved == source_run.resolve()
+
+
 def test_pending_batch_run_records_pending_status_for_resume(tmp_path: Path, monkeypatch):
     manifest_path = tmp_path / "batch" / "manifest.json"
 
@@ -534,6 +572,28 @@ def test_query_config_inference_accepts_building_locomo_event_state_source(tmp_p
             "format": "locomo.event_state_memory_manifest",
             "version": 2,
         },
+    )
+
+    inferred = cli.infer_query_config_from_memory_run(
+        tmp_path,
+        run_dir.name,
+        allow_event_state_query_building=True,
+    )
+
+    assert inferred["run_dir"] == run_dir
+    assert inferred["memory_manifest"]["status"] == "building"
+
+
+def test_query_config_inference_accepts_building_medmemorybench_event_state_source(tmp_path: Path):
+    run_dir = _write_memory_run(
+        tmp_path,
+        "20260907_020001",
+        experiment="event_state_test-model",
+        method_config_name="event_state_gemini",
+        dataset_config_name="medmemorybench",
+        stored_method_name="event_state",
+        manifest_method_name="event_state",
+        status="building",
     )
 
     inferred = cli.infer_query_config_from_memory_run(
