@@ -15,6 +15,9 @@ def _agent():
     agent.subject_aliases = {"patient": "primary_user"}
     agent._last_option_probe_coverage = {}
     agent._last_option_probe_relations = {}
+    agent._last_option_support_views = {}
+    agent._last_option_contradict_views = {}
+    agent._last_option_semantics = {}
     agent._last_requirement_normalization_actions = []
     return agent
 
@@ -159,13 +162,97 @@ def test_option_zero_memory_hit_is_not_a_false_verdict():
     assert set(agent._last_option_probe_coverage) == {"A", "B", "C", "D"}
 
 
-def test_option_relation_confidence_is_not_a_correctness_probability():
+def test_option_safety_constraint_can_support_or_contradict_by_normalized_predicate():
     agent = _agent()
-    memory = {"id": "m1", "claim": "Patient has a documented allergy to cefuroxime.", "value": "cefuroxime", "verbatim_value": "cefuroxime", "semantic_role": "SAFETY_CONSTRAINT", "scope": "allergy", "state_key": "", "object_anchor": "cefuroxime", "entities": ["cefuroxime"], "scope_entities": []}
-    relation = agent._option_memory_relation("Cefuroxime", memory, 0)
-    assert relation["relation"] == "SAFETY_CONSTRAINT_ON_OPTION"
-    assert relation["confidence"] == 1.0
-    assert "verdict" not in relation
+    memory = {
+        "id": "m1",
+        "claim": "Patient has a documented allergy to cefuroxime.",
+        "value": "cefuroxime",
+        "verbatim_value": "cefuroxime",
+        "semantic_role": "SAFETY_CONSTRAINT",
+        "scope": "allergy",
+        "object_anchor": "cefuroxime",
+        "entities": ["cefuroxime"],
+        "scope_entities": [],
+        "stance": "AFFIRM",
+        "assertion_mode": "DIRECT",
+    }
+    avoid = {
+        "predicate": "the medication should be avoided",
+        "support_roles": ["SAFETY_CONSTRAINT"],
+        "contradict_roles": [],
+    }
+    safe = {
+        "predicate": "the medication is safe to take",
+        "support_roles": ["GUIDANCE"],
+        "contradict_roles": ["SAFETY_CONSTRAINT"],
+    }
+    support = agent._option_memory_relation("Cefuroxime", memory, 0, avoid)
+    contradiction = agent._option_memory_relation("Cefuroxime", memory, 0, safe)
+    assert support["relation"] == "SUPPORTS"
+    assert contradiction["relation"] == "CONTRADICTS"
+    assert support["confidence"] >= 0.9
+    assert contradiction["confidence"] >= 0.9
+
+
+def test_option_observation_is_context_not_fake_support_without_role_authorization():
+    agent = _agent()
+    memory = {
+        "id": "m1",
+        "claim": "Patient is currently taking basal insulin.",
+        "value": "basal insulin",
+        "verbatim_value": "basal insulin",
+        "semantic_role": "OBSERVATION",
+        "object_anchor": "basal_insulin",
+        "entities": ["basal insulin"],
+        "scope_entities": [],
+        "stance": "AFFIRM",
+        "assertion_mode": "DIRECT",
+    }
+    semantics = {
+        "predicate": "recommended treatment action",
+        "support_roles": ["GUIDANCE", "ACCEPTED_POLICY"],
+        "contradict_roles": ["SAFETY_CONSTRAINT"],
+    }
+    relation = agent._option_memory_relation("basal insulin", memory, 0, semantics)
+    assert relation["relation"] == "CONTEXT_FOR"
+    assert relation["confidence"] > 0.5
+
+
+def test_option_negated_memory_reverses_authorized_evidential_stance():
+    agent = _agent()
+    memory = {
+        "id": "m1",
+        "claim": "The action was not recommended.",
+        "value": "action X",
+        "verbatim_value": "action X",
+        "semantic_role": "GUIDANCE",
+        "object_anchor": "action_x",
+        "entities": ["action X"],
+        "scope_entities": [],
+        "stance": "NEGATE",
+        "assertion_mode": "DIRECT",
+    }
+    semantics = {
+        "predicate": "recommended action",
+        "support_roles": ["GUIDANCE"],
+        "contradict_roles": [],
+    }
+    relation = agent._option_memory_relation("action X", memory, 0, semantics)
+    assert relation["relation"] == "CONTRADICTS"
+
+
+def test_option_semantics_overlap_is_removed_to_prevent_false_deterministic_stance():
+    parsed = {
+        "option_semantics": {
+            "predicate": "appropriate choice",
+            "support_roles": ["GUIDANCE", "OBSERVATION"],
+            "contradict_roles": ["OBSERVATION", "SAFETY_CONSTRAINT"],
+        }
+    }
+    normalized = SmartMem0Agent._aop_option_semantics(parsed, {"A": "x"})
+    assert normalized["support_roles"] == ["GUIDANCE"]
+    assert normalized["contradict_roles"] == ["SAFETY_CONSTRAINT"]
 
 
 def test_query_type_remains_behaviorally_inert():
