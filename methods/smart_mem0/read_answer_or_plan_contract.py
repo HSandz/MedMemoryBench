@@ -1,8 +1,9 @@
 """Answer-or-plan control flow for SmartMem0 reads.
 
 The single semantic controller either proposes a complete answer already contained in one
-seed or emits the minimal evidence obligations required for retrieval. DIRECT is a
-semantic-completeness decision, never a short-answer mode or a language-specific rule.
+seed or emits the minimal evidence obligations required for retrieval. Candidate
+propositions are a generic evidence-evaluation primitive; visible multiple-choice options
+are only one producer. DIRECT is semantic completeness, never answer length or language.
 """
 
 import json
@@ -16,7 +17,8 @@ from .read_requirement_contract import REQUIREMENT_CONTROLLER_POLICY, REQUIREMEN
 
 ANSWER_OR_PLAN_PRIORITY = """
 CONTROL-FLOW PRIORITY — ANSWER OR PLAN:
-Inspect the Top-3 SEEDS before building a retrieval plan.
+Inspect exactly the Top-3 SEEDS before building a retrieval plan. Candidate-proposition
+pack entries are additional bounded retrieval candidates, NOT extra seeds.
 
 CANONICAL OUTPUT:
 Always emit answer_mode as exactly one of:
@@ -26,31 +28,49 @@ Always emit answer_mode as exactly one of:
 - ADVISE: the answer is a recommendation/action decision.
 - EXPLAIN: the answer requires explaining a reason/mechanism.
 - INFER: the answer requires combining participant evidence with a general-domain bridge.
-- SELECT: the answer requires deciding among visible answer options.
+- SELECT: the answer requires deciding among explicit candidate propositions.
 This vocabulary is language-independent. Infer it from meaning, not from cue words.
 If uncertain between EXTRACT and any other mode, choose the non-EXTRACT mode.
 
-For VISIBLE OPTIONS, also emit option_semantics:
-{"predicate":"short semantic predicate the correct options must satisfy",
- "support_roles":["..."],"contradict_roles":["..."]}
-The allowed role names are:
-SAFETY_CONSTRAINT, ACCEPTED_POLICY, GUIDANCE, PREFERENCE, MEASUREMENT, OBSERVATION.
-This is NOT an option verdict. It only normalizes the question predicate so deterministic
-code can interpret later retrieved memories in any language.
-- support_roles: if a retrieved memory with this semantic_role explicitly binds an option,
-  that memory would support the option AS AN ANSWER TO THE QUESTION PREDICATE.
-- contradict_roles: the same condition would contradict the option as an answer.
-- Omit a role when its meaning is ambiguous for the predicate. Never put the same role in
-  both lists.
-Examples by semantics:
-- "Which item is contraindicated/should be avoided?" normally treats an explicit
-  SAFETY_CONSTRAINT as support.
-- "Which item is safe/appropriate to use?" normally treats an explicit
-  SAFETY_CONSTRAINT as contradiction.
-- A recommendation/action question may treat explicit GUIDANCE or ACCEPTED_POLICY as
-  support, while an OBSERVATION is usually only context unless the observed fact itself is
-  the proposition being selected.
-Interpret the predicate in QUESTION's language; the role vocabulary is canonical.
+CANDIDATE PROPOSITION CONTRACT:
+An explicit candidate proposition is a proposition to EVALUATE using memory, not an
+evidence value that memory itself must supply. Visible answer options are one producer,
+but the same primitive can represent candidate actions, hypotheses, explanations, or
+entities supplied structurally by another caller.
+
+When CANDIDATE PROPOSITIONS are supplied, also emit:
+"proposition_semantics": {
+  "predicate": "short semantic predicate a selected proposition must satisfy"
+}
+and:
+"proposition_evidence": {
+  "<proposition id>": [
+    {
+      "memory_ref": "$seed0|$seed1|$seed2|one packet ref authorized for this proposition",
+      "relation": "SUPPORTS|CONTRADICTS|CONTEXT_FOR|UNKNOWN",
+      "confidence": 0.0
+    }
+  ]
+}
+
+Relation meanings are relative to the QUESTION predicate:
+- SUPPORTS: the memory materially supports this proposition satisfying the predicate.
+- CONTRADICTS: the memory materially argues against this proposition satisfying it.
+- CONTEXT_FOR: the memory is genuinely relevant and useful but does not by itself support
+  or contradict the proposition strongly enough.
+- UNKNOWN: the semantic relation cannot be determined reliably.
+
+confidence means P(the memory↔proposition RELATION LABEL is correct). It is NOT the
+probability that the proposition itself is correct.
+- If relation confidence is below 0.50, use UNKNOWN.
+- Reserve SUPPORTS/CONTRADICTS for clear material evidence; when confidence is below 0.70,
+  prefer UNKNOWN rather than overstating a strong evidential relation.
+- CONTEXT_FOR may be used when relevance is clear even though support direction is not.
+- No annotation, UNKNOWN, or no personal-memory support does NOT mean the proposition is
+  false. A proposition can still be correct via later retrieved evidence, elimination, or
+  an authorized world-knowledge bridge.
+- Do NOT choose final proposition labels in LLM #1. LLM #2 owns the final answer.
+- Do not invent memory refs. Packet refs are proposition-scoped. Top-3 seed refs are global.
 
 Emit candidate only when answer_mode=EXTRACT and EXACTLY ONE cited seed already contains
 the COMPLETE participant-specific answer to QUESTION. The answer may be an entity, value,
@@ -112,14 +132,6 @@ _HARD_DIRECT_RELATIONS = {
 }
 
 _VALID_ANSWER_MODES = {"EXTRACT", "COMPARE", "ADVISE", "EXPLAIN", "INFER", "SELECT"}
-_OPTION_EVIDENCE_ROLES = {
-    "SAFETY_CONSTRAINT",
-    "ACCEPTED_POLICY",
-    "GUIDANCE",
-    "PREFERENCE",
-    "MEASUREMENT",
-    "OBSERVATION",
-}
 
 
 def _answer_or_plan_policy() -> str:
@@ -146,35 +158,22 @@ class ReadAnswerOrPlanContractMixin:
         return mode if mode in _VALID_ANSWER_MODES else ""
 
     @staticmethod
-    def _aop_option_semantics(parsed: Any, options: Dict[str, Any]) -> Dict[str, Any]:
-        if not options or not isinstance(parsed, dict):
+    def _aop_proposition_semantics(parsed: Any) -> Dict[str, str]:
+        if not isinstance(parsed, dict):
             return {}
-        raw = parsed.get("option_semantics")
+        raw = parsed.get("proposition_semantics")
+        if not isinstance(raw, dict):
+            raw = parsed.get("option_semantics")
         if not isinstance(raw, dict):
             return {}
-        predicate = " ".join(str(raw.get("predicate") or "").split())[:180]
-        support = {
-            str(role or "").upper()
-            for role in (raw.get("support_roles") or [])
-            if str(role or "").upper() in _OPTION_EVIDENCE_ROLES
-        }
-        contradict = {
-            str(role or "").upper()
-            for role in (raw.get("contradict_roles") or [])
-            if str(role or "").upper() in _OPTION_EVIDENCE_ROLES
-        }
-        overlap = support & contradict
-        support -= overlap
-        contradict -= overlap
-        return {
-            "predicate": predicate,
-            "support_roles": sorted(support),
-            "contradict_roles": sorted(contradict),
-        }
+        predicate = " ".join(
+            str(raw.get("predicate") or raw.get("selection_predicate") or "").split()
+        )[:180]
+        return {"predicate": predicate} if predicate else {}
 
     def _aop_direct_surface_allowed(self, question: str, ir: Dict[str, Any]) -> bool:
         del question
-        if ir.get("visible_options"):
+        if ir.get("visible_options") or ir.get("candidate_propositions"):
             return False
         if str(ir.get("answer_mode") or "").upper() != "EXTRACT":
             return False
@@ -207,9 +206,7 @@ class ReadAnswerOrPlanContractMixin:
             else:
                 answer_mode = "UNKNOWN"
         ir["answer_mode"] = answer_mode
-        ir["option_semantics"] = self._aop_option_semantics(
-            parsed, ir.get("visible_options") or {}
-        )
+        ir["proposition_semantics"] = self._aop_proposition_semantics(parsed)
         requirements = ir.get("requirements") or []
         single_question = (
             len(requirements) == 1
@@ -228,8 +225,16 @@ class ReadAnswerOrPlanContractMixin:
     def _rc_public_ir(self, ir):
         public = super()._rc_public_ir(ir)
         public["answer_mode"] = str(ir.get("answer_mode") or "UNKNOWN")
-        if ir.get("visible_options"):
-            public["option_semantics"] = deepcopy(ir.get("option_semantics") or {})
+        if ir.get("candidate_propositions"):
+            public["candidate_propositions"] = deepcopy(
+                ir.get("candidate_propositions") or {}
+            )
+            public["proposition_semantics"] = deepcopy(
+                ir.get("proposition_semantics") or {}
+            )
+            public["proposition_evidence"] = deepcopy(
+                ir.get("proposition_evidence") or {}
+            )
         return public
 
     def _aop_direct_projection(self, ir: Dict[str, Any], question: str):
@@ -263,6 +268,7 @@ class ReadAnswerOrPlanContractMixin:
             not candidate
             or len(requirements) != 1
             or ir.get("visible_options")
+            or ir.get("candidate_propositions")
             or str(ir.get("answer_mode") or "").upper() != "EXTRACT"
             or str(ir.get("answer_type") or "").upper() != "DATE"
         ):
@@ -337,29 +343,86 @@ class ReadAnswerOrPlanContractMixin:
             spec["world_knowledge_bridge_allowed"] = True
         elif mode in {"EXTRACT", "COMPARE", "SELECT"}:
             spec["requires_inference"] = bool(spec.get("requires_inference", False))
-        if ir.get("visible_options"):
-            semantics = deepcopy(ir.get("option_semantics") or {})
-            plan["option_semantics"] = semantics
-            plan.setdefault("semantic_ir", {})["option_semantics"] = semantics
+
+        propositions = deepcopy(ir.get("candidate_propositions") or {})
+        if propositions:
+            plan["candidate_propositions"] = propositions
+            plan["proposition_semantics"] = deepcopy(
+                ir.get("proposition_semantics") or {}
+            )
+            plan["proposition_evidence"] = deepcopy(
+                ir.get("proposition_evidence") or {}
+            )
+            semantic_ir = plan.setdefault("semantic_ir", {})
+            semantic_ir["candidate_propositions"] = deepcopy(propositions)
+            semantic_ir["proposition_semantics"] = deepcopy(
+                ir.get("proposition_semantics") or {}
+            )
+            semantic_ir["proposition_evidence"] = deepcopy(
+                ir.get("proposition_evidence") or {}
+            )
         return plan
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
-        del context_map
         self._last_option_probe_coverage = {}
         self._last_option_probe_relations = {}
         self._last_option_support_views = {}
         self._last_option_contradict_views = {}
         self._last_option_semantics = {}
+        self._last_candidate_propositions = {}
+        self._last_candidate_proposition_pack = {}
+        self._last_proposition_probe_coverage = {}
+        self._last_proposition_relation_views = {}
+        self._last_proposition_support_views = {}
+        self._last_proposition_contradict_views = {}
+        self._last_proposition_context_views = {}
+        self._last_proposition_unknown_views = {}
+        self._last_proposition_semantics = {}
+
         reset_terminal = getattr(self, "_terminal_reset_state", None)
         if callable(reset_terminal):
             reset_terminal()
         self._active_controller_seeds = list(seeds[:3])
+
         options = self._question_options(question) or {}
+        propositions = {}
+        normalize_propositions = getattr(self, "_normalize_candidate_propositions", None)
+        if callable(normalize_propositions):
+            propositions = normalize_propositions(options)
+            if not propositions and isinstance(context_map, dict):
+                propositions = normalize_propositions(
+                    context_map.get("candidate_propositions")
+                )
+
+        pack_builder = getattr(self, "_build_candidate_proposition_pack", None)
+        proposition_pack = (
+            pack_builder(
+                propositions,
+                frame=frame,
+                seeds=seeds[:3],
+                question=question,
+            )
+            if callable(pack_builder) and propositions
+            else {}
+        )
+
         hints = {
             "dates": list(getattr(frame, "dates", ()) or ()),
             "source_speaker": getattr(frame, "speaker_role", ""),
             "explicit_entities": list(getattr(frame, "entities", ()) or ()),
         }
+        proposition_instruction = ""
+        if propositions:
+            proposition_instruction = (
+                "\nCANDIDATE PROPOSITIONS (structural, not verdicts):\n"
+                + json.dumps(propositions, ensure_ascii=False)
+                + "\nCANDIDATE PROPOSITION PACK (bounded retrieval candidates; not extra seeds):\n"
+                + json.dumps(proposition_pack, ensure_ascii=False)
+                + "\nAnnotate proposition_evidence only with $seed0..$seed2 or packet refs "
+                "authorized under candidate_refs for that proposition. Do not output final "
+                "selected proposition labels in this controller response."
+            )
+
         prompt = (
             _answer_or_plan_policy()
             + "\n"
@@ -369,15 +432,23 @@ class ReadAnswerOrPlanContractMixin:
                 hints=json.dumps(hints, ensure_ascii=False),
                 seeds=json.dumps(self._rc_seed_payload(seeds), ensure_ascii=False),
             )
-            + '\nAlso include top-level "answer_mode". When VISIBLE OPTIONS are present, '
-            'also include top-level "option_semantics" using the canonical contract above.'
+            + '\nAlso include top-level "answer_mode".'
+            + (
+                '\nWhen candidate propositions are supplied, also include top-level '
+                '"proposition_semantics" and "proposition_evidence" using the canonical '
+                "contract above."
+                if propositions
+                else ""
+            )
+            + proposition_instruction
         )
+
         raw_ir = {}
         try:
             response = self._llm_client.chat(
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=680,
+                max_tokens=820,
                 response_format={"type": "json_object"},
             )
             usage = self._response_usage(response, prompt)
@@ -388,7 +459,34 @@ class ReadAnswerOrPlanContractMixin:
             usage = {}
             ir = self._rc_normalize_ir({}, question, frame)
             error = str(exc)
-        self._last_option_semantics = deepcopy(ir.get("option_semantics") or {})
+
+        ir["candidate_propositions"] = dict(propositions)
+        if propositions and not ir.get("proposition_semantics"):
+            ir["proposition_semantics"] = {}
+        normalizer = getattr(self, "_normalize_candidate_proposition_evidence", None)
+        proposition_evidence = (
+            normalizer(
+                raw_ir.get("proposition_evidence"),
+                proposition_pack,
+                seeds[:3],
+                propositions,
+            )
+            if callable(normalizer) and propositions
+            else {}
+        )
+        ir["proposition_evidence"] = deepcopy(proposition_evidence)
+
+        activator = getattr(self, "_activate_candidate_proposition_evidence", None)
+        if callable(activator) and propositions:
+            activator(
+                propositions,
+                proposition_evidence,
+                visible_options=bool(options),
+                predicate=str(
+                    (ir.get("proposition_semantics") or {}).get("predicate") or ""
+                ),
+            )
+
         projection = self._aop_direct_projection(ir, question)
         supports, authorization, active_ir = None, "NO_COMPLETE_CANDIDATE", ir
         if projection is not None:
@@ -397,6 +495,7 @@ class ReadAnswerOrPlanContractMixin:
             )
             if supports is not None:
                 active_ir = projection
+
         actions = list(active_ir.get("normalization_actions") or [])
         self._last_requirement_normalization_actions = list(actions)
         warnings = [
@@ -420,7 +519,12 @@ class ReadAnswerOrPlanContractMixin:
             "normalization_actions": actions,
             "graph_warnings": warnings,
             "candidate_authorization": authorization,
+            "candidate_proposition_pack_size": len(
+                proposition_pack.get("candidates") or []
+            ),
+            "candidate_proposition_count": len(propositions),
         }
+
         if supports is not None:
             candidate = active_ir["candidate"]
             answer = candidate["answer"]
@@ -440,6 +544,7 @@ class ReadAnswerOrPlanContractMixin:
                 }
             )
             return supports, {}, telemetry
+
         plan = self._controller_plan(ir, question, frame)
         telemetry = dict(common)
         telemetry.update(
