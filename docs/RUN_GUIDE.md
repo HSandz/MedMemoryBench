@@ -235,7 +235,7 @@ Use OpenRouter model IDs, including the provider prefix. A model-level
 should remain in `.env`. The judge also accepts `JUDGE_PROVIDER=openrouter` and
 uses the OpenRouter defaults unless `JUDGE_API_KEY` or `JUDGE_BASE_URL` is set.
 
-The optional `model.openrouter.provider` mapping is passed unchanged as
+The optional `query_model.openrouter.provider` mapping is passed unchanged as
 OpenRouter's provider-routing object. It can use documented fields such as
 `order`, `only`, `ignore`, `allow_fallbacks`, `require_parameters`, `sort`,
 `data_collection`, `zdr`, `quantizations`, `preferred_min_throughput`,
@@ -509,7 +509,7 @@ and `judge` operation buckets. Memory-build usage is stored separately in
 Vertex Gemini uses Cloud Storage JSONL staging and requires
 `GOOGLE_BATCH_GCS_URI` or `--batch-gcs-uri`. OpenRouter submits inline requests
 to its Batch API and ignores the GCS argument. It preserves
-`model.openrouter.provider` routing when the selected upstream has a batch
+`query_model.openrouter.provider` routing when the selected upstream has a batch
 endpoint. Before submission, the client checks OpenRouter's `:batch` model
 variant against the configured provider routing and service tier. If no batch
 endpoint matches, or support cannot be confirmed, it logs the reason and uses

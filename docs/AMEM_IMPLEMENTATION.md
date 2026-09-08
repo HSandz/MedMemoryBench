@@ -101,15 +101,19 @@ The selector uses only the raw question and stored memory state. It receives any
 Common fields:
 
 ```yaml
-model:
+query_model:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 2000
+
+memorize_model:
   provider: gemini
   name: gemini-2.5-flash
   temperature: 0.0
   max_completion_tokens: 2000
 
 build_config:
-  amem_backend: vertex
-  amem_model: gemini-2.5-flash
   amem_embedding_model: all-MiniLM-L6-v2
   amem_evo_threshold: 100
   amem_max_tokens: 1000
