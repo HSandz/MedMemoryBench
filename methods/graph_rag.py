@@ -5,6 +5,8 @@ import sys
 import time
 import logging
 import heapq
+import warnings
+from contextlib import contextmanager
 from typing import Callable, Optional, List, Tuple, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +60,23 @@ DEFAULT_EDGES_THRESHOLD = 0.8
 DEFAULT_RETRIEVE_NUM = 5
 DEFAULT_MAX_WORKERS = 3
 LLM_CONTEXT_LIMIT = 127000
+
+_FIXED_SAMPLING_WARNING = (
+    r"Model '.*' uses fixed sampling defaults; the sampling parameter\(s\) "
+    r".* will be ignored\."
+)
+
+
+@contextmanager
+def _suppress_fixed_sampling_warning():
+    """Hide LangChain's expected fixed-sampling notice for this call only."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_FIXED_SAMPLING_WARNING,
+            category=UserWarning,
+        )
+        yield
 
 def _get_embeddings(embedding_model: str = None):
     """Create Embeddings instance supporting OpenAI API and local HuggingFace models."""
@@ -116,15 +135,16 @@ class _RotatingVertexChatModel(ChatGoogleGenerativeAI):
         }
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        return self._rotation_client._run_with_service_account_rotation(
-            lambda client, credentials, project: self._account_models[id(credentials)]._generate(
-                messages,
-                stop=stop,
-                run_manager=run_manager,
-                **kwargs,
-            ),
-            "GraphRAG LangChain call",
-        )
+        with _suppress_fixed_sampling_warning():
+            return self._rotation_client._run_with_service_account_rotation(
+                lambda client, credentials, project: self._account_models[id(credentials)]._generate(
+                    messages,
+                    stop=stop,
+                    run_manager=run_manager,
+                    **kwargs,
+                ),
+                "GraphRAG LangChain call",
+            )
 
 
 def _get_chat_model(
