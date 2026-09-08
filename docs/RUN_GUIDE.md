@@ -340,6 +340,15 @@ python main.py --stage query --memory-run YYYYMMDD_HHMMSS
 
 The query stage reads the stored effective configuration and writes under the source run's `query_runs/` directory. Use `--resume` for an incomplete query child. Do not change snapshot-incompatible A-MEM flags between stages.
 
+Long Context, Embedding RAG, and BM25 RAG support the same MedMemoryBench
+workflow. Embedding-RAG snapshots include the indexed vectors as validated NumPy
+sidecars, so query-only execution restores them without re-embedding dialogue:
+
+```bash
+python main.py -m embedding_rag_gemini -d medmemorybench --stage memory
+python main.py --stage query --memory-run YYYYMMDD_HHMMSS --query-workers 5
+```
+
 Event-State supports the same staged workflow for LoCoMo, with a snapshot per
 complete conversation sample rather than a persona/evaluation unit:
 
@@ -509,7 +518,7 @@ its chat-completions shape and correlates results by `custom_id`. See the
 
 ## Parallel Query Workers
 
-`--workers N` controls memory-construction preparation and defaults to `1`.
+`--workers N` controls supported memory-construction preparation and defaults to `1`.
 Use `--query-workers N` to run up to `N` local query retrieval and prompt
 preparation tasks at once; it defaults to `5`:
 
@@ -534,8 +543,9 @@ execution. Event-State memory preparation also displays a per-unit
 both preparation and ordered stateful commit steps, so completion means the
 entire memory build is finished.
 
-When running `--stage query` against completed A-MEM or LoCoMo Event-State snapshots, independent
-unit contexts can initialize without waiting for earlier units. Each unit uses
+When running `--stage query` against completed MedMemoryBench snapshot-backed
+methods or LoCoMo Event-State snapshots, independent unit contexts can initialize
+without waiting for earlier units. Each unit uses
 an isolated agent/memory context, while `--query-workers N` remains a single
 global cap across all real-time queries, not a per-unit cap. Result, batch, deferred-judge, and
 checkpoint commits retain dataset order. This optimization requires query-stage

@@ -531,6 +531,16 @@ def test_agent_manager_enables_internal_batch_for_openrouter():
     assert params["vertex_batch_wait"] is True
 
 
+def test_graphrag_is_not_advertised_as_final_answer_batchable():
+    method_config = MethodConfig.from_dict({
+        "method_name": "graph_rag",
+        "method_type": "rag",
+        "model": {"provider": "gemini", "name": "gemini-2.5-flash"},
+    })
+
+    assert AgentManager.supports_configured_batch_queries(method_config) is False
+
+
 def test_batch_factory_selects_openrouter_transport(tmp_path):
     client = object.__new__(OpenRouterClient)
     client.model = "openai/gpt-4o"

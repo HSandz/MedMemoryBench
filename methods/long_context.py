@@ -10,6 +10,7 @@ class LongContextAgent(BaseAgent):
     """Baseline method using LLM's long context capability."""
 
     METHOD_TYPE = "baseline"
+    SNAPSHOT_VERSION = 1
 
     def __init__(
         self,
@@ -76,6 +77,13 @@ class LongContextAgent(BaseAgent):
             return
 
         if self.truncation_strategy == "oldest_first":
+            # Retain the tail of a single oversized session rather than
+            # accidentally evicting the only stored item.
+            if len(self._memory_chunks) == 1:
+                encoded = self._tokenizer.encode(self._context)
+                self._context = self._tokenizer.decode(encoded[-self.max_context_tokens:])
+                self._memory_chunks = [self._context]
+                return
             while self._memory_chunks and self.count_tokens(self._context) > self.max_context_tokens:
                 self._memory_chunks.pop(0)
                 self._context = "\n\n".join(self._memory_chunks)
@@ -128,6 +136,39 @@ class LongContextAgent(BaseAgent):
         """Reset agent."""
         super().reset()
         self._context = ""
+
+    def supports_memory_snapshots(self) -> bool:
+        """The retained text is sufficient to restore this baseline exactly."""
+        return True
+
+    def export_memory_state(self, context_id=None) -> dict:
+        """Export retained context without serializing the LLM client."""
+        return {
+            "method": "long_context",
+            "snapshot_version": self.SNAPSHOT_VERSION,
+            "context_id": self._context_id if context_id is None else context_id,
+            "memory_chunks": list(self._memory_chunks),
+            "context": self._context,
+        }
+
+    def import_memory_state(self, state: dict, context_id=None) -> None:
+        """Restore a previously exported retained context."""
+        if (
+            not isinstance(state, dict)
+            or state.get("method") != "long_context"
+            or state.get("snapshot_version") != self.SNAPSHOT_VERSION
+        ):
+            raise ValueError("Invalid long-context memory snapshot")
+        chunks = state.get("memory_chunks")
+        context = state.get("context")
+        if not isinstance(chunks, list) or not all(isinstance(chunk, str) for chunk in chunks):
+            raise ValueError("Long-context snapshot chunks are invalid")
+        if not isinstance(context, str):
+            raise ValueError("Long-context snapshot context is invalid")
+        self._memory_chunks = list(chunks)
+        self._context = context
+        self._is_initialized = bool(chunks or context)
+        self._context_id = context_id if context_id is not None else state.get("context_id")
 
     @property
     def context(self) -> str:

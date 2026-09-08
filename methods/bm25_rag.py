@@ -1,7 +1,7 @@
 """BM25 RAG Agent - sparse retrieval with BM25 algorithm."""
 
 import logging
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
 from utils.llm_client import create_llm_client, format_messages, BaseLLMClient
@@ -14,6 +14,7 @@ class BM25RAGAgent(BaseAgent):
 
     METHOD_TYPE = "rag"
     DEFAULT_MAX_CONTEXT_TOKENS = 120000
+    SNAPSHOT_VERSION = 1
 
     def __init__(
         self,
@@ -99,18 +100,19 @@ class BM25RAGAgent(BaseAgent):
         return chunks
 
     def _build_index(self) -> None:
-        """Build BM25 index from chunks."""
+        """Build BM25 statistics from an already-tokenized corpus."""
         if not self._chunks:
             return
 
         from rank_bm25 import BM25Okapi
-        self._tokenized_corpus = [self._tokenize(doc) for doc in self._chunks]
         self._bm25 = BM25Okapi(self._tokenized_corpus, k1=self.k1, b=self.b)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
-        """Add text to memory and build BM25 index."""
+        """Add text and tokenize only its newly produced chunks."""
         self._memory_chunks.append(text)
-        self._chunks.extend(self._split_text_into_chunks(text))
+        new_chunks = self._split_text_into_chunks(text)
+        self._chunks.extend(new_chunks)
+        self._tokenized_corpus.extend(self._tokenize(chunk) for chunk in new_chunks)
         self._is_initialized = True
         self._build_index()
 
@@ -205,6 +207,52 @@ class BM25RAGAgent(BaseAgent):
         self._bm25 = None
         self._tokenized_corpus = []
         self._chunks = []
+
+    def supports_memory_snapshots(self) -> bool:
+        """Chunks are sufficient to deterministically reconstruct BM25 state."""
+        return True
+
+    def export_memory_state(self, context_id=None) -> Dict[str, Any]:
+        """Export source chunks; BM25 statistics are derived on restoration."""
+        return {
+            "method": "bm25_rag",
+            "snapshot_version": self.SNAPSHOT_VERSION,
+            "context_id": self._context_id if context_id is None else context_id,
+            "memory_chunks": list(self._memory_chunks),
+            "chunks": list(self._chunks),
+            "tokenized_corpus": [list(tokens) for tokens in self._tokenized_corpus],
+        }
+
+    def import_memory_state(self, state: Dict[str, Any], context_id=None) -> None:
+        """Restore pre-tokenized chunks and rebuild only BM25's derived statistics."""
+        if (
+            not isinstance(state, dict)
+            or state.get("method") != "bm25_rag"
+            or state.get("snapshot_version") != self.SNAPSHOT_VERSION
+        ):
+            raise ValueError("Invalid BM25-RAG memory snapshot")
+        memory_chunks = state.get("memory_chunks")
+        chunks = state.get("chunks")
+        tokenized_corpus = state.get("tokenized_corpus")
+        if (
+            not isinstance(memory_chunks, list)
+            or not isinstance(chunks, list)
+            or not isinstance(tokenized_corpus, list)
+            or not all(isinstance(chunk, str) for chunk in memory_chunks + chunks)
+            or len(tokenized_corpus) != len(chunks)
+            or not all(
+                isinstance(tokens, list) and all(isinstance(token, str) for token in tokens)
+                for tokens in tokenized_corpus
+            )
+        ):
+            raise ValueError("BM25-RAG snapshot state is invalid")
+        self._memory_chunks = list(memory_chunks)
+        self._chunks = list(chunks)
+        self._tokenized_corpus = [list(tokens) for tokens in tokenized_corpus]
+        self._bm25 = None
+        self._build_index()
+        self._is_initialized = bool(self._memory_chunks or self._chunks)
+        self._context_id = context_id if context_id is not None else state.get("context_id")
 
     @property
     def has_index(self) -> bool:

@@ -1,7 +1,7 @@
 """Embedding RAG Agent - vector retrieval with FAISS."""
 
 import logging
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
 from utils.llm_client import create_llm_client, format_messages, BaseLLMClient
@@ -51,6 +51,10 @@ class BaseLocalEmbeddings:
         """Embed single query."""
         return self._embed_single(text)
 
+    def __call__(self, text: str) -> List[float]:
+        """Provide LangChain's legacy callable embedding interface."""
+        return self.embed_query(text)
+
 
 class ContrieverEmbeddings(BaseLocalEmbeddings):
     """Facebook Contriever model using CLS token pooling."""
@@ -93,6 +97,7 @@ class EmbeddingRAGAgent(BaseAgent):
 
     METHOD_TYPE = "rag"
     DEFAULT_MAX_CONTEXT_TOKENS = 120000
+    SNAPSHOT_VERSION = 1
 
     def __init__(
         self,
@@ -193,27 +198,32 @@ class EmbeddingRAGAgent(BaseAgent):
 
         return self._embedding_model_instance
 
-    def _build_vectorstore(self) -> None:
-        """Build FAISS vector store from chunks."""
-        if not self._chunks:
+    def _add_chunks_to_vectorstore(self, chunks: List[str]) -> None:
+        """Index only newly added chunks, preserving the existing FAISS order."""
+        if not chunks:
             return
 
         from langchain_community.vectorstores import FAISS
         from langchain_core.documents import Document
 
+        start_index = len(self._chunks) - len(chunks)
         documents = [
             Document(page_content=chunk, metadata={"index": i})
-            for i, chunk in enumerate(self._chunks)
+            for i, chunk in enumerate(chunks, start=start_index)
         ]
-
-        self._vectorstore = FAISS.from_documents(documents, self._get_embedding_model())
+        embeddings = self._get_embedding_model()
+        if self._vectorstore is None:
+            self._vectorstore = FAISS.from_documents(documents, embeddings)
+        else:
+            self._vectorstore.add_documents(documents)
 
     def memorize(self, text: str, **kwargs) -> MemoryBuildResult:
-        """Add text to memory and build vector store."""
+        """Add text to memory and incrementally extend the vector store."""
         self._memory_chunks.append(text)
-        self._chunks.extend(self._split_text_into_chunks(text))
+        new_chunks = self._split_text_into_chunks(text)
+        self._chunks.extend(new_chunks)
         self._is_initialized = True
-        self._build_vectorstore()
+        self._add_chunks_to_vectorstore(new_chunks)
 
         return MemoryBuildResult(
             success=True,
@@ -300,6 +310,74 @@ class EmbeddingRAGAgent(BaseAgent):
         super().reset()
         self._vectorstore = None
         self._chunks = []
+
+    def supports_memory_snapshots(self) -> bool:
+        """The chunks and FAISS vectors form a complete read-only query state."""
+        return True
+
+    def export_memory_state(self, context_id=None) -> Dict[str, Any]:
+        """Export chunks and exact dense vectors without serializing FAISS pickle data."""
+        import numpy as np
+
+        embeddings = np.empty((0, 0), dtype=np.float32)
+        if self._vectorstore is not None:
+            index = self._vectorstore.index
+            embeddings = np.asarray(
+                [index.reconstruct(i) for i in range(index.ntotal)], dtype=np.float32
+            )
+        if len(embeddings) != len(self._chunks):
+            raise ValueError("Embedding RAG index does not match its chunks")
+        return {
+            "method": "embedding_rag",
+            "snapshot_version": self.SNAPSHOT_VERSION,
+            "context_id": self._context_id if context_id is None else context_id,
+            "memory_chunks": list(self._memory_chunks),
+            "chunks": list(self._chunks),
+            "embedding_artifacts": {
+                "chunks": {
+                    "dtype": str(embeddings.dtype),
+                    "shape": list(embeddings.shape),
+                    "ids": [str(index) for index in range(len(self._chunks))],
+                    "values": embeddings,
+                }
+            },
+        }
+
+    def import_memory_state(self, state: Dict[str, Any], context_id=None) -> None:
+        """Restore FAISS directly from validated vectors without re-embedding text."""
+        if (
+            not isinstance(state, dict)
+            or state.get("method") != "embedding_rag"
+            or state.get("snapshot_version") != self.SNAPSHOT_VERSION
+        ):
+            raise ValueError("Invalid embedding-RAG memory snapshot")
+        memory_chunks = state.get("memory_chunks")
+        chunks = state.get("chunks")
+        artifacts = state.get("embedding_artifacts", {})
+        descriptor = artifacts.get("chunks") if isinstance(artifacts, dict) else None
+        vectors = descriptor.get("values") if isinstance(descriptor, dict) else None
+        if (
+            not isinstance(memory_chunks, list)
+            or not isinstance(chunks, list)
+            or not all(isinstance(chunk, str) for chunk in memory_chunks + chunks)
+            or vectors is None
+            or len(vectors) != len(chunks)
+        ):
+            raise ValueError("Embedding-RAG snapshot state is invalid")
+
+        self._memory_chunks = list(memory_chunks)
+        self._chunks = list(chunks)
+        self._vectorstore = None
+        if self._chunks:
+            from langchain_community.vectorstores import FAISS
+
+            self._vectorstore = FAISS.from_embeddings(
+                zip(self._chunks, vectors.tolist()),
+                self._get_embedding_model(),
+                metadatas=[{"index": i} for i in range(len(self._chunks))],
+            )
+        self._is_initialized = bool(self._memory_chunks or self._chunks)
+        self._context_id = context_id if context_id is not None else state.get("context_id")
 
     @property
     def has_vectorstore(self) -> bool:

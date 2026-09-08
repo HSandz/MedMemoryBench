@@ -114,8 +114,19 @@ class AgentManager:
             return not params.get("use_native_query", True)
         return method_key in {
             "long_context", "embedding_rag", "bm25_rag", "lightmem",
-            "zep", "remem", "graph_rag", "amem", "mem0", "memos",
+            "zep", "remem", "amem", "mem0", "memos",
             "memrl",
+        }
+
+    @classmethod
+    def supports_configured_memory_snapshots(
+        cls,
+        method_config: MethodConfig,
+    ) -> bool:
+        """Check snapshot support without constructing an adapter or provider client."""
+        return cls._matched_method_key(method_config.method_name) in {
+            "long_context", "embedding_rag", "bm25_rag", "event_state",
+            "amem", "amem_fix", "amem_test",
         }
 
     @classmethod

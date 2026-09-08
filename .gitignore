@@ -69,6 +69,7 @@ env/
 !/tests/test_llm_configuration.py
 !/tests/test_modal_provider.py
 !/tests/test_query_workers.py
+!/tests/test_simple_baseline_state.py
 !/tests/test_amem_workers.py
 !/tests/test_event_state_prompt_contracts.py
 !/tests/test_medmemorybench_source_identity.py

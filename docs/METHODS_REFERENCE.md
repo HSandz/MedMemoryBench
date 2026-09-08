@@ -16,10 +16,10 @@ The method controls the write path and read path. The answer model and judge mod
 
 | Method | Family | Adapter | Final-answer batch | Notes |
 |---|---|---|---|---|
-| `long_context` | Baseline | Available | Yes | Full retained history with truncation. |
-| `embedding_rag` | Dense RAG | Available | Yes | FAISS/vector retrieval. |
+| `long_context` | Baseline | Available | Yes | Full retained history with truncation; snapshot-backed. |
+| `embedding_rag` | Dense RAG | Available | Yes | Incremental FAISS/vector retrieval; snapshot-backed. |
 | `event_state` | Agentic memory | Available | Yes | Immutable episodes plus versioned semantic claims; see `event_state_method.md`. |
-| `bm25_rag` | Sparse RAG | Available | Yes | Lexical BM25 retrieval. |
+| `bm25_rag` | Sparse RAG | Available | Yes | Incremental tokenization with lexical BM25 retrieval; snapshot-backed. |
 | `graph_rag` | Graph RAG | Available | No | May batch internal concept extraction. |
 | `amem` / `amem_fix` / `amem_test` | Agentic memory | Available | Yes | See `AMEM_IMPLEMENTATION.md`. |
 | `letta` | Agentic memory | Available | No | Stateful tool/agent loop. |
@@ -63,6 +63,13 @@ For a fair comparison, pin the complete YAML, answer model, judge provider/model
 - **Managed services:** Zep depends on remote state, credentials, service version, cost, and privacy settings.
 
 Do not treat historical outputs as rankings. Inspect `retrieved_memories`, method logs, `run_config.json`, and judge configuration before attributing an error to retrieval or answer generation.
+
+The three simple baselines can use MedMemoryBench `--stage memory`, `--stage
+query`, and `--append`. Their snapshots retain the exact answer-visible text;
+embedding RAG also stores its dense vectors in validated NumPy sidecars, so a
+query-only run does not re-embed historical dialogue. `--query-workers` safely
+parallelizes independent query preparation. `--workers` does not parallelize
+baseline ingestion because each unit's session order remains the memory order.
 Mixed artifacts created before source-identity schema version 1 may contain
 positional source-ID collisions and are not valid noise-robustness comparisons.
 

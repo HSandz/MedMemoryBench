@@ -1009,6 +1009,10 @@ class GraphRAGAgent(BaseAgent):
             }
         )
 
+    def supports_batch_queries(self) -> bool:
+        """Graph traversal has dependent LLM calls before its final answer."""
+        return False
+
     def reset(self) -> None:
         """Reset agent state for new evaluation context (new persona).
 

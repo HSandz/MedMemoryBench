@@ -1240,6 +1240,10 @@ class MedMemoryBenchEvaluator:
         support = getattr(self.agent_manager, "supports_memory_snapshots", None)
         return bool(callable(support) and support())
 
+    def _supports_configured_memory_snapshots(self) -> bool:
+        """Check stage eligibility before constructing a mutable adapter."""
+        return AgentManager.supports_configured_memory_snapshots(self.method_config)
+
     def _supports_staged_queries(self) -> bool:
         manager = getattr(self, "agent_manager", None)
         if manager is None:
@@ -1280,7 +1284,13 @@ class MedMemoryBenchEvaluator:
     def _memory_method_label(self) -> str:
         """Return the user-facing name for the active snapshot-backed method."""
         method_name = str(getattr(self.method_config, "method_name", "")).lower()
-        return "Event-State" if method_name == "event_state" else "A-MEM"
+        labels = {
+            "long_context": "Long Context",
+            "embedding_rag": "Embedding RAG",
+            "bm25_rag": "BM25 RAG",
+            "event_state": "Event-State",
+        }
+        return labels.get(method_name, "A-MEM")
 
     def _memory_snapshot_path(self, unit: EvaluationUnit) -> Path:
         return self._memory_snapshot_dir() / (
@@ -2300,7 +2310,11 @@ class MedMemoryBenchEvaluator:
         memory_build_time: float = 0.0,
         memory_build_metrics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Path]:
-        if self.dry_run or not self._supports_memory_snapshots():
+        if (
+            self.dry_run
+            or self._memory_snapshot_manifest is None
+            or not self._supports_memory_snapshots()
+        ):
             return None
         self._log("    --- Memory Snapshot Start ---")
         path = self._write_memory_snapshot(
@@ -2323,6 +2337,7 @@ class MedMemoryBenchEvaluator:
                 or getattr(self, "force_resume", False)
             )
             or self.dry_run
+            or self._memory_snapshot_manifest is None
             or not self._supports_memory_snapshots()
         ):
             return None
@@ -2440,13 +2455,13 @@ class MedMemoryBenchEvaluator:
 
         self._init_dataset()
 
-        if self.execution_stage != "all" and not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
+        if self.execution_stage != "all" and not self._supports_configured_memory_snapshots():
             raise ValueError(
-                "Separated memory/query execution is currently implemented for AMem methods only"
+                "Separated memory/query execution requires a snapshot-backed method"
             )
         if getattr(self, "append", False):
-            if not (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
-                raise ValueError("--append is currently implemented for AMem methods only")
+            if not self._supports_configured_memory_snapshots():
+                raise ValueError("--append requires a snapshot-backed method")
             self._prepare_append_plan()
 
         resumed = False
@@ -2455,7 +2470,12 @@ class MedMemoryBenchEvaluator:
 
         if self.execution_stage == "query":
             self._load_memory_snapshot_manifest()
-        elif not self.dry_run and (self.method_config.method_name.lower().startswith("amem") or self.method_config.method_name.lower() == "event_state"):
+        elif not self.dry_run and (
+            self.method_config.method_name.lower().startswith("amem")
+            or self.method_config.method_name.lower() == "event_state"
+            or self.execution_stage == "memory"
+            or getattr(self, "append", False)
+        ) and self._supports_configured_memory_snapshots():
             self._start_memory_snapshot_manifest(resume_existing=resumed)
 
         # Deferred judge inputs belong to the loaded checkpoint namespace.
