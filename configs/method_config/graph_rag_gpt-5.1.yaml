@@ -2,7 +2,7 @@ method_name: graph_rag
 method_type: rag
 description: Graph RAG Agent - Knowledge graph based RAG with concept extraction and
   graph traversal
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0

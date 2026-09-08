@@ -366,6 +366,13 @@ class LightMemAgent(BaseAgent):
         lightmem_max_tokens: int = 2000,
         lightmem_top_p: float = 0.1,
         lightmem_buffer_max_tokens: int = 4096,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         # Token limits
         max_context_tokens: int = 120000,
         **kwargs,
@@ -395,6 +402,19 @@ class LightMemAgent(BaseAgent):
 
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_temperature = (
+            lightmem_temperature if memory_temperature is None else memory_temperature
+        )
+        self._memory_max_tokens = memory_max_tokens or lightmem_max_tokens
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else kwargs.get("llm_client_kwargs", {})
+        )
 
         # Initialize LLM client for final QA
         self._llm_client: BaseLLMClient = create_llm_client(
@@ -409,13 +429,13 @@ class LightMemAgent(BaseAgent):
 
         # Initialize LLM client for LightMem internal operations (memory extraction)
         self._lightmem_llm_client: BaseLLMClient = create_llm_client(
-            provider=provider,
-            model=model,
-            temperature=lightmem_temperature,
-            max_tokens=lightmem_max_tokens,
-            api_key=api_key,
-            base_url=base_url,
-            **kwargs.get("llm_client_kwargs", {}),
+            provider=self._memory_provider,
+            model=self._memory_model,
+            temperature=self._memory_temperature,
+            max_tokens=self._memory_max_tokens,
+            api_key=self._memory_api_key,
+            base_url=self._memory_base_url,
+            **self._memory_llm_client_kwargs,
         )
 
         # LightMem instances per context_id
@@ -469,11 +489,15 @@ class LightMemAgent(BaseAgent):
             "memory_manager": {
                 "model_name": "openai",
                 "configs": {
-                    "model": self.model,
-                    "api_key": self._api_key,
-                    "openai_base_url": self._base_url,
-                    "temperature": self.lightmem_temperature,
-                    "max_tokens": self.lightmem_max_tokens,
+                    "model": getattr(self, "_memory_model", self.model),
+                    "api_key": getattr(self, "_memory_api_key", self._api_key),
+                    "openai_base_url": getattr(self, "_memory_base_url", self._base_url),
+                    "temperature": getattr(
+                        self, "_memory_temperature", self.lightmem_temperature
+                    ),
+                    "max_tokens": getattr(
+                        self, "_memory_max_tokens", self.lightmem_max_tokens
+                    ),
                     "top_p": self.lightmem_top_p,
                 }
             },

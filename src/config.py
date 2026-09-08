@@ -334,7 +334,11 @@ class MethodConfig:
     method_type: str  # baseline / rag / agentic_memory
     description: str = ""
 
+    # ``model`` remains the effective query model for compatibility with
+    # evaluator code and historical YAML files. ``query_model`` is its
+    # explicit, user-facing alias in newly written configurations.
     model: ModelConfig = field(default_factory=ModelConfig)
+    query_model: Optional[ModelConfig] = None
     embedding: Optional[EmbeddingConfig] = None
     memorize_model: Optional[ModelConfig] = None  # Optional separate memory-build model
     build_config: Dict[str, Any] = field(default_factory=dict)
@@ -347,7 +351,9 @@ class MethodConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MethodConfig":
         """Create config from dict."""
-        model_data = data.get("model", {})
+        if "model" in data and "query_model" in data:
+            raise ValueError("Specify either model or query_model, not both")
+        model_data = data.get("query_model", data.get("model", {}))
         openrouter_provider, openrouter_service_tier = _parse_openrouter_options(
             model_data, "model"
         )
@@ -524,6 +530,7 @@ class MethodConfig:
             method_type=data.get("method_type", "baseline"),
             description=data.get("description", ""),
             model=model_config,
+            query_model=model_config,
             embedding=embedding_config,
             memorize_model=memorize_model_config,
             build_config=build_config,

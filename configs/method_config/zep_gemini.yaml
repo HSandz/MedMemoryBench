@@ -1,7 +1,7 @@
 method_name: zep
 method_type: agentic_memory
 description: Zep Agent using hybrid Gemini provider for final answers
-model:
+query_model:
   provider: gemini
   name: gemini-2.5-flash
   temperature: 0.0

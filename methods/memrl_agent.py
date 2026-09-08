@@ -306,6 +306,13 @@ class MemRLAgent(BaseAgent):
         provider: str = "openai",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         # MemRL specific parameters
         retrieve_num: int = 5,
         candidate_top_k: int = 12,
@@ -413,6 +420,17 @@ class MemRLAgent(BaseAgent):
         )
         self._provider = provider
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else self._llm_client_kwargs
+        )
 
         # Batch is limited to the independent script-generation map phase.
         # Ordered memory writes and all value/Q updates still use MemRL's
@@ -435,6 +453,15 @@ class MemRLAgent(BaseAgent):
             api_key=api_key,
             base_url=base_url,
             **kwargs.get("llm_client_kwargs", {}),
+        )
+        self._memory_llm_client: BaseLLMClient = create_llm_client(
+            provider=self._memory_provider,
+            model=self._memory_model,
+            temperature=self._memory_temperature,
+            max_tokens=self._memory_max_tokens,
+            api_key=self._memory_api_key,
+            base_url=self._memory_base_url,
+            **self._memory_llm_client_kwargs,
         )
 
         # Progress tracker
@@ -470,34 +497,34 @@ class MemRLAgent(BaseAgent):
     def _create_mos_config(self) -> str:
         """Create a temporary MemOS configuration file."""
         self._temp_dir = tempfile.mkdtemp(prefix="memrl_agent_")
-        use_gemini = is_gemini_provider(self._provider)
+        use_gemini = is_gemini_provider(self._memory_provider)
         llm_config = {
-            "model_name_or_path": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "model_name_or_path": self._memory_model,
+            "temperature": self._memory_temperature,
+            "max_tokens": self._memory_max_tokens,
         }
         extractor_config = {
-            "model_name_or_path": self.model,
+            "model_name_or_path": self._memory_model,
             "temperature": self.memrl_extractor_temperature,
             "max_tokens": self.memrl_extractor_max_tokens,
         }
-        if self._provider == "openrouter":
+        if self._memory_provider == "openrouter":
             extra_body = {
                 key: value
                 for key, value in (
-                    ("provider", self._llm_client_kwargs.get("provider_routing")),
-                    ("service_tier", self._llm_client_kwargs.get("service_tier")),
+                    ("provider", self._memory_llm_client_kwargs.get("provider_routing")),
+                    ("service_tier", self._memory_llm_client_kwargs.get("service_tier")),
                 )
                 if value is not None
             } or None
             llm_config["extra_body"] = extra_body
             extractor_config["extra_body"] = extra_body
         if use_gemini:
-            llm_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
-            extractor_config.update({"gemini_provider": self._provider, "api_key": self._api_key})
+            llm_config.update({"gemini_provider": self._memory_provider, "api_key": self._memory_api_key})
+            extractor_config.update({"gemini_provider": self._memory_provider, "api_key": self._memory_api_key})
         else:
-            llm_config.update({"api_key": self._api_key, "api_base": self._base_url})
-            extractor_config.update({"api_key": self._api_key, "api_base": self._base_url})
+            llm_config.update({"api_key": self._memory_api_key, "api_base": self._memory_base_url})
+            extractor_config.update({"api_key": self._memory_api_key, "api_base": self._memory_base_url})
 
         # Embedder config based on provider
         if self.embedding_provider == "local":
@@ -572,10 +599,10 @@ class MemRLAgent(BaseAgent):
 
         # Create tracked LLM provider using our llm_client
         self._tracked_llm = TrackedLLMProvider(
-            llm_client=self._llm_client,
-            model_name=self.model,
-            default_temperature=self.temperature,
-            default_max_tokens=self.max_tokens,
+            llm_client=self._memory_llm_client,
+            model_name=self._memory_model,
+            default_temperature=self._memory_temperature,
+            default_max_tokens=self._memory_max_tokens,
             keyword_temperature=self.memrl_keyword_temperature,
             keyword_max_tokens=self.memrl_keyword_max_tokens,
             script_temperature=self.memrl_script_temperature,

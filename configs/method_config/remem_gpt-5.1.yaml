@@ -1,7 +1,7 @@
 method_name: remem
 method_type: agentic_memory
 description: ReMem - Reasoning with Episodic Memory for complex QA
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0

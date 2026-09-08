@@ -116,7 +116,7 @@ Generation reasoning can be configured per YAML model block when the selected
 model supports it:
 
 ```yaml
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   reasoning_effort: high
@@ -130,14 +130,15 @@ Gemini 2.5 requires an integer `reasoning_effort` interpreted as
 `thinkingConfig.thinkingBudget` (for example, `1024`); invalid Gemini
 model/value combinations fail before submission. Other providers pass the
 documented value through for the provider API to validate.
-The optional `memorize_model.reasoning_effort` applies independently to A-MEM
-build calls. Judge calls use `JUDGE_REASONING_EFFORT` in `.env`.
+The optional `memorize_model.reasoning_effort` applies independently to every
+adapter with build-time LLM calls. Judge calls use `JUDGE_REASONING_EFFORT` in
+`.env`.
 
 For `NIM/nvidia/nemotron-*` models served through Bifrost, configure the
 NVIDIA reasoning controls with the model's `nim` block:
 
 ```yaml
-model:
+query_model:
   provider: openai
   name: NIM/nvidia/nemotron-3.5-lightning-30b-a3b
   nim:
@@ -219,7 +220,7 @@ and usage tracking as the `openai` provider. Set `OPENROUTER_API_KEY`; the base
 URL defaults to `https://openrouter.ai/api/v1`. Select it in a method config:
 
 ```yaml
-model:
+query_model:
   provider: openrouter
   name: openai/gpt-5.1
   openrouter:
@@ -242,17 +243,20 @@ OpenRouter's provider-routing object. It can use documented fields such as
 run the same model through different upstream providers without changing the
 model ID.
 
-The optional `model.openrouter.service_tier` selects an OpenRouter service tier.
+The optional `query_model.openrouter.service_tier` selects an OpenRouter service tier.
 Current opt-in values are `flex` and `priority`; `fast` is an alias for
 `priority`. Omit the field for normal default routing. Priority requests prefer
 matching priority endpoints and may fall back, while flex requests stay on
 flex-capable endpoints. Tier availability depends on the selected model and
 upstream provider.
 
-A-MEM methods can configure build calls independently with `memorize_model`,
-using the same model/OpenRouter shape. This allows, for example, flex build
-calls while the top-level query `model` omits `service_tier` and uses Batch API.
-See [A-MEM Method Guide](AMEM_GUIDE.md#configuration).
+`query_model` configures all query-stage LLM calls, including final answers.
+`memorize_model` independently configures LLM-backed construction for
+GraphRAG, A-MEM variants, Event-State, Mem0, MemOS, MemRL, MIRIX, Letta,
+LightMem, ReMem, and HippoRAG. Both blocks accept the same provider and
+OpenRouter fields; `model` remains a backward-compatible alias for
+`query_model`. This allows, for example, flex build calls while the query model
+omits `service_tier` and uses Batch API.
 
 Official references: [provider routing](https://openrouter.ai/docs/provider-routing)
 and [service tiers](https://openrouter.ai/docs/guides/features/service-tiers).

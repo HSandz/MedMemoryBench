@@ -408,6 +408,13 @@ class RememAgent(BaseAgent):
         max_context_tokens: int = 120000,
         # Working directory
         working_dir: Optional[str] = None,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -415,6 +422,17 @@ class RememAgent(BaseAgent):
         self.provider = provider
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else kwargs.get("llm_client_kwargs", {})
+        )
 
         self.extract_method = extract_method
         self.is_directed_graph = is_directed_graph
@@ -470,6 +488,15 @@ class RememAgent(BaseAgent):
             base_url=base_url,
             **kwargs.get("llm_client_kwargs", {}),
         )
+        self._memory_llm_client = create_llm_client(
+            provider=self._memory_provider,
+            model=self._memory_model,
+            temperature=self._memory_temperature,
+            max_tokens=self._memory_max_tokens,
+            api_key=self._memory_api_key,
+            base_url=self._memory_base_url,
+            **self._memory_llm_client_kwargs,
+        )
 
         # ReMem instance pool (keyed by context_id)
         self._remem_instances: Dict[int, Any] = {}
@@ -490,12 +517,12 @@ class RememAgent(BaseAgent):
         if self._vertex_batch_client is None:
             manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
             self._vertex_batch_client = create_batch_client(
-                self._llm_client,
+                self._memory_llm_client,
                 gcs_uri=self._vertex_batch_gcs_uri,
                 manifest_path=scoped_manifest_path(
                     manifest_dir,
                     "remem_internal_batch_manifest",
-                    model=self._llm_client.model,
+                    model=self._memory_llm_client.model,
                     config_hash=self._vertex_batch_config_hash,
                 ),
                 wait=self._vertex_batch_wait,
@@ -550,13 +577,13 @@ class RememAgent(BaseAgent):
             save_dir=save_dir,
 
             # LLM config
-            llm_name=self.model,
-            llm_base_url=self._base_url,
+            llm_name=self._memory_model,
+            llm_base_url=self._memory_base_url,
             llm_infer_mode="online",
-            temperature=self.temperature,
+            temperature=self._memory_temperature,
 
             # Extraction LLM (same model)
-            extract_llm_label=self.model,
+            extract_llm_label=self._memory_model,
 
             # Extraction method
             extract_method=self.extract_method,
@@ -619,19 +646,24 @@ class RememAgent(BaseAgent):
         logger.info(f"  extract_method: {self.extract_method}")
         logger.info(f"  save_dir: {config.save_dir}")
 
-        tracked_llm = TrackedLLMWrapper(
+        tracked_memory_llm = TrackedLLMWrapper(
+            llm_client=self._memory_llm_client,
+            llm_name=self._memory_model,
+            temperature=self._memory_temperature,
+            batch_client=self._get_internal_batch_client(),
+            batch_stage_prefix=f"remem-extraction-context-{context_id}",
+        )
+        tracked_query_llm = TrackedLLMWrapper(
             llm_client=self._llm_client,
             llm_name=self.model,
             temperature=self.temperature,
-            batch_client=self._get_internal_batch_client(),
-            batch_stage_prefix=f"remem-extraction-context-{context_id}",
         )
 
         remem = self._ReMem(
             global_config=config,
-            llm=tracked_llm,
-            extract_llm=tracked_llm,
-            qa_llm=tracked_llm,
+            llm=tracked_memory_llm,
+            extract_llm=tracked_memory_llm,
+            qa_llm=tracked_query_llm,
         )
 
         tracked_embedding = TrackedEmbeddingWrapper(

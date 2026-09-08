@@ -1,7 +1,7 @@
 method_name: embedding_rag
 method_type: rag
 description: Embedding RAG Agent - Dense vector retrieval based RAG method
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0

@@ -133,11 +133,14 @@ def _get_chat_model(
     max_tokens: int = 100,
     callbacks=None,
     llm_client_kwargs: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ):
     """Create Chat model instance with provider auto-detection."""
     model_lower = model_name.lower()
 
-    if 'gemini' in model_lower:
+    if (provider or "").lower() in {"gemini", "vertex"} or 'gemini' in model_lower:
         rotation_client = GeminiVertexClient(
             model=model_name,
             temperature=temperature,
@@ -157,8 +160,8 @@ def _get_chat_model(
             retries=1,
         )
 
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+    api_key = api_key or os.environ.get("OPENAI_API_KEY")
 
     kwargs = {
         "model_name": model_name,
@@ -688,11 +691,22 @@ class GraphRAG:
         batch_client: Optional[VertexBatchClient] = None,
         batch_stage_prefix: str = "graphrag-concepts",
         llm_client_kwargs: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        query_model_name: Optional[str] = None,
+        query_temperature: Optional[float] = None,
+        query_max_tokens: Optional[int] = None,
+        query_provider: Optional[str] = None,
+        query_api_key: Optional[str] = None,
+        query_base_url: Optional[str] = None,
+        query_llm_client_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.retrieve_num = retrieve_num
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._is_gemini = "gemini" in model_name.lower()
+        self._query_is_gemini = "gemini" in (query_model_name or model_name).lower()
         self._callbacks = callbacks or []
         self.batch_client = batch_client
         self.batch_stage_prefix = batch_stage_prefix
@@ -704,6 +718,19 @@ class GraphRAG:
             max_tokens=max_tokens,
             callbacks=self._callbacks,
             llm_client_kwargs=llm_client_kwargs,
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        self.query_llm = _get_chat_model(
+            model_name=query_model_name or model_name,
+            temperature=temperature if query_temperature is None else query_temperature,
+            max_tokens=max_tokens if query_max_tokens is None else query_max_tokens,
+            callbacks=self._callbacks,
+            llm_client_kwargs=query_llm_client_kwargs or llm_client_kwargs,
+            provider=query_provider or provider,
+            api_key=query_api_key or api_key,
+            base_url=query_base_url or base_url,
         )
 
         # Initialize components
@@ -728,9 +755,9 @@ class GraphRAG:
         self.query_engine = QueryEngine(
             vector_store,
             self.knowledge_graph,
-            self.llm,
+            self.query_llm,
             retrieve_num=self.retrieve_num,
-            is_gemini=self._is_gemini,
+            is_gemini=self._query_is_gemini,
         )
 
     def query(self, query: str) -> Tuple[str, str]:
@@ -775,6 +802,13 @@ class GraphRAGAgent(BaseAgent):
         embedding_model: Optional[str] = None,
         embedding_provider: Optional[str] = None,
         embedding_model_path: Optional[str] = None,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         vertex_batch_enabled: bool = False,
         vertex_batch_gcs_uri: Optional[str] = None,
         vertex_batch_wait: bool = False,
@@ -794,6 +828,17 @@ class GraphRAGAgent(BaseAgent):
         self._base_url = base_url
         self._provider = provider
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or api_key
+        self._memory_base_url = memory_base_url or base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else self._llm_client_kwargs
+        )
 
         self._embedding_model = embedding_model or embedding_model_path
         self._embedding_provider = embedding_provider
@@ -828,14 +873,14 @@ class GraphRAGAgent(BaseAgent):
         self._setup_environment()
 
         from utils.langchain_callback import TokenUsageCallbackHandler
-        usage_callback = TokenUsageCallbackHandler(model_name=self.model)
+        usage_callback = TokenUsageCallbackHandler(model_name=self._memory_model)
 
         self._graph_build_index += 1
         self._graph_rag = GraphRAG(
-            temperature=self.temperature,
-            model_name=self.model,
+            temperature=self._memory_temperature,
+            model_name=self._memory_model,
             retrieve_num=self.top_k,
-            max_tokens=self.max_tokens,
+            max_tokens=self._memory_max_tokens,
             embedding_model=self._embedding_model,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
@@ -845,7 +890,17 @@ class GraphRAGAgent(BaseAgent):
             batch_stage_prefix=(
                 f"graphrag-concepts-context-{self._context_id or 0}-build-{self._graph_build_index}"
             ),
-            llm_client_kwargs=self._llm_client_kwargs,
+            llm_client_kwargs=self._memory_llm_client_kwargs,
+            provider=self._memory_provider,
+            api_key=self._memory_api_key,
+            base_url=self._memory_base_url,
+            query_model_name=self.model,
+            query_temperature=self.temperature,
+            query_max_tokens=self.max_tokens,
+            query_provider=self._provider,
+            query_api_key=self._api_key,
+            query_base_url=self._base_url,
+            query_llm_client_kwargs=self._llm_client_kwargs,
         )
 
     def _get_concept_batch_client(self) -> Optional[VertexBatchClient]:
@@ -854,13 +909,13 @@ class GraphRAGAgent(BaseAgent):
             return None
         if self._vertex_batch_client is None:
             llm_client = create_llm_client(
-                provider=self._provider,
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                api_key=self._api_key,
-                base_url=self._base_url,
-                **self._llm_client_kwargs,
+                provider=self._memory_provider,
+                model=self._memory_model,
+                temperature=self._memory_temperature,
+                max_tokens=self._memory_max_tokens,
+                api_key=self._memory_api_key,
+                base_url=self._memory_base_url,
+                **self._memory_llm_client_kwargs,
             )
             manifest_dir = Path(self._vertex_batch_manifest_dir or "outputs/batch")
             self._vertex_batch_client = create_batch_client(

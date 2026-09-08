@@ -10,7 +10,12 @@ question -> retrieval/tool loop -> answer prompt -> answer
 answer + reference data -> local metric or LLM judge
 ```
 
-The method controls the write path and read path. The answer model and judge model are separate configurations. `prepare_batch_query()`/`finalize_batch_query()` make only the immutable final answer stage batchable; stateful memory construction and retrieval remain local.
+The method controls the write path and read path. `query_model` configures
+query-stage LLM calls, `memorize_model` can independently configure LLM-backed
+construction, and the judge model is separate. `model` remains a compatible
+alias for `query_model`. `prepare_batch_query()`/`finalize_batch_query()` make
+only the immutable final answer stage batchable; stateful memory construction
+and retrieval remain local.
 
 ## Registry Status
 

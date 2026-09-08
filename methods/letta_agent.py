@@ -56,6 +56,13 @@ class LettaAgent(BaseAgent):
         embedding_provider: str = "openai",
         memory_persona: str = "I am an assistant helping with medical QA while preserving long-term memory.",
         memory_human: str = "The user is a patient in a longitudinal medical dialogue setting.",
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -63,6 +70,17 @@ class LettaAgent(BaseAgent):
         self.provider = provider
         self._uses_vertex_gemini = is_vertex_batch_provider(provider)
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or api_key
+        self._memory_base_url = memory_base_url or base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else self._llm_client_kwargs
+        )
         self.api_key = api_key or os.environ.get("BIGMODEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = (
             base_url
@@ -70,6 +88,8 @@ class LettaAgent(BaseAgent):
             or os.environ.get("OPENAI_BASE_URL")
             or self.BIGMODEL_BASE_URL
         )
+        self._memory_api_key = memory_api_key or self.api_key
+        self._memory_base_url = memory_base_url or self.base_url
         self.retrieve_num = retrieve_num
         self.context_window = context_window
         self.embedding_model = embedding_model
@@ -96,12 +116,23 @@ class LettaAgent(BaseAgent):
         self._agent_ids: Dict[int, str] = {}
         self._client = None
         self._vertex_client = None
+        self._memory_vertex_client = None
         if self._uses_vertex_gemini:
             self._vertex_client = create_llm_client(
                 provider="vertex",
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+            )
+        if is_vertex_batch_provider(self._memory_provider):
+            self._memory_vertex_client = create_llm_client(
+                provider="vertex",
+                model=self._memory_model,
+                temperature=self._memory_temperature,
+                max_tokens=self._memory_max_tokens,
+                api_key=self._memory_api_key,
+                base_url=self._memory_base_url,
+                **self._memory_llm_client_kwargs,
             )
 
         self._apply_openai_compatible_env()
@@ -242,45 +273,55 @@ class LettaAgent(BaseAgent):
                 get_usage_tracker().record(llm_response)
                 logger.debug(f"Recorded Letta usage [{phase}]: prompt={prompt_tokens}, completion={completion_tokens}")
 
-    def _build_llm_config(self):
-        """Build LLMConfig for Letta agent creation."""
-        if self._uses_vertex_gemini:
-            location = self._vertex_client.location
-            project = self._vertex_client.project
+    def _build_llm_config(self, stage: str = "memory"):
+        """Build the independent memory-build or query-time Letta LLM config."""
+        if stage == "memory":
+            model, provider = self._memory_model, self._memory_provider
+            temperature, max_tokens = self._memory_temperature, self._memory_max_tokens
+            api_key, base_url = self._memory_api_key, self._memory_base_url
+            client_kwargs, vertex_client = (
+                self._memory_llm_client_kwargs,
+                self._memory_vertex_client,
+            )
+        else:
+            model, provider = self.model, self.provider
+            temperature, max_tokens = self.temperature, self.max_tokens
+            api_key, base_url = self.api_key, self.base_url
+            client_kwargs, vertex_client = self._llm_client_kwargs, self._vertex_client
+
+        if is_vertex_batch_provider(provider):
+            location = vertex_client.location
+            project = vertex_client.project
             return self._LLMConfig(
-                model=self.model,
+                model=model,
                 model_endpoint_type="google_vertex",
                 model_endpoint=f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}",
                 model_wrapper=None,
                 context_window=self.context_window,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=getattr(self, "_llm_client_kwargs", {}).get(
-                    "reasoning_effort"
-                ),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=client_kwargs.get("reasoning_effort"),
             )
-        endpoint = self.base_url or self.BIGMODEL_BASE_URL
+        endpoint = base_url or self.BIGMODEL_BASE_URL
         extra_body = None
-        if self.provider.lower() == "openrouter":
+        if provider.lower() == "openrouter":
             extra_body = {}
-            if self._llm_client_kwargs.get("provider_routing") is not None:
-                extra_body["provider"] = self._llm_client_kwargs["provider_routing"]
-            if self._llm_client_kwargs.get("service_tier") is not None:
-                extra_body["service_tier"] = self._llm_client_kwargs["service_tier"]
+            if client_kwargs.get("provider_routing") is not None:
+                extra_body["provider"] = client_kwargs["provider_routing"]
+            if client_kwargs.get("service_tier") is not None:
+                extra_body["service_tier"] = client_kwargs["service_tier"]
         return self._LLMConfig(
-            model=self.model,
+            model=model,
             model_endpoint_type=(
-                "openai" if self.provider.lower() == "openrouter" else self.provider
+                "openai" if provider.lower() == "openrouter" else provider
             ),
             model_endpoint=endpoint,
             model_wrapper=None,
             context_window=self.context_window,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            temperature=temperature,
+            max_tokens=max_tokens,
             extra_body=extra_body or None,
-            reasoning_effort=getattr(self, "_llm_client_kwargs", {}).get(
-                "reasoning_effort"
-            ),
+            reasoning_effort=client_kwargs.get("reasoning_effort"),
         )
 
     def _build_embedding_config(self):
@@ -646,17 +687,18 @@ class LettaAgent(BaseAgent):
 
         start_time = time.time()
         try:
-            # Switch to restricted context_window for query phase (token budget truncation)
-            # Only update once per agent (build phase is always completed before query phase)
-            if self.max_context_tokens and self.max_context_tokens < self.context_window:
-                if not getattr(self, '_query_context_applied', {}).get(agent_id):
-                    query_llm_config = self._build_llm_config().model_copy(
+            # Memory construction finishes before queries, so a persistent
+            # Letta agent can safely switch to its query-stage LLM once.
+            if not getattr(self, '_query_context_applied', {}).get(agent_id):
+                query_llm_config = self._build_llm_config(stage="query")
+                if self.max_context_tokens:
+                    query_llm_config = query_llm_config.model_copy(
                         update={"context_window": self.max_context_tokens}
                     )
-                    self._client.update_agent(agent_id, llm_config=query_llm_config)
-                    if not hasattr(self, '_query_context_applied'):
-                        self._query_context_applied = {}
-                    self._query_context_applied[agent_id] = True
+                self._client.update_agent(agent_id, llm_config=query_llm_config)
+                if not hasattr(self, '_query_context_applied'):
+                    self._query_context_applied = {}
+                self._query_context_applied[agent_id] = True
 
             response = self._client.user_message(agent_id=agent_id, message=query_message)
             query_time = time.time() - start_time

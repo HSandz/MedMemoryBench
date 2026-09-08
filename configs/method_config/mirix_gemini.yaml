@@ -1,7 +1,7 @@
 method_name: mirix
 method_type: agentic_memory
 description: MIRIX with Gemini model configuration
-model:
+query_model:
   provider: gemini
   name: gemini-2.5-flash
   temperature: 0.0

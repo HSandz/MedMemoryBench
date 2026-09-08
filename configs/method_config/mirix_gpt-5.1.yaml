@@ -2,7 +2,7 @@ method_name: mirix
 method_type: agentic_memory
 description: MIRIX - multi-agent memory system with Episodic, Semantic, Procedural,
   Resource, Core, and Knowledge Vault memories
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0
