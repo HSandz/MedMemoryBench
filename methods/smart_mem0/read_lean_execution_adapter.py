@@ -4,13 +4,18 @@ Public SmartMem0 plans expose only the Phase-3 retrieval primitives. ExecutionMi
 contains a few bounded-control branches keyed by the historical operation names, so this
 adapter supplies those aliases only inside execution. The public plan and returned trace
 remain lean.
+
+Multi-view SEARCH_FAMILY operations are intentionally kept in their public lean form until
+they pass through the higher-level Evidence Resolve dispatcher. This preserves single-owner
+physical execution while allowing requirement-local view fusion to run instead of being
+silently bypassed by the legacy SEMANTIC_SEARCH alias.
 """
 
 from copy import deepcopy
 
 
 class ReadLeanExecutionAdapterMixin:
-    LEAN_EXECUTION_ADAPTER_VERSION = "lean-execution-adapter-v1"
+    LEAN_EXECUTION_ADAPTER_VERSION = "lean-execution-adapter-v2-multiview"
 
     @staticmethod
     def _legacy_control_operation(operation):
@@ -19,11 +24,18 @@ class ReadLeanExecutionAdapterMixin:
         current["_lean_op"] = lean
         if lean == "SEARCH_FAMILY":
             mode = str(current.get("family_mode") or "semantic")
-            current["op"] = (
-                "LOCATE_ANCHOR"
-                if mode in {"anchor", "temporal_extremum"}
-                else "SEMANTIC_SEARCH"
-            )
+            # Evidence Resolve compiles bounded independent retrieval views on the
+            # public SEARCH_FAMILY operation. Do not rename that operation before
+            # the higher-level dispatcher gets a chance to fuse those views.
+            if current.get("retrieval_views"):
+                current["op"] = "SEARCH_FAMILY"
+                current["_multiview_dispatch_preserved"] = True
+            else:
+                current["op"] = (
+                    "LOCATE_ANCHOR"
+                    if mode in {"anchor", "temporal_extremum"}
+                    else "SEMANTIC_SEARCH"
+                )
         elif lean == "SELECT":
             current["op"] = "TEMPORAL_FILTER"
         elif lean == "EXPAND_RELATION":
@@ -39,6 +51,7 @@ class ReadLeanExecutionAdapterMixin:
         public = deepcopy(operation)
         public["op"] = lean
         public.pop("_lean_op", None)
+        public.pop("_multiview_dispatch_preserved", None)
         return super()._execute_operation(public, outputs, seeds, frame)
 
     def _execute_plan(self, plan, seeds, *args, **kwargs):
