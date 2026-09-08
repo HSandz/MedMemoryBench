@@ -137,10 +137,8 @@ def _get_chat_model(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
 ):
-    """Create Chat model instance with provider auto-detection."""
-    model_lower = model_name.lower()
-
-    if (provider or "").lower() in {"gemini", "vertex"} or 'gemini' in model_lower:
+    """Create a chat model using the explicitly configured provider."""
+    if (provider or "").lower() in {"gemini", "vertex"}:
         rotation_client = GeminiVertexClient(
             model=model_name,
             temperature=temperature,
@@ -200,7 +198,7 @@ class AnswerCheck(BaseModel):
     answer: str = Field(description="The current answer based on the context")
 
 
-def _invoke_realtime_chain(chain, inputs: Any, _is_gemini: bool):
+def _invoke_realtime_chain(chain, inputs: Any):
     """Invoke a LangChain runnable through the shared provider retry policy."""
     return run_with_llm_retry(chain.invoke, inputs)
 
@@ -252,7 +250,6 @@ class KnowledgeGraph:
         batch_stage_prefix: str = "graphrag-concepts",
         temperature: float = 0.7,
         max_tokens: int = 100,
-        is_gemini: bool = False,
     ) -> None:
         """Build the knowledge graph from document splits."""
         self._add_nodes(splits)
@@ -265,7 +262,6 @@ class KnowledgeGraph:
             batch_stage_prefix,
             temperature,
             max_tokens,
-            is_gemini,
         )
         self._add_edges(embeddings)
 
@@ -287,7 +283,6 @@ class KnowledgeGraph:
         batch_stage_prefix: str = "graphrag-concepts",
         temperature: float = 0.7,
         max_tokens: int = 100,
-        is_gemini: bool = False,
     ) -> None:
         """Extract concepts from all splits using multi-threading."""
         if batch_client is not None:
@@ -303,7 +298,7 @@ class KnowledgeGraph:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_node = {
-                executor.submit(self._extract_concepts_and_entities, split.page_content, llm, is_gemini): i
+                executor.submit(self._extract_concepts_and_entities, split.page_content, llm): i
                 for i, split in enumerate(splits)
             }
 
@@ -398,7 +393,7 @@ class KnowledgeGraph:
             for duplicate_node in duplicate_nodes.get(node, []):
                 self.graph.nodes[duplicate_node]["concepts"] = concepts
 
-    def _extract_concepts_and_entities(self, content: str, llm, is_gemini: bool = False) -> List[str]:
+    def _extract_concepts_and_entities(self, content: str, llm) -> List[str]:
         """Extract concepts and named entities from content."""
         if content in self.concept_cache:
             return self.concept_cache[content]
@@ -417,7 +412,7 @@ class KnowledgeGraph:
 
         general_concepts = []
         try:
-            result = _invoke_realtime_chain(concept_chain, {"text": content}, is_gemini)
+            result = _invoke_realtime_chain(concept_chain, {"text": content})
             general_concepts = result.concepts_list
         except Exception as exc:
             # Preserve named entities when the fully retried structured call
@@ -469,12 +464,11 @@ class QueryEngine:
     """Handles queries using vector store and knowledge graph traversal."""
 
     def __init__(self, vector_store, knowledge_graph: KnowledgeGraph, llm,
-                 retrieve_num: int = DEFAULT_RETRIEVE_NUM, is_gemini: bool = False):
+                 retrieve_num: int = DEFAULT_RETRIEVE_NUM):
         self.vector_store = vector_store
         self.knowledge_graph = knowledge_graph
         self.llm = llm
         self.retrieve_num = retrieve_num
-        self.is_gemini = is_gemini
         self._tokenizer = tiktoken.encoding_for_model("gpt-4o-mini")
         self.answer_check_chain = self._create_answer_check_chain()
 
@@ -548,7 +542,7 @@ class QueryEngine:
             base_compressor=compressor,
             base_retriever=retriever
         )
-        return _invoke_realtime_chain(compression_retriever, query, self.is_gemini)
+        return _invoke_realtime_chain(compression_retriever, query)
 
     def _expand_context(self, query: str, relevant_docs: List) -> Tuple[str, List[int], Dict[int, str], str]:
         """Expand context using Dijkstra-like graph traversal."""
@@ -630,7 +624,6 @@ class QueryEngine:
             response = _invoke_realtime_chain(
                 self.answer_check_chain,
                 {"query": query, "context": context},
-                self.is_gemini,
             )
             return response.is_complete, response.answer
         except Exception as e:
@@ -705,8 +698,6 @@ class GraphRAG:
         self.retrieve_num = retrieve_num
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._is_gemini = "gemini" in model_name.lower()
-        self._query_is_gemini = "gemini" in (query_model_name or model_name).lower()
         self._callbacks = callbacks or []
         self.batch_client = batch_client
         self.batch_stage_prefix = batch_stage_prefix
@@ -750,14 +741,12 @@ class GraphRAG:
             self.batch_stage_prefix,
             self.temperature,
             self.max_tokens,
-            self._is_gemini,
         )
         self.query_engine = QueryEngine(
             vector_store,
             self.knowledge_graph,
             self.query_llm,
             retrieve_num=self.retrieve_num,
-            is_gemini=self._query_is_gemini,
         )
 
     def query(self, query: str) -> Tuple[str, str]:

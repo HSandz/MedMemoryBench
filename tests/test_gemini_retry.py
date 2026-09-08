@@ -250,3 +250,33 @@ def test_graphrag_does_not_turn_transport_failures_into_answers():
 
     with pytest.raises(RuntimeError, match="no answer was recorded"):
         agent.query("question")
+
+
+def test_graphrag_uses_explicit_openai_provider_for_gemini_named_proxy(
+    monkeypatch,
+):
+    """An OpenAI-compatible model ID must not select the Vertex client."""
+    received = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+    class UnexpectedVertexClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("model name must not select Vertex")
+
+    monkeypatch.setattr(graph_rag, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(graph_rag, "GeminiVertexClient", UnexpectedVertexClient)
+
+    model = graph_rag._get_chat_model(
+        model_name="gemini/gemini-3.5-flash-lite",
+        provider="openai",
+        api_key="build-key",
+        base_url="https://proxy.example/v1",
+    )
+
+    assert isinstance(model, FakeChatOpenAI)
+    assert received["model_name"] == "gemini/gemini-3.5-flash-lite"
+    assert received["api_key"] == "build-key"
+    assert received["base_url"] == "https://proxy.example/v1"
