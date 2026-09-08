@@ -6,7 +6,7 @@ description: "BM25 RAG Agent using Gemini Enterprise Agent Platform"
 
 model:
   provider: "gemini"
-  name: "gemini-2.5-flash"
+  name: "gemini-3.5-flash-lite"
   temperature: 0.3
   max_completion_tokens: 10000
 
