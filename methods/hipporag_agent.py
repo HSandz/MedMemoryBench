@@ -315,6 +315,13 @@ class HippoRAGAgent(BaseAgent):
         max_input_tokens: int = 8000,
         max_context_tokens: int = 120000,
         working_dir: Optional[str] = None,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -322,6 +329,17 @@ class HippoRAGAgent(BaseAgent):
         self.provider = provider
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else kwargs.get("llm_client_kwargs", {})
+        )
 
         self.openie_mode = openie_mode
         self.is_directed_graph = is_directed_graph
@@ -361,6 +379,15 @@ class HippoRAGAgent(BaseAgent):
             api_key=api_key,
             base_url=base_url,
             **kwargs.get("llm_client_kwargs", {}),
+        )
+        self._memory_llm_client = create_llm_client(
+            provider=self._memory_provider,
+            model=self._memory_model,
+            temperature=self._memory_temperature,
+            max_tokens=self._memory_max_tokens,
+            api_key=self._memory_api_key,
+            base_url=self._memory_base_url,
+            **self._memory_llm_client_kwargs,
         )
 
         # Per-context instance pool: {context_id: HippoRAG}
@@ -461,10 +488,10 @@ class HippoRAGAgent(BaseAgent):
         config = self._BaseConfig(
             dataset=None,
             save_dir=save_dir,
-            llm_name=self.model,
-            llm_base_url=self._base_url,
-            temperature=self.temperature,
-            max_new_tokens=self.max_tokens,
+            llm_name=self._memory_model,
+            llm_base_url=self._memory_base_url,
+            temperature=self._memory_temperature,
+            max_new_tokens=self._memory_max_tokens,
             openie_mode=self.openie_mode,
             is_directed_graph=self.is_directed_graph,
             synonymy_edge_sim_threshold=self.synonymy_edge_sim_threshold,
@@ -496,10 +523,10 @@ class HippoRAGAgent(BaseAgent):
         logger.info(f"  embedding_model: {self.embedding_model}")
 
         tracked_llm = TrackedLLMWrapper(
-            llm_client=self._llm_client,
-            llm_name=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            llm_client=self._memory_llm_client,
+            llm_name=self._memory_model,
+            temperature=self._memory_temperature,
+            max_tokens=self._memory_max_tokens,
         )
 
         tracked_embedding = self._get_shared_embedding_model()
@@ -849,6 +876,18 @@ class HippoRAGAgent(BaseAgent):
             if not hipporag.ready_to_retrieve:
                 logger.info("[HippoRAG] Preparing retrieval objects...")
                 hipporag.prepare_retrieval_objects()
+
+            # The graph is immutable after indexing, so safely swap the
+            # build-time OpenIE client for the configured query-stage client.
+            query_llm = TrackedLLMWrapper(
+                llm_client=self._llm_client,
+                llm_name=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+            hipporag.llm_model = query_llm
+            if hasattr(hipporag, "rerank_filter") and hipporag.rerank_filter is not None:
+                hipporag.rerank_filter.llm_infer_fn = query_llm.infer
 
             # Step 1: Retrieve documents
             query_solutions = hipporag.retrieve(queries=[question])

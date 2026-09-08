@@ -2,7 +2,7 @@ method_name: memos
 method_type: agentic_memory
 description: MemOS (vendored) adapter for MedMemoryBench with configurable memory
   backend
-model:
+query_model:
   provider: openai
   name: Qwen3-235B-A22B
   temperature: 0.0

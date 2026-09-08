@@ -341,13 +341,13 @@ method_name: "embedding_rag"
 method_type: "rag"                  # baseline / rag / agentic_memory
 description: "Embedding RAG Agent - Dense vector retrieval based RAG method"
 
-model:
+query_model:
   provider: "openai"
   name: "gpt-5.1"
   temperature: 0.3
   max_completion_tokens: 200000
 
-agent_params:
+build_config:
   top_k: 5                          # Number of documents to retrieve
   chunk_size: 512                   # Text chunk size
   chunk_overlap: 50                 # Chunk overlap
@@ -361,17 +361,17 @@ Gemini providers are intentionally distinct:
 
 ```yaml
 # Vertex AI / Google Agent Platform (rotating service accounts; batch eligible)
-model:
+query_model:
   provider: "vertex"
   name: "gemini-2.5-flash"
 
 # Google AI Studio / Gemini Developer API (API keys; real-time only)
-model:
+query_model:
   provider: "ai_studio"
   name: "gemini-2.5-flash"
 
 # Hybrid rotation: each Vertex account, then each AI Studio key, then Vertex again
-model:
+query_model:
   provider: "gemini"
   name: "gemini-2.5-flash"
 ```
@@ -380,12 +380,33 @@ For Vertex, set `GOOGLE_SERVICE_ACCOUNT_FILE` to an ordered comma-separated list
 
 For AI Studio and hybrid Gemini, set `GOOGLE_AI_STUDIO_API_KEYS_FILE` to an ordered key file such as `secrets/google_ai_studio_api_keys.txt`; paths must be relative to the repository root. Put one key on each non-empty line; lines beginning with `#` are ignored. The key-file variable takes precedence over inline values and is ignored by Git when stored under `secrets/`. `GOOGLE_AI_STUDIO_API_KEYS` remains supported as an ordered comma-separated list, while `GOOGLE_AI_STUDIO_API_KEY`, `GOOGLE_API_KEY`, and `GEMINI_API_KEY` support single-key setups. Every recognized non-critical failure type has an independent retry count and exponential-delay sequence, including retryable HTTP statuses, provider rate-limit/timeout/connection/availability exceptions, empty responses, malformed structured responses, service-account authentication/permission failures, and AI Studio key/quota/restriction failures. A transport rotates when any one failure type reaches its configured threshold. For `provider: ai_studio`, `GOOGLE_AI_STUDIO_KEY_ROTATION_MODE` defaults to `sequential`, which only advances after a failure threshold; set it to `round_robin` to advance after `GOOGLE_AI_STUDIO_ROUND_ROBIN_CALLS_PER_KEY` successful top-level calls per key (default: `1`). Failure-driven rotation and permanent-key retirement still apply in either mode. Hybrid `gemini` retains its failure-driven Vertex/AI Studio transport rotation. `GOOGLE_AI_STUDIO_MAX_ROTATION_ROUNDS` controls full passes through the key pool for one failing `ai_studio` LLM call: it defaults to `1`, accepts positive integers, and accepts `-1` to retry indefinitely. A 429 whose provider message begins `You exceeded your current quota` rotates immediately; a generic `Resource has been exhausted` 429 retries the current key `GOOGLE_AI_STUDIO_RESOURCE_EXHAUSTED_RETRIES` times first (default: `3`). For the same provider, explicit 401, 403, or 404 messages that identify a deleted, disabled, suspended, or revoked API key, bound service account, or project retire that key immediately; when keys come from `GOOGLE_AI_STUDIO_API_KEYS_FILE`, the matching line is removed atomically so later runs cannot use it. AI Studio logs a single-line, truncated error summary before trying the next key. For example, three HTTP 429 failures and one empty response count as `3/5` and `1/5`, not `4/5`. The shared `GEMINI_MAX_RETRIES` limit uses the same per-failure-type accounting for non-rotating shared calls. Critical failures such as invalid requests remain non-retryable.
 
-All final-answer LLM settings belong in the method YAML's `model` block. Method
-adapters with extra internal LLM calls expose those settings under
-`agent_params`:
+`query_model` is the canonical configuration for every LLM call in the query
+stage, including final answers and query-time planner, rewrite, or native-agent
+calls. The legacy top-level `model` key remains accepted for historical YAMLs.
+Methods with LLM-backed memory construction can independently use the optional
+`memorize_model` block; when it is absent, construction falls back to
+`query_model`. Long-context, embedding, and BM25 baselines have no build-time
+LLM, and Zep construction remains managed by the remote service.
 
 ```yaml
-model:
+query_model:
+  provider: openai
+  name: gpt-5.1
+  temperature: 0.0
+  max_completion_tokens: 20000
+
+memorize_model:
+  provider: openai
+  name: gpt-5-mini
+  temperature: 0.0
+  max_completion_tokens: 4000
+```
+
+Method adapters with extra internal LLM calls expose per-operation decoding
+settings under `build_config`:
+
+```yaml
+query_model:
   temperature: 0.3
   max_completion_tokens: 20000
 

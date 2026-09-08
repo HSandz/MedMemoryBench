@@ -1,7 +1,7 @@
 method_name: memos
 method_type: agentic_memory
 description: MemOS with hybrid Gemini provider final-answer generation
-model:
+query_model:
   provider: gemini
   name: gemini-2.5-flash
   temperature: 0.0

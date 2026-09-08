@@ -1,7 +1,7 @@
 method_name: mem0
 method_type: agentic_memory
 description: Mem0 Agent - Agentic memory with automatic memory extraction and retrieval
-model:
+query_model:
   provider: openai
   name: Qwen3-235B-A22B
   temperature: 0.0

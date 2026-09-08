@@ -1,7 +1,7 @@
 method_name: hipporag
 method_type: graph_rag
 description: HippoRAG 2 using hybrid Gemini provider
-model:
+query_model:
   provider: gemini
   name: gemini-2.5-flash
   temperature: 0.0

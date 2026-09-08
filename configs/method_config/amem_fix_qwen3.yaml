@@ -1,7 +1,7 @@
 method_name: amem_fix
 method_type: agentic_memory
 description: A-Mem with atomic timestamped notes and original-style retrieval
-model:
+query_model:
   provider: openai
   name: Qwen3-235B-A22B-Instruct-2507
   temperature: 0.0

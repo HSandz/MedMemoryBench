@@ -262,9 +262,25 @@ class AgentManager:
             build_client_kwargs = {}
             build_max_tokens = None
 
+        # Adapters that make build-time LLM calls receive this complete,
+        # independently resolved configuration. Adapters without a build LLM
+        # simply ignore these kwargs through their existing ``**kwargs``.
+        if build_model_config is not None:
+            params.update({
+                "memory_model": build_model_config.name,
+                "memory_provider": build_model_config.provider,
+                "memory_temperature": build_model_config.temperature,
+                "memory_max_tokens": build_max_tokens,
+                "memory_api_key": build_api_key,
+                "memory_base_url": build_base_url,
+                "memory_llm_client_kwargs": build_client_kwargs,
+            })
+
         if (
             self._batch_api
-            and is_batch_provider(model_config.provider)
+            and is_batch_provider(
+                (build_model_config or model_config).provider
+            )
             and method_key in {"lightmem", "remem", "graph_rag", "memrl"}
         ):
             params.update({

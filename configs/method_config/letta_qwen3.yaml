@@ -1,7 +1,7 @@
 method_name: letta
 method_type: agentic_memory
 description: Letta (MemGPT) local client adapter for MedMemoryBench
-model:
+query_model:
   provider: openai
   name: Qwen3-235B-A22B
   temperature: 0.0

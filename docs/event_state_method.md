@@ -172,8 +172,9 @@ other ephemeral retrieval state are not persisted.
 Start with `configs/method_config/event_state_gemini.yaml` (or the
 `event_state_gpt-5.1.yaml` OpenAI variant). Build settings live under
 `build_config`; retrieval-only ablations live under `retrieval_config`.
-`memorize_model` controls extraction and state classification, while `model`
-controls final answers. The embedding backend supports repository-compatible
+`memorize_model` controls extraction and state classification, while
+`query_model` controls final answers and optional planner calls. The legacy
+`model` key remains accepted. The embedding backend supports repository-compatible
 local/HuggingFace and OpenAI configurations.
 
 ### Optional adaptive retrieval planner

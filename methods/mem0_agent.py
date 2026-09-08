@@ -35,6 +35,13 @@ class Mem0Agent(BaseAgent):
         embedding_provider: str = "openai",
         embedding_model_path: Optional[str] = None,
         retrieve_num: int = 5,
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -64,6 +71,17 @@ class Mem0Agent(BaseAgent):
         )
         self._provider = provider
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else self._llm_client_kwargs
+        )
 
         # LLM client for Q&A
         self._llm_client: BaseLLMClient = create_llm_client(
@@ -175,34 +193,34 @@ class Mem0Agent(BaseAgent):
         print(f"[Mem0Agent DEBUG] Qdrant path: {qdrant_path}")
 
         # Build Mem0 config
-        use_gemini = is_gemini_provider(self._provider)
+        use_gemini = is_gemini_provider(self._memory_provider)
         mem0_config = {
             "llm": {
                 "provider": "gemini" if use_gemini else "openai",
                 "config": {
-                    "model": self.model,
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                    "reasoning_effort": self._llm_client_kwargs.get("reasoning_effort"),
-                    "api_key": self._api_key,
-                    "openai_base_url": self._base_url,
-                    "gemini_provider": self._provider,
+                    "model": self._memory_model,
+                    "temperature": self._memory_temperature,
+                    "max_tokens": self._memory_max_tokens,
+                    "reasoning_effort": self._memory_llm_client_kwargs.get("reasoning_effort"),
+                    "api_key": self._memory_api_key,
+                    "openai_base_url": self._memory_base_url,
+                    "gemini_provider": self._memory_provider,
                     "extra_body": (
                         {
                             key: value
                             for key, value in (
                                 (
                                     "provider",
-                                    self._llm_client_kwargs.get("provider_routing"),
+                                    self._memory_llm_client_kwargs.get("provider_routing"),
                                 ),
                                 (
                                     "service_tier",
-                                    self._llm_client_kwargs.get("service_tier"),
+                                    self._memory_llm_client_kwargs.get("service_tier"),
                                 ),
                             )
                             if value is not None
                         }
-                        if self._provider == "openrouter"
+                        if self._memory_provider == "openrouter"
                         else None
                     ),
                 }

@@ -1,7 +1,7 @@
 method_name: lightmem
 method_type: agentic_memory
 description: LightMem - Lightweight Memory for LLM Agents
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0

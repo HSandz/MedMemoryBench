@@ -67,6 +67,13 @@ class MIRIXAgent(BaseAgent):
         max_context_tokens: int = 120000,
         # Query mode
         use_native_query: bool = True,  # Use MIRIX native send_message for query
+        memory_model: Optional[str] = None,
+        memory_provider: Optional[str] = None,
+        memory_temperature: Optional[float] = None,
+        memory_max_tokens: Optional[int] = None,
+        memory_api_key: Optional[str] = None,
+        memory_base_url: Optional[str] = None,
+        memory_llm_client_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
@@ -76,6 +83,17 @@ class MIRIXAgent(BaseAgent):
         self._llm_client_kwargs = dict(kwargs.get("llm_client_kwargs", {}))
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        self._memory_model = memory_model or model
+        self._memory_provider = memory_provider or provider
+        self._memory_temperature = temperature if memory_temperature is None else memory_temperature
+        self._memory_max_tokens = memory_max_tokens or max_tokens
+        self._memory_api_key = memory_api_key or self._api_key
+        self._memory_base_url = memory_base_url or self._base_url
+        self._memory_llm_client_kwargs = dict(
+            memory_llm_client_kwargs
+            if memory_llm_client_kwargs is not None
+            else self._llm_client_kwargs
+        )
 
         # Embedding config
         self.embedding_model = embedding_model
@@ -159,31 +177,32 @@ class MIRIXAgent(BaseAgent):
             logger.info("[MIRIXAgent] Ensuring database tables are created...")
             self._run_async(ensure_tables_created())
 
-            # Build LLM config
+            # Build the persistent memory-agent configuration first. It is
+            # switched to the query model only after memory construction.
             extra_body = None
-            if self._provider.lower() == "openrouter":
+            if self._memory_provider.lower() == "openrouter":
                 extra_body = {}
-                if self._llm_client_kwargs.get("provider_routing") is not None:
-                    extra_body["provider"] = self._llm_client_kwargs[
+                if self._memory_llm_client_kwargs.get("provider_routing") is not None:
+                    extra_body["provider"] = self._memory_llm_client_kwargs[
                         "provider_routing"
                     ]
-                if self._llm_client_kwargs.get("service_tier") is not None:
-                    extra_body["service_tier"] = self._llm_client_kwargs[
+                if self._memory_llm_client_kwargs.get("service_tier") is not None:
+                    extra_body["service_tier"] = self._memory_llm_client_kwargs[
                         "service_tier"
                     ]
-                if self._llm_client_kwargs.get("reasoning_effort") is not None:
+                if self._memory_llm_client_kwargs.get("reasoning_effort") is not None:
                     extra_body["reasoning"] = {
-                        "effort": self._llm_client_kwargs["reasoning_effort"]
+                        "effort": self._memory_llm_client_kwargs["reasoning_effort"]
                     }
             llm_config = LLMConfig(
-                model=self.model,
-                model_endpoint_type=self._get_mirix_endpoint_type(self._provider),
-                model_endpoint=self._base_url,
+                model=self._memory_model,
+                model_endpoint_type=self._get_mirix_endpoint_type(self._memory_provider),
+                model_endpoint=self._memory_base_url,
                 context_window=self.max_context_tokens,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                temperature=self._memory_temperature,
+                max_tokens=self._memory_max_tokens,
                 extra_body=extra_body or None,
-                reasoning_effort=self._llm_client_kwargs.get("reasoning_effort"),
+                reasoning_effort=self._memory_llm_client_kwargs.get("reasoning_effort"),
             )
 
             # Build embedding config
@@ -752,6 +771,20 @@ class MIRIXAgent(BaseAgent):
 
         async def do_query():
             nonlocal response_content, retrieved_memories, query_usage
+
+            if not getattr(self, "_query_llm_applied", False):
+                from mirix.schemas.llm_config import LLMConfig
+
+                await self._meta_agent.update_llm_config(LLMConfig(
+                    model=self.model,
+                    model_endpoint_type=self._get_mirix_endpoint_type(self._provider),
+                    model_endpoint=self._base_url,
+                    context_window=self.max_context_tokens,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self._llm_client_kwargs.get("reasoning_effort"),
+                ))
+                self._query_llm_applied = True
 
             # Use MIRIX native send_message - it will automatically retrieve
             # relevant memories and use them in the response

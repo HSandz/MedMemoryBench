@@ -2,7 +2,7 @@ method_name: memrl
 method_type: agentic_memory
 description: MemRL - value-driven procedural memory with Q-learning based retrieval
   and ε-greedy exploration
-model:
+query_model:
   provider: openai
   name: gpt-5.1
   temperature: 0.0
