@@ -18,7 +18,7 @@ This guide covers the A-MEM integration in MedMemoryBench. Repository-wide Pytho
 3. `amem` splits oversized text into token-bounded chunks and passes each chunk directly to `add_note()`.
 4. `amem_fix` converts structured dialogue turns into timestamped atomic notes, optionally generates keyword queries, retrieves semantic seeds, and expands linked notes.
 5. `amem_test` defaults to the atomic turn-note flow, but `amem_note_level` can combine all turns from each injected benchmark session into one note input. Both modes use the same A-MEM analysis, evolution, typed-edge (`SUPPORT`, `REFINE`, `SUPERSEDE`, `CONFLICT`, `RELATED`), temporal-state, provenance, indexing, and retrieval paths.
-6. Retrieval is local and read-only during query preparation, apart from the optional LLM call that turns a question into keywords. That rewrite uses the top-level query `model`, while note metadata and evolution use `memorize_model`. Gemini/AI Studio build-client initialization is deferred while restoring a snapshot, unless a build operation invokes it. Retrieved notes are placed in the final prompt; Vertex batch transport applies to final answer generation. `--stage memory` and `--stage query` can build and reuse snapshots.
+6. Retrieval is local and read-only during query preparation, apart from the optional LLM call that turns a question into keywords. That rewrite uses `query_model`, while note metadata and evolution use `memorize_model`. Gemini/AI Studio build-client initialization is deferred while restoring a snapshot, unless a build operation invokes it. Retrieved notes are placed in the final prompt; Vertex batch transport applies to final answer generation. `--stage memory` and `--stage query` can build and reuse snapshots.
 
 The robust layer may make up to three conditional evolution calls when adding a note: decide whether to evolve, strengthen details, and update neighbors. `amem_evo_threshold` controls periodic retriever consolidation.
 
@@ -48,12 +48,12 @@ counts include both recovered and terminal failures.
 
 ## Configuration
 
-AMEM method files separate `build_config` from `retrieval_config`. Build settings define the stored snapshot: embedding, chunking, metadata/evolution settings, and `amem_build_max_context_tokens`. The optional top-level `memorize_model` block independently configures the internal build LLM, including its provider, model, credentials, OpenRouter routing, and service tier. The top-level `model` configures both query keyword rewrites and final-answer generation. Legacy `build_config.amem_backend` and `build_config.amem_model` remain supported when `memorize_model` is absent. Retrieval settings can change on a frozen snapshot, including `retrieve_num`, keyword use, graph budgets, `amem_relation_min_confidence`, temporal ordering, provenance injection, and `amem_max_context_tokens`.
+AMEM method files separate `build_config` from `retrieval_config`. Build settings define the stored snapshot: embedding, chunking, metadata/evolution settings, and `amem_build_max_context_tokens`. The optional top-level `memorize_model` block independently configures the internal build LLM, including its provider, model, credentials, OpenRouter routing, and service tier. `query_model` configures both query keyword rewrites and final-answer generation. The legacy top-level `model` key and `build_config.amem_backend` / `build_config.amem_model` remain supported for historical configurations. Retrieval settings can change on a frozen snapshot, including `retrieve_num`, keyword use, graph budgets, `amem_relation_min_confidence`, temporal ordering, provenance injection, and `amem_max_context_tokens`.
 
 For example, use OpenRouter flex for memory construction while leaving query answering on OpenRouter's default tier so it remains independently eligible for Batch API routing:
 
 ```yaml
-model:
+query_model:
   provider: openrouter
   name: openai/gpt-5-nano
   openrouter:
@@ -82,7 +82,7 @@ build_config:
   amem_build_max_context_tokens: 200000
 ```
 
-Omitting `model.openrouter.service_tier` selects normal/default query routing; `memorize_model.openrouter.service_tier` affects only build calls. A-MEM construction remains real-time because it is stateful. With `--batch-api`, only the independently configured query-answer and judge stages use batch when their selected routes support it. Keep API keys in `.env`, or use the separate `api_key` and `base_url` fields in each model block for non-secret local configuration.
+Omitting `query_model.openrouter.service_tier` selects normal/default query routing; `memorize_model.openrouter.service_tier` affects only build calls. A-MEM construction remains real-time because it is stateful. With `--batch-api`, only the independently configured query-answer and judge stages use batch when their selected routes support it. Keep API keys in `.env`, or use the separate `api_key` and `base_url` fields in each model block for non-secret local configuration.
 
 For `amem_test`, the important build switches are `amem_note_level`, `amem_original_evolution`, `amem_typed_relations`, `amem_temporal_state`, and `amem_provenance`. `amem_temporal_transition_min_confidence` controls which inferred relations update stored temporal state. Query-time `amem_relation_min_confidence` only filters retrieved relations. Temporal state requires typed relations. Snapshot selection validates build semantics while allowing retrieval-only ablations; legacy manifests derive a build hash from their stored `run_config.json` when possible.
 

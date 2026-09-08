@@ -6,6 +6,11 @@ query_model:
   name: gemini-2.5-flash
   temperature: 0.0
   max_completion_tokens: 20000
+memorize_model:
+  provider: gemini
+  name: gemini-2.5-flash
+  temperature: 0.0
+  max_completion_tokens: 20000
 embedding:
   provider: local
   model: bge-small-zh-v1.5

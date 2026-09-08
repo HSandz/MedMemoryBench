@@ -7,6 +7,11 @@ query_model:
   name: gpt-5.1
   temperature: 0.0
   max_tokens: 10000
+memorize_model:
+  provider: openai
+  name: gpt-5.1
+  temperature: 0.0
+  max_tokens: 10000
 embedding:
   provider: local
   model: BAAI/bge-small-zh-v1.5

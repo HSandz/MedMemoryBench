@@ -242,29 +242,30 @@ MODAL_BASE_URL=https://your-workspace--medmemorybench-vllm-server.us-east.modal.
 accepts it as a compatibility fallback. `MODAL_API_KEY` is recommended because
 it describes the value's use by the OpenAI-compatible client.
 
-Configure a method YAML with `provider: modal` and the model name served by
+Configure a method YAML with `query_model.provider: modal` and the model name served by
 vLLM. For example:
 
 ```yaml
-model:
+query_model:
   provider: modal
   name: ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ
   temperature: 0.0
   max_completion_tokens: 4096
 ```
 
-For A-MEM configurations, also set the internal memory-building backend to
-`modal`; this routes A-MEM's metadata and evolution prompts to the same
-OpenAI-compatible Modal Server:
+For A-MEM configurations, add `memorize_model` to route metadata and evolution
+prompts to the same OpenAI-compatible Modal Server:
 
 ```yaml
-build_config:
-  amem_backend: modal
-  amem_model: ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ
+memorize_model:
+  provider: modal
+  name: ELVISIO/Qwen3-30B-A3B-Instruct-2507-AWQ
+  temperature: 0.0
+  max_completion_tokens: 4096
 ```
 
-The top-level `provider: modal` controls the agent's answer-generation client,
-while `amem_backend: modal` controls A-MEM's internal LLM calls.
+The `query_model.provider: modal` field controls the agent's answer-generation client,
+while `memorize_model.provider: modal` controls A-MEM's internal LLM calls.
 
 You can also put `api_key` and `base_url` directly in the model YAML, but using
 `.env` is safer and keeps credentials out of committed configuration files.

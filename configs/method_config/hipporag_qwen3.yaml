@@ -6,6 +6,11 @@ query_model:
   name: Qwen3-235B-A22B
   temperature: 0.0
   max_completion_tokens: 20000
+memorize_model:
+  provider: openai
+  name: Qwen3-235B-A22B
+  temperature: 0.0
+  max_completion_tokens: 20000
 embedding:
   provider: local
   model: BAAI/bge-small-zh-v1.5
