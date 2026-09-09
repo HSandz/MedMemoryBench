@@ -22,6 +22,7 @@ from .read_reasoning_bridge import ReadReasoningBridgeMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
 from .read_evidence_policy import ReadEvidencePolicyMixin
 from .read_evidence_precision import ReadEvidencePrecisionMixin
+from .read_progressive_retrieval import ReadProgressiveRetrievalMixin
 from .read_retrieval_fusion import ReadRetrievalFusionMixin
 from .read_evidence_resolve import ReadEvidenceResolveMixin
 from .read_semantic_closure import ReadSemanticClosureMixin
@@ -35,6 +36,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadProgressiveRetrievalMixin,
     ReadRetrievalFusionMixin,
     ReadEvidenceResolveMixin,
     ReadAnswerSensitiveControllerMixin,
