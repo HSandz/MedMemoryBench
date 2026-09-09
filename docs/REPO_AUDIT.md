@@ -20,10 +20,6 @@ Examples include `methods/amem/A-mem/memory_layer.py:461` and `methods/mem0/vect
 
 `benchmarks/medmemorybench/dataset.py:130` and `benchmarks/medmemorybench/dataset.py:186` quietly skip a missing dialogue or query file. A missing root directory raises a generic filesystem exception at `:100`, but incomplete persona data can produce an apparently successful run with zero sessions or queries. Fail early when required files are absent and reject runs with zero evaluation units unless the caller explicitly opts in.
 
-### Medium: provider configuration is not fully provider-specific across all methods
-
-`src/agent.py:79`-`:86` passes OpenAI API key/base URL defaults to every method. The Gemini Enterprise client safely ignores them and uses the service-account credential, but some adapters bypass the shared client: GraphRAG chooses `ChatGoogleGenerativeAI` from the model name in `methods/graph_rag.py:87` rather than the configured provider. Keep Gemini Enterprise runs to adapters that use `utils.llm_client` (for example `long_context`, BM25 RAG, and embedding RAG with a supported embedding provider) until each bypassing adapter has an explicit managed-Google integration.
-
 ### Medium: one listed method and one support script are not runnable from the checkout
 
 `mem1_gpt-5.1` is listed by the CLI, but `src/agent.py` imports `methods.mem1_agent`, which does not exist. In addition, `scripts/mirix-services.sh` references `docker/mirix-services.yml`, which is absent. Users receive a runtime import or compose-file failure rather than an actionable preflight error. Remove or repair the Mem1 configuration and include the MIRIX compose file (or fail early with the exact prerequisite).

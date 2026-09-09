@@ -1,6 +1,7 @@
 """Regression tests for the shared managed-Gemini retry policy."""
 
 from types import SimpleNamespace
+import warnings
 
 import pytest
 
@@ -250,3 +251,46 @@ def test_graphrag_does_not_turn_transport_failures_into_answers():
 
     with pytest.raises(RuntimeError, match="no answer was recorded"):
         agent.query("question")
+
+
+def test_graphrag_uses_explicit_openai_provider_for_gemini_named_proxy(
+    monkeypatch,
+):
+    """An OpenAI-compatible model ID must not select the Vertex client."""
+    received = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+    class UnexpectedVertexClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("model name must not select Vertex")
+
+    monkeypatch.setattr(graph_rag, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr(graph_rag, "GeminiVertexClient", UnexpectedVertexClient)
+
+    model = graph_rag._get_chat_model(
+        model_name="gemini/gemini-3.5-flash-lite",
+        provider="openai",
+        api_key="build-key",
+        base_url="https://proxy.example/v1",
+    )
+
+    assert isinstance(model, FakeChatOpenAI)
+    assert received["model_name"] == "gemini/gemini-3.5-flash-lite"
+    assert received["api_key"] == "build-key"
+    assert received["base_url"] == "https://proxy.example/v1"
+
+
+def test_graphrag_suppresses_fixed_sampling_warning():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with graph_rag._suppress_fixed_sampling_warning():
+            warnings.warn(
+                "Model 'gemini-3.5-flash-lite' uses fixed sampling defaults; the "
+                "sampling parameter(s) temperature will be ignored.",
+                UserWarning,
+            )
+
+    assert caught == []
