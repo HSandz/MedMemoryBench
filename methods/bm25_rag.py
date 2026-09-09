@@ -144,7 +144,7 @@ class BM25RAGAgent(BaseAgent):
         **kwargs
     ) -> AgentResponse:
         """Query the agent with BM25 retrieval."""
-        prepared = self.prepare_batch_query(question, system_message=system_message)
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
         response = self._llm_client.chat(prepared["messages"])
         return self.finalize_batch_query(prepared, response.content)
 
@@ -155,7 +155,8 @@ class BM25RAGAgent(BaseAgent):
         **kwargs,
     ) -> dict:
         """Do BM25 retrieval locally and make the final request batchable."""
-        retrieved_docs = self._retrieve(question)
+        retrieval_query = kwargs.get("raw_question") or question
+        retrieved_docs = self._retrieve(retrieval_query)
         truncated_docs = self.truncate_docs_to_context(
             docs=retrieved_docs,
             question=question,

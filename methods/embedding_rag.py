@@ -249,7 +249,7 @@ class EmbeddingRAGAgent(BaseAgent):
         **kwargs
     ) -> AgentResponse:
         """Query the agent with embedding retrieval."""
-        prepared = self.prepare_batch_query(question, system_message=system_message)
+        prepared = self.prepare_batch_query(question, system_message=system_message, **kwargs)
         response = self._llm_client.chat(prepared["messages"])
         return self.finalize_batch_query(prepared, response.content)
 
@@ -260,7 +260,8 @@ class EmbeddingRAGAgent(BaseAgent):
         **kwargs,
     ) -> dict:
         """Do local retrieval now and defer only immutable generation to Vertex."""
-        retrieved_docs = self._retrieve(question)
+        retrieval_query = kwargs.get("raw_question") or question
+        retrieved_docs = self._retrieve(retrieval_query)
         truncated_docs = self.truncate_docs_to_context(
             docs=retrieved_docs,
             question=question,

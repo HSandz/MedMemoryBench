@@ -434,7 +434,7 @@ class AMemTestAgent(AMemFixAgent):
         )
         self._amem_systems[context_id] = system
         logger.info(
-            "Created amem_test system context=%d original_evolution=%s "
+            "Created amem_test system context=%s original_evolution=%s "
             "typed_relations=%s temporal_state=%s provenance=%s "
             "candidates=%d typed_expansion=%d temporal_expansion=%d",
             context_id,
@@ -542,7 +542,7 @@ class AMemTestAgent(AMemFixAgent):
                 "config": {**stored_config, "note_level": "turn"},
             }
         super().import_memory_state(normalized_state, context_id=context_id)
-        resolved_context_id = int(
+        resolved_context_id = (
             state["context_id"] if context_id is None else context_id
         )
         memory_system = self._get_memory_system(resolved_context_id)
@@ -560,9 +560,9 @@ class AMemTestAgent(AMemFixAgent):
             if field_name in system_state:
                 setattr(memory_system, field_name, system_state[field_name])
 
-    def export_memory_state(self, context_id: Optional[int] = None) -> Dict[str, Any]:
+    def export_memory_state(self, context_id: Optional[Any] = None) -> Dict[str, Any]:
         state = super().export_memory_state(context_id=context_id)
-        resolved_context_id = self._get_context_id() if context_id is None else int(context_id)
+        resolved_context_id = self._get_context_id() if context_id is None else context_id
         memory_system = self._get_memory_system(resolved_context_id)
         for field_name in (
             "temporal_state_enabled",
@@ -1699,7 +1699,7 @@ class AMemTestAgent(AMemFixAgent):
         if retrieved_memories:
             retrieved_memories[0]["retrieval_audit"] = retrieval_audit
         logger.info(
-            "Experimental retrieval context=%d hybrid=%s graph=%s seeds=%s "
+            "Experimental retrieval context=%s hybrid=%s graph=%s seeds=%s "
             "graph_expansions=%s "
             "temporal_expansions=%s evidence=%s final=%s relations=%d",
             context_id,

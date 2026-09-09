@@ -61,6 +61,8 @@ def _embedding_rag():
     agent._vectorstore = None
     agent._embedding_model_instance = _Embeddings()
     agent._get_embedding_model = lambda: agent._embedding_model_instance
+    agent.embedding_model = "test_embed"
+    agent.embedding_provider = "test_provider"
     agent._is_initialized = False
     agent._context_id = None
     return agent
@@ -142,3 +144,72 @@ def test_bm25_rag_does_not_retokenize_prior_chunks_and_round_trips():
     restored.import_memory_state(state)
     assert restored._tokenized_corpus == agent._tokenized_corpus
     assert restored._retrieve("gamma") == ["gamma delta"]
+
+
+def test_bm25_and_embedding_rag_use_raw_question_when_provided():
+    bm25_agent = _bm25_rag()
+    bm25_agent.memorize("the patient took aspirin daily")
+
+    retrieval_queries = []
+    bm25_agent._retrieve = lambda q: retrieval_queries.append(q) or ["the patient took aspirin daily"]
+    bm25_agent._truncate_to_tokens = lambda text, max_tok: text
+    bm25_agent.count_tokens = lambda text: len(text.split())
+    bm25_agent.max_tokens = 50
+    bm25_agent.max_context_tokens = 500
+    bm25_agent.max_question_tokens = 200
+
+    full_prompt = "Few-shot example: dancing\nQuestion: What medication did the patient take?"
+    raw_q = "What medication did the patient take?"
+
+    bm25_agent.prepare_batch_query(full_prompt, raw_question=raw_q)
+    assert retrieval_queries == [raw_q]
+
+    emb_agent = _embedding_rag()
+    emb_agent.memorize("the patient took aspirin daily")
+    emb_retrievals = []
+    emb_agent._retrieve = lambda q: emb_retrievals.append(q) or ["the patient took aspirin daily"]
+    emb_agent._truncate_to_tokens = lambda text, max_tok: text
+    emb_agent.count_tokens = lambda text: len(text.split())
+    emb_agent.max_tokens = 50
+    emb_agent.max_context_tokens = 500
+    emb_agent.max_question_tokens = 200
+
+    emb_agent.prepare_batch_query(full_prompt, raw_question=raw_q)
+    assert emb_retrievals == [raw_q]
+
+
+def test_graph_rag_query_engine_extracts_locomo_question():
+    from methods.graph_rag import QueryEngine
+    engine = QueryEngine.__new__(QueryEngine)
+
+    prompt = "Instruction: Answer based on context.\n\nQuestion: What date did they meet?\n\nAnswer:"
+    assert engine._extract_retrieval_query(prompt) == "What date did they meet?"
+
+
+def test_amem_supports_string_context_id():
+    import unittest.mock as mock
+    from methods.amem_agent import AMemAgent
+    agent = AMemAgent.__new__(AMemAgent)
+    agent._context_id = None
+    agent._memory_chunks = []
+    agent._is_initialized = True
+    agent.MEMORY_STATE_VERSION = 1
+    agent._amem_systems = {}
+
+    agent.set_context_id("conv-30")
+    assert agent._get_context_id() == "conv-30"
+
+    mock_sys = mock.MagicMock()
+    mock_sys.evo_cnt = 0
+    mock_sys.evo_threshold = 10
+    mock_sys.max_context_chars = 1000
+    mock_sys.memories = {}
+    mock_sys.retriever.corpus = []
+    mock_sys.retriever.document_ids = []
+    mock_sys.retriever.embeddings = None
+    agent._amem_systems["conv-30"] = mock_sys
+    agent._memory_state_config = lambda: {}
+
+    state = agent.export_memory_state(context_id="conv-30")
+    assert state["context_id"] == "conv-30"
+

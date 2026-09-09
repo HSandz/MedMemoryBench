@@ -864,10 +864,12 @@ class LoCoMoEvaluator:
                                     "source_event_id": session.metadata.get("session_key"),
                                 })
                             memory_items.append(memory_item)
+                    is_last_session = (chunk_idx == total_chunks - 1)
                     memory_result = self.agent_manager.send_message(
                         message=formatted_text,
                         memorizing=True,
                         context_id=unit.context_id,
+                        is_last_session=is_last_session,
                         memory_items=memory_items,
                     )
 

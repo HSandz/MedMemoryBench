@@ -137,11 +137,11 @@ class AMemAgent(BaseAgent):
         module = importlib.import_module("memory_layer_robust")
         return getattr(module, "RobustAgenticMemorySystem")
 
-    def _get_context_id(self) -> int:
+    def _get_context_id(self) -> Any:
         """Get current context ID, defaulting to 0."""
         return self._context_id if self._context_id is not None else 0
 
-    def _get_memory_system(self, context_id: int):
+    def _get_memory_system(self, context_id: Any):
         """Get or create A-Mem system for the given context."""
         system = self._amem_systems.get(context_id)
         if system is not None:
@@ -183,7 +183,7 @@ class AMemAgent(BaseAgent):
         )
         self._amem_systems[context_id] = system
         logger.info(
-            "Created A-Mem system for context %d: model=%s, evo_threshold=%d, max_context_chars=%d",
+            "Created A-Mem system for context %s: model=%s, evo_threshold=%d, max_context_chars=%d",
             context_id, self.amem_model, self.amem_evo_threshold, max_context_chars
         )
         return system
@@ -225,9 +225,9 @@ class AMemAgent(BaseAgent):
         """A-MEM snapshots contain all state needed for later retrieval."""
         return True
 
-    def export_memory_state(self, context_id: Optional[int] = None) -> Dict[str, Any]:
+    def export_memory_state(self, context_id: Optional[Any] = None) -> Dict[str, Any]:
         """Export one context without serializing model or provider clients."""
-        resolved_context_id = self._get_context_id() if context_id is None else int(context_id)
+        resolved_context_id = self._get_context_id() if context_id is None else context_id
         memory_system = self._get_memory_system(resolved_context_id)
         embeddings = memory_system.retriever.embeddings
         embedding_state = None
@@ -293,7 +293,7 @@ class AMemAgent(BaseAgent):
     def import_memory_state(
         self,
         state: Dict[str, Any],
-        context_id: Optional[int] = None,
+        context_id: Optional[Any] = None,
     ) -> None:
         """Restore a snapshot without recomputing any stored embedding."""
         if state.get("format") != "medmemorybench.amem.memory_state":
@@ -335,9 +335,9 @@ class AMemAgent(BaseAgent):
         if not config_matches:
             raise ValueError("A-MEM memory snapshot configuration does not match the agent")
 
-        state_context_id = int(state["context_id"])
-        resolved_context_id = state_context_id if context_id is None else int(context_id)
-        if resolved_context_id != state_context_id:
+        state_context_id = state["context_id"]
+        resolved_context_id = state_context_id if context_id is None else context_id
+        if str(resolved_context_id) != str(state_context_id):
             raise ValueError(
                 f"A-MEM snapshot context {state_context_id} cannot load as {resolved_context_id}"
             )
@@ -648,7 +648,7 @@ class AMemAgent(BaseAgent):
         self._amem_systems = {}
         logger.debug("Reset A-Mem agent state")
 
-    def set_context_id(self, context_id: int) -> None:
+    def set_context_id(self, context_id: Any) -> None:
         """Set context ID for distinguishing personas."""
         super().set_context_id(context_id)
 
