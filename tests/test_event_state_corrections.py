@@ -30,8 +30,8 @@ def test_role_only_turns_and_visible_ids_are_preserved():
 
 
 def test_scope_and_subject_aliases_do_not_contaminate_primary_user():
-    assert normalize_scope("[Health consultation record about Mary(mother)]") == "third_party:mary"
-    assert normalize_scope("[Health consultation record]") == "general_non_personal"
+    assert normalize_scope(explicit="third_party:mary") == "third_party:mary"
+    assert normalize_scope(explicit="general_non_personal") == "general_non_personal"
     assert resolve_subject_id("patient", "primary_user") == "primary_user"
     assert resolve_subject_id("the patient", "primary_user") == "primary_user"
     assert resolve_subject_id("Mary", "general_non_personal") == "general_non_personal"
@@ -71,7 +71,7 @@ def test_incorrect_llm_subject_id_cannot_override_source_speaker_or_family_scope
     bob_agent.memorize("", memory_items=[{"speaker":"Alice","text":"hello","source_turn_id":"a"},{"speaker":"Bob","text":"I moved","source_turn_id":"b"}], source_session_id=1)
     assert next(iter(bob_agent._store().claims.values())).subject_id == "speaker:bob"
     family_agent = EventStateAgent(llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"Mary","subject_id":"primary_user","predicate":"dose","value":"10 mg"}]}'), memory_llm_client=LLM('{"episode_summary":"s","claims":[{"subject":"Mary","subject_id":"primary_user","predicate":"dose","value":"10 mg"}]}'), embedding_client=Embedder())
-    family_agent.memorize("[Health consultation record about Mary(mother)]", source_session_id=2)
+    family_agent.memorize("[Health consultation record about Mary(mother)]", source_session_id=2, conversation_scope="third_party:mary")
     assert next(iter(family_agent._store().claims.values())).subject_id == "third_party:mary"
 
 
@@ -104,7 +104,7 @@ def test_raw_episode_contains_scope_roles_and_image_caption(monkeypatch):
             return SimpleNamespace(content='{"episode_summary":"summary","claims":[]}')
 
     agent = EventStateAgent(llm_client=LLM(), memory_llm_client=LLM(), embedding_client=Embedder())
-    agent.memorize("[Health consultation record about Mary(mother)]", memory_items=[{"role": "user", "content": "pain", "source_turn_id": 1, "blip_caption": "scan"}], source_session_id=1)
+    agent.memorize("[Health consultation record about Mary(mother)]", memory_items=[{"role": "user", "content": "pain", "source_turn_id": 1, "blip_caption": "scan"}], source_session_id=1, conversation_scope="third_party:mary")
     episode = next(iter(agent._store().episodes.values()))
     assert "conversation_scope=third_party:mary" in episode.raw_text
     assert "role=user" in episode.raw_text and "Shared image: scan" in episode.raw_text

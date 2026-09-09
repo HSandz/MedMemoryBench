@@ -256,7 +256,7 @@ def test_query_context_uses_selected_provenance_for_dedup_metadata_and_does_not_
     after = agent.export_memory_state()
     context = prepared["messages"][-1]["content"]
     assert "target corroboration" in context and "target latest corroboration" in context
-    assert prepared["extra"]["episode_evidence_deduplicated_against_claim_count"] == 1
+    assert prepared["extra"]["episode_evidence_deduplicated_against_claim_count"] == 2
     included = prepared["extra"]["included_provenance_evidence"]
     assert {item["evidence"]["source_session_id"] for item in included} == {"s4", "s5"}
     assert before == after

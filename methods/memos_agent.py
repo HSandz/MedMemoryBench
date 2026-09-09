@@ -181,12 +181,16 @@ class MemOSAgent(BaseAgent):
         Returns:
             MemoryConfigFactory instance with configured backend.
         """
-        use_vertex_gemini = is_vertex_gemini_provider(self._memory_provider)
-        use_ai_studio = is_google_ai_studio_provider(self._memory_provider)
-        use_hybrid_gemini = is_hybrid_gemini_provider(self._memory_provider)
+        memory_provider = getattr(self, "_memory_provider", getattr(self, "_provider", "gemini"))
+        use_vertex_gemini = is_vertex_gemini_provider(memory_provider)
+        use_ai_studio = is_google_ai_studio_provider(memory_provider)
+        use_hybrid_gemini = is_hybrid_gemini_provider(memory_provider)
         use_gemini = use_vertex_gemini or use_ai_studio or use_hybrid_gemini
+        extractor_model = self.memos_model
+        if use_gemini and (not extractor_model or extractor_model == "ignored-for-gemini"):
+            extractor_model = getattr(self, "model", extractor_model)
         extractor_config: Dict[str, Any] = {
-            "model_name_or_path": self.memos_model,
+            "model_name_or_path": extractor_model,
             "temperature": getattr(
                 self, "memos_temperature", self.DEFAULT_EXTRACTOR_TEMPERATURE
             ),
@@ -194,18 +198,18 @@ class MemOSAgent(BaseAgent):
                 self, "memos_max_tokens", self.DEFAULT_EXTRACTOR_MAX_TOKENS
             ),
         }
-        if self._memory_provider == "openrouter":
+        if memory_provider == "openrouter":
             extractor_config["extra_body"] = {
                 key: value
                 for key, value in (
-                    ("provider", self._memory_llm_client_kwargs.get("provider_routing")),
-                    ("service_tier", self._memory_llm_client_kwargs.get("service_tier")),
+                    ("provider", getattr(self, "_memory_llm_client_kwargs", {}).get("provider_routing")),
+                    ("service_tier", getattr(self, "_memory_llm_client_kwargs", {}).get("service_tier")),
                 )
                 if value is not None
             } or None
         if use_ai_studio or use_hybrid_gemini:
             extractor_config.update({
-                "gemini_provider": self._memory_provider,
+                "gemini_provider": memory_provider,
                 "api_key": self._memos_api_key,
             })
         elif not use_vertex_gemini:
@@ -217,7 +221,7 @@ class MemOSAgent(BaseAgent):
         base_config: Dict[str, Any] = {
             "extractor_llm": {
                 "backend": (
-                    self._memory_provider
+                    memory_provider
                     if use_vertex_gemini
                     else "gemini" if use_ai_studio or use_hybrid_gemini else self.memos_backend
                 ),

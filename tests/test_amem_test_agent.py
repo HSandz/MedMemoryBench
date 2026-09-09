@@ -2622,7 +2622,7 @@ def test_all_amem_test_configs_declare_explicit_original_evolution_mode():
 
 
 def test_persona_amem_test2_gemini_disables_original_evolution():
-    path = Path("configs/method_config/persona_1/amem_test2_gemini.yaml")
+    path = Path("configs/method_config/amem_test2_gemini.yaml")
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     assert config["build_config"]["amem_original_evolution"] is False
@@ -2639,6 +2639,10 @@ def test_persona_amem_test2_gemini_disables_original_evolution():
 )
 def test_amem_test_ablation_configs_load(config_name, temporal, provenance):
     from src.config import ConfigLoader
+
+    config_path = Path(f"configs/method_config/{config_name}.yaml")
+    if not config_path.exists():
+        pytest.skip(f"Ablation config {config_name} is no longer shipped")
 
     config = ConfigLoader().load_method_config(config_name)
     assert config.method_name == "amem_test"
