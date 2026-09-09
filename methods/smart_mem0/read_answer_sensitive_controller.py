@@ -1,9 +1,10 @@
 """Answer-sensitive semantic controller policy for SmartMem0 READ.
 
-LLM #1 still owns semantic normalization only. This policy tightens two invariants exposed
-by frozen-read telemetry: a requirement must be a participant-memory variable, and a temporal
-selector must be necessary to choose the answer-bearing member of that variable. The policy
-is dataset-, mode- and language-neutral and does not add another model call.
+LLM #1 still owns semantic normalization only. This policy tightens three invariants exposed
+by frozen-read telemetry: a requirement must be a participant-memory variable, a temporal
+selector must be necessary to choose the answer-bearing member of that variable, and an
+inference plan must be premise-complete without inventing general-domain mechanisms as
+memories. The policy is dataset-, mode- and language-neutral and adds no model call.
 """
 
 import json
@@ -35,6 +36,24 @@ REQUIREMENTS
 - evidence_family is selector-neutral recall. constraints narrow recall but are never proof.
 - General-domain mechanisms/rules are not participant-memory requirements.
 
+PREMISE COMPLETENESS
+- For inference, causal explanation, comparison, decision, or cross-memory synthesis, do not
+  stop after naming only the two endpoints that appear in the question.
+- Within the same maximum of four requirements, include the smallest set of unmentioned
+  participant-specific premises whose values could materially change the conclusion. Useful
+  premise dimensions include a prior or current state, longitudinal baseline/trajectory,
+  persistent condition, constraint/policy, exposure or action, measurement, and observed
+  response/outcome.
+- A DERIVED premise is justified only when participant memory could contain its concrete
+  value and changing that value could change the answer. Do not add background facts merely
+  because they are related.
+- Do not encode general-domain causal/mechanistic steps as requirements. Those belong to an
+  INFER or POSSIBLE_CAUSE bridge after participant-specific endpoints and material premises
+  have been grounded.
+- The goal is premise-complete but minimal: LLM #2 may supply authorized general knowledge,
+  but it must never have to guess missing participant history, state, measurements, actions,
+  constraints, or outcomes.
+
 TEMPORAL SELECTOR DISCIPLINE
 - Default selector is empty. Time metadata existing on memories is not a reason to select.
 - Use EARLIEST/LATEST only when the question semantically asks for first/onset/earliest or
@@ -57,11 +76,12 @@ are grounded, connect the relevant requirement(s) to ANSWER with INFER.
 
 CAUSAL / EXPLANATORY
 For whether one participant exposure/event/state could explain another, use separate
-participant cause-side and effect-side requirements and POSSIBLE_CAUSE. Use CAUSES only when
-an explicit stored participant causal relation itself is required. When longitudinal
-progression can change the explanation, include the relevant prior baseline/current
-measurement as memory-valued requirements. Do not collapse such a question into one generic
-clinical assessment or explanation node.
+participant cause-side and effect-side requirements and POSSIBLE_CAUSE. Also include any
+participant-specific baseline, persistent state, prior condition, measurement, action, or
+response that materially changes whether that connection is plausible. Use CAUSES only when
+an explicit stored participant causal relation itself is required. Do not collapse such a
+question into one generic assessment or explanation node, and do not turn a general-domain
+mechanism into a fake participant memory.
 
 CANDIDATE SET
 Candidates are propositions, not memories. Return the smallest shared/discriminative
@@ -83,9 +103,11 @@ Every DERIVED requirement must participate in an answer-relevant bridge.
 FINAL SELF-CHECK BEFORE JSON
 1. Could participant memory contain a concrete value for every requirement?
 2. Would changing each requirement's value potentially change the answer?
-3. Is every non-empty selector actually necessary to choose among temporal members?
-4. Did you avoid turning the requested conclusion into a requirement?
-5. Are general-domain mechanisms bridges rather than fake memories?
+3. For an inference/synthesis, did you include every participant-specific premise that could
+   materially change the conclusion, rather than only the question endpoints?
+4. Is every non-empty selector actually necessary to choose among temporal members?
+5. Did you avoid turning the requested conclusion into a requirement?
+6. Are general-domain mechanisms bridges rather than fake memories?
 
 DIRECT CANDIDATE
 candidate is allowed only when exactly one QUESTION requirement is sufficient and exactly one
@@ -96,9 +118,9 @@ extremum/range, or multi-step reasoning.
 
 
 class ReadAnswerSensitiveControllerMixin:
-    """Use the selector-disciplined Requirement-vNext-2 policy without another LLM call."""
+    """Use the premise-complete Requirement-vNext-3 policy without another LLM call."""
 
-    CONTROLLER_SCHEMA_VERSION = "requirement-vnext-2"
+    CONTROLLER_SCHEMA_VERSION = "requirement-vnext-3"
     CONTROLLER_MAX_OUTPUT_TOKENS = 512
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
@@ -211,7 +233,7 @@ class ReadAnswerSensitiveControllerMixin:
                 proposition_pack.get("retrieval_views") or []
             ),
             "controller_schema_version": self.CONTROLLER_SCHEMA_VERSION,
-            "controller_policy": "answer_sensitive_selector_disciplined",
+            "controller_policy": "premise_complete_selector_disciplined",
         }
 
         if supports is not None:
