@@ -1,6 +1,7 @@
 """Regression tests for the shared managed-Gemini retry policy."""
 
 from types import SimpleNamespace
+import warnings
 
 import pytest
 
@@ -280,3 +281,16 @@ def test_graphrag_uses_explicit_openai_provider_for_gemini_named_proxy(
     assert received["model_name"] == "gemini/gemini-3.5-flash-lite"
     assert received["api_key"] == "build-key"
     assert received["base_url"] == "https://proxy.example/v1"
+
+
+def test_graphrag_suppresses_fixed_sampling_warning():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with graph_rag._suppress_fixed_sampling_warning():
+            warnings.warn(
+                "Model 'gemini-3.5-flash-lite' uses fixed sampling defaults; the "
+                "sampling parameter(s) temperature will be ignored.",
+                UserWarning,
+            )
+
+    assert caught == []

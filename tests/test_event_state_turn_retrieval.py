@@ -161,9 +161,9 @@ def test_configured_raw_excerpt_budget_reaches_effective_agent():
         llm_client=EmptyExtractionLLM(), memory_llm_client=EmptyExtractionLLM(),
         embedding_client=KeywordEmbedder(), **config.agent_params,
     )
-    assert config.retrieval_config["max_episode_source_excerpts_total"] == 2
-    assert agent.max_episode_source_excerpts_total == 2
-    assert agent._retrieval_config["max_episode_source_excerpts_total"] == 2
+    assert config.retrieval_config["max_episode_source_excerpts_total"] == 4
+    assert agent.max_episode_source_excerpts_total == 4
+    assert agent._retrieval_config["max_episode_source_excerpts_total"] == 4
 
 
 def test_claim_provenance_and_direct_turn_retrieval_render_one_copy():

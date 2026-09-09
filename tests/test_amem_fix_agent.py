@@ -151,6 +151,10 @@ def test_amem_fix_does_not_hide_exhausted_keyword_api_calls():
 
 
 def test_gemini_build_client_is_not_initialized_for_query_only_restore(monkeypatch):
+    import sys
+    amem_dir = str(Path(__file__).resolve().parent.parent / "methods" / "amem" / "A-mem")
+    if amem_dir not in sys.path:
+        sys.path.insert(0, amem_dir)
     calls = []
     robust_module = importlib.import_module("memory_layer_robust")
 

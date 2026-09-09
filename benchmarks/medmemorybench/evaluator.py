@@ -2312,7 +2312,7 @@ class MedMemoryBenchEvaluator:
     ) -> Optional[Path]:
         if (
             self.dry_run
-            or self._memory_snapshot_manifest is None
+            or getattr(self, "_memory_snapshot_manifest", None) is None
             or not self._supports_memory_snapshots()
         ):
             return None
@@ -2337,7 +2337,7 @@ class MedMemoryBenchEvaluator:
                 or getattr(self, "force_resume", False)
             )
             or self.dry_run
-            or self._memory_snapshot_manifest is None
+            or getattr(self, "_memory_snapshot_manifest", None) is None
             or not self._supports_memory_snapshots()
         ):
             return None
@@ -3512,10 +3512,9 @@ class MedMemoryBenchEvaluator:
                     if saved_request is not None
                     else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
-                formatted_question = self.prompt_manager.format_query(
+                formatted_question = self._format_query_prompt(
                     question=query.question,
                     query_type=query.query_type,
-                    prompt_protocol=self.prompt_protocol,
                 )
                 try:
                     prepared = self._run_api_call(
@@ -3705,10 +3704,9 @@ class MedMemoryBenchEvaluator:
             query, _, _, batch_request_time, prepared = item
             if prepared is not None:
                 return prepared, None
-            formatted_question = self.prompt_manager.format_query(
+            formatted_question = self._format_query_prompt(
                 question=query.question,
                 query_type=query.query_type,
-                prompt_protocol=self.prompt_protocol,
             )
             try:
                 return self._run_api_call(
@@ -3887,6 +3885,24 @@ class MedMemoryBenchEvaluator:
         self._pending_batch_queries = []
         return finalized
 
+    def _format_query_prompt(
+        self,
+        question: str,
+        query_type: Optional[str] = None,
+    ) -> str:
+        prompt_protocol = getattr(self, "prompt_protocol", "type_aware")
+        try:
+            return self.prompt_manager.format_query(
+                question=question,
+                query_type=query_type,
+                prompt_protocol=prompt_protocol,
+            )
+        except TypeError:
+            return self.prompt_manager.format_query(
+                question=question,
+                query_type=query_type,
+            )
+
     def _evaluate_query(
         self,
         query,
@@ -3906,10 +3922,9 @@ class MedMemoryBenchEvaluator:
                 details={"dry_run": True},
             )
 
-        formatted_question = self.prompt_manager.format_query(
+        formatted_question = self._format_query_prompt(
             question=query.question,
             query_type=query.query_type,
-            prompt_protocol=getattr(self, "prompt_protocol", "type_aware"),
         )
 
         try:
@@ -3975,10 +3990,9 @@ class MedMemoryBenchEvaluator:
         unit_id: Optional[int] = None,
     ) -> Optional[MetricResult]:
         """Run retrieval, final answering, and scoring as explicit stages."""
-        formatted_question = self.prompt_manager.format_query(
+        formatted_question = self._format_query_prompt(
             question=query.question,
             query_type=query.query_type,
-            prompt_protocol=getattr(self, "prompt_protocol", "type_aware"),
         )
         try:
             staged_query = self._run_api_call(
