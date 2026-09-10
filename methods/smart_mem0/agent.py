@@ -20,6 +20,7 @@ from .read_temporal_contract import ReadTemporalContractMixin
 from .read_execution_contract import ReadExecutionContractMixin
 from .read_plan_contract import ReadPlanContractMixin
 from .read_requirement_contract import ReadRequirementContractMixin
+from .read_requirement_graph import ReadRequirementGraphMixin
 from .read_reasoning_bridge import ReadReasoningBridgeMixin
 from .read_reasoning_completion import ReadReasoningCompletionMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
@@ -41,6 +42,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadRequirementGraphMixin,
     ReadQueryMemoryAlignmentMixin,
     ReadReasoningCompletionMixin,
     ReadProgressiveRetrievalMixin,
@@ -99,9 +101,14 @@ class SmartMem0Agent(
         self.enable_slot_support_validation = False
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
-        """Keep the generic query topology available to later deterministic arbitration."""
+        """Keep semantic telemetry available to deterministic context arbitration."""
         supports, plan, telemetry = super()._semantic_controller(
             question, seeds, frame, context_map=context_map
         )
         self._active_query_shape = deepcopy(telemetry.get("query_shape") or {})
+        self._active_requirement_graph = deepcopy(
+            telemetry.get("requirement_graph")
+            or getattr(self, "_active_requirement_graph", {})
+            or {}
+        )
         return supports, plan, telemetry
