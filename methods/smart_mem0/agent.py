@@ -25,6 +25,7 @@ from .read_evidence_policy import ReadEvidencePolicyMixin
 from .read_evidence_precision import ReadEvidencePrecisionMixin
 from .read_progressive_retrieval import ReadProgressiveRetrievalMixin
 from .read_retrieval_fusion import ReadRetrievalFusionMixin
+from .read_proof_context_retention import ReadProofContextRetentionMixin
 from .read_evidence_resolve import ReadEvidenceResolveMixin
 from .read_semantic_closure import ReadSemanticClosureMixin
 from .read_runtime_support import ReadRuntimeSupportMixin
@@ -40,6 +41,7 @@ class SmartMem0Agent(
     ReadReasoningCompletionMixin,
     ReadProgressiveRetrievalMixin,
     ReadRetrievalFusionMixin,
+    ReadProofContextRetentionMixin,
     ReadEvidenceResolveMixin,
     ReadAnswerSensitiveControllerMixin,
     ReadSemanticClosureMixin,
