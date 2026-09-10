@@ -1,5 +1,7 @@
 """Public SmartMem0 facade assembled from the locked two-stage READ architecture."""
 
+from copy import deepcopy
+
 from methods.base import BaseAgent
 from .capture import CaptureMixin
 from .consolidation import ConsolidationMixin
@@ -95,3 +97,11 @@ class SmartMem0Agent(
         self.enable_zero_result_recovery = True
         self.enable_planner_repair = False
         self.enable_slot_support_validation = False
+
+    def _semantic_controller(self, question, seeds, frame, context_map=None):
+        """Keep the generic query topology available to later deterministic arbitration."""
+        supports, plan, telemetry = super()._semantic_controller(
+            question, seeds, frame, context_map=context_map
+        )
+        self._active_query_shape = deepcopy(telemetry.get("query_shape") or {})
+        return supports, plan, telemetry
