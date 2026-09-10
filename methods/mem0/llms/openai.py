@@ -21,6 +21,7 @@ class OpenAILLM(LLMBase):
             self.config.model = "gpt-4o-mini"
 
         self._http_client = None  # Keep reference for proper cleanup
+        self._is_openrouter = self.config.api_provider == "openrouter"
         self._init_client()
 
     def _create_http_client(self):
@@ -58,10 +59,11 @@ class OpenAILLM(LLMBase):
 
         self._http_client = self._create_http_client()
 
-        if os.environ.get("OPENROUTER_API_KEY"):
+        if self._is_openrouter:
             self.client = OpenAI(
-                api_key=os.environ.get("OPENROUTER_API_KEY"),
+                api_key=self.config.api_key or os.environ.get("OPENROUTER_API_KEY"),
                 base_url=self.config.openrouter_base_url
+                or self.config.openai_base_url
                 or os.getenv("OPENROUTER_API_BASE")
                 or "https://openrouter.ai/api/v1",
                 http_client=self._http_client,
@@ -132,7 +134,7 @@ class OpenAILLM(LLMBase):
             "max_completion_tokens": self.config.max_tokens,
         }
         if self.config.reasoning_effort is not None:
-            if os.getenv("OPENROUTER_API_KEY"):
+            if self._is_openrouter:
                 extra_body = dict(params.get("extra_body") or {})
                 reasoning = dict(extra_body.get("reasoning") or {})
                 reasoning.setdefault("effort", self.config.reasoning_effort)
@@ -143,7 +145,7 @@ class OpenAILLM(LLMBase):
         if self.config.extra_body:
             params["extra_body"] = self.config.extra_body
 
-        if os.getenv("OPENROUTER_API_KEY"):
+        if self._is_openrouter:
             openrouter_params = {}
             if self.config.models:
                 openrouter_params["models"] = self.config.models

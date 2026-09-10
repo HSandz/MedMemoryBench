@@ -8,6 +8,7 @@ from remem.llm import CacheOpenAI
 from remem.prompts import PromptTemplateManager
 from remem.utils.logging_utils import get_logger
 from remem.utils.misc_utils import NerRawOutput, ParaphraseRawOutput, TripleRawOutput
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -99,7 +100,9 @@ class EpisodicExtraction:
         with ThreadPoolExecutor() as executor:
             # Create extraction futures for each chunk
             extraction_futures = {
-                executor.submit(self.episodic_extraction, chunk_key, passage): chunk_key
+                submit_with_copied_context(
+                    executor, self.episodic_extraction, chunk_key, passage
+                ): chunk_key
                 for chunk_key, passage in chunk_passages.items()
             }
 

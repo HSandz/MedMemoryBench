@@ -37,7 +37,7 @@ from metrics.retrieval_quality import compute_session_retrieval_quality
 from utils.templates import get_prompt_manager
 from utils.logger import truncate_error_message
 from utils.batch_client import create_batch_client
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import LLMResponse, get_usage_tracker
 from utils.vertex_batch import (
     BatchChatRequest,
     VertexBatchClient,
@@ -153,6 +153,7 @@ class LoCoMoEvaluator:
         }
         self._query_checkpoint_pending_writes = 0
         self._query_checkpoint_pending_records: List[Dict[str, Any]] = []
+        self._recovered_batch_usage_query_ids: set[Tuple[str, str]] = set()
         self._batch_retrieval_preparation_wall_time = 0.0
         self._memory_build_checkpoint_saved = False
 
@@ -571,7 +572,66 @@ class LoCoMoEvaluator:
         saved = self._query_checkpoint.get("results", {}).get(str(unit.context_id), {})
         if not isinstance(saved, dict):
             return []
-        return [MetricResult(**saved[query.query_id]) for query in unit.queries_to_evaluate if query.query_id in saved]
+        results = [
+            MetricResult(**saved[query.query_id])
+            for query in unit.queries_to_evaluate
+            if query.query_id in saved
+        ]
+        self._restore_batch_usage_from_checkpoint(unit.context_id, results)
+        return results
+
+    def _restore_batch_usage_from_checkpoint(
+        self,
+        context_id: Any,
+        results: List[MetricResult],
+    ) -> None:
+        """Rehydrate batch usage when a resume skips already-completed queries."""
+        recovered_ids = getattr(self, "_recovered_batch_usage_query_ids", None)
+        if recovered_ids is None:
+            recovered_ids = set()
+            self._recovered_batch_usage_query_ids = recovered_ids
+
+        tracker = get_usage_tracker()
+        model = getattr(getattr(self, "method_config", None), "model", None)
+        model_name = getattr(model, "name", "")
+        for result in results:
+            details = result.details if isinstance(result.details, dict) else {}
+            execution_usage = details.get("execution_usage", {})
+            answer_usage = (
+                execution_usage.get("answer", {})
+                if isinstance(execution_usage, dict) else {}
+            )
+            if (
+                not isinstance(answer_usage, dict)
+                or answer_usage.get("transport") != "batch"
+            ):
+                continue
+            key = (str(context_id), str(result.query_id))
+            if key in recovered_ids:
+                continue
+            recovered_ids.add(key)
+            tracker.set_phase("query")
+            tracker.record(LLMResponse(
+                content="",
+                input_tokens=answer_usage.get("input_tokens", 0),
+                output_tokens=answer_usage.get("output_tokens", 0),
+                visible_output_tokens=answer_usage.get("visible_output_tokens"),
+                thinking_tokens=answer_usage.get("thinking_tokens", 0),
+                model=model_name,
+            ))
+
+    @staticmethod
+    def _batch_answer_execution_usage(
+        batch_response: Any,
+    ) -> Dict[str, Any]:
+        """Preserve all provider token fields in resumable query results."""
+        return {
+            "transport": "batch",
+            "input_tokens": batch_response.input_tokens,
+            "output_tokens": batch_response.output_tokens,
+            "visible_output_tokens": batch_response.visible_output_tokens,
+            "thinking_tokens": batch_response.thinking_tokens,
+        }
 
     def _pending_query_unit(self, unit: EvaluationUnit) -> EvaluationUnit:
         saved = self._query_checkpoint.get("results", {}).get(str(unit.context_id), {})
@@ -864,10 +924,12 @@ class LoCoMoEvaluator:
                                     "source_event_id": session.metadata.get("session_key"),
                                 })
                             memory_items.append(memory_item)
+                    is_last_session = (chunk_idx == total_chunks - 1)
                     memory_result = self.agent_manager.send_message(
                         message=formatted_text,
                         memorizing=True,
                         context_id=unit.context_id,
+                        is_last_session=is_last_session,
                         memory_items=memory_items,
                     )
 
@@ -1266,11 +1328,9 @@ class LoCoMoEvaluator:
                 output_tokens=batch_response.output_tokens,
             )
             result = self._score_agent_response(query, response)
-            result.details.setdefault("execution_usage", {})["answer"] = {
-                "transport": "batch",
-                "input_tokens": batch_response.input_tokens,
-                "output_tokens": batch_response.output_tokens,
-            }
+            result.details.setdefault("execution_usage", {})["answer"] = (
+                self._batch_answer_execution_usage(batch_response)
+            )
             results.append(result)
         return results
 
@@ -1436,11 +1496,9 @@ class LoCoMoEvaluator:
                     )
                     result = self._score_agent_response(query, response)
                     if hasattr(result, "details"):
-                        result.details.setdefault("execution_usage", {})["answer"] = {
-                            "transport": "batch",
-                            "input_tokens": batch_response.input_tokens,
-                            "output_tokens": batch_response.output_tokens,
-                        }
+                        result.details.setdefault("execution_usage", {})["answer"] = (
+                            self._batch_answer_execution_usage(batch_response)
+                        )
 
                 result.memory_construction_time = item["memory_time_per_query"]
                 progress.update(1)
@@ -1962,20 +2020,33 @@ class LoCoMoEvaluator:
         summary["retrieval_quality"] = self._aggregate_locomo_retrieval(results)
 
     @staticmethod
-    def _batch_wall_time_seconds(stage: Dict[str, Any]) -> Optional[float]:
-        """Return batch job elapsed time only when its manifest timestamps agree."""
-        submitted_at = stage.get("submitted_at")
+    def _batch_elapsed_seconds(
+        stage: Dict[str, Any],
+        started_at_key: str,
+    ) -> Optional[float]:
+        """Return elapsed batch time only when the recorded timestamps agree."""
+        started_at = stage.get(started_at_key)
         completed_at = stage.get("completed_at")
-        if not isinstance(submitted_at, str) or not isinstance(completed_at, str):
+        if not isinstance(started_at, str) or not isinstance(completed_at, str):
             return None
         try:
             elapsed = (
                 datetime.fromisoformat(completed_at)
-                - datetime.fromisoformat(submitted_at)
+                - datetime.fromisoformat(started_at)
             ).total_seconds()
         except (TypeError, ValueError):
             return None
         return elapsed if elapsed >= 0 else None
+
+    @classmethod
+    def _batch_wall_time_seconds(cls, stage: Dict[str, Any]) -> Optional[float]:
+        """Return queue-inclusive elapsed time retained for legacy reports."""
+        return cls._batch_elapsed_seconds(stage, "submitted_at")
+
+    @classmethod
+    def _batch_overall_latency_seconds(cls, stage: Dict[str, Any]) -> Optional[float]:
+        """Return batch execution time from RUNNING to terminal completion."""
+        return cls._batch_elapsed_seconds(stage, "running_at")
 
     @staticmethod
     def _aggregate_batch_answer_usage(results: List[MetricResult]) -> Dict[str, Any]:
@@ -2002,13 +2073,38 @@ class LoCoMoEvaluator:
             "transport": "batch",
         }
 
+    def _batch_manifest_paths_for_report(self) -> List[Path]:
+        """Find the current run's manifest even when resume skipped batch setup."""
+        paths: List[Path] = []
+        manifest_path = getattr(getattr(self, "_batch_client", None), "manifest_path", None)
+        if manifest_path:
+            paths.append(Path(manifest_path))
+
+        model = getattr(getattr(self, "method_config", None), "model", None)
+        model_name = getattr(model, "name", None)
+        if model_name:
+            paths.append(scoped_manifest_path(
+                self.output_dir / "batch",
+                "locomo_batch_manifest",
+                model=model_name,
+                config_hash=self._batch_config_hash(),
+            ))
+
+        unique_paths: List[Path] = []
+        seen = set()
+        for path in paths:
+            key = str(path.resolve())
+            if key not in seen and path.exists():
+                seen.add(key)
+                unique_paths.append(path)
+        return unique_paths
+
     def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
         """Expose local phase accounting and batch lifecycle without fake latency."""
         operations = llm_usage.get("operations", {})
         query_operations = operations.get("query", {})
         batch_stages = []
-        manifest_path = getattr(getattr(self, "_batch_client", None), "manifest_path", None)
-        if manifest_path:
+        for manifest_path in self._batch_manifest_paths_for_report():
             try:
                 manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
                 for name, stage in (manifest.get("jobs") or {}).items():
@@ -2018,8 +2114,10 @@ class LoCoMoEvaluator:
                         "stage": name, "state": stage.get("state"),
                         "request_count": len(stage.get("requests") or []),
                         "submitted_at": stage.get("submitted_at"),
+                        "running_at": stage.get("running_at"),
                         "completed_at": stage.get("completed_at"),
-                        "wall_time_seconds": self._batch_wall_time_seconds(stage),
+                        "overall_latency_seconds": self._batch_overall_latency_seconds(stage),
+                        "queue_inclusive_elapsed_seconds": self._batch_wall_time_seconds(stage),
                     })
             except (OSError, json.JSONDecodeError):
                 pass
@@ -2048,8 +2146,8 @@ class LoCoMoEvaluator:
         else:
             answer_generation = {"transport": "realtime", "usage": realtime_usage}
         if answer_batch_stages:
-            answer_generation["batch_wall_time_seconds"] = answer_batch_stages[-1][
-                "wall_time_seconds"
+            answer_generation["batch_overall_latency_seconds"] = answer_batch_stages[-1][
+                "overall_latency_seconds"
             ]
         return {
             "schema_version": 2,

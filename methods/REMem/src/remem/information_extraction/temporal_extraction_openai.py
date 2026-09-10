@@ -10,6 +10,7 @@ from remem.prompts import PromptTemplateManager
 from remem.utils.chunk_utils import make_chunk_content
 from remem.utils.logging_utils import get_logger
 from remem.utils.misc_utils import TemporalRawOutput
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -83,7 +84,9 @@ class TemporalExtraction:
         with ThreadPoolExecutor(max_workers=8) as executor:
             # Create extraction futures for each chunk
             extraction_futures = {
-                executor.submit(self.temporal_extraction, chunk_key, passage): chunk_key
+                submit_with_copied_context(
+                    executor, self.temporal_extraction, chunk_key, passage
+                ): chunk_key
                 for chunk_key, passage in chunk_passages.items()
             }
 

@@ -16,6 +16,7 @@ from remem.utils.llm_utils import TextChatMessage
 from remem.utils.logging_utils import get_logger
 
 from .base import BaseLLM, LLMConfig
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -261,7 +262,10 @@ class CacheOpenAI(BaseLLM):
         results = [None] * len(messages_list)
         assert messages_list, "messages_list must be non-empty"
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {executor.submit(self.infer, msgs, **kwargs): idx for idx, msgs in enumerate(messages_list)}
+            future_to_idx = {
+                submit_with_copied_context(executor, self.infer, msgs, **kwargs): idx
+                for idx, msgs in enumerate(messages_list)
+            }
 
             with tqdm(total=len(messages_list), desc="batch_infer") as pbar:
                 for future in as_completed(future_to_idx):

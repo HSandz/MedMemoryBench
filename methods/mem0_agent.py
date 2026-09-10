@@ -203,6 +203,7 @@ class Mem0Agent(BaseAgent):
                     "max_tokens": self._memory_max_tokens,
                     "reasoning_effort": self._memory_llm_client_kwargs.get("reasoning_effort"),
                     "api_key": self._memory_api_key,
+                    "api_provider": self._memory_provider,
                     "openai_base_url": self._memory_base_url,
                     "gemini_provider": self._memory_provider,
                     "extra_body": (

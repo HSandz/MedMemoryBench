@@ -1,17 +1,22 @@
 from typing import Dict, Optional, List, Any
 import torch, numpy as np
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoModelForTokenClassification, AutoTokenizer
 
 class LlmLingua2Segmenter:
     def __init__(self, config: Optional[Dict] = None, shared: bool = False, compressor=None):
         self.config = config
 
         if shared is False:
-            self.model = AutoModel.from_pretrained(
-                pretrained_model_name_or_path=self.config["model_name"],
-                device_map=self.config.get("device_map", None),
-                torch_dtype=self.config.get("torch_dtype", None),
-                **self.config.get("model_config", {})
+            # LLMLingua-2 checkpoints are token-classification models. Loading
+            # one as AutoModel drops its trained classifier and invents a pooler.
+            model_kwargs = {
+                "device_map": self.config.get("device_map", None),
+                **self.config.get("model_config", {}),
+            }
+            if self.config.get("torch_dtype") is not None:
+                model_kwargs["torch_dtype"] = self.config["torch_dtype"]
+            self.model = AutoModelForTokenClassification.from_pretrained(
+                self.config["model_name"], **model_kwargs
             ).eval()
             self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
             self.buffer_len = self.config.get("buffer_len", 512)

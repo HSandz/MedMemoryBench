@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from rank_bm25 import BM25Okapi
 
 from memory_layer_robust import RobustAgenticMemorySystem, RobustMemoryNote
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import get_usage_tracker, submit_with_copied_context
 
 
 logger = logging.getLogger("amem_typed")
@@ -1053,7 +1053,11 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
         if workers == 1 or len(values) < 2:
             return [analyze(value) for value in values]
         with ThreadPoolExecutor(max_workers=min(workers, len(values))) as executor:
-            return list(executor.map(analyze, values))
+            futures = [
+                submit_with_copied_context(executor, analyze, value)
+                for value in values
+            ]
+            return [future.result() for future in futures]
 
     def add_notes_parallel(
         self,
@@ -1156,7 +1160,11 @@ class TypedRelationMemorySystem(RobustAgenticMemorySystem):
                 return [], "", str(exc)
 
         with ThreadPoolExecutor(max_workers=min(workers, len(prepared))) as executor:
-            relation_results = list(executor.map(infer, prepared))
+            futures = [
+                submit_with_copied_context(executor, infer, item)
+                for item in prepared
+            ]
+            relation_results = [future.result() for future in futures]
 
         note_ids: List[str] = []
         for item, (inferred_edges, raw_response, inference_error) in zip(

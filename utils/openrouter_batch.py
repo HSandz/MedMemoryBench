@@ -38,6 +38,7 @@ from utils.logger import truncate_error_message
 
 
 OPENROUTER_TERMINAL_STATES = {"completed", "failed", "expired", "cancelled"}
+OPENROUTER_RUNNING_STATES = {"in_progress", "processing", "running"}
 
 
 class OpenRouterBatchError(VertexBatchError):
@@ -407,25 +408,35 @@ class OpenRouterBatchClient(VertexBatchClient):
             raise OpenRouterBatchError("OpenRouter batch submission returned no batch ID.")
         state = str(payload.get("status") or "validating").lower()
         self._progress(f"Stage '{stage}': submitted {job_name} (state: {state}).")
-        return {
+        submitted_at = _utc_now()
+        job_entry = {
             "stage": stage,
             "job_name": job_name,
             "state": state,
             "project": self.project,
             "input_uri": None,
             "output_uri": None,
-            "submitted_at": _utc_now(),
+            "submitted_at": submitted_at,
             "requests": [request.to_manifest_dict() for request in requests],
             "request_fingerprint": self._request_fingerprint(requests),
             "responses": {},
         }
+        if state in OPENROUTER_RUNNING_STATES:
+            job_entry["running_at"] = submitted_at
+        return job_entry
 
     def _get_job(self, job_name: str, project: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", f"{self.base_url}/batches/{quote(job_name, safe='')}")
 
-    def _wait_for_job(self, job_entry: Dict[str, Any]) -> Dict[str, Any]:
+    def _wait_for_job(
+        self,
+        job_entry: Dict[str, Any],
+        manifest: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         job = self._get_job(job_entry["job_name"])
         state = str(job.get("status") or "").lower()
+        if self._record_running_at(job_entry, state) and manifest is not None:
+            self._save_manifest(manifest)
         attempts = 0
         self._progress(
             f"Stage '{job_entry['stage']}': {job_entry['job_name']} is {state or 'unknown'}; "
@@ -441,10 +452,22 @@ class OpenRouterBatchClient(VertexBatchClient):
                     f"Stage '{job_entry['stage']}': poll {attempts}; "
                     f"{job_entry['job_name']} is {new_state or 'unknown'}."
                 )
+            if self._record_running_at(job_entry, new_state) and manifest is not None:
+                self._save_manifest(manifest)
             state = new_state
         job_entry["state"] = state
         job_entry["completed_at"] = _utc_now()
+        if manifest is not None:
+            self._save_manifest(manifest)
         return job
+
+    @staticmethod
+    def _record_running_at(job_entry: Dict[str, Any], state: str) -> bool:
+        """Persist the first observed running state for execution-latency reporting."""
+        if state in OPENROUTER_RUNNING_STATES and not job_entry.get("running_at"):
+            job_entry["running_at"] = _utc_now()
+            return True
+        return False
 
     def _wait_or_raise_pending(
         self,
@@ -454,12 +477,18 @@ class OpenRouterBatchClient(VertexBatchClient):
     ) -> None:
         job = self._get_job(job_entry["job_name"])
         job_entry["state"] = str(job.get("status") or "").lower()
+        running_at_recorded = self._record_running_at(job_entry, job_entry["state"])
         if job_entry["state"] in OPENROUTER_TERMINAL_STATES:
+            if not job_entry.get("completed_at"):
+                job_entry["completed_at"] = _utc_now()
+            self._save_manifest(manifest)
             return
         if not self.wait_for_completion:
             self._save_manifest(manifest)
             raise OpenRouterBatchPending(stage, job_entry["job_name"], self.manifest_path)
-        self._wait_for_job(job_entry)
+        if running_at_recorded:
+            self._save_manifest(manifest)
+        self._wait_for_job(job_entry, manifest)
 
     @staticmethod
     def _content(body: Dict[str, Any]) -> str:

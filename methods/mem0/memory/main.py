@@ -28,6 +28,7 @@ from methods.mem0.memory.utils import (
     remove_code_blocks,
 )
 from methods.mem0.utils.factory import EmbedderFactory, LlmFactory, VectorStoreFactory
+from utils.llm_client import submit_with_copied_context
 
 # Setup user config
 setup_config()
@@ -171,8 +172,12 @@ class Memory(MemoryBase):
         # Note: Rate limiting is now handled by retry mechanisms in LLM and embedding modules
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, metadata, filters, infer)
-            future2 = executor.submit(self._add_to_graph, messages, filters)
+            future1 = submit_with_copied_context(
+                executor, self._add_to_vector_store, messages, metadata, filters, infer
+            )
+            future2 = submit_with_copied_context(
+                executor, self._add_to_graph, messages, filters
+            )
 
             concurrent.futures.wait([future1, future2])
 

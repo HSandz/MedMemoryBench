@@ -41,6 +41,7 @@ from utils.llm_client import (
     create_llm_client,
     get_usage_tracker,
     run_with_llm_retry,
+    submit_with_copied_context,
 )
 from utils.batch_client import create_batch_client
 from utils.vertex_batch import BatchChatRequest, VertexBatchClient, make_request_id, scoped_manifest_path
@@ -318,7 +319,9 @@ class KnowledgeGraph:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_node = {
-                executor.submit(self._extract_concepts_and_entities, split.page_content, llm): i
+                submit_with_copied_context(
+                    executor, self._extract_concepts_and_entities, split.page_content, llm
+                ): i
                 for i, split in enumerate(splits)
             }
 
@@ -514,10 +517,10 @@ class QueryEngine:
             return self._tokenizer.decode(tokens[:max_tokens])
         return text
 
-    def query(self, query: str) -> Tuple[str, str, List[int], Dict[int, str]]:
+    def query(self, query: str, raw_question: Optional[str] = None) -> Tuple[str, str, List[int], Dict[int, str]]:
         """Process a query and return answer with context."""
         # Extract the actual question for retrieval
-        retrieval_query = self._extract_retrieval_query(query)
+        retrieval_query = raw_question or self._extract_retrieval_query(query)
         logger.debug(f"[GraphRAG] Retrieval query: {retrieval_query[:100]}...")
 
         # Retrieve relevant documents
@@ -542,12 +545,13 @@ class QueryEngine:
         patterns = [
             r"Now Answer the Question:\s*(.*)",
             r"Here is the conversation:\s*(.*)",
+            r"(?:Question|问题)[:：]?\s*(.+?)(?:\n\n|\Z)",
         ]
 
         for pattern in patterns:
             match = re.search(pattern, query, re.DOTALL)
             if match:
-                return ''.join(match.groups())
+                return ''.join(match.groups()).strip()
 
         return query
 
@@ -769,12 +773,14 @@ class GraphRAG:
             retrieve_num=self.retrieve_num,
         )
 
-    def query(self, query: str) -> Tuple[str, str]:
+    def query(self, query: str, raw_question: Optional[str] = None) -> Tuple[str, str]:
         """Query the system and return answer with context."""
         if self.query_engine is None:
             raise RuntimeError("GraphRAG not initialized. Call process_documents first.")
 
-        final_answer, expanded_context, _, _ = self.query_engine.query(query)
+        final_answer, expanded_context, _, _ = self.query_engine.query(
+            query, raw_question=raw_question
+        )
 
         # Extract text from LLM response if needed
         if hasattr(final_answer, 'content'):
@@ -1047,7 +1053,8 @@ class GraphRAGAgent(BaseAgent):
             )
 
         try:
-            response, retrieval_context = self._graph_rag.query(question)
+            raw_question = kwargs.get("raw_question")
+            response, retrieval_context = self._graph_rag.query(question, raw_question=raw_question)
             response_text = response
         except Exception as exc:
             # Never score a transport error as an answer. The evaluator can

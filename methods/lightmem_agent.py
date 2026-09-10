@@ -15,7 +15,13 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Literal
 
 from .base import BaseAgent, MemoryBuildResult, AgentResponse
-from utils.llm_client import create_llm_client, format_messages, BaseLLMClient, get_usage_tracker
+from utils.llm_client import (
+    BaseLLMClient,
+    create_llm_client,
+    format_messages,
+    get_usage_tracker,
+    submit_with_copied_context,
+)
 
 
 class TrackedMemoryManager:
@@ -295,7 +301,13 @@ class TrackedMemoryManager:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             try:
-                results = list(executor.map(process_segment_wrapper, enumerate(extract_list)))
+                # ContextVars do not cross thread boundaries automatically. Each task
+                # needs its own copied context so build usage remains in memorize_phase.
+                futures = [
+                    submit_with_copied_context(executor, process_segment_wrapper, item)
+                    for item in enumerate(extract_list)
+                ]
+                results = [future.result() for future in futures]
             except Exception as e:
                 print(f"Error in parallel processing: {e}")
                 results = [None] * len(extract_list)
@@ -403,7 +415,7 @@ class LightMemAgent(BaseAgent):
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self._base_url = base_url or os.environ.get("OPENAI_BASE_URL")
         self._memory_model = memory_model or model
-        self._memory_provider = memory_provider or provider
+        self._memory_provider = (memory_provider or provider).lower()
         self._memory_api_key = memory_api_key or self._api_key
         self._memory_base_url = memory_base_url or self._base_url
         self._memory_temperature = (
@@ -491,7 +503,13 @@ class LightMemAgent(BaseAgent):
                 "configs": {
                     "model": getattr(self, "_memory_model", self.model),
                     "api_key": getattr(self, "_memory_api_key", self._api_key),
+                    "api_provider": self._memory_provider,
                     "openai_base_url": getattr(self, "_memory_base_url", self._base_url),
+                    "openrouter_base_url": (
+                        getattr(self, "_memory_base_url", self._base_url)
+                        if self._memory_provider == "openrouter"
+                        else None
+                    ),
                     "temperature": getattr(
                         self, "_memory_temperature", self.lightmem_temperature
                     ),

@@ -25,6 +25,7 @@ from utils.llm_client import (
     create_llm_client,
     format_messages,
     get_usage_tracker,
+    submit_with_copied_context,
 )
 from utils.batch_client import create_batch_client
 from utils.vertex_batch import (
@@ -175,7 +176,7 @@ class TrackedLLMWrapper:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
-                executor.submit(self.infer, msgs, **kwargs): idx
+                submit_with_copied_context(executor, self.infer, msgs, **kwargs): idx
                 for idx, msgs in enumerate(messages_list)
             }
 

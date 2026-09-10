@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import tempfile
+import contextvars
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -16,6 +17,12 @@ from functools import wraps
 
 from utils.tokenizer import get_tokenizer, TokenizerProtocol
 from utils.logger import truncate_error_message
+
+
+def submit_with_copied_context(executor: Any, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Submit one task with the caller's ContextVars, using a fresh context per task."""
+    worker_context = contextvars.copy_context()
+    return executor.submit(worker_context.run, fn, *args, **kwargs)
 
 try:
     from dotenv import load_dotenv
