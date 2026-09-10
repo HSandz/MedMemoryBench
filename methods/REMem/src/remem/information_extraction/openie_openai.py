@@ -14,6 +14,7 @@ from remem.utils.llm_utils import (
 )
 from remem.utils.logging_utils import get_logger
 from remem.utils.misc_utils import NerRawOutput, TripleRawOutput
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -146,7 +147,7 @@ class OpenIE:
         with ThreadPoolExecutor() as executor:
             # Create NER futures for each chunk
             ner_futures = {
-                executor.submit(self.ner, chunk_key, passage): chunk_key
+                submit_with_copied_context(executor, self.ner, chunk_key, passage): chunk_key
                 for chunk_key, passage in chunk_passages.items()
             }
 
@@ -174,7 +175,8 @@ class OpenIE:
         with ThreadPoolExecutor() as executor:
             # Create triple extraction futures for each chunk
             re_futures = {
-                executor.submit(
+                submit_with_copied_context(
+                    executor,
                     self.triple_extraction,
                     ner_result.chunk_id,
                     chunk_passages[ner_result.chunk_id],

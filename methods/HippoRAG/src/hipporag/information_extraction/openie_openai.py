@@ -10,6 +10,7 @@ from ..utils.logging_utils import get_logger
 from ..utils.llm_utils import fix_broken_generated_json, filter_invalid_triples
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput
 from ..llm.openai_gpt import CacheOpenAI
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -157,7 +158,7 @@ class OpenIE:
         with ThreadPoolExecutor() as executor:
             # Create NER futures for each chunk
             ner_futures = {
-                executor.submit(self.ner, chunk_key, passage): chunk_key
+                submit_with_copied_context(executor, self.ner, chunk_key, passage): chunk_key
                 for chunk_key, passage in chunk_passages.items()
             }
 
@@ -183,9 +184,13 @@ class OpenIE:
         with ThreadPoolExecutor() as executor:
             # Create triple extraction futures for each chunk
             re_futures = {
-                executor.submit(self.triple_extraction, ner_result.chunk_id,
-                                chunk_passages[ner_result.chunk_id],
-                                ner_result.unique_entities): ner_result.chunk_id
+                submit_with_copied_context(
+                    executor,
+                    self.triple_extraction,
+                    ner_result.chunk_id,
+                    chunk_passages[ner_result.chunk_id],
+                    ner_result.unique_entities,
+                ): ner_result.chunk_id
                 for ner_result in ner_results_list
             }
             # Collect triple extraction results with progress bar

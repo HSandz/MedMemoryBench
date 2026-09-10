@@ -41,6 +41,7 @@ from utils.llm_client import (
     create_llm_client,
     get_usage_tracker,
     run_with_llm_retry,
+    submit_with_copied_context,
 )
 from utils.batch_client import create_batch_client
 from utils.vertex_batch import BatchChatRequest, VertexBatchClient, make_request_id, scoped_manifest_path
@@ -318,7 +319,9 @@ class KnowledgeGraph:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_node = {
-                executor.submit(self._extract_concepts_and_entities, split.page_content, llm): i
+                submit_with_copied_context(
+                    executor, self._extract_concepts_and_entities, split.page_content, llm
+                ): i
                 for i, split in enumerate(splits)
             }
 

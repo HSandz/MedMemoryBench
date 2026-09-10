@@ -4,11 +4,12 @@ import json
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from methods.event_state_agent import EventStateAgent
 from methods.event_state.embeddings import DenseEmbedder
-from utils.llm_client import get_usage_tracker
+from utils.llm_client import LLMResponse, get_usage_tracker, submit_with_copied_context
 from benchmarks.base import EvaluationUnit
 from benchmarks.medmemorybench.dataset import MedSession
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
@@ -167,6 +168,41 @@ def test_worker_usage_scopes_are_recorded_in_memorize_phase():
     assert "event_state.extract" in operations.get("memorize", {})
     assert "event_state.embedding" in operations.get("memorize", {})
     assert "event_state.extract" not in operations.get("query", {})
+
+
+def test_copied_context_keeps_parallel_usage_in_the_callers_phase():
+    tracker = get_usage_tracker()
+    tracker.reset()
+    tracker.set_phase("memorize")
+    barrier = threading.Barrier(4)
+
+    def record_worker_usage(index: int) -> None:
+        barrier.wait(timeout=2)
+        tracker.record(LLMResponse(
+            content="ok",
+            input_tokens=index + 1,
+            output_tokens=1,
+            latency=0.01,
+            model="test-model",
+        ))
+
+    # Each submission must own a Context: a Context cannot enter two workers
+    # concurrently, and a worker otherwise starts in the default "unknown" phase.
+    with tracker.scope("threaded.build"):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                submit_with_copied_context(executor, record_worker_usage, index)
+                for index in range(4)
+            ]
+            for future in futures:
+                future.result()
+
+    usage = tracker.get_stats()
+    assert usage["memorize_phase"]["successful_calls"] == 4
+    assert usage["memorize_phase"]["input_tokens"] == 10
+    assert usage["query_phase"]["successful_calls"] == 0
+    assert usage["operations"]["memorize"]["threaded.build"]["successful_calls"] == 4
+    tracker.reset()
 
 
 def test_dense_embedder_initializes_backend_once_under_concurrent_first_use(monkeypatch):

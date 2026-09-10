@@ -27,7 +27,9 @@ class BaseMemoryManagerConfig:
         trust_remote_code: bool = True,
         # API model specific parameters
         api_key: Optional[str] = None,
+        api_provider: str = "openai",
         openai_base_url: Optional[str] = None, # OpenAI specific
+        openrouter_base_url: Optional[str] = None,
         deepseek_base_url: Optional[str] = None, # DeepSeek specific
         vllm_base_url: Optional[str] = None, # vLLM specific
         site_url: Optional[str] = None,
@@ -57,7 +59,9 @@ class BaseMemoryManagerConfig:
 
         # API model specific parameters
         self.api_key = api_key
+        self.api_provider = (api_provider or "openai").lower()
         self.openai_base_url = openai_base_url
+        self.openrouter_base_url = openrouter_base_url
         self.deepseek_base_url = deepseek_base_url
         self.vllm_base_url = vllm_base_url
         self.site_url = site_url

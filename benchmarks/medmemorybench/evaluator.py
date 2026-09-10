@@ -1439,12 +1439,31 @@ class MedMemoryBenchEvaluator:
             responses = stage.get("responses") or {}
             response_values = list(responses.values()) if isinstance(responses, dict) else []
             submitted_at = stage.get("submitted_at")
+            running_at = stage.get("running_at")
             completed_at = stage.get("completed_at")
-            duration_seconds = None
+            queue_inclusive_elapsed_seconds = None
+            overall_latency_seconds = None
+            queue_wait_seconds = None
             if isinstance(submitted_at, str) and isinstance(completed_at, str):
                 try:
-                    duration_seconds = (
+                    queue_inclusive_elapsed_seconds = (
                         datetime.fromisoformat(completed_at)
+                        - datetime.fromisoformat(submitted_at)
+                    ).total_seconds()
+                except ValueError:
+                    pass
+            if isinstance(running_at, str) and isinstance(completed_at, str):
+                try:
+                    overall_latency_seconds = (
+                        datetime.fromisoformat(completed_at)
+                        - datetime.fromisoformat(running_at)
+                    ).total_seconds()
+                except ValueError:
+                    pass
+            if isinstance(submitted_at, str) and isinstance(running_at, str):
+                try:
+                    queue_wait_seconds = (
+                        datetime.fromisoformat(running_at)
                         - datetime.fromisoformat(submitted_at)
                     ).total_seconds()
                 except ValueError:
@@ -1469,8 +1488,14 @@ class MedMemoryBenchEvaluator:
                 ),
                 "retry_count": len(stage.get("retries") or []),
                 "submitted_at": submitted_at,
+                "running_at": running_at,
                 "completed_at": completed_at,
-                "remote_elapsed_seconds": duration_seconds,
+                "overall_latency_seconds": overall_latency_seconds,
+                "queue_wait_seconds": queue_wait_seconds,
+                "queue_inclusive_elapsed_seconds": queue_inclusive_elapsed_seconds,
+                # Retain the legacy name for readers that interpret it as
+                # submission-to-completion rather than execution-only time.
+                "remote_elapsed_seconds": queue_inclusive_elapsed_seconds,
                 "token_usage": {
                     field: sum(
                         int(item.get(field, 0) or 0)
@@ -1539,6 +1564,24 @@ class MedMemoryBenchEvaluator:
                 getattr(self, "_judge_batch_client", None)
             )
         )
+        def batch_latency_for(*stage_prefixes: str) -> Optional[float]:
+            values = [
+                stage.get("overall_latency_seconds")
+                for stage in batch_stages
+                if stage.get("transport") == "batch"
+                and str(stage.get("stage", "")).startswith(stage_prefixes)
+                and stage.get("overall_latency_seconds") is not None
+            ]
+            return sum(values) if values else None
+
+        answer_usage = self._usage_total(
+            answer_batch, answer_realtime, event_state_final
+        )
+        answer_usage["batch_overall_latency_seconds"] = batch_latency_for("query")
+        judge_usage = self._usage_total(judge_batch, judge_realtime)
+        judge_usage["batch_overall_latency_seconds"] = batch_latency_for(
+            "judge", "rejudge"
+        )
         return {
             "schema_version": 1,
             "memory_build": {
@@ -1552,7 +1595,10 @@ class MedMemoryBenchEvaluator:
                 "cost": cost_unavailable,
             },
             "answer": {
-                "usage": self._usage_total(answer_batch, answer_realtime, event_state_final),
+                "usage": answer_usage,
+                "batch_overall_latency_seconds": answer_usage[
+                    "batch_overall_latency_seconds"
+                ],
                 "models": [answer_model],
                 "cost": cost_unavailable,
             },
@@ -1562,7 +1608,10 @@ class MedMemoryBenchEvaluator:
                 "cost": cost_unavailable,
             },
             "judge": {
-                "usage": self._usage_total(judge_batch, judge_realtime),
+                "usage": judge_usage,
+                "batch_overall_latency_seconds": judge_usage[
+                    "batch_overall_latency_seconds"
+                ],
                 "models": [judge_model],
                 "cost": cost_unavailable,
             },

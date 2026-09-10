@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
+from utils.llm_client import submit_with_copied_context
 
 from remem.agent.tools.base_tool import BaseTool
 from remem.utils.misc_utils import EpisodeRawOutput, QuerySolution, compute_mdhash_id
@@ -691,7 +692,10 @@ class EpisodicGistStrategy(RAGStrategy):
             # Process queries in parallel
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks
-                future_to_idx = {executor.submit(self._process_single_query, args): args[0] for args in args_list}
+                future_to_idx = {
+                    submit_with_copied_context(executor, self._process_single_query, args): args[0]
+                    for args in args_list
+                }
 
                 # Use tqdm with as_completed for progress tracking
                 with print_lock:

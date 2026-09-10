@@ -101,6 +101,8 @@ def _efficiency_with_timing_semantics(report: "EvaluationReport") -> Dict[str, A
             return None
         for field in (
             "end_to_end_wall_time_seconds",
+            "batch_overall_latency_seconds",
+            "overall_latency_seconds",
             "batch_wall_time_seconds",
             "wall_time_seconds",
         ):

@@ -314,9 +314,10 @@ def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path
         "model": "test-model",
         "jobs": {
             "query-final": {
-                "state": "completed",
-                "submitted_at": "2026-01-01T00:00:00+00:00",
-                "completed_at": "2026-01-01T00:00:03+00:00",
+                    "state": "completed",
+                    "submitted_at": "2026-01-01T00:00:00+00:00",
+                    "running_at": "2026-01-01T00:00:01+00:00",
+                    "completed_at": "2026-01-01T00:00:03+00:00",
                 "requests": [{"request_id": "q1"}],
                 "responses": {
                     "q1": {
@@ -346,6 +347,7 @@ def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path
 
     assert stage_usage["retrieval_preparation"]["usage"]["input_tokens"] == 11
     assert stage_usage["answer"]["usage"]["output_tokens"] == 12
+    assert stage_usage["answer"]["batch_overall_latency_seconds"] == 2.0
     assert stage_usage["judge"]["usage"]["input_tokens"] == 21
     assert stage_usage["unattributed_query_usage"]["call_count"] == 0
     assert stage_usage["batch_stages"] == [{
@@ -359,10 +361,14 @@ def test_stage_usage_separates_retrieval_answer_and_judge_batch_metrics(tmp_path
         "response_count": 1,
         "successful_response_count": 1,
         "failed_response_count": 0,
-        "retry_count": 0,
-        "submitted_at": "2026-01-01T00:00:00+00:00",
-        "completed_at": "2026-01-01T00:00:03+00:00",
-        "remote_elapsed_seconds": 3.0,
+            "retry_count": 0,
+            "submitted_at": "2026-01-01T00:00:00+00:00",
+            "running_at": "2026-01-01T00:00:01+00:00",
+            "completed_at": "2026-01-01T00:00:03+00:00",
+            "overall_latency_seconds": 2.0,
+            "queue_wait_seconds": 1.0,
+            "queue_inclusive_elapsed_seconds": 3.0,
+            "remote_elapsed_seconds": 3.0,
         "token_usage": {
             "input_tokens": 101,
             "output_tokens": 12,

@@ -12,7 +12,7 @@ import threading
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from typing import Any, TypeVar
 
 
@@ -243,14 +243,15 @@ class ContextThread(threading.Thread):
 
 class ContextThreadPoolExecutor(ThreadPoolExecutor):
     """
-    ThreadPoolExecutor that automatically propagates the main thread's trace_id to worker threads.
+    ThreadPoolExecutor that automatically propagates the caller's context to workers.
     """
 
     def submit(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> Any:
         """
         Submit a callable to be executed with the given arguments.
-        Automatically propagates the current thread's context to the worker thread.
+        Automatically propagates the current thread's ContextVars to the worker thread.
         """
+        worker_context = copy_context()
         main_trace_id = get_current_trace_id()
         main_api_path = get_current_api_path()
         main_env = get_current_env()
@@ -274,7 +275,9 @@ class ContextThreadPoolExecutor(ThreadPoolExecutor):
 
             return fn(*args, **kwargs)
 
-        return super().submit(wrapper, *args, **kwargs)
+        # A Context can only be entered by one thread at a time, so capture a
+        # fresh copy for every submitted task.
+        return super().submit(worker_context.run, wrapper, *args, **kwargs)
 
     def map(
         self,

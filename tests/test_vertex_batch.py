@@ -97,6 +97,24 @@ def test_vertex_batch_usage_separates_thought_tokens_from_visible_output():
     assert (response.output_tokens, response.visible_output_tokens, response.thinking_tokens) == (10, 4, 6)
 
 
+def test_vertex_batch_records_first_running_timestamp(monkeypatch, tmp_path):
+    client = _client(tmp_path, _Batches(_Storage()), _Storage())
+    states = iter(("JOB_STATE_PENDING", "JOB_STATE_RUNNING", "JOB_STATE_SUCCEEDED"))
+    timestamps = iter((
+        "2026-09-09T03:54:50+00:00",
+        "2026-09-09T04:37:23+00:00",
+    ))
+    client._get_job = lambda *args: SimpleNamespace(state=next(states))
+    monkeypatch.setattr(vertex_batch_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(vertex_batch_module, "_utc_now", lambda: next(timestamps))
+
+    job_entry = {"stage": "query-final", "job_name": "jobs/1"}
+    client._wait_for_job(job_entry)
+
+    assert job_entry["running_at"] == "2026-09-09T03:54:50+00:00"
+    assert job_entry["completed_at"] == "2026-09-09T04:37:23+00:00"
+
+
 class _Batches:
     def __init__(self, storage: _Storage, partial_first_job: bool = False):
         self.storage = storage

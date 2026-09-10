@@ -9,6 +9,7 @@ from remem.llm import CacheOpenAI
 from remem.prompts import PromptTemplateManager
 from remem.utils.logging_utils import get_logger
 from remem.utils.misc_utils import EpisodeRawOutput
+from utils.llm_client import submit_with_copied_context
 
 logger = get_logger(__name__)
 
@@ -153,7 +154,8 @@ class EpisodicGistExtraction:
             extraction_futures = {}
             for chunk_key, passage in chunk_passages.items():
                 gists = gist_map.get(chunk_key, []) if gist_map else None
-                future = executor.submit(
+                future = submit_with_copied_context(
+                    executor,
                     self._extract_chunk, chunk_key, passage, template=template, target=target, gists=gists
                 )
                 extraction_futures[future] = chunk_key

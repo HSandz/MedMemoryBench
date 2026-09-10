@@ -12,6 +12,7 @@ from benchmarks.medmemorybench.dataset import MedSession
 from benchmarks.medmemorybench.evaluator import MedMemoryBenchEvaluator
 from benchmarks.locomo.evaluator import LoCoMoEvaluator, LOCOMO_RESULT_JOURNAL_VERSION
 from methods.base import MemoryBuildResult
+from utils.llm_client import get_usage_tracker
 
 
 def _manager(tmp_path: Path, config_hash: str) -> MedMemoryBenchCheckpointManager:
@@ -255,6 +256,55 @@ def test_locomo_query_journal_restores_completed_results(tmp_path: Path, monkeyp
     resumed._load_query_checkpoint()
 
     assert resumed._query_checkpoint["results"]["sample-1"]["q-1"] == result.to_dict()
+
+
+def test_locomo_resume_rehydrates_checkpointed_batch_usage():
+    tracker = get_usage_tracker()
+    tracker.reset()
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.method_config = SimpleNamespace(model=SimpleNamespace(name="test-model"))
+    evaluator._query_checkpoint = {
+        "results": {
+            "sample-1": {
+                "q-1": {
+                    "query_id": "q-1",
+                    "query_type": "single_hop",
+                    "score": 1.0,
+                    "is_correct": True,
+                    "model_output": "answer",
+                    "expected_answer": "answer",
+                    "details": {
+                        "execution_usage": {
+                            "answer": {
+                                "transport": "batch",
+                                "input_tokens": 100,
+                                "output_tokens": 10,
+                                "visible_output_tokens": 6,
+                                "thinking_tokens": 4,
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+    unit = EvaluationUnit(
+        unit_id="unit-1",
+        context_id="sample-1",
+        sessions_to_inject=[],
+        queries_to_evaluate=[SimpleNamespace(query_id="q-1")],
+    )
+
+    assert len(evaluator._completed_query_results(unit)) == 1
+    assert len(evaluator._completed_query_results(unit)) == 1
+
+    usage = tracker.get_stats()["query_phase"]
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 10
+    assert usage["visible_output_tokens"] == 6
+    assert usage["thinking_tokens"] == 4
+    assert usage["call_count"] == 1
+    tracker.reset()
 
 
 def test_unfinished_session_marker_is_rolled_back_for_retry(tmp_path: Path):

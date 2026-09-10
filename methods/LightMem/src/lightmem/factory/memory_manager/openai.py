@@ -19,6 +19,7 @@ model_name_context_windows = {
 class OpenaiManager:
     def __init__(self, config: BaseMemoryManagerConfig):
         self.config = config
+        self._is_openrouter = self.config.api_provider == "openrouter"
 
         if not self.config.model:
             self.config.model = "gpt-4o-mini"
@@ -30,10 +31,11 @@ class OpenaiManager:
 
         http_client = httpx.Client(verify=False)
 
-        if os.environ.get("OPENROUTER_API_KEY"):  # Use OpenRouter
+        if self._is_openrouter:
             self.client = OpenAI(
-                api_key=os.environ.get("OPENROUTER_API_KEY"),
+                api_key=self.config.api_key or os.environ.get("OPENROUTER_API_KEY"),
                 base_url=self.config.openrouter_base_url
+                or self.config.openai_base_url
                 or os.getenv("OPENROUTER_API_BASE")
                 or "https://openrouter.ai/api/v1",
             )
@@ -105,7 +107,7 @@ class OpenaiManager:
             "top_p": self.config.top_p,
         }
 
-        if os.getenv("OPENROUTER_API_KEY"):
+        if self._is_openrouter:
             openrouter_params = {}
             
             models = getattr(self.config, 'models', None)    

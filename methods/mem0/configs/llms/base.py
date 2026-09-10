@@ -16,6 +16,7 @@ class BaseLlmConfig(ABC):
         model: Optional[Union[str, Dict]] = None,
         temperature: float = 0.1,
         api_key: Optional[str] = None,
+        api_provider: str = "openai",
         gemini_provider: str = "gemini",
         max_tokens: int = 2000,
         reasoning_effort: Optional[Union[str, int]] = None,
@@ -95,6 +96,7 @@ class BaseLlmConfig(ABC):
         self.model = model
         self.temperature = temperature
         self.api_key = api_key
+        self.api_provider = (api_provider or "openai").lower()
         self.gemini_provider = gemini_provider
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort

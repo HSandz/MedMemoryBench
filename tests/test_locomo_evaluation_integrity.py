@@ -17,6 +17,7 @@ from methods.event_state.schemas import Episode
 from methods.event_state.temporal import parse_stored_date, parse_temporal_query
 from src.config import ConfigLoader
 from src.result import EvaluationReport, ResultCollector, _efficiency_with_timing_semantics
+from utils.vertex_batch import scoped_manifest_path
 
 
 def test_official_f1_has_no_substring_or_negation_boost():
@@ -305,6 +306,7 @@ def test_locomo_batch_usage_and_wall_time_are_stage_level(tmp_path):
     manifest_path.write_text(json.dumps({"jobs": {"query-final": {
         "state": "completed", "requests": [{}, {}],
         "submitted_at": "2026-09-04T10:00:00+00:00",
+        "running_at": "2026-09-04T10:01:00+00:00",
         "completed_at": "2026-09-04T10:04:10+00:00",
     }}}), encoding="utf-8")
     evaluator._batch_client = SimpleNamespace(manifest_path=manifest_path)
@@ -318,10 +320,32 @@ def test_locomo_batch_usage_and_wall_time_are_stage_level(tmp_path):
         "input_tokens": 300, "output_tokens": 30, "total_tokens": 330,
         "request_count": 2, "successful_requests": 2, "transport": "batch",
     }
-    assert stage_usage["answer_generation"]["batch_wall_time_seconds"] == 250.0
-    assert stage_usage["batch_stages"][0]["wall_time_seconds"] == 250.0
+    assert stage_usage["answer_generation"]["batch_overall_latency_seconds"] == 190.0
+    assert stage_usage["batch_stages"][0]["overall_latency_seconds"] == 190.0
+    assert stage_usage["batch_stages"][0]["queue_inclusive_elapsed_seconds"] == 250.0
     assert stage_usage["retrieval_preparation"]["operation_wall_time_seconds"] == 30.0
     assert stage_usage["retrieval_preparation"]["end_to_end_wall_time_seconds"] == 42.0
+
+
+def test_locomo_resume_finds_its_saved_batch_manifest(tmp_path):
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.output_dir = tmp_path
+    evaluator.method_config = SimpleNamespace(
+        model=SimpleNamespace(name="test-model"),
+        raw_config={"method_name": "test"},
+    )
+    evaluator.dataset_config = SimpleNamespace(raw_config={"dataset_name": "locomo"})
+    evaluator._batch_client = None
+    manifest_path = scoped_manifest_path(
+        tmp_path / "batch",
+        "locomo_batch_manifest",
+        model="test-model",
+        config_hash=evaluator._batch_config_hash(),
+    )
+    manifest_path.parent.mkdir()
+    manifest_path.write_text(json.dumps({"jobs": {}}), encoding="utf-8")
+
+    assert evaluator._batch_manifest_paths_for_report() == [manifest_path]
 
 
 def test_batch_wall_time_rejects_missing_or_malformed_timestamps():
