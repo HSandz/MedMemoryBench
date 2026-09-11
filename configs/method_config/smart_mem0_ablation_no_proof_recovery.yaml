@@ -1,3 +1,0 @@
-# Deprecated: the former proof/recovery ablation switches were removed from the active
-# SmartMem0 architecture. Use smart_mem0.yaml; proof is now one-shot, post-retrieval and
-# non-destructive by invariant, while recovery is structural zero-hit only.
