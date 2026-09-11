@@ -7,6 +7,8 @@ selection, benchmark-specific routing, or the two-call READ ceiling.
 
 from copy import deepcopy
 
+from .read_execution_contract import ReadExecutionContractMixin
+
 
 class ReadAblationControlsMixin:
     """Expose deterministic READ-layer ablations without adding model calls."""
@@ -50,24 +52,61 @@ class ReadAblationControlsMixin:
         return super()._slot_covered(slot, support_ids, selected, relations)
 
     def _rcm_requires_proof(self, slot):
-        """Use independent proof switches for acquisition and FOUND/EMPTY status."""
+        """Gate only proof-driven acquisition; status has its own independent switch."""
         if not bool(getattr(self, "enable_reasoning_completion", True)):
             return False
-        if bool(getattr(self, "_read_ablation_status_phase", False)):
-            if not bool(getattr(self, "enable_proof_status_gate", True)):
-                return False
-        elif not bool(getattr(self, "enable_proof_expansion", True)):
+        if not bool(getattr(self, "enable_proof_expansion", True)):
             return False
         return super()._rcm_requires_proof(slot)
 
     def _retrieval_status(self, plan, slot_support, selected, relations):
-        """Mark proof calls made while computing completion separately from acquisition."""
-        previous = bool(getattr(self, "_read_ablation_status_phase", False))
-        self._read_ablation_status_phase = True
-        try:
+        """Optionally make retrieval completion structural rather than proof-gated.
+
+        This deliberately bypasses proof-aware `_slot_covered` and relation-support
+        filtering. Structural relation semantics (COMPARE/CAUSES/TEMPORAL_ORDER) remain
+        enforced through the base execution contract; only target proof loses authority to
+        downgrade FOUND/EMPTY and trigger recovery.
+        """
+        enabled = bool(getattr(self, "enable_reasoning_completion", True)) and bool(
+            getattr(self, "enable_proof_status_gate", True)
+        )
+        if enabled:
             return super()._retrieval_status(plan, slot_support, selected, relations)
-        finally:
-            self._read_ablation_status_phase = previous
+
+        requirement_status = {}
+        for slot in (plan or {}).get("required_slots") or []:
+            slot_id = str(slot.get("id") or "")
+            support_ids = list((slot_support or {}).get(slot_id) or [])
+            requirement_status[slot_id] = (
+                "FOUND"
+                if support_ids
+                and bool(
+                    self._slot_structure_covered(
+                        slot, support_ids, selected, relations
+                    )
+                )
+                else "EMPTY"
+            )
+
+        relation_status = ReadExecutionContractMixin._relation_status_map(
+            self, plan or {}, slot_support or {}, selected or [], relations or []
+        )
+        complete = bool(requirement_status) and all(
+            status == "FOUND" for status in requirement_status.values()
+        )
+        complete = complete and all(
+            str(status or "").upper() == "PROVEN"
+            for status in relation_status.values()
+        )
+        self._last_requirement_graph_stop_guard = {
+            "materiality_promotes_found": False,
+            "strict_requirement_status": dict(requirement_status),
+            "strict_relation_status": dict(relation_status),
+            "retrieval_complete": bool(complete),
+            "proof_status_gate_enabled": False,
+            "completion_semantics": "typed_structural_coverage_without_target_proof",
+        }
+        return requirement_status, relation_status, bool(complete)
 
     def _rcm_reasoning_ids(self, plan):
         if not bool(getattr(self, "enable_reasoning_completion", True)):

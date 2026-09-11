@@ -26,7 +26,7 @@ class _ControlBase:
         self.base_slot_covered_calls = 0
         self.structural_slot_covered_calls = 0
         self.base_proof_calls = 0
-        self.status_phase_proof_required = None
+        self.base_retrieval_status_calls = 0
 
     def _slot_covered(self, slot, support_ids, selected, relations):
         self.base_slot_covered_calls += 1
@@ -34,15 +34,15 @@ class _ControlBase:
 
     def _slot_structure_covered(self, slot, support_ids, selected, relations):
         self.structural_slot_covered_calls += 1
-        return True
+        return bool(support_ids)
 
     def _rcm_requires_proof(self, slot):
         self.base_proof_calls += 1
         return True
 
     def _retrieval_status(self, plan, slot_support, selected, relations):
-        self.status_phase_proof_required = self._rcm_requires_proof({})
-        return {}, {}, bool(self.status_phase_proof_required)
+        self.base_retrieval_status_calls += 1
+        return {"r1": "BASE"}, {}, False
 
     @staticmethod
     def _rcm_reasoning_ids(plan):
@@ -65,6 +65,19 @@ class _Harness(ReadAblationControlsMixin, _ControlBase):
     pass
 
 
+def _structural_plan():
+    return {
+        "required_slots": [
+            {
+                "id": "r1",
+                "type": "DIRECT",
+                "evidence_role": "REQUIREMENT",
+            }
+        ],
+        "semantic_relations": [],
+    }
+
+
 def test_ablation_controls_precede_identity_and_reasoning_completion_in_active_mro():
     mro = SmartMem0Agent.mro()
     assert mro.index(ReadAblationControlsMixin) < mro.index(
@@ -75,34 +88,40 @@ def test_ablation_controls_precede_identity_and_reasoning_completion_in_active_m
     )
 
 
-def test_default_controls_preserve_existing_proof_status_gate():
+def test_default_controls_preserve_existing_status_path():
     harness = _Harness()
-    assert harness._slot_covered({}, [], [], []) is False
-    assert harness.base_slot_covered_calls == 1
-    assert harness.structural_slot_covered_calls == 0
-    _, _, complete = harness._retrieval_status({}, {}, [], [])
-    assert complete is True
-    assert harness.status_phase_proof_required is True
+    status, _, complete = harness._retrieval_status(
+        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
+    )
+    assert status == {"r1": "BASE"}
+    assert complete is False
+    assert harness.base_retrieval_status_calls == 1
 
 
-def test_disabling_proof_status_gate_uses_structural_coverage_and_disables_status_proof():
+def test_disabling_proof_status_gate_uses_structural_retrieval_completion():
     harness = _Harness()
     harness.enable_proof_status_gate = False
-    assert harness._slot_covered({}, [], [], []) is True
-    assert harness.base_slot_covered_calls == 0
+    status, relations, complete = harness._retrieval_status(
+        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
+    )
+    assert status == {"r1": "FOUND"}
+    assert relations == {}
+    assert complete is True
+    assert harness.base_retrieval_status_calls == 0
     assert harness.structural_slot_covered_calls == 1
-    _, _, complete = harness._retrieval_status({}, {}, [], [])
-    assert complete is False
-    assert harness.status_phase_proof_required is False
+    assert harness._last_requirement_graph_stop_guard["proof_status_gate_enabled"] is False
 
 
-def test_disabling_proof_expansion_does_not_disable_status_gate():
+def test_disabling_proof_expansion_does_not_disable_status_path():
     harness = _Harness()
     harness.enable_proof_expansion = False
     assert harness._rcm_requires_proof({}) is False
-    _, _, complete = harness._retrieval_status({}, {}, [], [])
-    assert complete is True
-    assert harness.status_phase_proof_required is True
+    status, _, complete = harness._retrieval_status(
+        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
+    )
+    assert status == {"r1": "BASE"}
+    assert complete is False
+    assert harness.base_retrieval_status_calls == 1
 
 
 def test_disabling_reasoning_completion_disables_completion_side_effects():
@@ -112,9 +131,11 @@ def test_disabling_reasoning_completion_disables_completion_side_effects():
     assert harness._rcm_reasoning_ids({}) == set()
     assert harness._rcm_source_neighbors({}, [], set(), 2) == []
     assert harness._rcm_strengthen_prompt({}) is False
-    _, _, complete = harness._retrieval_status({}, {}, [], [])
-    assert complete is False
-    assert harness.status_phase_proof_required is False
+    status, _, complete = harness._retrieval_status(
+        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
+    )
+    assert status == {"r1": "FOUND"}
+    assert complete is True
 
 
 def test_ablation_telemetry_reports_controls_and_active_version_stack():
