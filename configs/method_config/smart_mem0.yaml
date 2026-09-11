@@ -1,6 +1,6 @@
 method_name: "smart_mem0"
 method_type: "agentic_memory"
-description: "SmartMem0: Adaptive Evidence-Grounded Long-Term Memory"
+description: "SmartMem0: Stable Semantic Evidence-Grounded Long-Term Memory"
 
 model:
   provider: "openai"
@@ -12,69 +12,41 @@ model:
 agent_params:
   subject_aliases:
     patient: "primary_user"
-  # Accuracy-first bounded retrieval. Reduce these only after measuring the
-  # accuracy/token trade-off on both MedMemoryBench and LoCoMo.
+
+  # Bounded, architecture-level retrieval limits. They are not benchmark routes.
   retrieve_num: 8
   max_context_tokens: 32768
 
-  # Memorize phase
+  # Memorize phase ---------------------------------------------------------
   enable_memory_write: true
   frozen_memory_path: null
-  # Increment when capture/consolidation semantics change incompatibly.
   memory_snapshot_revision: 16
-  # Split long sessions at complete turn boundaries so extraction preserves
-  # low-salience atomic facts instead of compressing them away.
   write_window_max_turns: 64
-  # A full session is useful as continuity context, but one large extraction
-  # call compresses away low-salience atomic facts. Two bounded turn windows
-  # preserve those facts while keeping write cost bounded.
   write_window_max_tokens: 8000
-  # full = bounded cross-session beliefs + within-session continuity.
-  # window = continuity only; none = clean ablation without write context.
   write_context_mode: none
   write_prior_belief_limit: 8
   write_provisional_limit: 4
   max_new_memories: 12
 
-  # Active READ route: one compact controller emits requirements, relations,
-  # and an optional atomic candidate after inspecting question + Top-3 seeds.
-  # Route, budget, and physical operations are derived by code. There is no
-  # separate planner LLM in the locked two-stage architecture.
-  enable_planner: false
-  enable_two_stage_controller: true
-  enable_slot_support_validation: false
-  enable_replan: false
-  enable_planner_repair: false
-
-  # READ ABLATION CONTROLS -------------------------------------------------
-  # Defaults below reproduce the current v5 behavior. These switches affect
-  # READ only and do not alter WRITE, model choice, snapshot revision, or the
-  # two-call LLM ceiling.
+  # READ architecture ------------------------------------------------------
+  # LLM #1 is a question-only semantic parser. It receives no retrieved memory.
+  # It may emit only projection, minimal participant-memory requirements,
+  # optional selectors, and genuine semantic relations.
   #
-  # Recommended first ablation (proof detached from acquisition/recovery):
-  #   enable_proof_status_gate: false
-  #   enable_proof_expansion: false
-  #   enable_zero_result_recovery: true
-  # Keep the remaining switches true. In that profile proof still exists for
-  # diagnostics/terminal certification, but a proof miss cannot downgrade
-  # structural coverage or open extra proof-driven retrieval views.
+  # Runtime code owns:
+  # - raw BM25/dense recall
+  # - durable-address resolution
+  # - selector execution
+  # - fusion / candidate budgets
+  # - structural coverage and bounded zero-hit recovery
+  # - one-shot, post-retrieval, non-destructive proof
+  # - context retention and terminal certification
   #
-  # Stronger no-recovery ablation:
-  #   enable_proof_status_gate: false
-  #   enable_proof_expansion: false
-  #   enable_zero_result_recovery: false
+  # Proof is an architecture invariant rather than a tuning switch: it cannot
+  # trigger acquisition, downgrade structural FOUND/EMPTY, or prune CandidateWorld.
   #
-  # Disable the whole reasoning-completion layer:
-  #   enable_reasoning_completion: false
-  # This also disables proof expansion/status gating, source-neighbor additions,
-  # and reasoning-prompt strengthening through the ablation mixin.
-  enable_reasoning_completion: true
-  enable_proof_status_gate: true
-  enable_proof_expansion: true
-  enable_reasoning_source_neighbors: true
-  enable_reasoning_prompt_strengthening: true
-  # Existing deterministic focus-only recovery now honors this YAML value;
-  # SmartMem0Agent no longer forces it back to true after construction.
+  # The only optional second retrieval pass is deterministic structural recovery,
+  # and it is eligible only when a required evidence lane has zero viable support.
   enable_zero_result_recovery: true
 
 embedding:

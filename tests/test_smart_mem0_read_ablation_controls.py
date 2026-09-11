@@ -1,164 +1,223 @@
 from methods.smart_mem0.agent import SmartMem0Agent
-from methods.smart_mem0.read_ablation_controls import ReadAblationControlsMixin
 from methods.smart_mem0.read_reasoning_completion import ReadReasoningCompletionMixin
-from methods.smart_mem0.read_requirement_identity_runtime import (
-    ReadRequirementIdentityRuntimeMixin,
+from methods.smart_mem0.read_stable_semantic_runtime import (
+    ReadStableSemanticRuntimeMixin,
+    STABLE_SEMANTIC_SCHEMA,
 )
 
 
-class _ControlBase:
-    QUERY_ORCHESTRATOR_VERSION = "orchestrator-test"
-    CONTROLLER_SCHEMA_VERSION = "controller-test"
-    REQUIREMENT_GRAPH_VERSION = "graph-test"
-    REQUIREMENT_GRAPH_RUNTIME_VERSION = "runtime-test"
-    PROJECTION_PROOF_VERSION = "proof-test"
-    REQUIREMENT_IDENTITY_VERSION = "identity-test"
-    REQUIREMENT_RESOLUTION_VERSION = "resolution-test"
-    REASONING_COMPLETION_VERSION = "reasoning-test"
-
+class _StableBase:
     def __init__(self):
-        self.enable_reasoning_completion = True
-        self.enable_proof_status_gate = True
-        self.enable_proof_expansion = True
-        self.enable_reasoning_source_neighbors = True
-        self.enable_reasoning_prompt_strengthening = True
-        self.enable_zero_result_recovery = True
-        self.base_slot_covered_calls = 0
-        self.structural_slot_covered_calls = 0
-        self.base_proof_calls = 0
-        self.base_retrieval_status_calls = 0
+        self.proof_calls = 0
+        self.recovery_slots = []
 
-    def _slot_covered(self, slot, support_ids, selected, relations):
-        self.base_slot_covered_calls += 1
-        return False
+    @staticmethod
+    def _rc_text(value):
+        return " ".join(str(value or "").replace("_", " ").casefold().split())
 
-    def _slot_structure_covered(self, slot, support_ids, selected, relations):
-        self.structural_slot_covered_calls += 1
+    @staticmethod
+    def _rc_question_span(value, question):
+        value = " ".join(str(value or "").split())
+        return value if value and value.casefold() in str(question).casefold() else ""
+
+    @staticmethod
+    def _question_stem(question):
+        return str(question or "").strip()
+
+    @staticmethod
+    def _rg_sparse_selector(value):
+        if not isinstance(value, dict):
+            return {}
+        relation = str(value.get("relation") or "").upper()
+        if relation == "CURRENT":
+            return {"relation": "CURRENT"}
+        if relation not in {
+            "LOCATE", "EARLIEST", "LATEST", "EXACT", "BEFORE", "AFTER", "BETWEEN"
+        }:
+            return {}
+        axis = str(value.get("axis") or "").lower()
+        if axis not in {
+            "event_time", "document_time", "origin_document_time", "effective_event_time"
+        }:
+            return {}
+        result = {"relation": relation, "axis": axis}
+        if value.get("anchor"):
+            result["anchor"] = str(value["anchor"])
+        if value.get("end"):
+            result["end"] = str(value["end"])
+        if relation in {"EXACT", "BEFORE", "AFTER"} and not result.get("anchor"):
+            return {}
+        if relation == "BETWEEN" and not (result.get("anchor") and result.get("end")):
+            return {}
+        return result
+
+    @staticmethod
+    def _slot_structure_covered(slot, support_ids, selected, relations):
+        del slot, selected, relations
         return bool(support_ids)
 
-    def _rcm_requires_proof(self, slot):
-        self.base_proof_calls += 1
-        return True
+    def _requirement_target_proof(self, slot, memory):
+        del slot
+        self.proof_calls += 1
+        return memory.get("id") == "m1"
 
-    def _retrieval_status(self, plan, slot_support, selected, relations):
-        self.base_retrieval_status_calls += 1
-        return {"r1": "BASE"}, {}, False
+    def _prepare_requirement_context_state(self, run, initial_seeds):
+        del initial_seeds
+        # Emulate the historical destructive proof owner.
+        run["requirement_context_candidates"] = {"r1": ["m1", "m2"]}
+        run["requirement_proof_support"] = {"r1": ["m1"]}
+        run["slot_support"]["r1"] = ["m1"]
+        return run
 
-    @staticmethod
-    def _rcm_reasoning_ids(plan):
-        return {"r1"}
-
-    @staticmethod
-    def _rcm_source_neighbors(slot, rows, existing_ids, limit):
-        return [{"id": "m-neighbor"}]
-
-    @staticmethod
-    def _rcm_strengthen_prompt(prepared):
-        return True
-
-    @staticmethod
-    def prepare_batch_query(question, system_message=None, **kwargs):
-        return {"question": question, "extra": {}}
+    def _make_deterministic_recovery_plan(self, missing_slots, question, existing_plan):
+        del question, existing_plan
+        self.recovery_slots = [slot["id"] for slot in missing_slots]
+        return {"required_slots": list(missing_slots)} if missing_slots else None
 
 
-class _Harness(ReadAblationControlsMixin, _ControlBase):
+class _Harness(ReadStableSemanticRuntimeMixin, _StableBase):
     pass
 
 
-def _structural_plan():
-    return {
-        "required_slots": [
+def test_stable_runtime_is_active_and_reasoning_completion_is_not():
+    mro = SmartMem0Agent.mro()
+    assert ReadStableSemanticRuntimeMixin in mro
+    assert ReadReasoningCompletionMixin not in mro
+    assert mro.index(ReadStableSemanticRuntimeMixin) < mro.index(
+        next(cls for cls in mro if cls.__name__ == "ReadRequirementGraphMixin")
+    )
+
+
+def test_controller_schema_has_no_memory_or_retrieval_authority():
+    lowered = STABLE_SEMANTIC_SCHEMA.casefold()
+    assert "top-3" not in lowered
+    assert "seed" not in lowered
+    assert "terminal_candidate" not in lowered
+    assert "proof_spec" not in lowered
+    assert "retrieval operation" not in lowered
+    assert '"aliases"' not in lowered
+    assert '"anchors"' not in lowered
+
+
+def test_sanitizer_canonicalizes_ids_merges_exact_duplicates_and_drops_weak_infer():
+    harness = _Harness()
+    raw = {
+        "projection": "VALUE",
+        "requirements": [
             {
-                "id": "r1",
-                "type": "DIRECT",
-                "evidence_role": "REQUIREMENT",
+                "need": "account balance",
+                "question_span": "account balance",
+                "selector": {"relation": "LATEST", "axis": "document_time"},
+                "aliases": ["ignored"],
+            },
+            {
+                "need": "account balance",
+                "question_span": "account balance",
+                "selector": {"relation": "LATEST", "axis": "document_time"},
+            },
+        ],
+        "relations": [
+            {"type": "INFER", "from": 1, "to": "ANSWER"},
+            {"type": "COMPARE", "from": 1, "to": 2},
+        ],
+        "terminal_candidate": {"answer": "ignored"},
+    }
+    sanitized = harness._stable_sanitize_controller_ir(
+        raw, "What is the latest account balance?", {}
+    )
+    assert [item["id"] for item in sanitized["requirements"]] == ["r1"]
+    assert len(sanitized["requirements"]) == 1
+    assert sanitized["requirements"][0]["need"] == "account balance"
+    assert sanitized["links"] == []
+    assert "terminal_candidate" not in sanitized
+    assert "aliases" not in sanitized["requirements"][0]
+
+
+def test_infer_requires_explicit_bridge_goal():
+    harness = _Harness()
+    raw = {
+        "projection": "TEXT",
+        "requirements": [{"need": "stored observation"}],
+        "relations": [
+            {
+                "type": "INFER",
+                "from": 1,
+                "to": "ANSWER",
+                "bridge_goal": "apply the external rule to the grounded observation",
             }
         ],
-        "semantic_relations": [],
     }
-
-
-def test_ablation_controls_precede_identity_and_reasoning_completion_in_active_mro():
-    mro = SmartMem0Agent.mro()
-    assert mro.index(ReadAblationControlsMixin) < mro.index(
-        ReadRequirementIdentityRuntimeMixin
+    sanitized = harness._stable_sanitize_controller_ir(
+        raw, "What follows from the stored observation?", {}
     )
-    assert mro.index(ReadAblationControlsMixin) < mro.index(
-        ReadReasoningCompletionMixin
-    )
+    assert sanitized["links"] == [
+        {
+            "type": "INFER",
+            "from": "r1",
+            "to": "ANSWER",
+            "bridge_goal": "apply the external rule to the grounded observation",
+        }
+    ]
 
 
-def test_default_controls_preserve_existing_status_path():
+def test_retrieval_views_are_need_first_without_alias_or_full_question_view():
     harness = _Harness()
-    status, _, complete = harness._retrieval_status(
-        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
+    harness._rg_unique_text = lambda values, limit=8: list(
+        dict.fromkeys(str(value) for value in values if value)
+    )[:limit]
+    views = harness._er_requirement_views(
+        {
+            "need": "account balance",
+            "resolved_keys": ["balance"],
+            "question_span": "account balance",
+        },
+        "What is the latest account balance?",
     )
-    assert status == {"r1": "BASE"}
-    assert complete is False
-    assert harness.base_retrieval_status_calls == 1
+    assert [item["kind"] for item in views] == ["need", "keys"]
+    assert views[0]["query"] == "account balance"
+    assert all(item["kind"] not in {"aliases", "question"} for item in views)
 
 
-def test_disabling_proof_status_gate_uses_structural_retrieval_completion():
+def test_proof_is_memoized_per_requirement_memory_pair():
     harness = _Harness()
-    harness.enable_proof_status_gate = False
-    status, relations, complete = harness._retrieval_status(
-        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
-    )
-    assert status == {"r1": "FOUND"}
-    assert relations == {}
-    assert complete is True
-    assert harness.base_retrieval_status_calls == 0
-    assert harness.structural_slot_covered_calls == 1
-    assert harness._last_requirement_graph_stop_guard["proof_status_gate_enabled"] is False
+    slot = {"id": "r1"}
+    memory = {"id": "m1"}
+    assert harness._requirement_target_proof(slot, memory) is True
+    assert harness._requirement_target_proof(slot, memory) is True
+    assert harness.proof_calls == 1
+    assert harness._stable_proof_cache_hits == 1
 
 
-def test_disabling_proof_expansion_does_not_disable_status_path():
+def test_proof_checkpoint_restores_structural_support_and_does_not_prune():
     harness = _Harness()
-    harness.enable_proof_expansion = False
-    assert harness._rcm_requires_proof({}) is False
-    status, _, complete = harness._retrieval_status(
-        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
-    )
-    assert status == {"r1": "BASE"}
-    assert complete is False
-    assert harness.base_retrieval_status_calls == 1
-
-
-def test_disabling_reasoning_completion_disables_completion_side_effects():
-    harness = _Harness()
-    harness.enable_reasoning_completion = False
-    assert harness._rcm_requires_proof({}) is False
-    assert harness._rcm_reasoning_ids({}) == set()
-    assert harness._rcm_source_neighbors({}, [], set(), 2) == []
-    assert harness._rcm_strengthen_prompt({}) is False
-    status, _, complete = harness._retrieval_status(
-        _structural_plan(), {"r1": ["m1"]}, [{"id": "m1"}], []
-    )
-    assert status == {"r1": "FOUND"}
-    assert complete is True
-
-
-def test_ablation_telemetry_reports_controls_and_active_version_stack():
-    harness = _Harness()
-    harness.enable_proof_status_gate = False
-    harness.enable_proof_expansion = False
-    prepared = harness.prepare_batch_query("question")
-    extra = prepared["extra"]
-
-    controls = extra["read_ablation_controls"]
-    assert controls["version"] == "read-ablation-controls-v1"
-    assert controls["enable_proof_status_gate"] is False
-    assert controls["enable_proof_expansion"] is False
-    assert controls["enable_zero_result_recovery"] is True
-
-    versions = extra["active_read_version_stack"]
-    assert versions == {
-        "orchestrator": "orchestrator-test",
-        "controller_schema": "controller-test",
-        "requirement_graph": "graph-test",
-        "requirement_graph_runtime": "runtime-test",
-        "proof": "proof-test",
-        "requirement_identity": "identity-test",
-        "requirement_resolution": "resolution-test",
-        "reasoning_completion": "reasoning-test",
+    run = {
+        "plan": {"required_slots": [{"id": "r1"}]},
+        "slot_support": {"r1": ["m1", "m2"]},
+        "operation_candidates": [{"id": "m1"}, {"id": "m2"}],
+        "beliefs": [],
+        "planning_seeds": [],
+        "relations": [],
     }
+    prepared = harness._prepare_requirement_context_state(run, [])
+    assert prepared["slot_support"]["r1"] == ["m1", "m2"]
+    assert prepared["requirement_proof_support"]["r1"] == ["m1"]
+    checkpoint = prepared["proof_checkpoint"]
+    assert checkpoint["candidate_world_unchanged"] is True
+    assert checkpoint["structural_support_restored"] is True
+    assert checkpoint["retrieval_authority"] is False
+    assert checkpoint["pruning_authority"] is False
+
+
+def test_recovery_filters_out_relation_only_or_proof_only_gaps():
+    harness = _Harness()
+    harness._stable_last_requirement_status = {"r1": "FOUND", "r2": "EMPTY"}
+    result = harness._make_deterministic_recovery_plan(
+        [{"id": "r1"}, {"id": "r2"}], "question", {}
+    )
+    assert harness.recovery_slots == ["r2"]
+    assert [slot["id"] for slot in result["required_slots"]] == ["r2"]
+
+    harness._stable_last_requirement_status = {"r1": "FOUND"}
+    assert harness._make_deterministic_recovery_plan(
+        [{"id": "r1"}], "question", {}
+    ) is None

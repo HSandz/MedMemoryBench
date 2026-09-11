@@ -8,7 +8,6 @@ from .consolidation import ConsolidationMixin
 from .core import CoreMemoryMixin
 from .execution import ExecutionMixin
 from .query import QueryMixin
-from .read_ablation_controls import ReadAblationControlsMixin
 from .read_answerability_contract import ReadAnswerabilityContractMixin
 from .read_terminal_answer_contract import ReadTerminalAnswerContractMixin
 from .read_answer_or_plan_contract import ReadAnswerOrPlanContractMixin
@@ -27,7 +26,6 @@ from .read_requirement_identity_runtime import ReadRequirementIdentityRuntimeMix
 from .read_requirement_projection_runtime import ReadRequirementProjectionRuntimeMixin
 from .read_requirement_resolution_runtime import ReadRequirementResolutionRuntimeMixin
 from .read_reasoning_bridge import ReadReasoningBridgeMixin
-from .read_reasoning_completion import ReadReasoningCompletionMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
 from .read_query_memory_alignment import ReadQueryMemoryAlignmentMixin
 from .read_evidence_policy import ReadEvidencePolicyMixin
@@ -37,6 +35,7 @@ from .read_retrieval_fusion import ReadRetrievalFusionMixin
 from .read_proof_context_retention import ReadProofContextRetentionMixin
 from .read_evidence_resolve import ReadEvidenceResolveMixin
 from .read_semantic_closure import ReadSemanticClosureMixin
+from .read_stable_semantic_runtime import ReadStableSemanticRuntimeMixin
 from .read_runtime_support import ReadRuntimeSupportMixin
 from .read_unified_retrieval import UnifiedRetrievalExecutorMixin
 from .read_proof_context import UnifiedProofContextMixin
@@ -47,14 +46,13 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
-    ReadAblationControlsMixin,
+    ReadStableSemanticRuntimeMixin,
     ReadRequirementIdentityRuntimeMixin,
     ReadRequirementResolutionRuntimeMixin,
     ReadRequirementProjectionRuntimeMixin,
     ReadRequirementGraphRuntimeMixin,
     ReadRequirementGraphMixin,
     ReadQueryMemoryAlignmentMixin,
-    ReadReasoningCompletionMixin,
     ReadProgressiveRetrievalMixin,
     ReadRetrievalFusionMixin,
     ReadProofContextRetentionMixin,
@@ -96,45 +94,48 @@ class SmartMem0Agent(
         requested = kwargs.pop("enable_two_stage_controller", True)
         if requested is False:
             raise ValueError(
-                "SmartMem0 legacy READ planner path was removed in architecture Phase 6"
+                "SmartMem0 stable READ requires the single semantic controller"
             )
 
-        # READ ablation switches are consumed here so BaseAgent and WRITE-path
-        # constructors never see experiment-only controls. Defaults reproduce v5.
-        reasoning_completion = kwargs.pop("enable_reasoning_completion", True)
-        proof_status_gate = kwargs.pop("enable_proof_status_gate", True)
-        proof_expansion = kwargs.pop("enable_proof_expansion", True)
-        reasoning_source_neighbors = kwargs.pop(
-            "enable_reasoning_source_neighbors", True
-        )
-        reasoning_prompt_strengthening = kwargs.pop(
-            "enable_reasoning_prompt_strengthening", True
-        )
+        # These were experiment-time authorities in v5. They are consumed only for
+        # backwards-compatible configs and are no longer part of the active architecture.
+        for legacy_key in (
+            "enable_planner",
+            "enable_unified_controller",
+            "enable_slot_support_validation",
+            "enable_replan",
+            "enable_planner_repair",
+            "enable_reasoning_completion",
+            "enable_proof_status_gate",
+            "enable_proof_expansion",
+            "enable_reasoning_source_neighbors",
+            "enable_reasoning_prompt_strengthening",
+        ):
+            kwargs.pop(legacy_key, None)
+
         zero_result_recovery = kwargs.pop("enable_zero_result_recovery", True)
 
         super().__init__(*args, **kwargs)
         self.enable_two_stage_controller = True
         self.max_read_llm_calls = self.MAX_TWO_STAGE_READ_LLM_CALLS
 
-        # Keep old configuration attributes explicitly disabled so downstream
-        # tooling cannot accidentally reactivate a removed middle LLM stage.
+        # Removed middle/control authorities stay explicitly disabled for telemetry and
+        # restored-request compatibility.
         self.enable_planner = False
         self.enable_replan = False
         self.enable_planner_repair = False
         self.enable_slot_support_validation = False
+        self.enable_reasoning_completion = False
+        self.enable_proof_status_gate = False
+        self.enable_proof_expansion = False
+        self.enable_reasoning_source_neighbors = False
+        self.enable_reasoning_prompt_strengthening = False
 
-        # Active READ ablation controls. These affect READ only and add no LLM calls.
-        self.enable_reasoning_completion = bool(reasoning_completion)
-        self.enable_proof_status_gate = bool(proof_status_gate)
-        self.enable_proof_expansion = bool(proof_expansion)
-        self.enable_reasoning_source_neighbors = bool(reasoning_source_neighbors)
-        self.enable_reasoning_prompt_strengthening = bool(
-            reasoning_prompt_strengthening
-        )
+        # The only adaptive second retrieval pass is structural zero-hit recovery.
         self.enable_zero_result_recovery = bool(zero_result_recovery)
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
-        """Keep semantic telemetry available to deterministic context arbitration."""
+        """Keep stable semantic telemetry available to deterministic arbitration."""
         supports, plan, telemetry = super()._semantic_controller(
             question, seeds, frame, context_map=context_map
         )
