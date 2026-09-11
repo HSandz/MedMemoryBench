@@ -68,16 +68,35 @@ Both `locomo.yaml` and `medmemorybench.yaml` define
 - `type_aware` reproduces the existing AQ-MedAI / MedMemoryBench harness:
   the answer prompt is specialized by the benchmark query type for upstream
   comparability.
-- `neutral` uses one dataset-appropriate answer contract for every query type.
-  The contract is sent as a system message; the user message contains only the
-  memory source label and visible question. The answer model is not given the
-  hidden benchmark category; query type remains available only to post-hoc
-  scoring and reporting, making this an architecture-neutral evaluation.
-  Neutral answers are grounded, shortest-complete, time-faithful, and use
-  `Unknown` when neither a proposition nor its negation is supported. They may
-  make concise inferences requested by the visible question when remembered
-  facts support them. Event-State still retrieves from the raw visible question,
-  not the formatted answer prompt.
+- `neutral` uses one shared, dataset-appropriate answer contract across all query types.
+  The contract is sent as a system message; the user message contains only an
+  architecture-neutral memory label ("Relevant remembered information" / "相关的记忆信息")
+  and the visible question. The answer model receives no benchmark query-type metadata,
+  preserving category-blind evaluation while query type remains available for
+  post-hoc scoring and reporting.
+  Under the neutral contract:
+  - **Visible-question-driven**: The required answer form, precision, and selection
+    behavior are determined strictly from the visible question itself rather than
+    hidden benchmark category conventions. If options are present and a selection is
+    requested, the selected option label(s) are returned.
+  - **Personalized-premise grounding**: Personalized or patient-specific facts must
+    originate in supported memory; general/domain knowledge may only be used to
+    derive a conclusion once every required personalized premise is supported, and
+    must never substitute for a missing premise.
+  - **Unsupported presuppositions**: Questions that presuppose an unsupported personal
+    fact, event, or relation are rejected rather than accepted as true.
+  - **Chronology and state**: Identity and relationships are preserved strictly;
+    the latest state is used only when the visible question asks for the current or latest
+    state, otherwise requested historical scope is preserved.
+  - **Temporal reasoning**: Relative time expressions are resolved against evidence
+    anchors; explicit requested date formats are matched without globally biasing
+    toward ISO or non-ISO dates.
+  - **Answer form and abstention**: Answers are the shortest complete response to the
+    visible question (including all requested items). Factual yes/no questions return
+    "Yes" only when supported, "No" only when negated, and "Unknown" otherwise. If the
+    answer cannot be supported under these rules, the model outputs exactly `Unknown`.
+  Event-State continues to retrieve from the raw visible question independently of the
+  formatted answer prompt.
 
 To run the neutral protocol, change only this dataset setting:
 

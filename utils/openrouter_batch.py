@@ -22,6 +22,7 @@ from utils.llm_client import (
     _is_retryable_exception,
     _log_retry_attempt,
     _sleep_after_failure,
+    extract_text_content,
     extract_usage_token_counts,
     get_usage_tracker,
 )
@@ -496,15 +497,7 @@ class OpenRouterBatchClient(VertexBatchClient):
         if not choices:
             return ""
         content = (choices[0].get("message") or {}).get("content") or ""
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
-                str(part.get("text", ""))
-                for part in content
-                if isinstance(part, dict)
-            )
-        return str(content)
+        return extract_text_content(content)
 
     def _collect(self, job_entry: Dict[str, Any]) -> Dict[str, BatchChatResponse]:
         job = self._get_job(job_entry["job_name"])

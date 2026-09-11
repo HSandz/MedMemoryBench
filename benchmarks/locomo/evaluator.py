@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -786,20 +787,6 @@ class LoCoMoEvaluator:
                 self._record_completed_query(item["sample_id"], item["result"])
             return
 
-        def query_sample(unit: EvaluationUnit) -> Tuple[EvaluationUnit, List[MetricResult]]:
-            manager = AgentManager(
-                method_config=self.method_config,
-                dataset_config=self.dataset_config,
-                batch_api=False,
-                workers=self.workers,
-            )
-            manager.import_memory_state(
-                self._read_memory_snapshot(unit)["memory_state"], context_id=unit.context_id
-            )
-            return unit, self._evaluate_realtime_queries(
-                unit.queries_to_evaluate, unit.context_id, manager=manager
-            )
-
         completed_prior = []
         pending_units = []
         for unit in units:
@@ -809,18 +796,97 @@ class LoCoMoEvaluator:
             self.aggregator.add_result(result)
             self.result_collector.add_result(result, sample_id)
 
-        query_workers = self._query_worker_count()
-        if query_workers > 1 and len(pending_units) > 1:
-            with ThreadPoolExecutor(max_workers=min(query_workers, len(pending_units))) as executor:
-                completed = list(executor.map(query_sample, pending_units))
+        units_with_queries = [u for u in pending_units if u.queries_to_evaluate]
+        query_jobs = [
+            (unit, query)
+            for unit in units_with_queries
+            for query in unit.queries_to_evaluate
+        ]
+        if not query_jobs:
+            return
+
+        query_worker_count = min(self._query_worker_count(), len(query_jobs))
+        if len(units_with_queries) > 1:
+            self._log(
+                f"  [Workers] Running {len(query_jobs):,} real-time queries across "
+                f"{len(units_with_queries):,} query units with {query_worker_count} "
+                "workers total."
+            )
         else:
-            completed = [query_sample(unit) for unit in pending_units]
-        for unit, results in completed:
-            for result in results:
+            self._log(
+                f"  [Workers] Running {len(query_jobs):,} real-time queries with "
+                f"{query_worker_count} workers."
+            )
+
+        unit_states: Dict[Any, Dict[str, Any]] = {}
+        unit_state_lock = threading.Lock()
+
+        def get_unit_state(unit: EvaluationUnit) -> Any:
+            with unit_state_lock:
+                state = unit_states.get(unit.context_id)
+                if state is None:
+                    if hasattr(self, "_read_memory_snapshot"):
+                        payload = self._read_memory_snapshot(unit)
+                        state = payload.get("memory_state", payload) if isinstance(payload, dict) else payload
+                    else:
+                        state = {}
+                    unit_states[unit.context_id] = state
+                return state
+
+        worker_local = threading.local()
+
+        def get_worker_manager(unit: EvaluationUnit) -> Optional[AgentManager]:
+            if not hasattr(worker_local, "managers"):
+                worker_local.managers = {}
+            manager = worker_local.managers.get(unit.context_id)
+            if manager is None:
+                state = get_unit_state(unit)
+                try:
+                    manager = AgentManager(
+                        method_config=getattr(self, "method_config", None),
+                        dataset_config=getattr(self, "dataset_config", None),
+                        batch_api=False,
+                        workers=1,
+                    )
+                    if hasattr(manager, "import_memory_state") and isinstance(state, dict) and state:
+                        manager.import_memory_state(
+                            state,
+                            context_id=unit.context_id,
+                        )
+                except Exception:
+                    manager = getattr(self, "agent_manager", None)
+                worker_local.managers[unit.context_id] = manager
+            return manager
+
+        def evaluate_query_job(job: Tuple[EvaluationUnit, LoCoMoQuery]) -> Tuple[EvaluationUnit, MetricResult]:
+            unit, query = job
+            manager = get_worker_manager(unit)
+            try:
+                result = self._evaluate_query(query, unit.context_id, manager=manager)
+            except TypeError:
+                result = self._evaluate_query(query, unit.context_id)
+            if hasattr(result, "memory_construction_time"):
                 result.memory_construction_time = 0.0
-                self.aggregator.add_result(result)
-                self.result_collector.add_result(result, unit.context_id)
-                self._record_completed_query(unit.context_id, result)
+            return unit, result
+
+        if query_worker_count > 1:
+            with ThreadPoolExecutor(max_workers=query_worker_count) as executor:
+                for unit, result in executor.map(evaluate_query_job, query_jobs):
+                    if hasattr(self, "aggregator") and hasattr(self.aggregator, "add_result"):
+                        self.aggregator.add_result(result)
+                    if hasattr(self, "result_collector") and hasattr(self.result_collector, "add_result"):
+                        self.result_collector.add_result(result, unit.context_id)
+                    if hasattr(self, "_record_completed_query"):
+                        self._record_completed_query(unit.context_id, result)
+        else:
+            for job in query_jobs:
+                unit, result = evaluate_query_job(job)
+                if hasattr(self, "aggregator") and hasattr(self.aggregator, "add_result"):
+                    self.aggregator.add_result(result)
+                if hasattr(self, "result_collector") and hasattr(self.result_collector, "add_result"):
+                    self.result_collector.add_result(result, unit.context_id)
+                if hasattr(self, "_record_completed_query"):
+                    self._record_completed_query(unit.context_id, result)
 
     def _split_sessions_into_chunks(
         self,
@@ -2277,6 +2343,7 @@ class LoCoMoEvaluator:
             ),
             "selector_mode": retrieval_config.get("selector_mode", "state_mmr"),
             "evidence_count": retrieval_config.get("evidence_count", 8),
+            "turn_evidence_count": retrieval_config.get("turn_evidence_count", 0),
             "claim_top_k": retrieval_config.get("claim_top_k", 30),
             "episode_top_k": retrieval_config.get("episode_top_k", 20),
             "retrieve_turns": retrieval_config.get("retrieve_turns", True),

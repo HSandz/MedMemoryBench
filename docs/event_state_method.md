@@ -297,12 +297,22 @@ is available through `turn_lexical_retrieval_enabled`, which defaults to
 `false`. Claim-derived and direct turn evidence are deduplicated by immutable
 episode/turn provenance before rendering. `evidence_count` is the maximum
 number of unique selected retrieval evidence objects after this
-provenance-aware deduplication. When a selected direct immutable turn duplicates
-a selected claim's rendered provenance turn, ESHM continues through the existing
-deterministic MMR order until that effective budget is filled or candidates are
-exhausted. Episode objects retain their independent `("episode", episode_id)`
-identity and are never collapsed merely because one of their archived turns is
-also selected.
+provenance-aware deduplication. `turn_evidence_count` defaults to `0`, which
+preserves the shared selection pool: direct turns compete with claims and
+episodes for `evidence_count`. Set it to a positive integer to give direct raw
+turns a separate final budget. In that mode, claim/episode fusion and selection
+uses all `evidence_count` slots, while dense and optional lexical turn retrieval
+are fused and selected independently up to `turn_evidence_count`; the final
+context can therefore contain up to their sum. `turn_top_k` remains the turn
+retrieval depth, and `retrieve_turns: false` still selects no direct turns.
+Claim and episode provenance excerpts remain controlled only by
+`max_source_excerpts_per_claim` and `max_episode_source_excerpts_total`; they do
+not consume the direct-turn budget. When a selected direct immutable turn
+duplicates a selected claim's rendered provenance turn, ESHM continues through
+the applicable deterministic selection order until that budget is filled or
+candidates are exhausted. Episode objects retain their independent
+`("episode", episode_id)` identity and are never collapsed merely because one
+of their archived turns is also selected.
 
 `max_episode_source_excerpts_total` is an explicit query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of

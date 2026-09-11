@@ -1140,6 +1140,96 @@ def extract_usage_token_counts(usage: Any) -> Tuple[int, int, int, int]:
     return input_tokens, output_tokens, output_tokens - thinking_tokens, thinking_tokens
 
 
+def extract_text_content(content: Any) -> str:
+    """Extract plain text from string, list of content parts, or structured response content."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: List[str] = []
+        for item in content:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, (list, tuple)):
+                parts.append(extract_text_content(item))
+            elif isinstance(item, dict):
+                item_type = str(item.get("type", "")).lower()
+                if item_type in ("thinking", "reasoning"):
+                    continue
+                if item.get("text") is not None:
+                    parts.append(str(item["text"]))
+                elif item.get("content") is not None:
+                    parts.append(extract_text_content(item["content"]))
+            elif hasattr(item, "text"):
+                item_type = str(getattr(item, "type", "")).lower()
+                if item_type in ("thinking", "reasoning"):
+                    continue
+                text_val = getattr(item, "text", None)
+                if text_val is not None:
+                    parts.append(str(text_val))
+            elif hasattr(item, "content"):
+                item_type = str(getattr(item, "type", "")).lower()
+                if item_type in ("thinking", "reasoning"):
+                    continue
+                content_val = getattr(item, "content", None)
+                if content_val is not None:
+                    parts.append(extract_text_content(content_val))
+            elif isinstance(item, (int, float)):
+                parts.append(str(item))
+        return "".join(parts)
+    if isinstance(content, dict):
+        if str(content.get("type", "")).lower() in ("thinking", "reasoning"):
+            return ""
+        if content.get("text") is not None:
+            return str(content["text"])
+        if content.get("content") is not None:
+            return extract_text_content(content["content"])
+        return str(content)
+    if hasattr(content, "text"):
+        if str(getattr(content, "type", "")).lower() in ("thinking", "reasoning"):
+            return ""
+        text_val = getattr(content, "text", None)
+        if text_val is not None:
+            return str(text_val)
+    if hasattr(content, "content"):
+        if str(getattr(content, "type", "")).lower() in ("thinking", "reasoning"):
+            return ""
+        content_val = getattr(content, "content", None)
+        if content_val is not None:
+            return extract_text_content(content_val)
+    return str(content)
+
+
+def extract_reasoning_content(message: Any = None, content: Any = None) -> Optional[str]:
+    """Extract reasoning or thinking content from message attributes or content parts."""
+    if message is not None:
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if reasoning:
+            return str(reasoning) if not isinstance(reasoning, str) else reasoning
+    raw_content = content if content is not None else (getattr(message, "content", None) if message is not None else None)
+    if isinstance(raw_content, (list, tuple)):
+        reasoning_parts = []
+        for item in raw_content:
+            if isinstance(item, dict):
+                item_type = str(item.get("type", "")).lower()
+                if item_type in ("thinking", "reasoning"):
+                    val = item.get("thinking") or item.get("reasoning") or item.get("text")
+                    if val:
+                        reasoning_parts.append(str(val))
+            elif hasattr(item, "type"):
+                item_type = str(getattr(item, "type", "")).lower()
+                if item_type in ("thinking", "reasoning"):
+                    val = getattr(item, "thinking", None) or getattr(item, "reasoning", None) or getattr(item, "text", None)
+                    if val:
+                        reasoning_parts.append(str(val))
+        if reasoning_parts:
+            return "".join(reasoning_parts)
+    return None
+
+
 @dataclass
 class LLMResponse:
     """LLM response result."""
@@ -1154,6 +1244,8 @@ class LLMResponse:
     finish_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.content, str):
+            self.content = extract_text_content(self.content)
         self.input_tokens = max(int(self.input_tokens or 0), 0)
         self.output_tokens = max(int(self.output_tokens or 0), 0)
         self.thinking_tokens = min(
@@ -1329,11 +1421,22 @@ class OpenAIClient(BaseLLMClient):
         latency = time.time() - start_time
 
         message = response.choices[0].message
-        content = message.content or ""
+        content = extract_text_content(message.content)
         finish_reason = response.choices[0].finish_reason
         refusal = getattr(message, "refusal", None)
+        if refusal is None and isinstance(message.content, (list, tuple)):
+            for part in message.content:
+                if isinstance(part, dict) and part.get("type") == "refusal":
+                    refusal = part.get("refusal")
+                elif getattr(part, "type", None) == "refusal":
+                    refusal = getattr(part, "refusal", None)
+                if refusal:
+                    break
+
         reasoning = getattr(message, "reasoning", None)
         reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is None:
+            reasoning_content = extract_reasoning_content(message, message.content)
         logger.debug(
             "OpenAI response metadata: finish_reason=%r, message.reasoning=%s, "
             "message.reasoning_content=%s",
@@ -1600,12 +1703,23 @@ class AzureOpenAIClient(BaseLLMClient):
         response = self.client.chat.completions.create(**params)
         latency = time.time() - start_time
 
-        content = response.choices[0].message.content or ""
-        finish_reason = response.choices[0].finish_reason
         message = response.choices[0].message
+        content = extract_text_content(message.content)
+        finish_reason = response.choices[0].finish_reason
         refusal = getattr(message, "refusal", None)
+        if refusal is None and isinstance(message.content, (list, tuple)):
+            for part in message.content:
+                if isinstance(part, dict) and part.get("type") == "refusal":
+                    refusal = part.get("refusal")
+                elif getattr(part, "type", None) == "refusal":
+                    refusal = getattr(part, "refusal", None)
+                if refusal:
+                    break
+
         reasoning = getattr(message, "reasoning", None)
         reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is None:
+            reasoning_content = extract_reasoning_content(message, message.content)
 
         if not content.strip():
             raise EmptyLLMResponseError(
@@ -1688,7 +1802,7 @@ class AnthropicClient(BaseLLMClient):
         response = self.client.messages.create(**params)
         latency = time.time() - start_time
 
-        content = response.content[0].text if response.content else ""
+        content = extract_text_content(response.content)
         if not content.strip():
             raise EmptyLLMResponseError(
                 f"Anthropic returned an empty response (model={self.model})."
@@ -1813,7 +1927,11 @@ class BaseGeminiClient(BaseLLMClient):
             tracker.record_failure_duration(time.perf_counter() - attempt_started_at)
             raise
         latency = time.time() - start_time
-        content = getattr(response, "text", "") or ""
+        try:
+            raw_text = getattr(response, "text", "") or ""
+        except Exception:
+            raw_text = ""
+        content = extract_text_content(raw_text)
         if not content.strip():
             candidates = getattr(response, "candidates", None) or []
             finish_reason = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
@@ -2920,6 +3038,8 @@ __all__ = [
     "TruncatedLLMResponseError",
     # Factory functions
     "create_llm_client",
+    "extract_text_content",
+    "extract_reasoning_content",
     "extract_usage_token_counts",
     "format_messages",
     # Retry config

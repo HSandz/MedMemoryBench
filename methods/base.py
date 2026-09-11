@@ -48,6 +48,11 @@ class AgentResponse:
     retrieved_memories: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.output, str):
+            from utils.llm_client import extract_text_content
+            self.output = extract_text_content(self.output)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "output": self.output,

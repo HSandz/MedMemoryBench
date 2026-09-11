@@ -130,6 +130,81 @@ class EventStateRetriever:
             "selected_temporal_episode_count": 0,
         }
 
+    def rank_candidate_pools(
+        self,
+        question: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        temporal_constraint: TemporalQueryConstraint | None = None,
+        parse_temporal_query: bool = True,
+        retrieve_claims_override: bool | None = None,
+        retrieve_episodes_override: bool | None = None,
+        retrieve_turns_override: bool | None = None,
+        state_view: str = "current",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        """Rank structured and direct-turn pools independently when configured.
+
+        The zero-budget path intentionally delegates to ``rank_candidates``
+        unchanged.  A positive direct-turn budget gives claims/episodes and
+        turns independent fusion normalization and candidate truncation before
+        their respective selectors run.
+        """
+        if int(self.config.get("turn_evidence_count", 0)) <= 0:
+            candidates, diagnostics = self.rank_candidates(
+                question,
+                query_vector=query_vector,
+                temporal_constraint=temporal_constraint,
+                parse_temporal_query=parse_temporal_query,
+                retrieve_claims_override=retrieve_claims_override,
+                retrieve_episodes_override=retrieve_episodes_override,
+                retrieve_turns_override=retrieve_turns_override,
+                state_view=state_view,
+            )
+            return candidates, [], diagnostics
+
+        structured, structured_diagnostics = self.rank_candidates(
+            question,
+            query_vector=query_vector,
+            temporal_constraint=temporal_constraint,
+            parse_temporal_query=parse_temporal_query,
+            retrieve_claims_override=retrieve_claims_override,
+            retrieve_episodes_override=retrieve_episodes_override,
+            retrieve_turns_override=False,
+            state_view=state_view,
+        )
+        turns, turn_diagnostics = self.rank_candidates(
+            question,
+            query_vector=query_vector,
+            temporal_constraint=temporal_constraint,
+            parse_temporal_query=parse_temporal_query,
+            retrieve_claims_override=False,
+            retrieve_episodes_override=False,
+            retrieve_turns_override=retrieve_turns_override,
+            state_view=state_view,
+        )
+        diagnostics = dict(structured_diagnostics)
+        diagnostics.update({
+            "turn_candidates": turn_diagnostics["turn_candidates"],
+            "lexical_turn_candidates": turn_diagnostics["lexical_turn_candidates"],
+            "pre_candidate_truncation_fused_candidate_count": (
+                structured_diagnostics["pre_candidate_truncation_fused_candidate_count"]
+                + turn_diagnostics["pre_candidate_truncation_fused_candidate_count"]
+            ),
+            "candidate_count": len(structured) + len(turns),
+            "post_candidate_truncation_candidate_count": len(structured) + len(turns),
+            "pre_candidate_truncation_candidates": (
+                structured_diagnostics["pre_candidate_truncation_candidates"]
+                + turn_diagnostics["pre_candidate_truncation_candidates"]
+            ),
+            "post_candidate_truncation_candidates": (
+                structured_diagnostics["post_candidate_truncation_candidates"]
+                + turn_diagnostics["post_candidate_truncation_candidates"]
+            ),
+            "non_turn_candidate_count": len(structured),
+            "direct_turn_candidate_count": len(turns),
+        })
+        return structured, turns, diagnostics
+
     def select_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],

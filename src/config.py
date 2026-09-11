@@ -495,6 +495,10 @@ class MethodConfig:
         else:
             build_config = {**legacy_agent_params, **raw_build_config}
             retrieval_config = dict(raw_retrieval_config)
+        if str(data.get("method_name", "")).lower() == "event_state":
+            # Persist the explicit zero default in run_config snapshots so old
+            # configurations have an auditable, backward-compatible meaning.
+            retrieval_config.setdefault("turn_evidence_count", 0)
         merged_agent_params = {**build_config, **retrieval_config}
 
         # Resolve relative paths against PROJECT_ROOT in both config sections.
