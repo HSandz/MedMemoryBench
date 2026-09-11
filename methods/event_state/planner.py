@@ -19,6 +19,10 @@ _TIME_MODES = {
     "record_interval",
     "knowledge_as_of",
 }
+_QUERY_ROLES = {"target", "support", "anchor"}
+_QUERY_AXES = {"none", "event", "record", "knowledge"}
+_QUERY_RELATIONS = {"none", "overlap", "before", "after", "as_of", "latest", "earliest"}
+_QUERY_PRECISIONS = {"exact", "bounded", "approximate", "unknown"}
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,45 @@ class PlannerDecision:
     requests: List[PlannerRequest]
     invalid_request_count: int = 0
     duplicate_request_count: int = 0
+
+
+@dataclass(frozen=True)
+class QuerySearch:
+    query: str
+    role: str
+
+
+@dataclass(frozen=True)
+class QueryTemporal:
+    axis: str = "none"
+    relation: str = "none"
+    start: Optional[date] = None
+    end: Optional[date] = None
+    anchor_search: Optional[int] = None
+    precision: str = "unknown"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"axis": self.axis, "relation": self.relation,
+                "start": self.start.isoformat() if self.start else None,
+                "end": self.end.isoformat() if self.end else None,
+                "anchor_search": self.anchor_search, "precision": self.precision}
+
+
+@dataclass(frozen=True)
+class QueryPlan:
+    searches: List[QuerySearch]
+    temporal: QueryTemporal
+    state_view: str
+    duplicate_search_count: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"searches": [{"query": item.query, "role": item.role} for item in self.searches],
+                "temporal": self.temporal.to_dict(), "state_view": self.state_view}
+
+
+def fallback_query_plan(question: str, state_view: str = "current") -> QueryPlan:
+    """The caller always retains the raw question; this represents no compiler constraints."""
+    return QueryPlan([], QueryTemporal(), state_view)
 
 
 def _parse_date(value: Any) -> date:
@@ -156,3 +199,68 @@ def validate_planner_output(value: Any, max_requests: int) -> PlannerDecision:
         else:
             invalid += 1
     return PlannerDecision("retrieve", None, valid, invalid, duplicates)
+
+
+def validate_query_compiler_output(value: Any, max_searches: int) -> QueryPlan:
+    """Strictly validate the one-shot compiler output without LLM repair."""
+    if not isinstance(value, dict):
+        raise ValueError("query compiler output must be an object")
+    raw_searches = value.get("searches")
+    if not isinstance(raw_searches, list) or len(raw_searches) > max_searches:
+        raise ValueError("searches must be a bounded list")
+    searches: List[QuerySearch] = []
+    seen = set()
+    duplicates = 0
+    for raw in raw_searches:
+        if not isinstance(raw, dict) or raw.get("role") not in _QUERY_ROLES:
+            raise ValueError("invalid search role")
+        query = raw.get("query")
+        if not isinstance(query, str) or not (query := " ".join(query.split())):
+            raise ValueError("search query must be non-empty")
+        if len(query) > MAX_REQUEST_QUERY_LENGTH:
+            raise ValueError("search query is too long")
+        key = (query.casefold(), raw["role"])
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        searches.append(QuerySearch(query, raw["role"]))
+    if not searches:
+        raise ValueError("query compiler requires at least one valid search")
+    raw_temporal = value.get("temporal")
+    if not isinstance(raw_temporal, dict):
+        raise ValueError("temporal must be an object")
+    axis, relation = raw_temporal.get("axis"), raw_temporal.get("relation")
+    precision = raw_temporal.get("precision")
+    if axis not in _QUERY_AXES or relation not in _QUERY_RELATIONS or precision not in _QUERY_PRECISIONS:
+        raise ValueError("invalid temporal enum")
+    start_raw, end_raw = raw_temporal.get("start"), raw_temporal.get("end")
+    if start_raw is not None and not isinstance(start_raw, str) or end_raw is not None and not isinstance(end_raw, str):
+        raise ValueError("temporal dates must be strings or null")
+    start = _parse_date(start_raw) if start_raw else None
+    end = _parse_date(end_raw) if end_raw else None
+    if start and end and start > end:
+        raise ValueError("temporal start must not exceed end")
+    if precision == "exact" and start and end and start != end:
+        raise ValueError("exact temporal interval must be one day")
+    anchor = raw_temporal.get("anchor_search")
+    if anchor is not None and (not isinstance(anchor, int) or isinstance(anchor, bool) or not 0 <= anchor < len(searches)):
+        raise ValueError("invalid anchor_search")
+    if anchor is not None and searches[anchor].role != "anchor":
+        raise ValueError("anchor_search must reference an anchor search")
+    if relation in {"before", "after"} and not (anchor is not None or start or end):
+        raise ValueError("before/after requires an anchor or explicit date")
+    if relation == "overlap" and (start is None or end is None):
+        raise ValueError("overlap requires a bounded interval")
+    if axis == "knowledge" and (relation != "as_of" or value.get("state_view") != "as_of"):
+        raise ValueError("knowledge requires as_of relation and state_view")
+    if relation == "as_of" and end is None:
+        raise ValueError("as_of requires an end date")
+    if relation == "as_of" and axis != "knowledge":
+        raise ValueError("as_of is a knowledge relation")
+    if axis == "none" and relation != "none":
+        raise ValueError("none axis requires none relation")
+    state_view = value.get("state_view")
+    if state_view not in _STATE_VIEWS:
+        raise ValueError("invalid state_view")
+    return QueryPlan(searches, QueryTemporal(axis, relation, start, end, anchor, precision), state_view, duplicates)

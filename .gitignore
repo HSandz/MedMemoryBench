@@ -55,6 +55,7 @@ env/
 /requirements_frozen.txt
 /tests/*
 !/tests/test_vertex_batch.py
+!/tests/test_vertex_auth_mode.py
 !/tests/test_amem_fix_agent.py
 !/tests/test_gemini_retry.py
 !/tests/test_google_ai_studio.py

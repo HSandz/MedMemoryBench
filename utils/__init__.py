@@ -15,6 +15,7 @@ from .llm_client import (
     create_llm_client,
     format_messages,
     get_google_service_account_files,
+    resolve_google_vertex_auth_mode,
 )
 from .templates import TemplateManager, get_template_manager
 
@@ -37,6 +38,7 @@ __all__ = [
     "create_llm_client",
     "format_messages",
     "get_google_service_account_files",
+    "resolve_google_vertex_auth_mode",
     # Templates
     "TemplateManager",
     "get_template_manager",

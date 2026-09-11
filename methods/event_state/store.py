@@ -40,6 +40,9 @@ class EventStateStore:
         self.turn_metadata: Dict[str, Dict[str, Any]] = {}
         self.claim_embeddings: Dict[str, List[float]] = {}
         self.claim_slot_embeddings: Dict[str, List[float]] = {}
+        # Rebuildable provenance index: a raw turn can support several events.
+        self.turn_temporal_spans: Dict[tuple[str, Any], List[Dict[str, str]]] = {}
+        self.episode_temporal_spans: Dict[str, List[Dict[str, str]]] = {}
 
     @staticmethod
     def stable_id(prefix: str, value: Any) -> str:
@@ -99,6 +102,20 @@ class EventStateStore:
         """Reconstruct index metadata for snapshots that predate turn search."""
         for episode in self.episodes.values():
             self._index_episode_turns(episode)
+        self.rebuild_temporal_indexes()
+
+    def rebuild_temporal_indexes(self) -> None:
+        """Derive event-time evidence from claim provenance, never record time."""
+        self.turn_temporal_spans, self.episode_temporal_spans = {}, {}
+        for claim in self.claims.values():
+            if not claim.event_time_start or not claim.event_time_end:
+                continue
+            span = {"start": claim.event_time_start, "end": claim.event_time_end,
+                    "precision": claim.event_time_precision}
+            for ref in claim.evidence:
+                self.episode_temporal_spans.setdefault(ref.episode_id, []).append(span)
+                for turn_id in ref.source_turn_ids:
+                    self.turn_temporal_spans.setdefault((ref.episode_id, turn_id), []).append(span)
 
     def turn_for_key(self, key: str) -> tuple[Optional[Episode], Optional[Any]]:
         metadata = self.turn_metadata.get(key, {})
@@ -119,6 +136,7 @@ class EventStateStore:
             self.claim_slot_embeddings[claim.claim_id] = list(slot_embedding if slot_embedding is not None else embedding)
         for evidence in claim.evidence:
             self.attach_claim_evidence(claim.claim_id, evidence, evidence.support_type)
+        self.rebuild_temporal_indexes()
 
     def attach_claim_evidence(self, claim_id: str, evidence: Any, support_type: str = "origin") -> bool:
         """Attach one provenance reference and keep the heterogeneous graph in sync."""
@@ -246,6 +264,14 @@ class EventStateStore:
                     if episode.source_session_id is not None
                 }
             ),
+            "claims_with_valid_time_text": sum(bool(claim.valid_time_text) for claim in self.claims.values()),
+            "claims_with_normalized_event_time": sum(bool(claim.event_time_start and claim.event_time_end) for claim in self.claims.values()),
+            "event_time_exact_count": sum(claim.event_time_precision == "exact" and bool(claim.event_time_start) for claim in self.claims.values()),
+            "event_time_bounded_count": sum(claim.event_time_precision == "bounded" and bool(claim.event_time_start) for claim in self.claims.values()),
+            "event_time_approximate_count": sum(claim.event_time_precision == "approximate" and bool(claim.event_time_start) for claim in self.claims.values()),
+            "event_time_unknown_count": sum(claim.event_time_precision == "unknown" or not claim.event_time_start for claim in self.claims.values()),
+            "turns_with_event_time_spans": len(self.turn_temporal_spans),
+            "episodes_with_event_time_spans": len(self.episode_temporal_spans),
         }
 
     @classmethod

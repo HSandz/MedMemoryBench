@@ -2023,6 +2023,50 @@ def get_google_service_account_files(
     return resolved_paths
 
 
+def resolve_google_vertex_auth_mode(
+    auth_mode: Optional[str] = None,
+    service_account_file: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+    service_account_files: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+) -> str:
+    """Resolve the authentication mode for Vertex Gemini.
+
+    Returns:
+        "service_account" or "adc"
+    """
+    configured = (
+        auth_mode
+        or os.environ.get("GOOGLE_VERTEX_AUTH_MODE")
+        or os.environ.get("GOOGLE_AUTH_MODE")
+    )
+    if configured:
+        mode = str(configured).strip().lower()
+        if mode in {"adc", "cli", "application_default_credentials"}:
+            return "adc"
+        if mode in {"service_account", "service-account", "sa", "json"}:
+            return "service_account"
+        if mode != "auto":
+            raise ValueError(
+                f"Invalid Google Vertex auth mode: {configured!r}. "
+                "Supported modes: 'service_account' (or 'sa'), 'adc' (or 'cli'), 'auto'."
+            )
+
+    # Auto-detection mode:
+    if service_account_files is not None or service_account_file is not None:
+        return "service_account"
+
+    env_sa = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if env_sa and env_sa.strip():
+        if env_sa.strip().lower() in {"adc", "cli"}:
+            return "adc"
+        return "service_account"
+
+    project_root = Path(__file__).resolve().parent.parent
+    if (project_root / "service-account.json").is_file():
+        return "service_account"
+
+    return "adc"
+
+
 def _is_vertex_service_account_retryable(exc: Exception) -> Tuple[bool, str]:
     """Include credential/auth failures that can be fixed by account rotation."""
     retryable, reason = _is_retryable_exception(exc)
@@ -2041,7 +2085,7 @@ def _is_vertex_service_account_retryable(exc: Exception) -> Tuple[bool, str]:
 
 
 class GeminiVertexClient(BaseGeminiClient):
-    """Vertex Gemini client with per-failure-type service-account rotation."""
+    """Vertex Gemini client with per-failure-type service-account rotation or ADC authentication."""
 
     def __init__(
         self,
@@ -2053,11 +2097,13 @@ class GeminiVertexClient(BaseGeminiClient):
         service_account_file: Union[str, Path, Sequence[Union[str, Path]], None] = None,
         service_account_files: Union[str, Path, Sequence[Union[str, Path]], None] = None,
         service_account_failure_threshold: Optional[int] = None,
+        auth_mode: Optional[str] = None,
         **kwargs
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
 
         try:
+            import google.auth
             from google import genai
             from google.oauth2 import service_account
         except ImportError as exc:
@@ -2073,29 +2119,75 @@ class GeminiVertexClient(BaseGeminiClient):
             raise ValueError("service_account_failure_threshold must be at least 1")
         self.service_account_failure_threshold = service_account_failure_threshold
 
-        configured_files = service_account_files or service_account_file
-        self.service_account_files = get_google_service_account_files(configured_files)
-        self._vertex_accounts: List[Tuple[Path, Any, str, Any]] = []
-        for credential_file in self.service_account_files:
-            credentials = service_account.Credentials.from_service_account_file(
-                str(credential_file),
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        self.auth_mode = resolve_google_vertex_auth_mode(
+            auth_mode=auth_mode or kwargs.get("auth_mode"),
+            service_account_file=service_account_file,
+            service_account_files=service_account_files,
+        )
+
+        self._vertex_accounts: List[Tuple[Optional[Path], Any, str, Any]] = []
+
+        if self.auth_mode == "service_account":
+            configured_files = service_account_files or service_account_file
+            self.service_account_files = get_google_service_account_files(configured_files)
+            for credential_file in self.service_account_files:
+                credentials = service_account.Credentials.from_service_account_file(
+                    str(credential_file),
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                account_project = project or credentials.project_id
+                if not account_project:
+                    raise ValueError(
+                        "Vertex Gemini requires a project_id in every service-account file "
+                        "or a project argument."
+                    )
+                # enterprise=True selects Google Agent Platform, not the Developer API.
+                account_client = genai.Client(
+                    enterprise=True,
+                    credentials=credentials,
+                    project=account_project,
+                    location=self.location,
+                )
+                self._vertex_accounts.append(
+                    (credential_file, credentials, account_project, account_client)
+                )
+        elif self.auth_mode == "adc":
+            try:
+                credentials, default_project = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to load Google Application Default Credentials (ADC). "
+                    "Authenticate via CLI with: 'gcloud auth application-default login' "
+                    "or set GOOGLE_APPLICATION_CREDENTIALS."
+                ) from exc
+
+            account_project = (
+                project
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+                or os.environ.get("CLOUDSDK_CORE_PROJECT")
+                or os.environ.get("GCP_PROJECT")
+                or getattr(credentials, "quota_project_id", None)
+                or getattr(credentials, "project_id", None)
+                or default_project
             )
-            account_project = project or credentials.project_id
             if not account_project:
                 raise ValueError(
-                    "Vertex Gemini requires a project_id in every service-account file "
-                    "or a project argument."
+                    "Vertex Gemini in ADC mode requires a project ID. "
+                    "Set GOOGLE_CLOUD_PROJECT in .env, pass 'project', or run "
+                    "'gcloud auth application-default set-quota-project <PROJECT_ID>'."
                 )
-            # enterprise=True selects Google Agent Platform, not the Developer API.
+
             account_client = genai.Client(
-                enterprise=True,
+                vertexai=True,
                 credentials=credentials,
                 project=account_project,
                 location=self.location,
             )
+            self.service_account_files = []
             self._vertex_accounts.append(
-                (credential_file, credentials, account_project, account_client)
+                (None, credentials, account_project, account_client)
             )
 
         self._account_lock = threading.Lock()
@@ -2118,7 +2210,7 @@ class GeminiVertexClient(BaseGeminiClient):
         self.project = project
         self.client = client
 
-    def _active_account(self) -> Tuple[int, Path, Any, str, Any]:
+    def _active_account(self) -> Tuple[int, Optional[Path], Any, str, Any]:
         with self._account_lock:
             account_index = self._active_account_index
             credential_file, credentials, project, client = self._vertex_accounts[account_index]
@@ -2191,11 +2283,15 @@ class GeminiVertexClient(BaseGeminiClient):
                 last_exception = exc
                 retryable, reason = _is_vertex_service_account_retryable(exc)
                 if not retryable:
+                    account_desc = (
+                        f"service account {account_index + 1}/{len(self._vertex_accounts)}"
+                        if credential_file
+                        else "ADC credentials"
+                    )
                     logger.error(
-                        "Vertex %s failed (non-retryable) with service account %d/%d: %s: %s",
+                        "Vertex %s failed (non-retryable) with %s: %s: %s",
                         operation_name,
-                        account_index + 1,
-                        len(self._vertex_accounts),
+                        account_desc,
                         type(exc).__name__,
                         truncate_error_message(exc),
                     )
@@ -2209,18 +2305,24 @@ class GeminiVertexClient(BaseGeminiClient):
                 if threshold_reached:
                     exhausted_accounts += 1
                 if rotated:
+                    account_name = credential_file.name if credential_file else "ADC"
+                    next_name = (
+                        self.service_account_files[active_index].name
+                        if active_index < len(self.service_account_files)
+                        else "ADC"
+                    )
                     logger.warning(
-                        "Vertex service account %d/%d (%s) reached %d/%d for %s; "
+                        "Vertex account %d/%d (%s) reached %d/%d for %s; "
                         "rotating to account %d/%d (%s).",
                         account_index + 1,
                         len(self._vertex_accounts),
-                        credential_file.name,
+                        account_name,
                         account_attempt,
                         self.service_account_failure_threshold,
                         failure_type,
                         active_index + 1,
                         len(self._vertex_accounts),
-                        self.service_account_files[active_index].name,
+                        next_name,
                     )
                     get_usage_tracker().record_retry()
                     continue
@@ -2241,8 +2343,13 @@ class GeminiVertexClient(BaseGeminiClient):
                 get_usage_tracker().record_retry()
                 _sleep_after_failure(delay)
 
+        exhausted_msg = (
+            "Vertex call failed after trying every configured service account"
+            if getattr(self, "auth_mode", "") == "service_account"
+            else "Vertex call failed with ADC authentication after maximum retries"
+        )
         raise LLMRetryExhaustedError(
-            "Vertex call failed after trying every configured service account",
+            exhausted_msg,
             last_exception=last_exception,
             attempts=total_attempts,
             failure_type=_get_retry_failure_type(last_exception),
@@ -2761,6 +2868,7 @@ class GeminiHybridClient(BaseGeminiClient):
                 "location",
                 "service_account_file",
                 "service_account_files",
+                "auth_mode",
             )
             if key in kwargs
         }
@@ -2790,6 +2898,7 @@ class GeminiHybridClient(BaseGeminiClient):
         self.credentials = self.vertex_client.credentials
         self.service_account_file = self.vertex_client.service_account_file
         self.client = self.vertex_client.client
+        self.auth_mode = getattr(self.vertex_client, "auth_mode", "auto")
 
         vertex_accounts = getattr(
             self.vertex_client,
@@ -3073,6 +3182,7 @@ __all__ = [
     "is_gemini_provider",
     "get_google_ai_studio_api_keys",
     "get_google_service_account_files",
+    "resolve_google_vertex_auth_mode",
     # Usage tracking
     "TokenUsage",
     "LLMUsageTracker",
