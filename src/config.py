@@ -112,6 +112,7 @@ class APIConfig:
 
     anthropic_api_key: str = ""
     google_ai_studio_api_keys: str = ""
+    google_auth_mode: str = ""
 
     default_llm_model: str = "gpt-4o-mini"
     default_embedding_model: str = "text-embedding-3-small"
@@ -233,6 +234,10 @@ def load_env_config(env_path: Optional[Path] = None) -> APIConfig:
             or os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
             or os.getenv("GOOGLE_API_KEY", "")
             or os.getenv("GEMINI_API_KEY", "")
+        ),
+        google_auth_mode=(
+            os.getenv("GOOGLE_VERTEX_AUTH_MODE", "")
+            or os.getenv("GOOGLE_AUTH_MODE", "")
         ),
         default_llm_model=os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini"),
         default_embedding_model=os.getenv("DEFAULT_EMBEDDING_MODEL", "text-embedding-3-small"),
@@ -495,6 +500,10 @@ class MethodConfig:
         else:
             build_config = {**legacy_agent_params, **raw_build_config}
             retrieval_config = dict(raw_retrieval_config)
+        if str(data.get("method_name", "")).lower() == "event_state":
+            # Persist the explicit zero default in run_config snapshots so old
+            # configurations have an auditable, backward-compatible meaning.
+            retrieval_config.setdefault("turn_evidence_count", 0)
         merged_agent_params = {**build_config, **retrieval_config}
 
         # Resolve relative paths against PROJECT_ROOT in both config sections.

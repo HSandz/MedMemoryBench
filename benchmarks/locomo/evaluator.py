@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -142,6 +143,7 @@ class LoCoMoEvaluator:
         self._batch_client: Optional[VertexBatchClient] = None
         self._batch_fallback_logged = False
         self._pending_batch_queries: List[Dict[str, Any]] = []
+        self._pending_query_plan_requests: List[Dict[str, Any]] = []
         self._memory_snapshot_manifest: Optional[Dict[str, Any]] = None
         self._memory_snapshot_dir_path: Optional[Path] = None
         self._query_checkpoint: Dict[str, Any] = {
@@ -786,20 +788,6 @@ class LoCoMoEvaluator:
                 self._record_completed_query(item["sample_id"], item["result"])
             return
 
-        def query_sample(unit: EvaluationUnit) -> Tuple[EvaluationUnit, List[MetricResult]]:
-            manager = AgentManager(
-                method_config=self.method_config,
-                dataset_config=self.dataset_config,
-                batch_api=False,
-                workers=self.workers,
-            )
-            manager.import_memory_state(
-                self._read_memory_snapshot(unit)["memory_state"], context_id=unit.context_id
-            )
-            return unit, self._evaluate_realtime_queries(
-                unit.queries_to_evaluate, unit.context_id, manager=manager
-            )
-
         completed_prior = []
         pending_units = []
         for unit in units:
@@ -809,18 +797,97 @@ class LoCoMoEvaluator:
             self.aggregator.add_result(result)
             self.result_collector.add_result(result, sample_id)
 
-        query_workers = self._query_worker_count()
-        if query_workers > 1 and len(pending_units) > 1:
-            with ThreadPoolExecutor(max_workers=min(query_workers, len(pending_units))) as executor:
-                completed = list(executor.map(query_sample, pending_units))
+        units_with_queries = [u for u in pending_units if u.queries_to_evaluate]
+        query_jobs = [
+            (unit, query)
+            for unit in units_with_queries
+            for query in unit.queries_to_evaluate
+        ]
+        if not query_jobs:
+            return
+
+        query_worker_count = min(self._query_worker_count(), len(query_jobs))
+        if len(units_with_queries) > 1:
+            self._log(
+                f"  [Workers] Running {len(query_jobs):,} real-time queries across "
+                f"{len(units_with_queries):,} query units with {query_worker_count} "
+                "workers total."
+            )
         else:
-            completed = [query_sample(unit) for unit in pending_units]
-        for unit, results in completed:
-            for result in results:
+            self._log(
+                f"  [Workers] Running {len(query_jobs):,} real-time queries with "
+                f"{query_worker_count} workers."
+            )
+
+        unit_states: Dict[Any, Dict[str, Any]] = {}
+        unit_state_lock = threading.Lock()
+
+        def get_unit_state(unit: EvaluationUnit) -> Any:
+            with unit_state_lock:
+                state = unit_states.get(unit.context_id)
+                if state is None:
+                    if hasattr(self, "_read_memory_snapshot"):
+                        payload = self._read_memory_snapshot(unit)
+                        state = payload.get("memory_state", payload) if isinstance(payload, dict) else payload
+                    else:
+                        state = {}
+                    unit_states[unit.context_id] = state
+                return state
+
+        worker_local = threading.local()
+
+        def get_worker_manager(unit: EvaluationUnit) -> Optional[AgentManager]:
+            if not hasattr(worker_local, "managers"):
+                worker_local.managers = {}
+            manager = worker_local.managers.get(unit.context_id)
+            if manager is None:
+                state = get_unit_state(unit)
+                try:
+                    manager = AgentManager(
+                        method_config=getattr(self, "method_config", None),
+                        dataset_config=getattr(self, "dataset_config", None),
+                        batch_api=False,
+                        workers=1,
+                    )
+                    if hasattr(manager, "import_memory_state") and isinstance(state, dict) and state:
+                        manager.import_memory_state(
+                            state,
+                            context_id=unit.context_id,
+                        )
+                except Exception:
+                    manager = getattr(self, "agent_manager", None)
+                worker_local.managers[unit.context_id] = manager
+            return manager
+
+        def evaluate_query_job(job: Tuple[EvaluationUnit, LoCoMoQuery]) -> Tuple[EvaluationUnit, MetricResult]:
+            unit, query = job
+            manager = get_worker_manager(unit)
+            try:
+                result = self._evaluate_query(query, unit.context_id, manager=manager)
+            except TypeError:
+                result = self._evaluate_query(query, unit.context_id)
+            if hasattr(result, "memory_construction_time"):
                 result.memory_construction_time = 0.0
-                self.aggregator.add_result(result)
-                self.result_collector.add_result(result, unit.context_id)
-                self._record_completed_query(unit.context_id, result)
+            return unit, result
+
+        if query_worker_count > 1:
+            with ThreadPoolExecutor(max_workers=query_worker_count) as executor:
+                for unit, result in executor.map(evaluate_query_job, query_jobs):
+                    if hasattr(self, "aggregator") and hasattr(self.aggregator, "add_result"):
+                        self.aggregator.add_result(result)
+                    if hasattr(self, "result_collector") and hasattr(self.result_collector, "add_result"):
+                        self.result_collector.add_result(result, unit.context_id)
+                    if hasattr(self, "_record_completed_query"):
+                        self._record_completed_query(unit.context_id, result)
+        else:
+            for job in query_jobs:
+                unit, result = evaluate_query_job(job)
+                if hasattr(self, "aggregator") and hasattr(self.aggregator, "add_result"):
+                    self.aggregator.add_result(result)
+                if hasattr(self, "result_collector") and hasattr(self.result_collector, "add_result"):
+                    self.result_collector.add_result(result, unit.context_id)
+                if hasattr(self, "_record_completed_query"):
+                    self._record_completed_query(unit.context_id, result)
 
     def _split_sessions_into_chunks(
         self,
@@ -1344,6 +1411,30 @@ class LoCoMoEvaluator:
         batch_client = self._get_batch_client()
         prepared_count = 0
 
+        # Query-compiler mode is deliberately two-stage: all memory-free plans
+        # first, then local retrieval, then one shared final-answer stage.
+        if self.agent_manager and self.agent_manager.uses_query_compiler():
+            event_state_snapshot = self._export_event_state_for_transfer(self.agent_manager, unit.context_id)
+            for query in unit.queries_to_evaluate:
+                formatted_question = self.prompt_manager.format_query(
+                    question=query.question, query_type=query.query_type,
+                    prompt_protocol=self.prompt_protocol,
+                )
+                request_id = make_request_id("query-plan", f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}")
+                # The compiler intentionally receives no benchmark query type
+                # or evaluator prompt wrapper; only deployable query text.
+                compiler = self.agent_manager.prepare_query_compiler(query.question)
+                self._pending_query_plan_requests.append({
+                    "request": BatchChatRequest(request_id=request_id, messages=compiler["messages"],
+                        temperature=compiler["temperature"], max_tokens=compiler["max_tokens"], phase="query-plan",
+                        metadata={"query_id": query.query_id, "unit_id": unit.unit_id, "context_id": unit.context_id}),
+                    "query": query, "question": formatted_question, "raw_question": query.question, "sample_id": unit.context_id,
+                    "unit_id": unit.unit_id, "memory_state": event_state_snapshot,
+                    "memory_time_per_query": memory_time_per_query,
+                })
+                prepared_count += 1
+            return prepared_count
+
         query_items = []
         for query in unit.queries_to_evaluate:
             request_id = make_request_id(
@@ -1447,6 +1538,36 @@ class LoCoMoEvaluator:
 
     def _complete_combined_batch_queries(self) -> Iterator[Dict[str, Any]]:
         """Submit one Vertex stage and stream local finalization results."""
+        if self._pending_query_plan_requests:
+            stage = "query-plan"
+            batch_client = self._get_batch_client()
+            pending_plans = self._pending_query_plan_requests
+            self._pending_query_plan_requests = []
+            requests = batch_client.get_saved_requests(stage) or [item["request"] for item in pending_plans]
+            self._log(f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined compiler request(s).")
+            responses = batch_client.run_stage(stage, requests)
+            retrieval_started = time.perf_counter()
+            for item in pending_plans:
+                batch_response = responses.get(item["request"].request_id)
+                content = batch_response.content if batch_response is not None and not batch_response.status else ""
+                manager = AgentManager(method_config=self.method_config, dataset_config=self.dataset_config,
+                    batch_api=self.batch_api, batch_gcs_uri=self.batch_gcs_uri, batch_wait=self.batch_wait, workers=1)
+                manager.import_memory_state(item["memory_state"], context_id=item["sample_id"])
+                prepared = manager.prepare_query_compiler_result(item["question"], content,
+                    context_id=item["sample_id"], **self._answer_query_kwargs(item["query"]))
+                final_id = make_request_id("query", f"{self.method_config.method_name}:{item['unit_id']}:{item['query'].query_id}")
+                final_request = BatchChatRequest(request_id=final_id, messages=prepared["messages"],
+                    temperature=self.method_config.model.temperature,
+                    max_tokens=(self.method_config.model.max_completion_tokens or self.method_config.model.max_tokens),
+                    phase="query", metadata={"query_id": item["query"].query_id, "unit_id": item["unit_id"],
+                    "context_id": item["sample_id"], PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared)})
+                self._pending_batch_queries.append({"request": final_request, "query": item["query"], "prepared": prepared,
+                    "sample_id": item["sample_id"], "memory_time_per_query": item["memory_time_per_query"],
+                    "compiler_usage": {"transport": "batch", "input_tokens": getattr(batch_response, "input_tokens", 0),
+                                       "output_tokens": getattr(batch_response, "output_tokens", 0), "call_count": 1}})
+            self._batch_retrieval_preparation_wall_time = getattr(self, "_batch_retrieval_preparation_wall_time", 0.0) + time.perf_counter() - retrieval_started
+            yield from self._complete_combined_batch_queries()
+            return
         if not self._pending_batch_queries:
             return
 
@@ -1499,6 +1620,8 @@ class LoCoMoEvaluator:
                         result.details.setdefault("execution_usage", {})["answer"] = (
                             self._batch_answer_execution_usage(batch_response)
                         )
+                        if item.get("compiler_usage"):
+                            result.details.setdefault("execution_usage", {})["query_compiler"] = item["compiler_usage"]
 
                 result.memory_construction_time = item["memory_time_per_query"]
                 progress.update(1)
@@ -2277,6 +2400,7 @@ class LoCoMoEvaluator:
             ),
             "selector_mode": retrieval_config.get("selector_mode", "state_mmr"),
             "evidence_count": retrieval_config.get("evidence_count", 8),
+            "turn_evidence_count": retrieval_config.get("turn_evidence_count", 0),
             "claim_top_k": retrieval_config.get("claim_top_k", 30),
             "episode_top_k": retrieval_config.get("episode_top_k", 20),
             "retrieve_turns": retrieval_config.get("retrieve_turns", True),

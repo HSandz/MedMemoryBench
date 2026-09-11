@@ -179,6 +179,38 @@ local/HuggingFace and OpenAI configurations.
 
 ### Optional adaptive retrieval planner
 
+`planner_mode` selects the query controller while retaining legacy defaults:
+
+```yaml
+planner_mode: off             # legacy single final-answer call
+# planner_mode: iterative     # legacy planner_rounds controller
+# planner_mode: query_compiler
+query_compiler_max_searches: 3
+planner_temperature: 0.0
+planner_max_tokens: 256
+planner_merge_mode: coverage_interleave
+```
+
+When omitted, `planner_mode` is `off` for `planner_rounds: 0` and `iterative`
+otherwise. `query_compiler` makes exactly one memory-free JSON compiler call,
+then local multi-query retrieval, then one answer call. Its schema is
+`searches[{query, role}]`, `temporal{axis, relation, start, end, anchor_search,
+precision}`, and `state_view`; malformed output falls back to the original
+question without a repair call. The raw question is always retrieval channel 0.
+
+Compiler temporal axes are distinct: `recorded_at` is when a conversation was
+recorded; `event_time_start/end` are normalized inclusive dates for when an
+underlying claim applied; `valid_from/valid_to` remain bitemporal state-lifecycle
+fields; and `valid_time_text` retains the source wording. Event-time spans are
+derived through claim provenance for episodes and immutable turns, so a turn can
+carry several spans. Event and record constraints softly rerank semantic
+candidates; knowledge `as_of` applies state visibility rules.
+
+With the Vertex batch transport query compiler uses exactly two combined stages:
+`query-plan` for every eligible query, local plan validation/retrieval after the
+entire stage completes, then `query-final` for every final answer. No planner
+batch job is submitted per sample or query.
+
 The query-only planner is disabled by default. Under `retrieval_config`, use:
 
 ```yaml
@@ -297,12 +329,22 @@ is available through `turn_lexical_retrieval_enabled`, which defaults to
 `false`. Claim-derived and direct turn evidence are deduplicated by immutable
 episode/turn provenance before rendering. `evidence_count` is the maximum
 number of unique selected retrieval evidence objects after this
-provenance-aware deduplication. When a selected direct immutable turn duplicates
-a selected claim's rendered provenance turn, ESHM continues through the existing
-deterministic MMR order until that effective budget is filled or candidates are
-exhausted. Episode objects retain their independent `("episode", episode_id)`
-identity and are never collapsed merely because one of their archived turns is
-also selected.
+provenance-aware deduplication. `turn_evidence_count` defaults to `0`, which
+preserves the shared selection pool: direct turns compete with claims and
+episodes for `evidence_count`. Set it to a positive integer to give direct raw
+turns a separate final budget. In that mode, claim/episode fusion and selection
+uses all `evidence_count` slots, while dense and optional lexical turn retrieval
+are fused and selected independently up to `turn_evidence_count`; the final
+context can therefore contain up to their sum. `turn_top_k` remains the turn
+retrieval depth, and `retrieve_turns: false` still selects no direct turns.
+Claim and episode provenance excerpts remain controlled only by
+`max_source_excerpts_per_claim` and `max_episode_source_excerpts_total`; they do
+not consume the direct-turn budget. When a selected direct immutable turn
+duplicates a selected claim's rendered provenance turn, ESHM continues through
+the applicable deterministic selection order until that budget is filled or
+candidates are exhausted. Episode objects retain their independent
+`("episode", episode_id)` identity and are never collapsed merely because one
+of their archived turns is also selected.
 
 `max_episode_source_excerpts_total` is an explicit query-only
 `retrieval_config` setting with a default of `2`. It selects one global set of

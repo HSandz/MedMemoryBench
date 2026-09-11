@@ -186,3 +186,87 @@ def test_medmemorybench_batch_path_does_not_dispatch_real_time_workers():
 
     assert evaluator._evaluate_unit_queries(unit, total_memory_time=0.0) == []
     assert prepared == [7]
+
+
+def test_locomo_snapshot_queries_bounded_global_workers_and_slides_across_samples():
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    evaluator.batch_api = False
+    evaluator.query_workers = 3
+    evaluator._log = lambda *args, **kwargs: None
+    evaluator._completed_query_results = lambda unit: []
+    evaluator._pending_query_unit = lambda unit: unit
+    evaluator._read_memory_snapshot = lambda unit: {"memory_state": {"sample": unit.context_id}}
+
+    class MockAggregator:
+        def __init__(self):
+            self.results = []
+        def add_result(self, res):
+            self.results.append(res)
+
+    class MockCollector:
+        def __init__(self):
+            self.results = []
+        def add_result(self, res, context_id):
+            self.results.append((context_id, res))
+
+    evaluator.aggregator = MockAggregator()
+    evaluator.result_collector = MockCollector()
+    recorded_checkpoints = []
+    evaluator._record_completed_query = lambda cid, res: recorded_checkpoints.append((cid, res))
+
+    active_workers = 0
+    max_active_workers = 0
+    events = []
+    lock = threading.Lock()
+
+    def evaluate_query(query, context_id, manager=None):
+        nonlocal active_workers, max_active_workers
+        with lock:
+            active_workers += 1
+            max_active_workers = max(max_active_workers, active_workers)
+            events.append((context_id, query.query_id, "start"))
+        time.sleep(0.04)
+        with lock:
+            events.append((context_id, query.query_id, "end"))
+            active_workers -= 1
+        return SimpleNamespace(query_id=query.query_id, memory_construction_time=0.0)
+
+    evaluator._evaluate_query = evaluate_query
+
+    unit1 = SimpleNamespace(
+        unit_id=0,
+        context_id="sample-1",
+        queries_to_evaluate=[
+            SimpleNamespace(query_id="u1-q0"),
+            SimpleNamespace(query_id="u1-q1"),
+        ],
+    )
+    unit2 = SimpleNamespace(
+        unit_id=1,
+        context_id="sample-2",
+        queries_to_evaluate=[
+            SimpleNamespace(query_id="u2-q0"),
+            SimpleNamespace(query_id="u2-q1"),
+        ],
+    )
+    unit3 = SimpleNamespace(
+        unit_id=2,
+        context_id="sample-3",
+        queries_to_evaluate=[
+            SimpleNamespace(query_id="u3-q0"),
+            SimpleNamespace(query_id="u3-q1"),
+        ],
+    )
+
+    evaluator._run_snapshot_queries([unit1, unit2, unit3])
+
+    assert max_active_workers == 3
+    u1_end_indices = [idx for idx, ev in enumerate(events) if ev[0] == "sample-1" and ev[2] == "end"]
+    u2_start_indices = [idx for idx, ev in enumerate(events) if ev[0] == "sample-2" and ev[2] == "start"]
+    assert u2_start_indices[0] < u1_end_indices[-1]
+
+    collected_contexts = [cid for cid, _ in evaluator.result_collector.results]
+    assert collected_contexts == ["sample-1", "sample-1", "sample-2", "sample-2", "sample-3", "sample-3"]
+    assert len(evaluator.aggregator.results) == 6
+    assert len(recorded_checkpoints) == 6
+

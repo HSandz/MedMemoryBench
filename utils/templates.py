@@ -49,6 +49,12 @@ MEMORY_SOURCE_DESCRIPTIONS: Dict[str, Dict[str, str]] = {
     },
 }
 
+NEUTRAL_MEMORY_SOURCE_DESCRIPTIONS: Dict[str, str] = {
+    "medmemorybench": "相关的记忆信息",
+    "medmemorybench_en": "Relevant remembered information",
+    "locomo": "Relevant remembered information",
+}
+
 
 class PromptManager:
     def __init__(self, dataset: str, method: str = None, language: str = "zh"):
@@ -124,7 +130,7 @@ class PromptManager:
                 raise ValueError(f"No neutral QA template found for {self.dataset}")
             return template.format(
                 question=question,
-                memory_source=self._memory_source_description(),
+                memory_source=self._memory_source_description(prompt_protocol="neutral"),
             )
 
         key = f"{self._template_prefix}_{query_type}_qa"
@@ -145,10 +151,18 @@ class PromptManager:
 
         return template.format(
             question=question,
-            memory_source=self._memory_source_description(),
+            memory_source=self._memory_source_description(prompt_protocol="type_aware"),
         )
 
-    def _memory_source_description(self) -> str:
+    def _memory_source_description(self, prompt_protocol: str = "type_aware") -> str:
+        if prompt_protocol == "neutral":
+            return NEUTRAL_MEMORY_SOURCE_DESCRIPTIONS.get(
+                self._template_prefix,
+                NEUTRAL_MEMORY_SOURCE_DESCRIPTIONS.get(
+                    self.dataset,
+                    "相关的记忆信息" if self.language.startswith("zh") else "Relevant remembered information",
+                ),
+            )
         return MEMORY_SOURCE_DESCRIPTIONS.get(self._template_prefix, {}).get(
             self.method_type, MEMORY_SOURCE_DESCRIPTIONS.get(self.dataset, {}).get(
                 self.method_type, "the relevant memories"

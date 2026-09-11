@@ -17,7 +17,7 @@ from methods.event_state.store import EventStateStore
 from methods.event_state.temporal import parse_temporal_query
 from methods.event_state.retrieval import EventStateRetriever
 from methods.event_state_agent import EventStateAgent
-from src.config import ConfigLoader
+from src.config import ConfigLoader, MethodConfig
 
 
 class KeywordEmbedder:
@@ -70,6 +70,196 @@ def _claim_for_turns(turn_ids):
         for turn_id in turn_ids
     ]
     return Claim("C", "A", "speaker:a", "detail", "needle", evidence=evidence)
+
+
+def _budget_fixture(
+    *,
+    structured_count=4,
+    turn_count=4,
+    evidence_count=3,
+    turn_evidence_count=0,
+    retrieve_turns=True,
+    turn_lexical_retrieval_enabled=False,
+):
+    agent = EventStateAgent(
+        llm_client=EmptyExtractionLLM(), memory_llm_client=EmptyExtractionLLM(),
+        embedding_client=KeywordEmbedder(), evidence_count=evidence_count,
+        turn_evidence_count=turn_evidence_count, candidate_count=max(20, structured_count * 2),
+        turn_top_k=turn_count, retrieve_turns=retrieve_turns,
+        turn_lexical_retrieval_enabled=turn_lexical_retrieval_enabled,
+        inject_source_evidence=False,
+    )
+    store = EventStateStore("budget")
+    for index in range(max(structured_count, turn_count)):
+        episode = Episode(
+            f"E{index}", "budget", f"session-{index}", index, None, None,
+            ["A"], "primary_user", "", f"episode {index}",
+            [TurnEvidence(f"t{index}", "A", "user", f"needle turn {index}")]
+            if index < turn_count else [],
+        )
+        store.add_episode(
+            episode,
+            [1.0, 0.0],
+            [[1.0, 0.0]] if index < turn_count else [],
+        )
+        if index < structured_count:
+            store.add_claim(
+                Claim(f"C{index}", "A", "speaker:a", "detail", f"needle {index}"),
+                [1.0, 0.0],
+            )
+    agent.set_context_id("budget")
+    agent._stores["budget"] = store
+    return agent, store
+
+
+def test_zero_turn_budget_reproduces_the_shared_selection_pipeline():
+    agent, store = _budget_fixture(evidence_count=3, turn_evidence_count=0)
+    retriever = EventStateRetriever(store, KeywordEmbedder(), **agent._retrieval_config)
+
+    legacy_ranked, legacy_extra = retriever.rank_candidates("needle", [1.0, 0.0])
+    pooled_ranked, turn_ranked, pooled_extra = retriever.rank_candidate_pools(
+        "needle", [1.0, 0.0],
+    )
+    assert pooled_ranked == legacy_ranked
+    assert turn_ranked == []
+    assert pooled_extra == legacy_extra
+    legacy_order, legacy_extra = retriever.select_candidates(
+        legacy_ranked, legacy_extra, count=len(legacy_ranked),
+    )
+    legacy_selected, legacy_effective = agent._effective_evidence_selection(
+        store, legacy_order, [[1.0, 0.0]],
+    )
+    prepared = agent.prepare_batch_query("needle", raw_question="needle")
+
+    assert [record["id"] for record in prepared["retrieved_memories"]] == [
+        item["id"] for item in legacy_selected if item["type"] != "turn"
+    ] + [item["id"] for item in legacy_selected if item["type"] == "turn"]
+    assert prepared["extra"]["effective_selected_turn_count"] == legacy_effective[
+        "effective_selected_turn_count"
+    ]
+    assert "separate_turn_evidence_budget" not in prepared["extra"]
+
+
+def test_separate_turn_budget_keeps_twelve_structured_items_and_four_turns():
+    agent, _store = _budget_fixture(
+        structured_count=12,
+        turn_count=4,
+        evidence_count=12,
+        turn_evidence_count=4,
+    )
+    prepared = agent.prepare_batch_query("needle", raw_question="needle")
+
+    assert prepared["extra"]["evidence_count"] == 12
+    assert prepared["extra"]["turn_evidence_count"] == 4
+    assert prepared["extra"]["separate_turn_evidence_budget"] is True
+    assert prepared["extra"]["selected_non_turn_count"] == 12
+    assert prepared["extra"]["selected_direct_turn_count"] == 4
+    assert prepared["extra"]["selected_total_count"] == 16
+    assert len(prepared["retrieved_memories"]) == 16
+
+
+def test_separate_direct_turns_do_not_reduce_structured_selection():
+    without_turns, _ = _budget_fixture(
+        structured_count=6, turn_count=4, evidence_count=3, retrieve_turns=False,
+    )
+    with_turns, _ = _budget_fixture(
+        structured_count=6, turn_count=4, evidence_count=3, turn_evidence_count=2,
+    )
+    structured_only = without_turns.prepare_batch_query("needle", raw_question="needle")
+    separate = with_turns.prepare_batch_query("needle", raw_question="needle")
+
+    assert [record["id"] for record in separate["retrieved_memories"] if record["type"] != "immutable_turn"] == [
+        record["id"] for record in structured_only["retrieved_memories"]
+    ]
+    assert separate["extra"]["selected_non_turn_count"] == 3
+    assert separate["extra"]["selected_direct_turn_count"] == 2
+
+
+def test_separate_turn_budget_returns_only_available_turns_and_honors_retrieve_flag():
+    available, _ = _budget_fixture(
+        structured_count=3, turn_count=2, evidence_count=3, turn_evidence_count=4,
+    )
+    disabled, _ = _budget_fixture(
+        structured_count=3, turn_count=4, evidence_count=3, turn_evidence_count=4,
+        retrieve_turns=False,
+    )
+
+    available_prepared = available.prepare_batch_query("needle", raw_question="needle")
+    disabled_prepared = disabled.prepare_batch_query("needle", raw_question="needle")
+
+    assert available_prepared["extra"]["selected_direct_turn_count"] == 2
+    assert available_prepared["extra"]["selected_total_count"] == 5
+    assert disabled_prepared["extra"]["selected_direct_turn_count"] == 0
+    assert disabled_prepared["extra"]["selected_total_count"] == 3
+
+
+def test_separate_turn_budget_fuses_dense_and_lexical_turns_before_its_cap():
+    agent, store = _budget_fixture(
+        structured_count=0,
+        turn_count=4,
+        evidence_count=1,
+        turn_evidence_count=2,
+        turn_lexical_retrieval_enabled=True,
+    )
+    retriever = EventStateRetriever(store, KeywordEmbedder(), **agent._retrieval_config)
+    _structured, fused_turns, _diagnostics = retriever.rank_candidate_pools(
+        "needle", [1.0, 0.0],
+    )
+    expected_turns, _expected_diagnostics = retriever.rank_candidates(
+        "needle", [1.0, 0.0],
+        retrieve_claims_override=False,
+        retrieve_episodes_override=False,
+    )
+    prepared = agent.prepare_batch_query("needle", raw_question="needle")
+
+    assert fused_turns == expected_turns
+    assert prepared["extra"]["turn_candidate_count"] == 4
+    assert prepared["extra"]["lexical_turn_candidates"] == 4
+    assert prepared["extra"]["selected_direct_turn_count"] == 2
+    direct_ids = [
+        record["id"] for record in prepared["retrieved_memories"]
+        if record["type"] == "immutable_turn"
+    ]
+    assert len(direct_ids) == len(set(direct_ids)) == 2
+
+
+def test_separate_budget_regression_expands_total_without_expanding_structured_budget():
+    shared, _ = _budget_fixture(
+        structured_count=4, turn_count=4, evidence_count=3, turn_evidence_count=0,
+    )
+    separate, _ = _budget_fixture(
+        structured_count=4, turn_count=4, evidence_count=3, turn_evidence_count=2,
+    )
+    shared_prepared = shared.prepare_batch_query("needle", raw_question="needle")
+    separate_prepared = separate.prepare_batch_query("needle", raw_question="needle")
+
+    assert len(shared_prepared["retrieved_memories"]) <= 3
+    assert separate_prepared["extra"]["selected_non_turn_count"] <= 3
+    assert separate_prepared["extra"]["selected_direct_turn_count"] <= 2
+    assert len(separate_prepared["retrieved_memories"]) <= 5
+    assert len(separate_prepared["retrieved_memories"]) == 5
+
+
+def test_turn_evidence_count_validation_and_omitted_config_default():
+    try:
+        EventStateAgent(turn_evidence_count=-1, embedding_client=KeywordEmbedder())
+    except ValueError as exc:
+        assert "turn_evidence_count" in str(exc)
+    else:
+        raise AssertionError("negative turn_evidence_count must fail validation")
+
+    config = MethodConfig.from_dict({
+        "method_name": "event_state",
+        "method_type": "agentic_memory",
+        "model": {"provider": "openai", "name": "test"},
+        "retrieval_config": {"evidence_count": 3, "candidate_count": 3},
+    })
+    assert config.retrieval_config["turn_evidence_count"] == 0
+    agent = EventStateAgent(
+        llm_client=EmptyExtractionLLM(), memory_llm_client=EmptyExtractionLLM(),
+        embedding_client=KeywordEmbedder(), **config.agent_params,
+    )
+    assert agent._retrieval_config["turn_evidence_count"] == 0
 
 
 def test_episode_retrieval_sampling_spans_source_order_and_keeps_captions():

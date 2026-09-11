@@ -13,6 +13,7 @@ ENUMS = {
     "modality": {"asserted", "observed", "planned", "recommended", "hypothetical"},
     "persistence": {"state", "episode", "history"},
 }
+EVENT_TIME_PRECISIONS = {"exact", "bounded", "approximate", "unknown"}
 NO_INFORMATION_VALUES = {"", "unknown", "unspecified", "not specified", "not provided", "n/a"}
 
 
@@ -111,6 +112,9 @@ def claim_semantic_fingerprint(raw: Dict[str, Any]) -> str:
         "valid_from": str(raw.get("valid_from")).strip() if isinstance(raw.get("valid_from"), str) else None,
         "valid_to": str(raw.get("valid_to")).strip() if isinstance(raw.get("valid_to"), str) else None,
         "valid_time_text": str(raw.get("valid_time_text")).strip() if isinstance(raw.get("valid_time_text"), str) else None,
+        "event_time_start": str(raw.get("event_time_start")).strip() if isinstance(raw.get("event_time_start"), str) else None,
+        "event_time_end": str(raw.get("event_time_end")).strip() if isinstance(raw.get("event_time_end"), str) else None,
+        "event_time_precision": str(raw.get("event_time_precision") or "unknown").strip().casefold(),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
@@ -183,6 +187,27 @@ def normalize_ingress_temporal_bounds(
     return normalized, telemetry
 
 
+def normalize_event_time_annotation(raw: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    """Keep semantic claims when their optional normalized event annotation is bad."""
+    result = dict(raw)
+    start = result.get("event_time_start")
+    end = result.get("event_time_end")
+    precision = str(result.get("event_time_precision") or "unknown").strip().casefold()
+    start_date, end_date = _parse_iso_date(start), _parse_iso_date(end)
+    valid = precision in EVENT_TIME_PRECISIONS
+    valid = valid and ((start is None and end is None) or (start_date is not None and end_date is not None))
+    valid = valid and not (start_date is not None and end_date is not None and start_date > end_date)
+    valid = valid and not (precision == "exact" and start_date is not None and start_date != end_date)
+    if not valid:
+        result.update({"event_time_start": None, "event_time_end": None, "event_time_precision": "unknown"})
+        return result, True
+    if start_date is None:
+        result.update({"event_time_start": None, "event_time_end": None, "event_time_precision": "unknown"})
+    else:
+        result.update({"event_time_start": start_date.isoformat(), "event_time_end": end_date.isoformat(), "event_time_precision": precision})
+    return result, False
+
+
 def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: Set[Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
@@ -205,6 +230,7 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
     # Extractor confidence is retained for snapshot compatibility only. ESHM
     # does not use it for semantic decisions, so store one neutral sentinel.
     confidence = 0.5
+    normalized_event, _ = normalize_event_time_annotation(raw)
     return {
         **raw,
         "subject": str(raw.get("subject") or ""),
@@ -223,6 +249,9 @@ def validated_claim(raw: Any, source_turn_ids: Iterable[Any], allowed_turn_ids: 
         "valid_from": raw.get("valid_from") if isinstance(raw.get("valid_from"), str) else None,
         "valid_to": raw.get("valid_to") if isinstance(raw.get("valid_to"), str) else None,
         "valid_time_text": raw.get("valid_time_text") if isinstance(raw.get("valid_time_text"), str) else None,
+        "event_time_start": normalized_event["event_time_start"],
+        "event_time_end": normalized_event["event_time_end"],
+        "event_time_precision": normalized_event["event_time_precision"],
     }
 
 

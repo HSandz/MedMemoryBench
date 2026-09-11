@@ -182,7 +182,9 @@ class LettaAgent(BaseAgent):
     def _apply_openai_compatible_env(self) -> None:
         """Set OpenAI-compatible env vars so vendored Letta can pick up credentials."""
         if self._uses_vertex_gemini:
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(self._vertex_client.service_account_file)
+            sa_file = getattr(self._vertex_client, "service_account_file", None)
+            if sa_file:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(sa_file)
         else:
             if self.api_key:
                 os.environ["OPENAI_API_KEY"] = self.api_key

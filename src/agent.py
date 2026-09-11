@@ -107,8 +107,11 @@ class AgentManager:
             method_config, "raw_config", {}
         ).get("retrieval_config", {})
         if method_key == "event_state":
-            # Planner rounds have dependent retrieval/answer calls and cannot
-            # be represented by the single final-answer batch request.
+            mode = retrieval.get("planner_mode", params.get("planner_mode"))
+            # Only the legacy iterative controller has dependent repeated
+            # retrieval calls. query_compiler has an explicit two-stage path.
+            if mode == "iterative":
+                return False
             return int(retrieval.get("planner_rounds", params.get("planner_rounds", 0)) or 0) == 0
         if method_key == "mirix":
             return not params.get("use_native_query", True)
@@ -1010,6 +1013,26 @@ class AgentManager:
         if not self.supports_batch_queries():
             return None
         return getattr(self._agent, "_llm_client", None)
+
+    def uses_query_compiler(self) -> bool:
+        return self._matched_method_key(self.method_name) == "event_state" and getattr(self._agent, "planner_mode", None) == "query_compiler"
+
+    def prepare_query_compiler(self, message: str, **kwargs) -> Dict[str, Any]:
+        if not self.uses_query_compiler():
+            raise RuntimeError("Query compiler is not enabled")
+        return self._agent.prepare_query_compiler(message, **kwargs)
+
+    def prepare_query_compiler_result(self, message: str, content: str, **kwargs) -> Dict[str, Any]:
+        if not self.uses_query_compiler():
+            raise RuntimeError("Query compiler is not enabled")
+        query_system_prompt = kwargs.pop("query_system_prompt", None)
+        if query_system_prompt is not None:
+            kwargs["answer_system_prompt"] = query_system_prompt
+        context_id = kwargs.pop("context_id", None)
+        if context_id is not None and context_id != self._context_id:
+            self._context_id = context_id
+            self._agent.set_context_id(context_id)
+        return self._agent.prepare_query_compiler_result(message, content, **kwargs)
 
     def prepare_batch_query(self, message: str, **kwargs) -> Dict[str, Any]:
         """Prepare local retrieval and an immutable final-answer request."""

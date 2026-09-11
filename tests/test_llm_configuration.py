@@ -7,15 +7,21 @@ import pytest
 
 from metrics.llm_judge import LLMJudge
 from methods.memrl_agent import MemRLAgent, TrackedLLMProvider
+from methods.base import AgentResponse
 from src.agent import AgentManager
 from src.config import APIConfig, DatasetConfig, MethodConfig, load_env_config
 from src.evaluator import Evaluator
 from utils.batch_client import create_batch_client
 from utils.llm_client import (
     AnthropicClient,
+    AzureOpenAIClient,
+    EmptyLLMResponseError,
+    LLMResponse,
     OpenAIClient,
     OpenRouterClient,
     create_llm_client,
+    extract_reasoning_content,
+    extract_text_content,
     extract_usage_token_counts,
     TruncatedLLMResponseError,
 )
@@ -672,3 +678,156 @@ def test_usage_breakdown_normalizes_gemini_and_aggregate_provider_schemas():
     assert extract_usage_token_counts(
         SimpleNamespace(input_tokens=9, output_tokens=3)
     ) == (9, 3, 3, 0)
+
+
+def test_extract_text_content_primitives():
+    assert extract_text_content(None) == ""
+    assert extract_text_content("") == ""
+    assert extract_text_content("hello world") == "hello world"
+    assert extract_text_content(123) == "123"
+
+
+def test_extract_text_content_lists_and_parts():
+    assert extract_text_content(["hello ", "world"]) == "hello world"
+    assert extract_text_content([{"type": "text", "text": "hello "}]) == "hello "
+    assert extract_text_content([{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]) == "hello world"
+    assert extract_text_content([{"text": "just text"}]) == "just text"
+    assert extract_text_content([{"content": "content field"}]) == "content field"
+
+    # Ignore thinking/reasoning blocks
+    assert extract_text_content([
+        {"type": "thinking", "thinking": "Let me think deeply..."},
+        {"type": "text", "text": "Here is the answer."},
+    ]) == "Here is the answer."
+
+    # Objects with text or content attributes
+    part1 = SimpleNamespace(type="text", text="Part 1: ")
+    part2 = SimpleNamespace(type="text", text="Part 2")
+    part_think = SimpleNamespace(type="thinking", thinking="Ignore me")
+    assert extract_text_content([part_think, part1, part2]) == "Part 1: Part 2"
+
+    # Nested lists
+    assert extract_text_content([["nested ", "list "], [{"type": "text", "text": "item"}]]) == "nested list item"
+
+
+def test_extract_reasoning_content():
+    msg = SimpleNamespace(reasoning_content="Direct reasoning")
+    assert extract_reasoning_content(msg) == "Direct reasoning"
+
+    msg2 = SimpleNamespace(content=[
+        {"type": "thinking", "thinking": "Step 1 thinking..."},
+        {"type": "text", "text": "Final answer"},
+    ])
+    assert extract_reasoning_content(msg2) == "Step 1 thinking..."
+
+
+def test_llm_response_coerces_list_content():
+    resp = LLMResponse(content=[{"type": "text", "text": "Answer text"}])  # type: ignore
+    assert isinstance(resp.content, str)
+    assert resp.content == "Answer text"
+
+
+def test_agent_response_coerces_list_output():
+    resp = AgentResponse(output=[{"type": "text", "text": "Output text"}])  # type: ignore
+    assert isinstance(resp.output, str)
+    assert resp.output == "Output text"
+
+
+def test_openai_client_chat_handles_list_content():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=[{"type": "text", "text": "Patient was diagnosed with influenza."}],
+                refusal=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=15),
+    )
+    client = object.__new__(OpenAIClient)
+    client.model = "gemini/gemini-3.5-flash-lite"
+    client.temperature = 0.0
+    client.max_tokens = 1000
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: response)
+        )
+    )
+
+    llm_resp = OpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "What is the diagnosis?"}])
+    assert isinstance(llm_resp.content, str)
+    assert llm_resp.content == "Patient was diagnosed with influenza."
+
+
+def test_openai_client_chat_handles_empty_list_content_raises_retryable():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=[{"type": "text", "text": "   "}],
+                refusal=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=0),
+    )
+    client = object.__new__(OpenAIClient)
+    client.model = "gemini/gemini-3.5-flash-lite"
+    client.temperature = 0.0
+    client.max_tokens = 1000
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: response)
+        )
+    )
+
+    with pytest.raises(EmptyLLMResponseError):
+        OpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "hi"}])
+
+
+def test_azure_openai_client_chat_handles_list_content():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=["Line 1\n", "Line 2"],
+                refusal=None,
+            ),
+            finish_reason="stop",
+        )],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=15),
+    )
+    client = object.__new__(AzureOpenAIClient)
+    client.model = "gpt-4o"
+    client.deployment = "gpt-4o"
+    client.temperature = 0.0
+    client.max_tokens = 1000
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: response)
+        )
+    )
+
+    llm_resp = AzureOpenAIClient.chat.__wrapped__(client, [{"role": "user", "content": "hi"}])
+    assert isinstance(llm_resp.content, str)
+    assert llm_resp.content == "Line 1\nLine 2"
+
+
+def test_anthropic_client_chat_handles_thinking_and_text_blocks():
+    response = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="thinking", thinking="Thinking about query..."),
+            SimpleNamespace(type="text", text="The answer is 42."),
+        ],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=20),
+    )
+    client = object.__new__(AnthropicClient)
+    client.model = "claude-3-7-sonnet-20250219"
+    client.temperature = 1.0
+    client.max_tokens = 1000
+    client.client = SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **kwargs: response)
+    )
+
+    llm_resp = AnthropicClient.chat.__wrapped__(client, [{"role": "user", "content": "hi"}])
+    assert isinstance(llm_resp.content, str)
+    assert llm_resp.content == "The answer is 42."
+

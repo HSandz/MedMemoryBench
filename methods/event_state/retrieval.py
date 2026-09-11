@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from copy import deepcopy
 import re
+from datetime import date
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .embeddings import cosine
 from .store import EventStateStore
+from .planner import QueryPlan
 from .temporal import (
     TemporalQueryConstraint,
     claim_temporal_match,
@@ -130,6 +132,81 @@ class EventStateRetriever:
             "selected_temporal_episode_count": 0,
         }
 
+    def rank_candidate_pools(
+        self,
+        question: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        temporal_constraint: TemporalQueryConstraint | None = None,
+        parse_temporal_query: bool = True,
+        retrieve_claims_override: bool | None = None,
+        retrieve_episodes_override: bool | None = None,
+        retrieve_turns_override: bool | None = None,
+        state_view: str = "current",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        """Rank structured and direct-turn pools independently when configured.
+
+        The zero-budget path intentionally delegates to ``rank_candidates``
+        unchanged.  A positive direct-turn budget gives claims/episodes and
+        turns independent fusion normalization and candidate truncation before
+        their respective selectors run.
+        """
+        if int(self.config.get("turn_evidence_count", 0)) <= 0:
+            candidates, diagnostics = self.rank_candidates(
+                question,
+                query_vector=query_vector,
+                temporal_constraint=temporal_constraint,
+                parse_temporal_query=parse_temporal_query,
+                retrieve_claims_override=retrieve_claims_override,
+                retrieve_episodes_override=retrieve_episodes_override,
+                retrieve_turns_override=retrieve_turns_override,
+                state_view=state_view,
+            )
+            return candidates, [], diagnostics
+
+        structured, structured_diagnostics = self.rank_candidates(
+            question,
+            query_vector=query_vector,
+            temporal_constraint=temporal_constraint,
+            parse_temporal_query=parse_temporal_query,
+            retrieve_claims_override=retrieve_claims_override,
+            retrieve_episodes_override=retrieve_episodes_override,
+            retrieve_turns_override=False,
+            state_view=state_view,
+        )
+        turns, turn_diagnostics = self.rank_candidates(
+            question,
+            query_vector=query_vector,
+            temporal_constraint=temporal_constraint,
+            parse_temporal_query=parse_temporal_query,
+            retrieve_claims_override=False,
+            retrieve_episodes_override=False,
+            retrieve_turns_override=retrieve_turns_override,
+            state_view=state_view,
+        )
+        diagnostics = dict(structured_diagnostics)
+        diagnostics.update({
+            "turn_candidates": turn_diagnostics["turn_candidates"],
+            "lexical_turn_candidates": turn_diagnostics["lexical_turn_candidates"],
+            "pre_candidate_truncation_fused_candidate_count": (
+                structured_diagnostics["pre_candidate_truncation_fused_candidate_count"]
+                + turn_diagnostics["pre_candidate_truncation_fused_candidate_count"]
+            ),
+            "candidate_count": len(structured) + len(turns),
+            "post_candidate_truncation_candidate_count": len(structured) + len(turns),
+            "pre_candidate_truncation_candidates": (
+                structured_diagnostics["pre_candidate_truncation_candidates"]
+                + turn_diagnostics["pre_candidate_truncation_candidates"]
+            ),
+            "post_candidate_truncation_candidates": (
+                structured_diagnostics["post_candidate_truncation_candidates"]
+                + turn_diagnostics["post_candidate_truncation_candidates"]
+            ),
+            "non_turn_candidate_count": len(structured),
+            "direct_turn_candidate_count": len(turns),
+        })
+        return structured, turns, diagnostics
+
     def select_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
@@ -159,6 +236,131 @@ class EventStateRetriever:
     def retrieve(self, question: str, query_vector: Sequence[float] | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         candidates, extra = self.rank_candidates(question, query_vector=query_vector)
         return self.select_candidates(candidates, extra)
+
+    def rank_query_plan(
+        self, question: str, plan: QueryPlan, query_vectors: Sequence[Sequence[float]] | None = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        """Run compiler channels locally, retaining the raw query as channel zero.
+
+        Unlike legacy temporal retrieval this never adds a broad date-only
+        candidate list. Temporal evidence only changes the score of semantic
+        candidates that survived coverage-aware fusion.
+        """
+        channels = [question] + [search.query for search in plan.searches]
+        vectors = list(query_vectors or [self.embedder.embed_query(item) for item in channels])
+        structured_channels, turn_channels, channel_details = [], [], []
+        as_of = None
+        if plan.temporal.axis == "knowledge" and plan.temporal.end:
+            as_of = TemporalQueryConstraint("as_of", target_date=plan.temporal.end, intent="knowledge")
+        for index, (channel, vector) in enumerate(zip(channels, vectors)):
+            structured, turns, details = self.rank_candidate_pools(
+                channel, query_vector=vector, temporal_constraint=as_of,
+                parse_temporal_query=False, state_view=plan.state_view,
+            )
+            structured_channels.append(structured)
+            if int(self.config.get("turn_evidence_count", 0)) > 0:
+                turn_channels.append(turns)
+            channel_details.append({"channel_index": index, "query": channel,
+                                    "role": "original" if index == 0 else plan.searches[index - 1].role,
+                                    "structured_candidates": len(structured), "turn_candidates": len(turns)})
+        structured = self.merge_rank_channels(structured_channels)
+        turns = self.merge_rank_channels(turn_channels) if turn_channels else []
+        anchor_spans = self._anchor_spans(plan, structured_channels, turn_channels)
+        structured = self._rerank_query_plan_temporal(structured, plan, anchor_spans)
+        turns = self._rerank_query_plan_temporal(turns, plan, anchor_spans)
+        return structured, turns, {
+            "query_compiler_channels": channel_details,
+            "original_query_channel": question,
+            "coverage_merge_mode": self.config.get("planner_merge_mode", "coverage_interleave"),
+            "anchor_temporal_resolution_success": bool(anchor_spans) if plan.temporal.anchor_search is not None else None,
+            "resolved_anchor_spans_count": len(anchor_spans),
+            "temporalized_candidate_count": sum(bool(item.get("temporal_score")) for item in structured + turns),
+        }
+
+    @staticmethod
+    def _span_dates(span: Dict[str, Any]) -> tuple[date | None, date | None]:
+        return parse_stored_date(span.get("start")), parse_stored_date(span.get("end"))
+
+    def _candidate_spans(self, item: Dict[str, Any], axis: str) -> List[Dict[str, str]]:
+        if axis == "record":
+            if item["type"] == "turn":
+                episode, _turn = self.store.turn_for_key(item["id"])
+                recorded = episode.recorded_at if episode else None
+            elif item["type"] == "episode":
+                recorded = self.store.episodes[item["id"]].recorded_at
+            else:
+                recorded = self.store.claims[item["id"]].recorded_at
+            return [{"start": recorded, "end": recorded, "precision": "exact"}] if parse_stored_date(recorded) else []
+        if item["type"] == "turn":
+            episode, turn = self.store.turn_for_key(item["id"])
+            return list(self.store.turn_temporal_spans.get((episode.episode_id, turn.turn_id), [])) if episode and turn else []
+        if item["type"] == "episode":
+            return list(self.store.episode_temporal_spans.get(item["id"], []))
+        claim = self.store.claims[item["id"]]
+        return ([{"start": claim.event_time_start, "end": claim.event_time_end,
+                  "precision": claim.event_time_precision}]
+                if claim.event_time_start and claim.event_time_end else [])
+
+    def _anchor_spans(self, plan: QueryPlan, structured_channels: Sequence[Sequence[Dict[str, Any]]], turn_channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, str]]:
+        anchor = plan.temporal.anchor_search
+        if anchor is None:
+            return []
+        # +1 accounts for the always-on original-query channel.
+        rows = list(structured_channels[anchor + 1]) + (list(turn_channels[anchor + 1]) if anchor + 1 < len(turn_channels) else [])
+        spans = []
+        for item in rows[:10]:
+            spans.extend(self._candidate_spans(item, "event"))
+        unique = {(item.get("start"), item.get("end"), item.get("precision")): item for item in spans}
+        return [unique[key] for key in sorted(unique)]
+
+    def _rerank_query_plan_temporal(self, candidates: List[Dict[str, Any]], plan: QueryPlan, anchors: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
+        temporal = plan.temporal
+        if temporal.axis == "none" or temporal.axis == "knowledge":
+            return candidates
+        scores = []
+        for item in candidates:
+            score, match = self._temporal_compatibility(self._candidate_spans(item, temporal.axis), temporal, anchors)
+            item["semantic_score"] = float(item.get("final_score", item.get("score", 0.0)))
+            item["temporal_score"] = score
+            item["temporal_match_type"] = match
+            scores.append(score)
+        # Missing annotations are a neutral soft signal, never a filter.
+        relevance = normalize_scores([float(item.get("semantic_score", 0.0)) for item in candidates])
+        weight = float(self.config.get("temporal_retrieval_weight", 1.0))
+        for item, semantic in zip(candidates, relevance):
+            item["joint_score"] = semantic + weight * float(item.get("temporal_score", 0.0))
+            item["final_score"] = item["joint_score"]
+        return sorted(candidates, key=lambda item: (-item.get("final_score", 0.0), item["id"]))
+
+    def _temporal_compatibility(self, spans: Sequence[Dict[str, str]], temporal: Any, anchors: Sequence[Dict[str, str]]) -> tuple[float, str | None]:
+        if not spans:
+            return 0.0, None
+        requested = [(temporal.start, temporal.end)] if temporal.start or temporal.end else []
+        if temporal.relation in {"before", "after"} and anchors:
+            requested = [self._span_dates(span) for span in anchors]
+        best = 0.0
+        for span in spans:
+            start, end = self._span_dates(span)
+            if not start or not end:
+                continue
+            precision = {"exact": 1.0, "bounded": .8, "approximate": .55, "unknown": .3}.get(span.get("precision"), .3)
+            for target_start, target_end in requested or [(None, None)]:
+                match = temporal.relation == "none"
+                if temporal.relation == "overlap":
+                    match = target_start is not None and target_end is not None and start <= target_end and end >= target_start
+                elif temporal.relation == "before":
+                    match = target_start is not None and end <= target_start
+                elif temporal.relation == "after":
+                    match = target_end is not None and start >= target_end
+                elif temporal.relation == "latest":
+                    match = True
+                elif temporal.relation == "earliest":
+                    match = True
+                if match:
+                    # Ordering is local to the semantic pool; date ordinal only breaks ties.
+                    ordering = ((end.toordinal() / 10**7) if temporal.relation == "latest" else (-start.toordinal() / 10**7) if temporal.relation == "earliest" else 0)
+                    best = max(best, precision + ordering)
+        return best, temporal.relation if best else None
 
     def merge_rank_channels(self, channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
         """Fuse planner channels, interleaving coverage before final selection."""

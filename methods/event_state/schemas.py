@@ -113,6 +113,10 @@ class Claim:
     subject_id: str = ""
     # A value-independent semantic variable used only by state compilation.
     state_slot: Optional[str] = None
+    # Kept at the end so legacy positional Claim callers remain valid.
+    event_time_start: Optional[str] = None
+    event_time_end: Optional[str] = None
+    event_time_precision: str = "unknown"
 
     def semantic_text(self) -> str:
         qualifiers = ", ".join(f"{key}: {value}" for key, value in self.qualifiers.items())
@@ -146,6 +150,9 @@ def claim_from_dict(value: Dict[str, Any]) -> Claim:
     value = dict(value)
     value.setdefault("subject_id", value.get("subject_key", ""))
     value.setdefault("state_slot", None)
+    value.setdefault("event_time_start", None)
+    value.setdefault("event_time_end", None)
+    value.setdefault("event_time_precision", "unknown")
     claim = Claim(**{**value, "evidence": evidence})
     if claim.persistence == "history":
         claim.state_slot = None
