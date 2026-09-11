@@ -97,6 +97,22 @@ def test_vertex_batch_usage_separates_thought_tokens_from_visible_output():
     assert (response.output_tokens, response.visible_output_tokens, response.thinking_tokens) == (10, 4, 6)
 
 
+def test_vertex_batch_marks_empty_stop_output_as_retriable_provider_failure():
+    response = VertexBatchClient._parse_row(
+        {
+            "status": "",
+            "response": {"candidates": [{
+                "content": {"parts": [{"text": ""}]}, "finishReason": "STOP",
+            }]},
+        },
+        "request-1",
+    )
+
+    assert response.content == ""
+    assert response.finish_reason == "STOP"
+    assert response.status == "empty provider response (finish_reason=STOP)"
+
+
 def test_vertex_batch_records_first_running_timestamp(monkeypatch, tmp_path):
     client = _client(tmp_path, _Batches(_Storage()), _Storage())
     states = iter(("JOB_STATE_PENDING", "JOB_STATE_RUNNING", "JOB_STATE_SUCCEEDED"))

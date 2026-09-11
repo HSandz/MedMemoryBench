@@ -271,6 +271,7 @@ class BatchChatResponse:
     raw_response: Any = field(default_factory=dict)
     visible_output_tokens: Optional[int] = None
     thinking_tokens: int = 0
+    finish_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.input_tokens = max(int(self.input_tokens or 0), 0)
@@ -986,9 +987,16 @@ class VertexBatchClient:
         usage = response.get("usageMetadata") or response.get("usage_metadata") or {}
         candidates = response.get("candidates") or []
         content = ""
+        finish_reason = None
         if candidates:
             parts = (candidates[0].get("content") or {}).get("parts") or []
             content = "".join(part.get("text", "") for part in parts)
+            finish_reason = candidates[0].get("finishReason") or candidates[0].get("finish_reason")
+        if not status and not content:
+            status = (
+                "empty provider response"
+                + (f" (finish_reason={finish_reason})" if finish_reason else "")
+            )
         input_tokens, output_tokens, visible_output_tokens, thinking_tokens = (
             extract_usage_token_counts(usage)
         )
@@ -1001,6 +1009,7 @@ class VertexBatchClient:
             thinking_tokens=thinking_tokens,
             status=status,
             raw_response=row,
+            finish_reason=str(finish_reason) if finish_reason is not None else None,
         )
 
     def _collect(self, job_entry: Dict[str, Any]) -> Dict[str, BatchChatResponse]:
@@ -1040,6 +1049,7 @@ class VertexBatchClient:
                 "output_tokens": response.output_tokens,
                 "visible_output_tokens": response.visible_output_tokens,
                 "thinking_tokens": response.thinking_tokens,
+                "finish_reason": response.finish_reason,
                 "status": response.status,
             }
             for request_id, response in responses.items()
@@ -1228,6 +1238,7 @@ class VertexBatchClient:
                 "output_tokens": response.output_tokens,
                 "visible_output_tokens": response.visible_output_tokens,
                 "thinking_tokens": response.thinking_tokens,
+                "finish_reason": response.finish_reason,
                 "status": response.status,
             }
             for request_id, response in responses.items()
