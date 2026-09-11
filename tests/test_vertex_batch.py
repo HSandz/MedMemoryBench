@@ -284,13 +284,60 @@ def test_json_schema_mapping_and_saved_request_restore(tmp_path):
     uploaded = json.loads(next(iter(storage.uploads.values())))
     config = uploaded["request"]["generationConfig"]
     assert config["responseMimeType"] == "application/json"
-    assert config["responseSchema"] == schema
+    assert config["responseSchema"] == {
+        "type": "OBJECT",
+        "properties": {"concepts_list": {"type": "ARRAY", "items": {"type": "STRING"}}},
+        "required": ["concepts_list"],
+    }
     restored = client.get_saved_request("concepts", "structured")
     assert restored is not None
     assert restored.messages == request.messages
     assert restored.metadata == request.metadata
     assert client.has_stage("concepts") is True
     assert [item.request_id for item in client.get_saved_requests("concepts")] == ["structured"]
+
+
+def test_vertex_schema_uses_nullable_for_json_schema_null_union():
+    request = BatchChatRequest(
+        request_id="nullable",
+        messages=[{"role": "user", "content": "return a date"}],
+        temperature=0.0,
+        max_tokens=10,
+        response_format={"type": "json_object", "response_json_schema": {
+            "type": "object",
+            "properties": {"date": {"type": ["string", "null"]}},
+        }},
+    )
+
+    schema = request.to_vertex_request()["generationConfig"]["responseSchema"]
+
+    assert schema["type"] == "OBJECT"
+    assert schema["properties"]["date"] == {"type": "STRING", "nullable": True}
+
+
+def test_all_failed_stage_aborts_before_any_retry(tmp_path):
+    storage = _Storage()
+    client = _client(tmp_path, _Batches(storage), storage)
+    saved = []
+    cancelled = []
+    client._save_manifest = lambda manifest: saved.append(dict(manifest))
+    client._cancel_job = lambda name, project=None: cancelled.append((name, project))
+    responses = {
+        "one": BatchChatResponse(request_id="one", content="", status="invalid request"),
+        "two": BatchChatResponse(request_id="two", content="", status="invalid request"),
+    }
+    manifest, job = {}, {"stage": "query-plan", "retries": [{
+        "job_name": "jobs/retry", "project": "test-project", "state": "JOB_STATE_RUNNING",
+    }]}
+
+    with pytest.raises(VertexBatchError, match="no usable responses"):
+        client._abort_all_failed_stage("query-plan", job, manifest, responses)
+
+    assert job["all_requests_failed"] is True
+    assert manifest["aborted"] is True
+    assert saved
+    assert cancelled == [("jobs/retry", "test-project")]
+    assert job["retries"][0]["cancel_requested"] is True
 
 
 def test_saved_request_lookups_load_and_index_manifest_once(tmp_path, monkeypatch):

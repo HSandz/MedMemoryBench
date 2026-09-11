@@ -77,6 +77,41 @@ class VertexBatchPending(RuntimeError):
         self.manifest_path = manifest_path
 
 
+def _vertex_response_schema(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert standard JSON Schema to Vertex's protobuf Schema dialect.
+
+    Vertex Batch accepts one ``type`` enum per schema node, rather than JSON
+    Schema's ``[type, null]`` union. Its ``nullable`` field is the equivalent
+    safe representation. Type names are enum strings in raw JSONL requests.
+    """
+    type_names = {
+        "object": "OBJECT", "array": "ARRAY", "string": "STRING",
+        "number": "NUMBER", "integer": "INTEGER", "boolean": "BOOLEAN",
+    }
+
+    def convert(item: Any) -> Any:
+        if isinstance(item, list):
+            return [convert(entry) for entry in item]
+        if not isinstance(item, dict):
+            return item
+        converted = {key: convert(entry) for key, entry in item.items()}
+        schema_type = converted.get("type")
+        if isinstance(schema_type, list):
+            concrete = [entry for entry in schema_type if entry != "null"]
+            if len(concrete) != 1:
+                raise VertexBatchError(
+                    "Vertex response schemas support only nullable single types."
+                )
+            converted["type"] = concrete[0]
+            converted["nullable"] = True
+            schema_type = concrete[0]
+        if isinstance(schema_type, str):
+            converted["type"] = type_names.get(schema_type.casefold(), schema_type)
+        return converted
+
+    return convert(value)
+
+
 @dataclass
 class BatchChatRequest:
     """A serializable GenerateContent request and its local correlation data."""
@@ -141,11 +176,11 @@ class BatchChatRequest:
             if response_json_schema is not None:
                 if not isinstance(response_json_schema, dict):
                     raise VertexBatchError("response_json_schema must be a JSON object.")
-                generation_config["responseSchema"] = response_json_schema
+                generation_config["responseSchema"] = _vertex_response_schema(response_json_schema)
             elif response_schema is not None:
                 if not isinstance(response_schema, dict):
                     raise VertexBatchError("response_schema must be a JSON object.")
-                generation_config["responseSchema"] = response_schema
+                generation_config["responseSchema"] = _vertex_response_schema(response_schema)
 
         effective_reasoning_effort = (
             self.reasoning_effort if self.reasoning_effort is not None else reasoning_effort
@@ -789,6 +824,25 @@ class VertexBatchClient:
 
         return self._run_with_vertex_credentials("batch job polling", get_job)
 
+    def _cancel_job(self, job_name: str, project: Optional[str] = None) -> None:
+        """Request cancellation for an outstanding provider job."""
+        if (
+            self._credential_client is not None
+            and project
+            and hasattr(self._credential_client, "_select_project")
+        ):
+            self._credential_client._select_project(project)
+
+        def cancel_job(credentials, selected_project):
+            genai_client = (
+                self._genai_client
+                if self._genai_client is not None
+                else self._new_batch_genai_client(credentials, selected_project)
+            )
+            return genai_client.batches.cancel(name=job_name)
+
+        self._run_with_vertex_credentials("batch job cancellation", cancel_job)
+
     def _wait_for_job(
         self,
         job_entry: Dict[str, Any],
@@ -1046,6 +1100,42 @@ class VertexBatchClient:
             or not responses[request.request_id].content
         ]
 
+    def _abort_all_failed_stage(
+        self,
+        stage: str,
+        job_entry: Dict[str, Any],
+        manifest: Dict[str, Any],
+        responses: Dict[str, BatchChatResponse],
+    ) -> None:
+        """Stop a run before retrying a systemic request failure."""
+        usable = sum(
+            1 for response in responses.values()
+            if not response.status and bool(response.content)
+        )
+        if usable:
+            return
+        failed = sum(1 for response in responses.values() if response.status)
+        job_entry["all_requests_failed"] = True
+        job_entry["abort_reason"] = (
+            f"No usable responses: {failed} failed rows and "
+            f"{len(responses) - failed} empty successful rows."
+        )
+        for retry in job_entry.get("retries", []):
+            if retry.get("state") in TERMINAL_STATES:
+                continue
+            try:
+                self._cancel_job(retry["job_name"], retry.get("project"))
+                retry["cancel_requested"] = True
+            except Exception as exc:  # Keep the local run aborted even if cancellation races completion.
+                retry["cancel_error"] = truncate_error_message(str(exc))
+        manifest["aborted"] = True
+        manifest["abort_reason"] = f"Vertex batch stage '{stage}' had no usable responses."
+        self._save_manifest(manifest)
+        raise VertexBatchError(
+            f"Vertex batch stage '{stage}' produced no usable responses; "
+            "aborting the run without retries. Inspect the saved per-row status."
+        )
+
     def run_stage(
         self,
         stage: str,
@@ -1084,6 +1174,7 @@ class VertexBatchClient:
 
         self._wait_or_raise_pending(stage, job_entry, manifest)
         responses = self._collect(job_entry)
+        self._abort_all_failed_stage(stage, job_entry, manifest, responses)
 
         # Vertex can finish a failed job with usable partial output. Preserve
         # those rows and submit only missing/failed IDs, never duplicate work.
@@ -1091,7 +1182,11 @@ class VertexBatchClient:
         # First collect a retry that a previous --resume invocation submitted.
         for retry_entry in retries:
             self._wait_or_raise_pending(retry_entry["stage"], retry_entry, manifest)
-            responses.update(self._collect(retry_entry))
+            retry_responses = self._collect(retry_entry)
+            self._abort_all_failed_stage(
+                retry_entry["stage"], retry_entry, manifest, retry_responses,
+            )
+            responses.update(retry_responses)
 
         unresolved = self._unresolved_requests(requests, responses)
         while unresolved and len(retries) < 3:
@@ -1118,7 +1213,9 @@ class VertexBatchClient:
             self._save_manifest(manifest)
 
             self._wait_or_raise_pending(retry_stage, retry_entry, manifest)
-            responses.update(self._collect(retry_entry))
+            retry_responses = self._collect(retry_entry)
+            self._abort_all_failed_stage(retry_stage, retry_entry, manifest, retry_responses)
+            responses.update(retry_responses)
             unresolved = self._unresolved_requests(requests, responses)
 
         job_entry["missing_request_ids"] = sorted(

@@ -207,15 +207,15 @@ def query_compiler_json_schema() -> Dict[str, Any]:
         "type": "object",
         "properties": {
             "searches": {"type": "array", "items": {"type": "object", "properties": {
-                "query": {"type": "string"}, "role": {"enum": sorted(_QUERY_ROLES)},
+                "query": {"type": "string"}, "role": {"type": "string", "enum": sorted(_QUERY_ROLES)},
             }, "required": ["query", "role"]}},
             "temporal": {"type": "object", "properties": {
-                "axis": {"enum": sorted(_QUERY_AXES)}, "relation": {"enum": sorted(_QUERY_RELATIONS)},
+                "axis": {"type": "string", "enum": sorted(_QUERY_AXES)}, "relation": {"type": "string", "enum": sorted(_QUERY_RELATIONS)},
                 "start": {"type": ["string", "null"]}, "end": {"type": ["string", "null"]},
                 "anchor_search": {"type": ["integer", "null"]},
-                "precision": {"enum": sorted(_QUERY_PRECISIONS)},
+                "precision": {"type": "string", "enum": sorted(_QUERY_PRECISIONS)},
             }, "required": ["axis", "relation", "start", "end", "anchor_search", "precision"]},
-            "state_view": {"enum": sorted(_STATE_VIEWS)},
+            "state_view": {"type": "string", "enum": sorted(_STATE_VIEWS)},
         },
         "required": ["searches", "temporal", "state_view"],
     }
