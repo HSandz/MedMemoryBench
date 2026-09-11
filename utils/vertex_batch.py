@@ -125,6 +125,9 @@ class BatchChatRequest:
     phase: str = "query"
     metadata: Dict[str, Any] = field(default_factory=dict)
     correlation_label: Optional[str] = None
+    # Some structured planning calls can safely use local fallback on an empty
+    # provider response; final-answer calls retain the conservative retry.
+    retry_empty_response: bool = True
 
     def __post_init__(self) -> None:
         if self.correlation_label is None:
@@ -252,6 +255,7 @@ class BatchChatRequest:
             max_tokens=data["max_tokens"],
             reasoning_effort=data.get("reasoning_effort"),
             response_format=data.get("response_format"),
+            retry_empty_response=data.get("retry_empty_response", True),
             phase=data.get("phase", "query"),
             metadata=data.get("metadata", {}),
             correlation_label=data.get("correlation_label", ""),
@@ -1046,9 +1050,14 @@ class VertexBatchClient:
         }
         job_entry["missing_request_ids"] = sorted(expected_ids - set(responses))
         failed = sum(1 for response in responses.values() if response.status)
+        empty = sum(1 for response in responses.values() if not response.status and not response.content)
+        job_entry["empty_response_ids"] = sorted(
+            request_id for request_id, response in responses.items()
+            if not response.status and not response.content
+        )
         self._progress(
             f"Stage '{job_entry['stage']}': collected {len(responses):,}/{len(requests):,} output row(s); "
-            f"{failed:,} failed, {len(job_entry['missing_request_ids']):,} missing."
+            f"{failed:,} failed, {empty:,} empty, {len(job_entry['missing_request_ids']):,} missing."
         )
         return responses
 
@@ -1097,7 +1106,7 @@ class VertexBatchClient:
             for request in requests
             if request.request_id not in responses
             or bool(responses[request.request_id].status)
-            or not responses[request.request_id].content
+            or (request.retry_empty_response and not responses[request.request_id].content)
         ]
 
     def _abort_all_failed_stage(
@@ -1179,16 +1188,28 @@ class VertexBatchClient:
         # Vertex can finish a failed job with usable partial output. Preserve
         # those rows and submit only missing/failed IDs, never duplicate work.
         retries = job_entry.setdefault("retries", [])
+        unresolved = self._unresolved_requests(requests, responses)
         # First collect a retry that a previous --resume invocation submitted.
         for retry_entry in retries:
+            if not unresolved:
+                # A newer request policy may make a prior retry unnecessary
+                # (for example, an empty compiler response with a local
+                # fallback). Do not wait for or bill that stale retry.
+                if retry_entry.get("state") not in TERMINAL_STATES:
+                    try:
+                        self._cancel_job(retry_entry["job_name"], retry_entry.get("project"))
+                        retry_entry["cancel_requested"] = True
+                    except Exception as exc:
+                        retry_entry["cancel_error"] = truncate_error_message(str(exc))
+                continue
             self._wait_or_raise_pending(retry_entry["stage"], retry_entry, manifest)
             retry_responses = self._collect(retry_entry)
             self._abort_all_failed_stage(
                 retry_entry["stage"], retry_entry, manifest, retry_responses,
             )
             responses.update(retry_responses)
+            unresolved = self._unresolved_requests(requests, responses)
 
-        unresolved = self._unresolved_requests(requests, responses)
         while unresolved and len(retries) < 3:
             retry_stage = f"{stage}-retry-{len(retries) + 1}"
             self._progress(

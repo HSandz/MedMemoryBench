@@ -1502,7 +1502,7 @@ class LoCoMoEvaluator:
                 self._pending_query_plan_requests.append({
                     "request": BatchChatRequest(request_id=request_id, messages=compiler["messages"],
                         temperature=compiler["temperature"], max_tokens=compiler["max_tokens"],
-                        response_format=compiler.get("response_format"), phase="query-plan",
+                        response_format=compiler.get("response_format"), retry_empty_response=False, phase="query-plan",
                         metadata={"query_id": query.query_id, "unit_id": unit.unit_id, "context_id": unit.context_id}),
                     "query": query, "question": formatted_question, "raw_question": query.question, "sample_id": unit.context_id,
                     "unit_id": unit.unit_id, "memory_state": event_state_snapshot,
