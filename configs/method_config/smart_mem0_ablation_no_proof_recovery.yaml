@@ -1,0 +1,51 @@
+method_name: "smart_mem0"
+method_type: "agentic_memory"
+description: "SmartMem0 ablation: proof detached from acquisition/recovery"
+
+model:
+  provider: "openai"
+  name: "gemini-3.5-flash-lite"
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  temperature: 0.3
+  max_completion_tokens: 8192
+
+agent_params:
+  subject_aliases:
+    patient: "primary_user"
+  retrieve_num: 8
+  max_context_tokens: 32768
+
+  # Keep WRITE and snapshot semantics identical to the v5 baseline.
+  enable_memory_write: true
+  frozen_memory_path: null
+  memory_snapshot_revision: 16
+  write_window_max_turns: 64
+  write_window_max_tokens: 8000
+  write_context_mode: none
+  write_prior_belief_limit: 8
+  write_provisional_limit: 4
+  max_new_memories: 12
+
+  # Locked two-stage READ architecture; no middle planner/validator/replan LLM.
+  enable_planner: false
+  enable_two_stage_controller: true
+  enable_slot_support_validation: false
+  enable_replan: false
+  enable_planner_repair: false
+
+  # ABLATION UNDER TEST:
+  # - Keep reasoning completion and answer prompt behavior.
+  # - Proof is still computed/telemetried, but it cannot downgrade typed
+  #   structural coverage or trigger proof-specific auxiliary/cold expansion.
+  # - Deterministic recovery remains enabled only for requirements that are
+  #   structurally empty, isolating proof-driven recovery from true misses.
+  enable_reasoning_completion: true
+  enable_proof_status_gate: false
+  enable_proof_expansion: false
+  enable_reasoning_source_neighbors: true
+  enable_reasoning_prompt_strengthening: true
+  enable_zero_result_recovery: true
+
+embedding:
+  provider: "local"
+  model: "sentence-transformers/all-MiniLM-L6-v2"

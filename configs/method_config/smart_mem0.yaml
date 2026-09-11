@@ -36,20 +36,46 @@ agent_params:
   write_provisional_limit: 4
   max_new_memories: 12
 
-  # Compatibility switch retained by the benchmark facade. The active path
-  # compiles retrieval deterministically from minimal semantic IR and never
-  # calls a separate planner LLM.
-  enable_planner: true
-  # Active read route: one compact controller emits requirements, relations,
+  # Active READ route: one compact controller emits requirements, relations,
   # and an optional atomic candidate after inspecting question + Top-3 seeds.
-  # Route, budget, and physical operations are derived by code.
+  # Route, budget, and physical operations are derived by code. There is no
+  # separate planner LLM in the locked two-stage architecture.
+  enable_planner: false
   enable_two_stage_controller: true
-  # Frozen off: typed requirement coverage is deterministic, preserving the
-  # controller + answer two-call upper bound.
   enable_slot_support_validation: false
   enable_replan: false
-  enable_zero_result_recovery: true
   enable_planner_repair: false
+
+  # READ ABLATION CONTROLS -------------------------------------------------
+  # Defaults below reproduce the current v5 behavior. These switches affect
+  # READ only and do not alter WRITE, model choice, snapshot revision, or the
+  # two-call LLM ceiling.
+  #
+  # Recommended first ablation (proof detached from acquisition/recovery):
+  #   enable_proof_status_gate: false
+  #   enable_proof_expansion: false
+  #   enable_zero_result_recovery: true
+  # Keep the remaining switches true. In that profile proof still exists for
+  # diagnostics/terminal certification, but a proof miss cannot downgrade
+  # structural coverage or open extra proof-driven retrieval views.
+  #
+  # Stronger no-recovery ablation:
+  #   enable_proof_status_gate: false
+  #   enable_proof_expansion: false
+  #   enable_zero_result_recovery: false
+  #
+  # Disable the whole reasoning-completion layer:
+  #   enable_reasoning_completion: false
+  # This also disables proof expansion/status gating, source-neighbor additions,
+  # and reasoning-prompt strengthening through the ablation mixin.
+  enable_reasoning_completion: true
+  enable_proof_status_gate: true
+  enable_proof_expansion: true
+  enable_reasoning_source_neighbors: true
+  enable_reasoning_prompt_strengthening: true
+  # Existing deterministic focus-only recovery now honors this YAML value;
+  # SmartMem0Agent no longer forces it back to true after construction.
+  enable_zero_result_recovery: true
 
 embedding:
   provider: "local"

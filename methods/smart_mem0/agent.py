@@ -8,6 +8,7 @@ from .consolidation import ConsolidationMixin
 from .core import CoreMemoryMixin
 from .execution import ExecutionMixin
 from .query import QueryMixin
+from .read_ablation_controls import ReadAblationControlsMixin
 from .read_answerability_contract import ReadAnswerabilityContractMixin
 from .read_terminal_answer_contract import ReadTerminalAnswerContractMixin
 from .read_answer_or_plan_contract import ReadAnswerOrPlanContractMixin
@@ -46,6 +47,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadAblationControlsMixin,
     ReadRequirementIdentityRuntimeMixin,
     ReadRequirementResolutionRuntimeMixin,
     ReadRequirementProjectionRuntimeMixin,
@@ -96,6 +98,20 @@ class SmartMem0Agent(
             raise ValueError(
                 "SmartMem0 legacy READ planner path was removed in architecture Phase 6"
             )
+
+        # READ ablation switches are consumed here so BaseAgent and WRITE-path
+        # constructors never see experiment-only controls. Defaults reproduce v5.
+        reasoning_completion = kwargs.pop("enable_reasoning_completion", True)
+        proof_status_gate = kwargs.pop("enable_proof_status_gate", True)
+        proof_expansion = kwargs.pop("enable_proof_expansion", True)
+        reasoning_source_neighbors = kwargs.pop(
+            "enable_reasoning_source_neighbors", True
+        )
+        reasoning_prompt_strengthening = kwargs.pop(
+            "enable_reasoning_prompt_strengthening", True
+        )
+        zero_result_recovery = kwargs.pop("enable_zero_result_recovery", True)
+
         super().__init__(*args, **kwargs)
         self.enable_two_stage_controller = True
         self.max_read_llm_calls = self.MAX_TWO_STAGE_READ_LLM_CALLS
@@ -104,9 +120,18 @@ class SmartMem0Agent(
         # tooling cannot accidentally reactivate a removed middle LLM stage.
         self.enable_planner = False
         self.enable_replan = False
-        self.enable_zero_result_recovery = True
         self.enable_planner_repair = False
         self.enable_slot_support_validation = False
+
+        # Active READ ablation controls. These affect READ only and add no LLM calls.
+        self.enable_reasoning_completion = bool(reasoning_completion)
+        self.enable_proof_status_gate = bool(proof_status_gate)
+        self.enable_proof_expansion = bool(proof_expansion)
+        self.enable_reasoning_source_neighbors = bool(reasoning_source_neighbors)
+        self.enable_reasoning_prompt_strengthening = bool(
+            reasoning_prompt_strengthening
+        )
+        self.enable_zero_result_recovery = bool(zero_result_recovery)
 
     def _semantic_controller(self, question, seeds, frame, context_map=None):
         """Keep semantic telemetry available to deterministic context arbitration."""
