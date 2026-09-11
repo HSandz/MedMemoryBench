@@ -22,6 +22,7 @@ from .read_plan_contract import ReadPlanContractMixin
 from .read_requirement_contract import ReadRequirementContractMixin
 from .read_requirement_graph import ReadRequirementGraphMixin
 from .read_requirement_graph_runtime import ReadRequirementGraphRuntimeMixin
+from .read_requirement_identity_runtime import ReadRequirementIdentityRuntimeMixin
 from .read_requirement_projection_runtime import ReadRequirementProjectionRuntimeMixin
 from .read_requirement_resolution_runtime import ReadRequirementResolutionRuntimeMixin
 from .read_reasoning_bridge import ReadReasoningBridgeMixin
@@ -45,6 +46,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    ReadRequirementIdentityRuntimeMixin,
     ReadRequirementResolutionRuntimeMixin,
     ReadRequirementProjectionRuntimeMixin,
     ReadRequirementGraphRuntimeMixin,
