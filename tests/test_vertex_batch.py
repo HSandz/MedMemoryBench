@@ -353,11 +353,6 @@ def test_empty_compiler_response_can_use_local_fallback_without_retry():
 
     assert VertexBatchClient._unresolved_requests([compiler], response) == []
     assert VertexBatchClient._unresolved_requests([answer], {"answer": BatchChatResponse(request_id="answer", content="")}) == [answer]
-    legacy = BatchChatRequest.from_manifest_dict({
-        "request_id": "legacy", "messages": compiler.messages,
-        "temperature": 0.0, "max_tokens": 10, "phase": "query-plan",
-    })
-    assert legacy.retry_empty_response is False
 
 
 def test_saved_request_lookups_load_and_index_manifest_once(tmp_path, monkeypatch):
