@@ -27,7 +27,7 @@ from .event_state.prompts import (
     QUERY_PLANNER_SYSTEM_PROMPT,
     STRUCTURED_OUTPUT_REPAIR_SYSTEM_PROMPT,
 )
-from .event_state.planner import QueryPlan, fallback_query_plan, validate_planner_output, validate_query_compiler_output
+from .event_state.planner import QueryPlan, fallback_query_plan, query_compiler_json_schema, salvage_query_compiler_output, validate_planner_output
 from .event_state.retrieval import EventStateRetriever
 from .event_state.schemas import Claim, Episode, EvidenceRef, NormalizedTurn, TurnEvidence
 from .event_state.store import EventStateStore
@@ -163,7 +163,7 @@ class EventStateAgent(BaseAgent):
 
     METHOD_TYPE = "agentic_memory"
 
-    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, event_time_normalization_enabled=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, retrieve_turns=True, claim_top_k=30, episode_top_k=20, turn_top_k=8, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, turn_retrieval_weight=1.0, turn_lexical_retrieval_enabled=False, turn_lexical_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, turn_evidence_count=0, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_mode=None, query_compiler_max_searches=3, planner_temperature=0.0, planner_max_tokens=1200, planner_merge_mode="coverage_interleave", **kwargs):
+    def __init__(self, model="gpt-4o-mini", temperature=1.0, max_tokens=2000, provider="openai", api_key=None, base_url=None, llm_client_kwargs=None, memory_model=None, memory_provider=None, memory_temperature=0.0, memory_max_tokens=1800, memory_api_key=None, memory_base_url=None, memory_llm_client_kwargs=None, llm_client=None, memory_llm_client=None, embedding_model="sentence-transformers/all-MiniLM-L6-v2", embedding_provider="local", embedding_model_path=None, embedding_api_key=None, embedding_base_url=None, embedding_client=None, enable_episodes=True, enable_state_claims=True, enable_state_compilation=True, extraction_max_tokens=1800, extraction_temperature=0.0, max_claims_per_episode=20, state_candidate_top_k=5, state_current_candidate_top_k=3, state_candidate_min_similarity=0.45, update_min_confidence=0.55, update_temperature=0.0, update_max_tokens=800, store_raw_episode_text=True, enable_bitemporal_time=True, event_time_normalization_enabled=True, preserve_turn_evidence=True, max_context_tokens=120000, retrieve_claims=True, retrieve_episodes=True, retrieve_turns=True, claim_top_k=30, episode_top_k=20, turn_top_k=8, candidate_count=40, fusion_mode="rrf", rrf_k=60.0, claim_retrieval_weight=1.0, episode_retrieval_weight=1.0, turn_retrieval_weight=1.0, turn_lexical_retrieval_enabled=False, turn_lexical_retrieval_weight=1.0, temporal_retrieval_enabled=True, temporal_retrieval_weight=1.0, ppr_enabled=False, ppr_alpha=0.85, ppr_max_iterations=20, ppr_tolerance=1e-6, ppr_expand_hops=2, ppr_mix_weight=0.35, ppr_weight_supersedes=1.2, ppr_weight_refines=1.0, ppr_weight_conflict=0.8, ppr_weight_evidence=0.7, selector_mode="state_mmr", evidence_count=8, turn_evidence_count=0, mmr_lambda=0.7, state_relation_bonus=0.05, source_diversity_bonus=0.02, representation_balance_bonus=0.02, inject_source_evidence=True, max_source_excerpts_per_claim=2, max_episode_source_excerpts_total=2, event_state_workers=1, planner_rounds=0, planner_max_requests=3, planner_mode=None, query_compiler_max_searches=3, query_compiler_max_tokens=256, planner_temperature=0.0, planner_max_tokens=1200, planner_merge_mode="coverage_interleave", **kwargs):
         super().__init__(model, temperature, max_tokens, **kwargs)
         if fusion_mode != "rrf":
             raise ValueError("Event-State fusion_mode currently supports only 'rrf'")
@@ -196,8 +196,10 @@ class EventStateAgent(BaseAgent):
             raise ValueError("query_compiler mode requires planner_rounds=0")
         if planner_mode == "iterative" and not int(planner_rounds):
             raise ValueError("iterative planner_mode requires planner_rounds > 0")
-        if not 1 <= int(query_compiler_max_searches) <= 8:
-            raise ValueError("query_compiler_max_searches must be between 1 and 8")
+        if not 0 <= int(query_compiler_max_searches) <= 8:
+            raise ValueError("query_compiler_max_searches must be between 0 and 8")
+        if int(query_compiler_max_tokens) <= 0:
+            raise ValueError("query_compiler_max_tokens must be positive")
         self.max_context_tokens = int(max_context_tokens)
         self.max_claims_per_episode = max(0, int(max_claims_per_episode))
         self.extraction_max_tokens, self.extraction_temperature = int(extraction_max_tokens), float(extraction_temperature)
@@ -211,6 +213,7 @@ class EventStateAgent(BaseAgent):
         self.planner_rounds = int(planner_rounds)
         self.planner_mode = planner_mode
         self.query_compiler_max_searches = int(query_compiler_max_searches)
+        self.query_compiler_max_tokens = int(query_compiler_max_tokens)
         self.planner_max_requests = int(planner_max_requests)
         self.planner_temperature = float(planner_temperature)
         self.planner_max_tokens = int(planner_max_tokens)
@@ -223,7 +226,7 @@ class EventStateAgent(BaseAgent):
         self._stores: Dict[Any, EventStateStore] = {}
         self._context_id = None
         self._build_config = {"enable_episodes": self.enable_episodes, "enable_state_claims": self.enable_state_claims, "enable_state_compilation": self.enable_state_compilation, "extraction_max_tokens": self.extraction_max_tokens, "extraction_temperature": self.extraction_temperature, "max_claims_per_episode": self.max_claims_per_episode, "state_candidate_top_k": int(state_candidate_top_k), "state_current_candidate_top_k": max(1, int(state_current_candidate_top_k)), "state_candidate_min_similarity": float(state_candidate_min_similarity), "update_min_confidence": float(update_min_confidence), "update_temperature": self.update_temperature, "update_max_tokens": self.update_max_tokens, "store_raw_episode_text": self.store_raw_episode_text, "enable_bitemporal_time": self.enable_bitemporal_time, "event_time_normalization_enabled": self.event_time_normalization_enabled, "preserve_turn_evidence": self.preserve_turn_evidence}
-        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "retrieve_turns": bool(retrieve_turns), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "turn_top_k": int(turn_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "turn_retrieval_weight": float(turn_retrieval_weight), "turn_lexical_retrieval_enabled": bool(turn_lexical_retrieval_enabled), "turn_lexical_retrieval_weight": float(turn_lexical_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "turn_evidence_count": normalized_turn_evidence_count, "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "max_episode_source_excerpts_total": self.max_episode_source_excerpts_total, "planner_rounds": self.planner_rounds, "planner_mode": self.planner_mode, "query_compiler_max_searches": self.query_compiler_max_searches, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens, "planner_merge_mode": self.planner_merge_mode}
+        self._retrieval_config = {"retrieve_claims": bool(retrieve_claims), "retrieve_episodes": bool(retrieve_episodes), "retrieve_turns": bool(retrieve_turns), "claim_top_k": int(claim_top_k), "episode_top_k": int(episode_top_k), "turn_top_k": int(turn_top_k), "candidate_count": int(candidate_count), "fusion_mode": fusion_mode, "rrf_k": float(rrf_k), "claim_retrieval_weight": float(claim_retrieval_weight), "episode_retrieval_weight": float(episode_retrieval_weight), "turn_retrieval_weight": float(turn_retrieval_weight), "turn_lexical_retrieval_enabled": bool(turn_lexical_retrieval_enabled), "turn_lexical_retrieval_weight": float(turn_lexical_retrieval_weight), "temporal_retrieval_enabled": bool(temporal_retrieval_enabled), "temporal_retrieval_weight": float(temporal_retrieval_weight), "ppr_enabled": bool(ppr_enabled), "ppr_alpha": float(ppr_alpha), "ppr_max_iterations": int(ppr_max_iterations), "ppr_tolerance": float(ppr_tolerance), "ppr_expand_hops": int(ppr_expand_hops), "ppr_mix_weight": float(ppr_mix_weight), "ppr_weight_supersedes": float(ppr_weight_supersedes), "ppr_weight_refines": float(ppr_weight_refines), "ppr_weight_conflict": float(ppr_weight_conflict), "ppr_weight_evidence": float(ppr_weight_evidence), "selector_mode": selector_mode, "evidence_count": int(evidence_count), "turn_evidence_count": normalized_turn_evidence_count, "mmr_lambda": float(mmr_lambda), "state_relation_bonus": float(state_relation_bonus), "source_diversity_bonus": float(source_diversity_bonus), "representation_balance_bonus": float(representation_balance_bonus), "max_episode_source_excerpts_total": self.max_episode_source_excerpts_total, "planner_rounds": self.planner_rounds, "planner_mode": self.planner_mode, "query_compiler_max_searches": self.query_compiler_max_searches, "query_compiler_max_tokens": self.query_compiler_max_tokens, "planner_max_requests": self.planner_max_requests, "planner_temperature": self.planner_temperature, "planner_max_tokens": self.planner_max_tokens, "planner_merge_mode": self.planner_merge_mode}
 
     def _store(self, context_id=None) -> EventStateStore:
         key = self._context_id if context_id is None else context_id
@@ -1098,18 +1101,24 @@ class EventStateAgent(BaseAgent):
         if reference_time is not None and not isinstance(reference_time, str):
             reference_time = None
         user = f"[QUESTION]\n{question}\n\nREFERENCE_TIME: {reference_time or 'null'}\nMAX_SEARCHES: {self.query_compiler_max_searches}"
+        schema = query_compiler_json_schema()
         return {"messages": format_messages(user, QUERY_COMPILER_SYSTEM_PROMPT),
-                "temperature": self.planner_temperature, "max_tokens": self.planner_max_tokens}
+                "temperature": self.planner_temperature, "max_tokens": self.query_compiler_max_tokens,
+                "response_format": {"type": "json_object", "response_json_schema": schema},
+                "response_json_schema": schema}
 
     def validate_query_compiler_response(self, question: str, content: str) -> tuple[QueryPlan, Dict[str, Any]]:
         diagnostics = {"enabled": True, "planner_mode": "query_compiler", "compiler_parse_success": False,
-                       "compiler_validation_success": False, "compiler_fallback_used": False,
+                       "compiler_validation_success": False, "compiler_salvage_used": False,
+                       "compiler_fallback_used": False, "compiler_warning_codes": [],
                        "compiler_failure_reason": None}
         try:
             value = parse_json(content)
             diagnostics["compiler_parse_success"] = True
-            plan = validate_query_compiler_output(value, self.query_compiler_max_searches)
+            plan, warnings, salvage_used = salvage_query_compiler_output(value, self.query_compiler_max_searches)
             diagnostics["compiler_validation_success"] = True
+            diagnostics["compiler_salvage_used"] = salvage_used
+            diagnostics["compiler_warning_codes"] = warnings[:16]
         except Exception as exc:
             plan = fallback_query_plan(question)
             diagnostics.update({"compiler_fallback_used": True, "compiler_failure_reason": str(exc)[:300]})
@@ -1128,7 +1137,8 @@ class EventStateAgent(BaseAgent):
         retriever = EventStateRetriever(store, self._embedder, **self._retrieval_config)
         channels = [kwargs.get("raw_question", question)] + [item.query for item in plan.searches]
         vectors = [self._embedder.embed_query(item) for item in channels]
-        ranked, turns, retrieval_extra = retriever.rank_query_plan(channels[0], plan, vectors)
+        with get_usage_tracker().scope("event_state.retrieval"):
+            ranked, turns, retrieval_extra = retriever.rank_query_plan(channels[0], plan, vectors)
         if plan.temporal.axis != "none":
             if plan.temporal.start and plan.temporal.end:
                 retrieval_extra["retrieval_interpretation"] = f"{plan.temporal.axis.title()}-time window: {plan.temporal.start} through {plan.temporal.end}"
@@ -1296,6 +1306,19 @@ class EventStateAgent(BaseAgent):
             "post_candidate_count": self._candidate_trace(post_candidates, store, len(post_candidates)),
             "final_memory_object_selection": self._candidate_trace(selected, store, len(selected)),
         }
+        compiler_stages = retrieval_extra.get("channel_semantic_candidates")
+        if isinstance(compiler_stages, dict):
+            candidate_stages["channel_semantic_candidates"] = {
+                key: [self._candidate_trace(channel, store, len(channel)) for channel in channels]
+                for key, channels in compiler_stages.items() if isinstance(channels, list)
+            }
+            for stage_name in ("merged_semantic_union", "temporally_reranked_union"):
+                stage = retrieval_extra.get(stage_name, {})
+                if isinstance(stage, dict):
+                    candidate_stages[stage_name] = {
+                        key: self._candidate_trace(candidates, store, len(candidates))
+                        for key, candidates in stage.items() if isinstance(candidates, list)
+                    }
         base_extra = {
             key: value for key, value in retrieval_extra.items()
             if key not in {"pre_candidate_truncation_candidates", "post_candidate_truncation_candidates"}
@@ -1328,6 +1351,14 @@ class EventStateAgent(BaseAgent):
             if record["type"] == "episode" and record.get("source_session_id") is not None
         }
         extra = {**base_extra, "retrieval_record_schema_version": 3, "retrieval_stage_candidates": candidate_stages, "claim_candidate_count": retrieval_extra.get("claim_candidates", 0), "episode_candidate_count": retrieval_extra.get("episode_candidates", 0), "turn_candidate_count": retrieval_extra.get("turn_candidates", 0), "selected_ids": [record["id"] for record in records], "included_ids": included_ids, "selected_context_tokens": selected_context_tokens, "included_context_tokens": included_tokens, "context_truncated": included_tokens < selected_context_tokens, "selected_candidate_count": retrieval_extra.get("selected_candidate_count", len(selected)), "selected_claim_count": sum(record["type"] == "state_claim" for record in records), "selected_episode_count": sum(record["type"] == "episode" for record in records), "selected_memory_object_count": sum(record["type"] != "immutable_turn" for record in records), "selected_turn_count": sum(record["type"] == "immutable_turn" for record in records), "selected_raw_turn_count": sum(record["type"] == "immutable_turn" for record in records), "deduplicated_turn_count": retrieval_extra.get("deduplicated_turn_count", 0), "deduplicated_selected_turn_count": retrieval_extra.get("deduplicated_selected_turn_count", 0), "backfilled_candidate_count": retrieval_extra.get("backfilled_candidate_count", 0), "backfilled_after_turn_dedup_count": retrieval_extra.get("backfilled_after_turn_dedup_count", 0), "effective_selected_turn_count": retrieval_extra.get("effective_selected_turn_count", sum(record["type"] == "immutable_turn" for record in records)), "effective_retrieved_record_count": len(records), "selected_turn_ids_before_dedup": retrieval_extra.get("selected_turn_ids_before_dedup", []), "selected_turn_ids_after_dedup": retrieval_extra.get("selected_turn_ids_after_dedup", []), "selected_episode_evidence_excerpt_count": sum(len(record.get("episode_evidence_turn_ids", [])) for record in records if record["type"] == "episode"), "episode_evidence_candidate_turn_count": episode_evidence_candidate_turn_count, "raw_episode_turn_candidate_count": episode_evidence_candidate_turn_count + len(indexed_turns), "episode_evidence_deduplicated_against_claim_count": episode_evidence_deduplicated_against_claim_count, "selected_episode_count_with_evidence": sum(bool(record.get("episode_evidence_turn_ids")) for record in records if record["type"] == "episode"), "configured_global_raw_excerpt_budget": self.max_episode_source_excerpts_total, "source_evidence_turns_contributed_by_claims": sum(len(item.get("evidence", {}).get("source_turn_ids", [])) for item in (item for record in records for item in record.get("included_provenance_evidence", []))), "answer_visible_distinct_source_turn_count": source_turn_count, "total_answer_visible_distinct_source_turns": source_turn_count, "candidate_episode_source_session_count": len(candidate_episode_sessions), "selected_episode_source_session_count": len(selected_episode_sessions), "included_claim_count": sum(record["type"] == "state_claim" for record in records if record["id"] in included_ids), "included_episode_count": sum(record["type"] == "episode" for record in records if record["id"] in included_ids), "included_provenance_evidence": [item for record in records for item in record.get("included_provenance_evidence", [])]}
+        selected_claims = [store.claims[record["id"]] for record in records
+                           if record["type"] == "state_claim" and record["id"] in store.claims]
+        extra["selected_claim_status_counts"] = dict(sorted(Counter(claim.status for claim in selected_claims).items()))
+        extra["selected_claim_persistence_counts"] = dict(sorted(Counter(claim.persistence for claim in selected_claims).items()))
+        if sum(extra["selected_claim_status_counts"].values()) != extra["selected_claim_count"]:
+            raise AssertionError("selected claim status diagnostics must describe final evidence")
+        if sum(extra["selected_claim_persistence_counts"].values()) != extra["selected_claim_count"]:
+            raise AssertionError("selected claim persistence diagnostics must describe final evidence")
         return {"messages": format_messages(user_content, answer_system), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     def _initial_query_context(self, question: str, system_message: Optional[str], **kwargs):
@@ -1377,7 +1408,8 @@ class EventStateAgent(BaseAgent):
             with get_usage_tracker().scope("event_state.query_compiler"):
                 try:
                     response = self._llm_client.chat(compiler["messages"], temperature=compiler["temperature"],
-                                                     max_tokens=compiler["max_tokens"], response_format={"type": "json_object"})
+                                                     max_tokens=compiler["max_tokens"], response_format=compiler["response_format"],
+                                                     response_json_schema=compiler["response_json_schema"])
                 except TypeError:
                     response = self._llm_client.chat(compiler["messages"], temperature=compiler["temperature"], max_tokens=compiler["max_tokens"])
             prepared = self.prepare_query_compiler_result(question, str(getattr(response, "content", "")), system_message, **kwargs)

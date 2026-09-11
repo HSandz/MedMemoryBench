@@ -509,7 +509,7 @@ class MethodConfig:
         # Resolve relative paths against PROJECT_ROOT in both config sections.
         _path_keys = {
             "embedding_model_path", "model_path",
-            "working_dir", "q2q_project_path",
+            "working_dir", "q2q_project_path", "query_compiler_plan_cache_path",
         }
         def resolve_paths(params: Dict[str, Any]) -> Dict[str, Any]:
             resolved = {}

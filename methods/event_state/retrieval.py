@@ -88,6 +88,7 @@ class EventStateRetriever:
         candidate_count = int(self.config.get("candidate_count", 40))
         candidates = candidates[:candidate_count]
         claim_candidate_statuses = Counter(self.store.claims[identifier].status for identifier, _ in claim_rank)
+        claim_candidate_persistence = Counter(self.store.claims[identifier].persistence for identifier, _ in claim_rank)
         temporal_historical = sum(
             1 for identifier, _score, _match in temporal_claim_rank
             if self.store.claims[identifier].status in {"superseded", "refined"}
@@ -116,6 +117,8 @@ class EventStateRetriever:
             "selector_mode": self.config.get("selector_mode", "state_mmr"),
             "selected_ids": [],
             "claim_candidate_status_counts": dict(sorted(claim_candidate_statuses.items())),
+            "candidate_claim_status_counts": dict(sorted(claim_candidate_statuses.items())),
+            "candidate_claim_persistence_counts": dict(sorted(claim_candidate_persistence.items())),
             "selected_claim_status_counts": {},
             "selected_claim_persistence_counts": {},
             "hidden_prior_state_candidate_count": hidden_prior_state_count,
@@ -248,6 +251,24 @@ class EventStateRetriever:
         """
         channels = [question] + [search.query for search in plan.searches]
         vectors = list(query_vectors or [self.embedder.embed_query(item) for item in channels])
+        no_temporal_constraint = plan.temporal.axis == "none" or plan.temporal.relation == "none"
+        if not plan.searches and no_temporal_constraint and plan.state_view == "current":
+            # Preserve the normal single-channel geometry exactly. In particular,
+            # do not normalize a second time through planner-level fusion.
+            structured, turns, details = self.rank_candidate_pools(
+                question, query_vector=vectors[0], parse_temporal_query=False, state_view="current",
+            )
+            details.update({
+                "query_compiler_channels": [{"channel_index": 0, "query": question, "role": "original",
+                                             "structured_candidates": len(structured), "turn_candidates": len(turns)}],
+                "original_query_channel": question, "coverage_merge_mode": "single_channel",
+                "channel_semantic_candidates": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
+                "merged_semantic_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
+                "temporally_reranked_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
+                "anchor_resolution_status": "none", "anchor_candidate_count": 0,
+                "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
+            })
+            return structured, turns, details
         structured_channels, turn_channels, channel_details = [], [], []
         as_of = None
         if plan.temporal.axis == "knowledge" and plan.temporal.end:
@@ -265,16 +286,22 @@ class EventStateRetriever:
                                     "structured_candidates": len(structured), "turn_candidates": len(turns)})
         structured = self.merge_rank_channels(structured_channels)
         turns = self.merge_rank_channels(turn_channels) if turn_channels else []
-        anchor_spans = self._anchor_spans(plan, structured_channels, turn_channels)
+        anchor_spans, anchor_diagnostics = self._resolve_anchor_spans(plan, structured_channels, turn_channels)
         structured = self._rerank_query_plan_temporal(structured, plan, anchor_spans)
         turns = self._rerank_query_plan_temporal(turns, plan, anchor_spans)
         return structured, turns, {
             "query_compiler_channels": channel_details,
             "original_query_channel": question,
             "coverage_merge_mode": self.config.get("planner_merge_mode", "coverage_interleave"),
-            "anchor_temporal_resolution_success": bool(anchor_spans) if plan.temporal.anchor_search is not None else None,
+            "anchor_temporal_resolution_success": anchor_diagnostics["anchor_resolution_status"] == "resolved",
             "resolved_anchor_spans_count": len(anchor_spans),
+            **anchor_diagnostics,
             "temporalized_candidate_count": sum(bool(item.get("temporal_score")) for item in structured + turns),
+            "channel_semantic_candidates": {"structured": [[dict(item) for item in channel] for channel in structured_channels],
+                                                  "turns": [[dict(item) for item in channel] for channel in turn_channels]},
+            "merged_semantic_union": {"structured": [dict(item) for item in self.merge_rank_channels(structured_channels)],
+                                        "turns": [dict(item) for item in self.merge_rank_channels(turn_channels)] if turn_channels else []},
+            "temporally_reranked_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
         }
 
     @staticmethod
@@ -301,17 +328,44 @@ class EventStateRetriever:
                   "precision": claim.event_time_precision}]
                 if claim.event_time_start and claim.event_time_end else [])
 
-    def _anchor_spans(self, plan: QueryPlan, structured_channels: Sequence[Sequence[Dict[str, Any]]], turn_channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, str]]:
+    def _resolve_anchor_spans(self, plan: QueryPlan, structured_channels: Sequence[Sequence[Dict[str, Any]]], turn_channels: Sequence[Sequence[Dict[str, Any]]]) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
         anchor = plan.temporal.anchor_search
         if anchor is None:
-            return []
+            return [], {"anchor_resolution_status": "none", "anchor_candidate_count": 0,
+                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": []}
         # +1 accounts for the always-on original-query channel.
         rows = list(structured_channels[anchor + 1]) + (list(turn_channels[anchor + 1]) if anchor + 1 < len(turn_channels) else [])
-        spans = []
-        for item in rows[:10]:
-            spans.extend(self._candidate_spans(item, "event"))
-        unique = {(item.get("start"), item.get("end"), item.get("precision")): item for item in spans}
-        return [unique[key] for key in sorted(unique)]
+        temporal_rows = []
+        for item in rows:
+            for span in self._candidate_spans(item, "event"):
+                start, end = self._span_dates(span)
+                if start and end:
+                    temporal_rows.append((span, max(0.0, float(item.get("final_score", item.get("score", 0.0))))))
+        if not temporal_rows:
+            return [], {"anchor_resolution_status": "missing_metadata", "anchor_candidate_count": len(rows),
+                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": []}
+        # Greedily group overlapping event intervals. This intentionally does
+        # not union disjoint dates merely because they were retrieved together.
+        clusters: List[Dict[str, Any]] = []
+        for span, relevance in sorted(temporal_rows, key=lambda row: (row[0]["start"], row[0]["end"])):
+            start, end = self._span_dates(span)
+            compatible = next((cluster for cluster in clusters if start <= cluster["end"] and end >= cluster["start"]), None)
+            precision = {"exact": 1.0, "bounded": .8, "approximate": .55, "unknown": .3}.get(span.get("precision"), .3)
+            if compatible is None:
+                compatible = {"start": start, "end": end, "rows": [], "score": 0.0}
+                clusters.append(compatible)
+            compatible["start"] = min(compatible["start"], start)
+            compatible["end"] = max(compatible["end"], end)
+            compatible["rows"].append(span)
+            compatible["score"] += relevance * precision
+        clusters.sort(key=lambda cluster: (-cluster["score"], cluster["start"], cluster["end"]))
+        if len(clusters) > 1 and clusters[1]["score"] >= clusters[0]["score"] * .8:
+            return [], {"anchor_resolution_status": "ambiguous", "anchor_candidate_count": len(rows),
+                        "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": []}
+        resolved = [{"start": clusters[0]["start"].isoformat(), "end": clusters[0]["end"].isoformat(),
+                     "precision": "bounded" if clusters[0]["start"] != clusters[0]["end"] else "exact"}]
+        return resolved, {"anchor_resolution_status": "resolved", "anchor_candidate_count": len(rows),
+                          "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": resolved}
 
     def _rerank_query_plan_temporal(self, candidates: List[Dict[str, Any]], plan: QueryPlan, anchors: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
         temporal = plan.temporal
@@ -324,11 +378,28 @@ class EventStateRetriever:
             item["temporal_score"] = score
             item["temporal_match_type"] = match
             scores.append(score)
-        # Missing annotations are a neutral soft signal, never a filter.
-        relevance = normalize_scores([float(item.get("semantic_score", 0.0)) for item in candidates])
+        if temporal.relation in {"latest", "earliest"}:
+            dated = []
+            for item in candidates:
+                spans = self._candidate_spans(item, temporal.axis)
+                points = [self._span_dates(span)[1 if temporal.relation == "latest" else 0] for span in spans]
+                points = [point for point in points if point is not None]
+                if points:
+                    dated.append((item, max(points) if temporal.relation == "latest" else min(points)))
+            if dated:
+                low, high = min(point for _item, point in dated), max(point for _item, point in dated)
+                for item, point in dated:
+                    order = 1.0 if high == low else (
+                        (point - low).days / (high - low).days if temporal.relation == "latest"
+                        else (high - point).days / (high - low).days
+                    )
+                    item["temporal_score"] = min(1.0, float(item["temporal_score"]) * (.5 + .5 * order))
+        # Missing annotations are neutral. Temporal compatibility can only
+        # amplify semantic relevance; it cannot manufacture it.
         weight = float(self.config.get("temporal_retrieval_weight", 1.0))
-        for item, semantic in zip(candidates, relevance):
-            item["joint_score"] = semantic + weight * float(item.get("temporal_score", 0.0))
+        for item in candidates:
+            semantic = max(0.0, float(item.get("semantic_score", 0.0)))
+            item["joint_score"] = semantic * (1.0 + weight * min(1.0, float(item.get("temporal_score", 0.0))))
             item["final_score"] = item["joint_score"]
         return sorted(candidates, key=lambda item: (-item.get("final_score", 0.0), item["id"]))
 
@@ -349,21 +420,24 @@ class EventStateRetriever:
                 if temporal.relation == "overlap":
                     match = target_start is not None and target_end is not None and start <= target_end and end >= target_start
                 elif temporal.relation == "before":
-                    match = target_start is not None and end <= target_start
+                    match = target_start is not None and end < target_start
                 elif temporal.relation == "after":
-                    match = target_end is not None and start >= target_end
+                    match = target_end is not None and start > target_end
                 elif temporal.relation == "latest":
                     match = True
                 elif temporal.relation == "earliest":
                     match = True
                 if match:
                     # Ordering is local to the semantic pool; date ordinal only breaks ties.
-                    ordering = ((end.toordinal() / 10**7) if temporal.relation == "latest" else (-start.toordinal() / 10**7) if temporal.relation == "earliest" else 0)
-                    best = max(best, precision + ordering)
+                    best = max(best, min(1.0, precision))
         return best, temporal.relation if best else None
 
     def merge_rank_channels(self, channels: Sequence[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Fuse planner channels, interleaving coverage before final selection."""
+        """Union bounded channel pools while retaining semantic relevance.
+
+        Planner channels widen recall. They do not replace channel-zero scores
+        with an outer rank-only score or reduce the union to one channel's cap.
+        """
         values: Dict[str, Dict[str, Any]] = {}
         rrf_k = float(self.config.get("rrf_k", 60.0))
         merge_mode = self.config.get("planner_merge_mode", "coverage_interleave")
@@ -372,8 +446,7 @@ class EventStateRetriever:
                 identifier = item["id"]
                 if identifier not in values:
                     merged = deepcopy(item)
-                    # These fields describe a prior channel selection, not this
-                    # planner-level outer fusion and selection pass.
+                    # Prior selection fields do not describe this union.
                     for key in (
                         "final_score",
                         "selection_score",
@@ -391,34 +464,28 @@ class EventStateRetriever:
                     merged.setdefault("planner_request_indices", []).append(channel_index - 1)
                 merged["planner_request_indices"] = sorted(set(merged.get("planner_request_indices", [])))
                 merged["planner_channel_support_count"] = int(merged.get("planner_channel_support_count", 0)) + 1
-                contribution = 1.0 / (rrf_k + rank)
-                if merge_mode == "sum_rrf":
-                    merged["planner_fusion_score"] = float(merged.get("planner_fusion_score", 0.0)) + contribution
-                else:
-                    merged["planner_fusion_score"] = max(float(merged.get("planner_fusion_score", 0.0)), contribution)
-                merged["score"] = merged["planner_fusion_score"]
-                merged["fusion_score"] = merged["score"]
+                relevance = max(0.0, float(item.get("final_score", item.get("score", 0.0))))
+                supports = merged.setdefault("planner_channel_support", [])
+                supports.append({"channel": channel_index, "rank": rank, "relevance": relevance})
+                merged["planner_channel_support"] = sorted(supports, key=lambda support: support["channel"])
+                merged["planner_fusion_score"] = max(float(merged.get("planner_fusion_score", 0.0)), relevance)
+                merged["max_channel_relevance"] = max(float(merged.get("max_channel_relevance", 0.0)), relevance)
                 if channel_index == 0:
                     merged["base_rank"] = rank
-        candidate_count = int(self.config.get("candidate_count", 40))
+                    merged["original_query_relevance"] = relevance
+        for merged in values.values():
+            merged["planner_channel_support_count"] = len(merged.get("planner_channel_support", []))
+            if merge_mode == "sum_rrf":
+                merged["planner_rrf_score"] = sum(1.0 / (rrf_k + item["rank"]) for item in merged["planner_channel_support"])
+            # MMR consumes semantic relevance; channel coverage remains explicit
+            # metadata rather than a replacement relevance metric.
+            merged["score"] = float(merged["max_channel_relevance"])
+            merged["fusion_score"] = merged["score"]
+            merged["final_score"] = merged["score"]
         if merge_mode == "sum_rrf":
             rows = list(values.values())
-            rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["id"]))
-            return self._set_merged_final_scores(rows[:candidate_count])
-        ordered: List[Dict[str, Any]] = []
-        seen = set()
-        max_depth = max((len(channel) for channel in channels), default=0)
-        for depth in range(max_depth):
-            for channel in channels:
-                if depth >= len(channel):
-                    continue
-                identifier = channel[depth]["id"]
-                if identifier not in seen:
-                    seen.add(identifier)
-                    ordered.append(values[identifier])
-                    if len(ordered) >= candidate_count:
-                        return self._set_merged_final_scores(ordered)
-        return self._set_merged_final_scores(ordered)
+            return sorted(rows, key=lambda item: (-float(item.get("planner_rrf_score", 0.0)), -float(item["final_score"]), item["id"]))
+        return sorted(values.values(), key=lambda item: (-float(item["final_score"]), item["id"]))
 
     @staticmethod
     def _set_merged_final_scores(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:

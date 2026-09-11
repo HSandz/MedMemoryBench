@@ -157,6 +157,11 @@ class LoCoMoEvaluator:
         self._query_checkpoint_pending_records: List[Dict[str, Any]] = []
         self._recovered_batch_usage_query_ids: set[Tuple[str, str]] = set()
         self._batch_retrieval_preparation_wall_time = 0.0
+        self._batch_manager_creation_count = 0
+        self._batch_memory_import_count = 0
+        self._compiler_cache_hits = 0
+        self._compiler_cache_misses = 0
+        self._compiler_calls_this_run = 0
         self._memory_build_checkpoint_saved = False
 
         # Memory chunk configuration
@@ -176,6 +181,55 @@ class LoCoMoEvaluator:
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+    def _query_compiler_cache_config(self) -> Dict[str, Any]:
+        retrieval = (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {})
+        enabled = bool(retrieval.get("query_compiler_plan_cache_enabled", True))
+        configured_path = retrieval.get("query_compiler_plan_cache_path")
+        path = Path(configured_path) if configured_path else self.output_dir / "query_compiler_plans.jsonl"
+        return {"enabled": enabled, "path": path}
+
+    def _query_compiler_cache_fingerprint(self, question: str, reference_time: Optional[str] = None) -> str:
+        """Fingerprint compiler inputs only; retrieval ablations deliberately reuse plans."""
+        retrieval = (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {})
+        model = self.method_config.model
+        payload = {
+            "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "reference_time": reference_time,
+            "provider": getattr(model, "provider", None), "model": getattr(model, "name", None),
+            "prompt_version": "event_state_query_compiler_v1", "schema_version": 1,
+            "max_searches": retrieval.get("query_compiler_max_searches", 3),
+            "temperature": retrieval.get("planner_temperature", 0.0),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+    def _load_query_compiler_plan_cache(self) -> Dict[str, Dict[str, Any]]:
+        config = self._query_compiler_cache_config()
+        if not config["enabled"] or not config["path"].is_file():
+            return {}
+        rows: Dict[str, Dict[str, Any]] = {}
+        try:
+            with config["path"].open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    entry = json.loads(line)
+                    if isinstance(entry, dict) and isinstance(entry.get("fingerprint"), str) and isinstance(entry.get("raw_model_output"), str):
+                        rows[entry["fingerprint"]] = entry
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._log(f"Ignoring unreadable query compiler plan cache: {exc}", level="WARNING")
+        return rows
+
+    def _append_query_compiler_plan_cache(self, entry: Dict[str, Any]) -> None:
+        config = self._query_compiler_cache_config()
+        if not config["enabled"]:
+            return
+        try:
+            config["path"].parent.mkdir(parents=True, exist_ok=True)
+            with config["path"].open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            self._log(f"Could not persist query compiler plan cache: {exc}", level="WARNING")
 
     def _answer_query_kwargs(self, query: LoCoMoQuery) -> Dict[str, Any]:
         """Keep benchmark type metadata out of neutral agent-facing requests."""
@@ -1415,22 +1469,45 @@ class LoCoMoEvaluator:
         # first, then local retrieval, then one shared final-answer stage.
         if self.agent_manager and self.agent_manager.uses_query_compiler():
             event_state_snapshot = self._export_event_state_for_transfer(self.agent_manager, unit.context_id)
+            plan_cache = self._load_query_compiler_plan_cache()
             for query in unit.queries_to_evaluate:
                 formatted_question = self.prompt_manager.format_query(
                     question=query.question, query_type=query.query_type,
                     prompt_protocol=self.prompt_protocol,
                 )
+                final_id = make_request_id("query", f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}")
+                saved_final = batch_client.get_saved_request("query-final", final_id)
+                restored_final = restore_prepared_query(saved_final) if saved_final else None
+                if restored_final is not None:
+                    # The answer manifest is the authoritative frozen request
+                    # during resume; do not recompile or rerun local retrieval.
+                    self._pending_batch_queries.append({
+                        "request": saved_final, "query": query, "prepared": restored_final,
+                        "sample_id": unit.context_id, "memory_time_per_query": memory_time_per_query,
+                        "compiler_usage": {"transport": "resume", "input_tokens": 0, "output_tokens": 0, "call_count": 0},
+                    })
+                    prepared_count += 1
+                    continue
                 request_id = make_request_id("query-plan", f"{self.method_config.method_name}:{unit.unit_id}:{query.query_id}")
                 # The compiler intentionally receives no benchmark query type
                 # or evaluator prompt wrapper; only deployable query text.
                 compiler = self.agent_manager.prepare_query_compiler(query.question)
+                reference_time = None
+                fingerprint = self._query_compiler_cache_fingerprint(query.question, reference_time)
+                cached = plan_cache.get(fingerprint)
+                if cached is not None:
+                    self._compiler_cache_hits += 1
+                else:
+                    self._compiler_cache_misses += 1
                 self._pending_query_plan_requests.append({
                     "request": BatchChatRequest(request_id=request_id, messages=compiler["messages"],
-                        temperature=compiler["temperature"], max_tokens=compiler["max_tokens"], phase="query-plan",
+                        temperature=compiler["temperature"], max_tokens=compiler["max_tokens"],
+                        response_format=compiler.get("response_format"), phase="query-plan",
                         metadata={"query_id": query.query_id, "unit_id": unit.unit_id, "context_id": unit.context_id}),
                     "query": query, "question": formatted_question, "raw_question": query.question, "sample_id": unit.context_id,
                     "unit_id": unit.unit_id, "memory_state": event_state_snapshot,
-                    "memory_time_per_query": memory_time_per_query,
+                    "memory_time_per_query": memory_time_per_query, "reference_time": reference_time,
+                    "compiler_fingerprint": fingerprint, "cached_plan": cached,
                 })
                 prepared_count += 1
             return prepared_count
@@ -1543,18 +1620,49 @@ class LoCoMoEvaluator:
             batch_client = self._get_batch_client()
             pending_plans = self._pending_query_plan_requests
             self._pending_query_plan_requests = []
-            requests = batch_client.get_saved_requests(stage) or [item["request"] for item in pending_plans]
+            misses = [item for item in pending_plans if item.get("cached_plan") is None]
+            saved_plan_requests = batch_client.get_saved_requests(stage) if misses else []
+            expected_plan_ids = {item["request"].request_id for item in misses}
+            requests = (saved_plan_requests if {request.request_id for request in saved_plan_requests} == expected_plan_ids
+                        else [item["request"] for item in misses])
             self._log(f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined compiler request(s).")
-            responses = batch_client.run_stage(stage, requests)
+            planner_started = time.perf_counter()
+            responses = batch_client.run_stage(stage, requests) if requests else {}
+            planner_wall_time = time.perf_counter() - planner_started
+            self._compiler_calls_this_run += len(requests)
             retrieval_started = time.perf_counter()
+            managers_by_context: Dict[Any, AgentManager] = {}
             for item in pending_plans:
+                cached = item.get("cached_plan")
                 batch_response = responses.get(item["request"].request_id)
-                content = batch_response.content if batch_response is not None and not batch_response.status else ""
-                manager = AgentManager(method_config=self.method_config, dataset_config=self.dataset_config,
-                    batch_api=self.batch_api, batch_gcs_uri=self.batch_gcs_uri, batch_wait=self.batch_wait, workers=1)
-                manager.import_memory_state(item["memory_state"], context_id=item["sample_id"])
+                content = cached["raw_model_output"] if cached is not None else (
+                    batch_response.content if batch_response is not None and not batch_response.status else ""
+                )
+                context_id = item["sample_id"]
+                manager = managers_by_context.get(context_id)
+                if manager is None:
+                    manager = AgentManager(method_config=self.method_config, dataset_config=self.dataset_config,
+                        batch_api=self.batch_api, batch_gcs_uri=self.batch_gcs_uri, batch_wait=self.batch_wait, workers=1)
+                    manager.import_memory_state(item["memory_state"], context_id=context_id)
+                    managers_by_context[context_id] = manager
+                    self._batch_manager_creation_count += 1
+                    self._batch_memory_import_count += 1
                 prepared = manager.prepare_query_compiler_result(item["question"], content,
                     context_id=item["sample_id"], **self._answer_query_kwargs(item["query"]))
+                compiler_diagnostics = prepared.get("extra", {}).get("query_compiler", {})
+                if cached is None and compiler_diagnostics.get("compiler_validation_success"):
+                    self._append_query_compiler_plan_cache({
+                        "fingerprint": item["compiler_fingerprint"], "question_sha256": hashlib.sha256(item["raw_question"].encode("utf-8")).hexdigest(),
+                        "reference_time": item["reference_time"],
+                        "provider": getattr(self.method_config.model, "provider", None), "model": getattr(self.method_config.model, "name", None),
+                        "prompt_version": "event_state_query_compiler_v1", "schema_version": 1,
+                        "max_searches": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_searches", 3),
+                        "temperature": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("planner_temperature", 0.0),
+                        "raw_model_output": content, "validated_plan": compiler_diagnostics.get("validated_plan"),
+                        "parse_success": compiler_diagnostics.get("compiler_parse_success"),
+                        "salvage_used": compiler_diagnostics.get("compiler_salvage_used"),
+                        "warning_codes": compiler_diagnostics.get("compiler_warning_codes", []),
+                    })
                 final_id = make_request_id("query", f"{self.method_config.method_name}:{item['unit_id']}:{item['query'].query_id}")
                 final_request = BatchChatRequest(request_id=final_id, messages=prepared["messages"],
                     temperature=self.method_config.model.temperature,
@@ -1563,8 +1671,14 @@ class LoCoMoEvaluator:
                     "context_id": item["sample_id"], PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared)})
                 self._pending_batch_queries.append({"request": final_request, "query": item["query"], "prepared": prepared,
                     "sample_id": item["sample_id"], "memory_time_per_query": item["memory_time_per_query"],
-                    "compiler_usage": {"transport": "batch", "input_tokens": getattr(batch_response, "input_tokens", 0),
-                                       "output_tokens": getattr(batch_response, "output_tokens", 0), "call_count": 1}})
+                    "compiler_usage": {"transport": "cache" if cached is not None else "batch", "input_tokens": 0 if cached is not None else getattr(batch_response, "input_tokens", 0),
+                                       "output_tokens": 0 if cached is not None else getattr(batch_response, "output_tokens", 0), "call_count": 0 if cached is not None else 1,
+                                       "cache_hit": cached is not None},
+                    "batch_retrieval_diagnostics": {"manager_creation_count": self._batch_manager_creation_count,
+                        "memory_import_count": self._batch_memory_import_count,
+                        "planner_batch_wall_time": planner_wall_time,
+                        "compiler_cache_hits": self._compiler_cache_hits, "compiler_cache_misses": self._compiler_cache_misses,
+                        "compiler_calls_this_run": self._compiler_calls_this_run}})
             self._batch_retrieval_preparation_wall_time = getattr(self, "_batch_retrieval_preparation_wall_time", 0.0) + time.perf_counter() - retrieval_started
             yield from self._complete_combined_batch_queries()
             return
@@ -1581,7 +1695,9 @@ class LoCoMoEvaluator:
             f"[Vertex] Stage '{stage}': dispatching {len(requests):,} combined "
             "final-answer request(s) from all prepared samples."
         )
+        answer_started = time.perf_counter()
         responses = batch_client.run_stage(stage, requests)
+        answer_wall_time = time.perf_counter() - answer_started
         pending_items = self._pending_batch_queries
         self._pending_batch_queries = []
         self._log(
@@ -1622,6 +1738,11 @@ class LoCoMoEvaluator:
                         )
                         if item.get("compiler_usage"):
                             result.details.setdefault("execution_usage", {})["query_compiler"] = item["compiler_usage"]
+                        result.details.setdefault("event_state_batch", {}).update({
+                            **item.get("batch_retrieval_diagnostics", {}),
+                            "local_retrieval_preparation_wall_time": getattr(self, "_batch_retrieval_preparation_wall_time", 0.0),
+                            "final_answer_batch_wall_time": answer_wall_time,
+                        })
 
                 result.memory_construction_time = item["memory_time_per_query"]
                 progress.update(1)

@@ -186,8 +186,11 @@ planner_mode: off             # legacy single final-answer call
 # planner_mode: iterative     # legacy planner_rounds controller
 # planner_mode: query_compiler
 query_compiler_max_searches: 3
+query_compiler_max_tokens: 256
+query_compiler_plan_cache_enabled: true
+# query_compiler_plan_cache_path: /path/to/query_compiler_plans.jsonl
 planner_temperature: 0.0
-planner_max_tokens: 256
+planner_max_tokens: 1200  # legacy iterative planner only
 planner_merge_mode: coverage_interleave
 ```
 
@@ -196,20 +199,34 @@ otherwise. `query_compiler` makes exactly one memory-free JSON compiler call,
 then local multi-query retrieval, then one answer call. Its schema is
 `searches[{query, role}]`, `temporal{axis, relation, start, end, anchor_search,
 precision}`, and `state_view`; malformed output falls back to the original
-question without a repair call. The raw question is always retrieval channel 0.
+question without a repair call. Parsed plans are locally canonicalized by
+component: valid searches survive invalid temporal metadata, duplicate searches
+are removed, unsafe temporal constraints become `none`, and an empty search
+list is valid. The raw question is always retrieval channel 0.
 
 Compiler temporal axes are distinct: `recorded_at` is when a conversation was
 recorded; `event_time_start/end` are normalized inclusive dates for when an
 underlying claim applied; `valid_from/valid_to` remain bitemporal state-lifecycle
 fields; and `valid_time_text` retains the source wording. Event-time spans are
 derived through claim provenance for episodes and immutable turns, so a turn can
-carry several spans. Event and record constraints softly rerank semantic
-candidates; knowledge `as_of` applies state visibility rules.
+carry several spans. Event and record constraints multiplicatively rerank
+semantic candidates (`semantic * (1 + temporal_weight * compatibility)`);
+knowledge `as_of` applies state visibility rules. A request for an event's date
+is not itself a temporal retrieval filter. Expanded channels form a bounded
+union with per-channel relevance/support metadata rather than replacing the
+original query's semantic relevance.
 
 With the Vertex batch transport query compiler uses exactly two combined stages:
 `query-plan` for every eligible query, local plan validation/retrieval after the
 entire stage completes, then `query-final` for every final answer. No planner
 batch job is submitted per sample or query.
+
+The optional cross-run `query_compiler_plans.jsonl` artifact is separate from
+the Vertex stage manifest. Its compiler-only fingerprint contains the visible
+question hash, authoritative reference time, compiler provider/model, prompt
+and schema versions, maximum searches, and temperature--not retrieval settings.
+Cache hits make no compiler provider call; cache entries retain raw output, the
+validated plan, parse/salvage status, and bounded warning codes.
 
 The query-only planner is disabled by default. Under `retrieval_config`, use:
 

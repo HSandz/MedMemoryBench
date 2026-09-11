@@ -201,66 +201,128 @@ def validate_planner_output(value: Any, max_requests: int) -> PlannerDecision:
     return PlannerDecision("retrieve", None, valid, invalid, duplicates)
 
 
-def validate_query_compiler_output(value: Any, max_searches: int) -> QueryPlan:
-    """Strictly validate the one-shot compiler output without LLM repair."""
+def query_compiler_json_schema() -> Dict[str, Any]:
+    """Provider-side guard matching the locally canonicalized compiler shape."""
+    return {
+        "type": "object",
+        "properties": {
+            "searches": {"type": "array", "items": {"type": "object", "properties": {
+                "query": {"type": "string"}, "role": {"enum": sorted(_QUERY_ROLES)},
+            }, "required": ["query", "role"]}},
+            "temporal": {"type": "object", "properties": {
+                "axis": {"enum": sorted(_QUERY_AXES)}, "relation": {"enum": sorted(_QUERY_RELATIONS)},
+                "start": {"type": ["string", "null"]}, "end": {"type": ["string", "null"]},
+                "anchor_search": {"type": ["integer", "null"]},
+                "precision": {"enum": sorted(_QUERY_PRECISIONS)},
+            }, "required": ["axis", "relation", "start", "end", "anchor_search", "precision"]},
+            "state_view": {"enum": sorted(_STATE_VIEWS)},
+        },
+        "required": ["searches", "temporal", "state_view"],
+    }
+
+
+def salvage_query_compiler_output(value: Any, max_searches: int) -> tuple[QueryPlan, List[str], bool]:
+    """Validate independent plan components without inventing semantics.
+
+    A parsed object is useful even if one component is malformed: the visible
+    question remains channel zero, so dropping an unsafe expansion or date is
+    preferable to discarding valid sibling fields.
+    """
     if not isinstance(value, dict):
         raise ValueError("query compiler output must be an object")
     raw_searches = value.get("searches")
-    if not isinstance(raw_searches, list) or len(raw_searches) > max_searches:
-        raise ValueError("searches must be a bounded list")
+    warnings: List[str] = []
+    salvage_used = False
+    if not isinstance(raw_searches, list):
+        raw_searches = []
+        warnings.append("invalid_searches")
+        salvage_used = True
     searches: List[QuerySearch] = []
     seen = set()
     duplicates = 0
-    for raw in raw_searches:
+    for raw in raw_searches[:max(0, int(max_searches))]:
         if not isinstance(raw, dict) or raw.get("role") not in _QUERY_ROLES:
-            raise ValueError("invalid search role")
+            warnings.append("invalid_search")
+            salvage_used = True
+            continue
         query = raw.get("query")
         if not isinstance(query, str) or not (query := " ".join(query.split())):
-            raise ValueError("search query must be non-empty")
+            warnings.append("invalid_search")
+            salvage_used = True
+            continue
         if len(query) > MAX_REQUEST_QUERY_LENGTH:
-            raise ValueError("search query is too long")
-        key = (query.casefold(), raw["role"])
+            warnings.append("search_too_long")
+            salvage_used = True
+            continue
+        key = query.casefold()
         if key in seen:
             duplicates += 1
+            warnings.append("duplicate_search")
+            salvage_used = True
             continue
         seen.add(key)
         searches.append(QuerySearch(query, raw["role"]))
-    if not searches:
-        raise ValueError("query compiler requires at least one valid search")
-    raw_temporal = value.get("temporal")
-    if not isinstance(raw_temporal, dict):
-        raise ValueError("temporal must be an object")
-    axis, relation = raw_temporal.get("axis"), raw_temporal.get("relation")
-    precision = raw_temporal.get("precision")
-    if axis not in _QUERY_AXES or relation not in _QUERY_RELATIONS or precision not in _QUERY_PRECISIONS:
-        raise ValueError("invalid temporal enum")
-    start_raw, end_raw = raw_temporal.get("start"), raw_temporal.get("end")
-    if start_raw is not None and not isinstance(start_raw, str) or end_raw is not None and not isinstance(end_raw, str):
-        raise ValueError("temporal dates must be strings or null")
-    start = _parse_date(start_raw) if start_raw else None
-    end = _parse_date(end_raw) if end_raw else None
-    if start and end and start > end:
-        raise ValueError("temporal start must not exceed end")
-    if precision == "exact" and start and end and start != end:
-        raise ValueError("exact temporal interval must be one day")
-    anchor = raw_temporal.get("anchor_search")
-    if anchor is not None and (not isinstance(anchor, int) or isinstance(anchor, bool) or not 0 <= anchor < len(searches)):
-        raise ValueError("invalid anchor_search")
-    if anchor is not None and searches[anchor].role != "anchor":
-        raise ValueError("anchor_search must reference an anchor search")
-    if relation in {"before", "after"} and not (anchor is not None or start or end):
-        raise ValueError("before/after requires an anchor or explicit date")
-    if relation == "overlap" and (start is None or end is None):
-        raise ValueError("overlap requires a bounded interval")
-    if axis == "knowledge" and (relation != "as_of" or value.get("state_view") != "as_of"):
-        raise ValueError("knowledge requires as_of relation and state_view")
-    if relation == "as_of" and end is None:
-        raise ValueError("as_of requires an end date")
-    if relation == "as_of" and axis != "knowledge":
-        raise ValueError("as_of is a knowledge relation")
-    if axis == "none" and relation != "none":
-        raise ValueError("none axis requires none relation")
+    if len(raw_searches) > max_searches:
+        warnings.append("search_limit_exceeded")
+        salvage_used = True
+
     state_view = value.get("state_view")
     if state_view not in _STATE_VIEWS:
-        raise ValueError("invalid state_view")
-    return QueryPlan(searches, QueryTemporal(axis, relation, start, end, anchor, precision), state_view, duplicates)
+        state_view = "current"
+        warnings.append("invalid_state_view")
+        salvage_used = True
+
+    raw_temporal = value.get("temporal")
+    temporal = QueryTemporal()
+    if not isinstance(raw_temporal, dict):
+        warnings.append("invalid_temporal")
+        salvage_used = True
+    else:
+        axis, relation = raw_temporal.get("axis"), raw_temporal.get("relation")
+        precision = raw_temporal.get("precision")
+        try:
+            if axis not in _QUERY_AXES or relation not in _QUERY_RELATIONS or precision not in _QUERY_PRECISIONS:
+                raise ValueError("enum")
+            start_raw, end_raw = raw_temporal.get("start"), raw_temporal.get("end")
+            if (start_raw is not None and not isinstance(start_raw, str)) or (end_raw is not None and not isinstance(end_raw, str)):
+                raise ValueError("date_type")
+            start = _parse_date(start_raw) if start_raw else None
+            end = _parse_date(end_raw) if end_raw else None
+            if start and end and start > end:
+                raise ValueError("reversed_interval")
+            if precision == "exact" and start and end and start != end:
+                precision = "bounded"
+                warnings.append("exact_interval_canonicalized")
+                salvage_used = True
+            anchor = raw_temporal.get("anchor_search")
+            if anchor is not None:
+                if not isinstance(anchor, int) or isinstance(anchor, bool) or not 0 <= anchor < len(searches):
+                    raise ValueError("invalid_anchor")
+                if searches[anchor].role != "anchor":
+                    searches[anchor] = QuerySearch(searches[anchor].query, "anchor")
+                    warnings.append("anchor_role_canonicalized")
+                    salvage_used = True
+            if axis == "none" and relation != "none":
+                raise ValueError("none_axis_relation")
+            if relation in {"before", "after"} and not (anchor is not None or start or end):
+                raise ValueError("unbound_ordering")
+            if relation == "overlap" and (start is None or end is None):
+                raise ValueError("incomplete_overlap")
+            if relation == "as_of" and (axis != "knowledge" or end is None or state_view != "as_of"):
+                raise ValueError("invalid_as_of")
+            if axis == "knowledge" and relation != "as_of":
+                raise ValueError("invalid_knowledge")
+            temporal = QueryTemporal(axis, relation, start, end, anchor, precision)
+        except ValueError as exc:
+            warnings.append(f"temporal_{str(exc)}")
+            salvage_used = True
+    if state_view == "as_of" and temporal.relation != "as_of":
+        state_view = "current"
+        warnings.append("as_of_without_knowledge_constraint")
+        salvage_used = True
+    return QueryPlan(searches, temporal, state_view, duplicates), sorted(set(warnings)), salvage_used
+
+
+def validate_query_compiler_output(value: Any, max_searches: int) -> QueryPlan:
+    """Compatibility wrapper returning the locally canonicalized plan."""
+    return salvage_query_compiler_output(value, max_searches)[0]
