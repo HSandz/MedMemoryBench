@@ -255,7 +255,9 @@ class BatchChatRequest:
             max_tokens=data["max_tokens"],
             reasoning_effort=data.get("reasoning_effort"),
             response_format=data.get("response_format"),
-            retry_empty_response=data.get("retry_empty_response", True),
+            retry_empty_response=data.get(
+                "retry_empty_response", data.get("phase", "query") != "query-plan"
+            ),
             phase=data.get("phase", "query"),
             metadata=data.get("metadata", {}),
             correlation_label=data.get("correlation_label", ""),
