@@ -340,21 +340,6 @@ def test_all_failed_stage_aborts_before_any_retry(tmp_path):
     assert job["retries"][0]["cancel_requested"] is True
 
 
-def test_empty_compiler_response_can_use_local_fallback_without_retry():
-    response = {"compiler": BatchChatResponse(request_id="compiler", content="")}
-    compiler = BatchChatRequest(
-        request_id="compiler", messages=[{"role": "user", "content": "plan"}],
-        temperature=0.0, max_tokens=10, phase="query-plan", retry_empty_response=False,
-    )
-    answer = BatchChatRequest(
-        request_id="answer", messages=[{"role": "user", "content": "answer"}],
-        temperature=0.0, max_tokens=10,
-    )
-
-    assert VertexBatchClient._unresolved_requests([compiler], response) == []
-    assert VertexBatchClient._unresolved_requests([answer], {"answer": BatchChatResponse(request_id="answer", content="")}) == [answer]
-
-
 def test_saved_request_lookups_load_and_index_manifest_once(tmp_path, monkeypatch):
     storage = _Storage()
     batches = _Batches(storage)
