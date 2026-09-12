@@ -195,6 +195,26 @@ def test_only_explicit_hard_owner_metadata_can_reject_support():
     assert result.extra["grounding_guard"]["failures"][0]["reason"] == "HARD_OWNER_MISMATCH"
 
 
+def test_hard_metadata_survives_into_fallback_reader():
+    agent = Harness(
+        [memory(owner_id="alice")],
+        controller={"decision": "SEARCH", "queries": ["current location"]},
+    )
+    result = agent.query(
+        QuestionInput(
+            "Where am I based?",
+            hard_metadata={"owner_id": "alice", "namespace": "profile-1"},
+        )
+    )
+    assert result.output == "synthesis"
+    assert len(agent.calls) == 2
+    fallback_prompt = "\n".join(
+        str(message.get("content") or "") for message in agent.calls[1]
+    )
+    assert '"owner_id": "alice"' in fallback_prompt
+    assert '"namespace": "profile-1"' in fallback_prompt
+
+
 def test_visible_candidates_do_not_create_a_query_type_or_force_second_call():
     agent = Harness()
     result = agent.query("Which is supported?\nA) Boston\nB) Paris")
@@ -246,6 +266,7 @@ def test_search_path_keeps_acquired_evidence_for_second_reader():
         result.extra["candidate_world_ids"]
     )
     assert len(result.extra["final_context_ids"]) <= 16
+    assert result.extra["evidence_count"] > 0
 
 
 def test_empty_world_recovery_is_bounded_and_no_llm_loop():

@@ -8,8 +8,10 @@ from itertools import zip_longest
 ANSWER_OR_SEARCH_PROMPT = """You are the only semantic controller in a grounded memory system.
 
 Use QUESTION, BASE EVIDENCE, STORED RELATIONS, and optional CALLER INSTRUCTIONS.
-BASE EVIDENCE and STORED RELATIONS are factual evidence. CALLER INSTRUCTIONS may
-control style or output format but are not factual evidence.
+BASE EVIDENCE and STORED RELATIONS are the only factual source. Memory records are
+not automatically affirmative/current truth: respect each record's stance, status,
+owner, qualifiers, and time fields. CALLER INSTRUCTIONS may control style or output
+format but are not factual evidence.
 
 You may interpret paraphrases, resolve references, compare evidence, and combine
 multiple displayed premises. Do not introduce entity-specific factual premises from
