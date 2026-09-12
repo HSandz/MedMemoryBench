@@ -268,6 +268,9 @@ class EventStateRetriever:
                 "anchor_resolution_status": "none", "anchor_candidate_count": 0,
                 "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
                 "resolved_anchor_source_types": [], "resolved_anchor_source_ids": [],
+                "temporalized_candidate_count": sum(
+                    bool(item.get("temporal_score")) for item in structured + turns
+                ),
             })
             return structured, turns, details
         structured_channels, turn_channels, channel_details = [], [], []
@@ -408,7 +411,9 @@ class EventStateRetriever:
 
     def _rerank_query_plan_temporal(self, candidates: List[Dict[str, Any]], plan: QueryPlan, anchors: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
         temporal = plan.temporal
-        if temporal.axis == "none" or temporal.axis == "knowledge":
+        # ``event/none`` retains event-time answer intent in the plan, but it
+        # does not impose a retrieval-time temporal constraint.
+        if temporal.axis == "none" or temporal.axis == "knowledge" or temporal.relation == "none":
             return candidates
         scores = []
         for item in candidates:
@@ -445,6 +450,8 @@ class EventStateRetriever:
         return sorted(candidates, key=lambda item: (-item.get("final_score", 0.0), item["id"]))
 
     def _temporal_compatibility(self, spans: Sequence[Dict[str, str]], temporal: Any, anchors: Sequence[Dict[str, str]]) -> tuple[float, str | None]:
+        if temporal.relation == "none":
+            return 0.0, None
         if not spans:
             return 0.0, None
         requested = [(temporal.start, temporal.end)] if temporal.start or temporal.end else []

@@ -190,8 +190,10 @@ class LoCoMoEvaluator:
         path = Path(configured_path) if configured_path else self.output_dir / "query_compiler_plans.jsonl"
         return {"enabled": enabled, "path": path}
 
-    def _query_compiler_cache_fingerprint(self, question: str, reference_time: Optional[str] = None) -> str:
-        """Fingerprint compiler inputs only; retrieval ablations deliberately reuse plans."""
+    def _query_compiler_cache_fingerprint_payload(
+        self, question: str, reference_time: Optional[str] = None, *, include_max_tokens: bool = True,
+    ) -> Dict[str, Any]:
+        """Return compiler-only cache inputs, optionally in the legacy shape."""
         retrieval = (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {})
         model = self.method_config.model
         payload = {
@@ -204,7 +206,33 @@ class LoCoMoEvaluator:
             "max_searches": retrieval.get("query_compiler_max_searches", 3),
             "temperature": retrieval.get("planner_temperature", 0.0),
         }
+        if include_max_tokens:
+            payload["query_compiler_max_tokens"] = retrieval.get("query_compiler_max_tokens", 256)
+        return payload
+
+    def _query_compiler_cache_fingerprint(self, question: str, reference_time: Optional[str] = None) -> str:
+        """Fingerprint compiler inputs only; retrieval ablations deliberately reuse plans."""
+        payload = self._query_compiler_cache_fingerprint_payload(question, reference_time)
         return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+    def _legacy_query_compiler_cache_entry(
+        self, plan_cache: Dict[str, Dict[str, Any]], question: str, reference_time: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Read v2 entries made before token limits joined the fingerprint.
+
+        Those entries omitted the token limit entirely, so only the historical
+        default of 256 can be identified without risking reuse under a changed
+        compiler limit. New entries always use the complete fingerprint.
+        """
+        retrieval = (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {})
+        if retrieval.get("query_compiler_max_tokens", 256) != 256:
+            return None
+        payload = self._query_compiler_cache_fingerprint_payload(
+            question, reference_time, include_max_tokens=False,
+        )
+        return plan_cache.get(
+            hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+        )
 
     def _load_query_compiler_plan_cache(self) -> Dict[str, Dict[str, Any]]:
         config = self._query_compiler_cache_config()
@@ -1506,7 +1534,9 @@ class LoCoMoEvaluator:
                 compiler = self.agent_manager.prepare_query_compiler(query.question)
                 reference_time = None
                 fingerprint = self._query_compiler_cache_fingerprint(query.question, reference_time)
-                cached = plan_cache.get(fingerprint)
+                cached = plan_cache.get(fingerprint) or self._legacy_query_compiler_cache_entry(
+                    plan_cache, query.question, reference_time,
+                )
                 if cached is not None:
                     self._compiler_cache_hits += 1
                 else:
@@ -1683,6 +1713,7 @@ class LoCoMoEvaluator:
                             "provider": getattr(self.method_config.model, "provider", None), "model": getattr(self.method_config.model, "name", None),
                             "prompt_version": "event_state_query_compiler_v2", "schema_version": 2,
                             "max_searches": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_searches", 3),
+                            "query_compiler_max_tokens": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_tokens", 256),
                             "temperature": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("planner_temperature", 0.0),
                             "raw_model_output": content, "validated_plan": compiler_diagnostics.get("validated_plan"),
                             "parse_success": compiler_diagnostics.get("compiler_parse_success"),

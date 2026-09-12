@@ -260,12 +260,16 @@ batch job is submitted per sample or query.
 The optional cross-run `query_compiler_plans.jsonl` artifact is separate from
 the Vertex stage manifest. Its compiler-only fingerprint contains the visible
 question hash, authoritative reference time, compiler provider/model, prompt
-and schema versions, maximum searches, and temperature--not retrieval settings.
+and schema versions, maximum searches, compiler maximum tokens, and
+temperature--not retrieval settings.
 Cache hits make no compiler provider call; cache entries retain raw output, the
 validated plan, parse/salvage status, and bounded warning codes.
 The current compiler cache fingerprint uses prompt version
 `event_state_query_compiler_v2` and schema version `2`; v1 entries are not
 reused because their temporal contract may have been interpreted differently.
+Legacy v2 cache rows written before compiler maximum tokens entered the
+fingerprint remain readable only at the historical default of 256 tokens;
+newly written v2 rows include that value.
 
 The query-only planner is disabled by default. Under `retrieval_config`, use:
 
