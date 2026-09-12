@@ -1644,54 +1644,70 @@ class LoCoMoEvaluator:
             self._compiler_calls_this_run += len(requests)
             retrieval_started = time.perf_counter()
             managers_by_context: Dict[Any, AgentManager] = {}
-            for item in pending_plans:
-                cached = item.get("cached_plan")
-                batch_response = responses.get(item["request"].request_id)
-                content = cached["raw_model_output"] if cached is not None else (
-                    batch_response.content if batch_response is not None and not batch_response.status else ""
-                )
-                context_id = item["sample_id"]
-                manager = managers_by_context.get(context_id)
-                if manager is None:
-                    manager = AgentManager(method_config=self.method_config, dataset_config=self.dataset_config,
-                        batch_api=self.batch_api, batch_gcs_uri=self.batch_gcs_uri, batch_wait=self.batch_wait, workers=1)
-                    manager.import_memory_state(item["memory_state"], context_id=context_id)
-                    managers_by_context[context_id] = manager
-                    self._batch_manager_creation_count += 1
-                    self._batch_memory_import_count += 1
-                item["memory_state"] = None
-                prepared = manager.prepare_query_compiler_result(item["question"], content,
-                    context_id=item["sample_id"], **self._answer_query_kwargs(item["query"]))
-                compiler_diagnostics = prepared.get("extra", {}).get("query_compiler", {})
-                if cached is None and compiler_diagnostics.get("compiler_validation_success"):
-                    self._append_query_compiler_plan_cache({
-                        "fingerprint": item["compiler_fingerprint"], "question_sha256": hashlib.sha256(item["raw_question"].encode("utf-8")).hexdigest(),
-                        "reference_time": item["reference_time"],
-                        "provider": getattr(self.method_config.model, "provider", None), "model": getattr(self.method_config.model, "name", None),
-                        "prompt_version": "event_state_query_compiler_v2", "schema_version": 2,
-                        "max_searches": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_searches", 3),
-                        "temperature": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("planner_temperature", 0.0),
-                        "raw_model_output": content, "validated_plan": compiler_diagnostics.get("validated_plan"),
-                        "parse_success": compiler_diagnostics.get("compiler_parse_success"),
-                        "salvage_used": compiler_diagnostics.get("compiler_salvage_used"),
-                        "warning_codes": compiler_diagnostics.get("compiler_warning_codes", []),
-                    })
-                final_id = make_request_id("query", f"{self.method_config.method_name}:{item['unit_id']}:{item['query'].query_id}")
-                final_request = BatchChatRequest(request_id=final_id, messages=prepared["messages"],
-                    temperature=self.method_config.model.temperature,
-                    max_tokens=(self.method_config.model.max_completion_tokens or self.method_config.model.max_tokens),
-                    phase="query", metadata={"query_id": item["query"].query_id, "unit_id": item["unit_id"],
-                    "context_id": item["sample_id"], PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared)})
-                self._pending_batch_queries.append({"request": final_request, "query": item["query"], "prepared": prepared,
-                    "sample_id": item["sample_id"], "memory_time_per_query": item["memory_time_per_query"],
-                    "compiler_usage": {"transport": "cache" if cached is not None else "batch", "input_tokens": 0 if cached is not None else getattr(batch_response, "input_tokens", 0),
-                                       "output_tokens": 0 if cached is not None else getattr(batch_response, "output_tokens", 0), "call_count": 0 if cached is not None else 1,
-                                       "cache_hit": cached is not None},
-                    "batch_retrieval_diagnostics": {"manager_creation_count": self._batch_manager_creation_count,
-                        "memory_import_count": self._batch_memory_import_count,
-                        "planner_batch_wall_time": planner_wall_time,
-                        "compiler_cache_hits": self._compiler_cache_hits, "compiler_cache_misses": self._compiler_cache_misses,
-                        "compiler_calls_this_run": self._compiler_calls_this_run}})
+            self._log(
+                "[Vertex] Stage 'query-plan': preparing "
+                f"{len(pending_plans):,} local retrieval context(s) for the final-answer batch."
+            )
+            preparation_progress = tqdm(
+                total=len(pending_plans),
+                desc="Preparing final batch requests",
+                unit="plan",
+                dynamic_ncols=True,
+                file=sys.stdout,
+                disable=not getattr(self, "verbose", True),
+            )
+            try:
+                for item in pending_plans:
+                    cached = item.get("cached_plan")
+                    batch_response = responses.get(item["request"].request_id)
+                    content = cached["raw_model_output"] if cached is not None else (
+                        batch_response.content if batch_response is not None and not batch_response.status else ""
+                    )
+                    context_id = item["sample_id"]
+                    manager = managers_by_context.get(context_id)
+                    if manager is None:
+                        manager = AgentManager(method_config=self.method_config, dataset_config=self.dataset_config,
+                            batch_api=self.batch_api, batch_gcs_uri=self.batch_gcs_uri, batch_wait=self.batch_wait, workers=1)
+                        manager.import_memory_state(item["memory_state"], context_id=context_id)
+                        managers_by_context[context_id] = manager
+                        self._batch_manager_creation_count += 1
+                        self._batch_memory_import_count += 1
+                    item["memory_state"] = None
+                    prepared = manager.prepare_query_compiler_result(item["question"], content,
+                        context_id=item["sample_id"], **self._answer_query_kwargs(item["query"]))
+                    compiler_diagnostics = prepared.get("extra", {}).get("query_compiler", {})
+                    if cached is None and compiler_diagnostics.get("compiler_validation_success"):
+                        self._append_query_compiler_plan_cache({
+                            "fingerprint": item["compiler_fingerprint"], "question_sha256": hashlib.sha256(item["raw_question"].encode("utf-8")).hexdigest(),
+                            "reference_time": item["reference_time"],
+                            "provider": getattr(self.method_config.model, "provider", None), "model": getattr(self.method_config.model, "name", None),
+                            "prompt_version": "event_state_query_compiler_v2", "schema_version": 2,
+                            "max_searches": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_searches", 3),
+                            "temperature": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("planner_temperature", 0.0),
+                            "raw_model_output": content, "validated_plan": compiler_diagnostics.get("validated_plan"),
+                            "parse_success": compiler_diagnostics.get("compiler_parse_success"),
+                            "salvage_used": compiler_diagnostics.get("compiler_salvage_used"),
+                            "warning_codes": compiler_diagnostics.get("compiler_warning_codes", []),
+                        })
+                    final_id = make_request_id("query", f"{self.method_config.method_name}:{item['unit_id']}:{item['query'].query_id}")
+                    final_request = BatchChatRequest(request_id=final_id, messages=prepared["messages"],
+                        temperature=self.method_config.model.temperature,
+                        max_tokens=(self.method_config.model.max_completion_tokens or self.method_config.model.max_tokens),
+                        phase="query", metadata={"query_id": item["query"].query_id, "unit_id": item["unit_id"],
+                        "context_id": item["sample_id"], PREPARED_QUERY_METADATA_KEY: snapshot_prepared_query(prepared)})
+                    self._pending_batch_queries.append({"request": final_request, "query": item["query"], "prepared": prepared,
+                        "sample_id": item["sample_id"], "memory_time_per_query": item["memory_time_per_query"],
+                        "compiler_usage": {"transport": "cache" if cached is not None else "batch", "input_tokens": 0 if cached is not None else getattr(batch_response, "input_tokens", 0),
+                                           "output_tokens": 0 if cached is not None else getattr(batch_response, "output_tokens", 0), "call_count": 0 if cached is not None else 1,
+                                           "cache_hit": cached is not None},
+                        "batch_retrieval_diagnostics": {"manager_creation_count": self._batch_manager_creation_count,
+                            "memory_import_count": self._batch_memory_import_count,
+                            "planner_batch_wall_time": planner_wall_time,
+                            "compiler_cache_hits": self._compiler_cache_hits, "compiler_cache_misses": self._compiler_cache_misses,
+                            "compiler_calls_this_run": self._compiler_calls_this_run}})
+                    preparation_progress.update(1)
+            finally:
+                preparation_progress.close()
             self._batch_retrieval_preparation_wall_time = getattr(self, "_batch_retrieval_preparation_wall_time", 0.0) + time.perf_counter() - retrieval_started
             # Release heavy stage-1 resources and run garbage collection before stage 2
             managers_by_context.clear()
