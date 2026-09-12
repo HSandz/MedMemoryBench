@@ -1,6 +1,7 @@
 """Strict two-stage READ orchestration and LLM-call budget enforcement."""
 
 from copy import deepcopy
+from .read_usage_contract import record_read_usage
 
 
 class ReadQueryOrchestratorMixin:
@@ -13,8 +14,7 @@ class ReadQueryOrchestratorMixin:
         tokens = dict((extra or {}).get("query_tokens") or {})
         controller = dict((extra or {}).get("semantic_controller") or {})
         middle_tokens = {
-            stage: int(tokens.get(stage, 0) or 0)
-            for stage in cls.MIDDLE_TOKEN_STAGES
+            stage: int(tokens.get(stage, 0) or 0) for stage in cls.MIDDLE_TOKEN_STAGES
         }
         validation_calls = sum(
             1
@@ -80,7 +80,13 @@ class ReadQueryOrchestratorMixin:
         )
         extra["query_orchestrator_version"] = self.QUERY_ORCHESTRATOR_VERSION
         extra["two_stage_audit"] = deepcopy(audit)
+        record_read_usage(extra)
         return prepared
+
+    def finalize_batch_query(self, prepared, content):
+        result = super().finalize_batch_query(prepared, content)
+        record_read_usage(result.extra)
+        return result
 
     def generate_prepared_batch_answer(self, prepared):
         extra = prepared.setdefault("extra", {})
@@ -98,4 +104,5 @@ class ReadQueryOrchestratorMixin:
         )
         final_extra["two_stage_audit"] = deepcopy(final_audit)
         final_extra["query_orchestrator_version"] = self.QUERY_ORCHESTRATOR_VERSION
+        record_read_usage(final_extra)
         return result

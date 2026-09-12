@@ -10,17 +10,28 @@ from .read_evidence_certificate import EvidenceCertificateMixin
 
 
 class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
-    QUESTION_READ_VERSION = "question-authoritative-advisory-v3"
+    QUESTION_READ_VERSION = "question-authoritative-advisory-v4"
 
     def _ad_context_selection(self, world, certificate, acquisition):
         by_id = {m["id"]: m for m in world}
         certified = [by_id[mid] for mid in certificate["support_ids"] if mid in by_id]
         # One support per distinct surface first; repeated confirmations cannot crowd
         # out competing answers or independent option evidence.
+        limit = (
+            3
+            if certificate["terminal"]["closed"]
+            else (
+                5
+                if certificate["status"] == "SUPPORTED_COMPETING"
+                and certificate["terminal"]["eligible"]
+                else 8
+            )
+        )
         unique = self._ad_round_robin(
             [[by_id[g["support_ids"][0]] for g in certificate["supported_surfaces"]]],
             self.FINAL_CONTEXT_LIMIT,
         )
+        limit = min(8, max(limit, len(unique)))
         option_groups = [
             [by_id[mid] for mid in mids if mid in by_id]
             for mids in acquisition["option_candidate_ids"].values()
@@ -29,11 +40,20 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
             [by_id[mid] for mid in acquisition[key] if mid in by_id]
             for key in ("base_exact_ids", "base_lexical_ids", "base_dense_ids")
         ]
-        ordered = unique[: self.FINAL_CONTEXT_LIMIT]
-        fill = self._ad_round_robin([*option_groups, *rails], self.FINAL_CONTEXT_LIMIT)
+        hint_groups = [
+            [by_id[mid] for mid in operation["output_ids"] if mid in by_id][:1]
+            for operation in acquisition.get("retrieval_trace", [])
+            if operation["operation"] in {"ADVISORY_HINT", "ATOMIC_HYPOTHESIS"}
+        ]
+        ordered = unique[:limit]
+        # Small explicit reservations: hints cannot be starved by a full raw top-8.
+        fill = self._ad_round_robin(
+            [rails[1][:1], rails[2][:1], *hint_groups, *option_groups, rails[0][:2]],
+            limit,
+        )
         seen = {m["id"] for m in ordered}
         for memory in fill + certified + world:
-            if memory["id"] not in seen and len(ordered) < self.FINAL_CONTEXT_LIMIT:
+            if memory["id"] not in seen and len(ordered) < limit:
                 ordered.append(memory)
                 seen.add(memory["id"])
         return ordered
@@ -124,7 +144,9 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
         base_ids, world_ids = {m["id"] for m in base}, {m["id"] for m in world}
         assert base_ids <= world_ids, "Advisor evicted question-owned evidence"
         assert len(world) <= self.CANDIDATE_WORLD_LIMIT
-        selected = self._ad_context_selection(world, certificate, acquisition)
+        selected = self._ad_context_selection(
+            world, certificate, {**acquisition, **expansion}
+        )
         final_ids = {m["id"] for m in selected}
         assert final_ids <= world_ids, "Context introduced an unacquired memory"
         context, evidence = self._ad_structured_context(
@@ -146,6 +168,12 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
         if self._question_options(question):
             instruction += self._multiple_choice_answer_instruction(
                 self._question_options(question)
+            )
+            instruction += (
+                " For each option internally separate supporting facts, contradicting facts, "
+                "and missing information before applying the question predicate. Unknown is "
+                "not automatically false or contraindicated. Check all supplied evidence, "
+                "not only the retrieval associations listed for that option."
             )
         messages = format_messages(
             question, "\n\n".join(filter(None, [system_message, instruction, context]))
@@ -230,7 +258,7 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
                 "boundary_violation": False,
                 "arbitration_expansion_violation": False,
                 "evidence_boundary_violation": False,
-                "retrieval_complete": bool(world),
+                "candidate_world_nonempty": bool(world),
                 "planner_called": False,
                 "replan_called": False,
                 "memory_tokens": len(self._tokenizer.encode(context)),

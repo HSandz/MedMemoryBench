@@ -13,6 +13,7 @@ from methods.smart_mem0.read_question_runtime import QuestionReadRuntimeMixin
 from methods.smart_mem0.read_query_orchestrator import ReadQueryOrchestratorMixin
 from methods.smart_mem0.query import QueryMixin
 from methods.smart_mem0.retrieval import RetrievalOperationsMixin
+from methods.smart_mem0.read_evidence_certificate import EvidenceCertificateMixin
 
 
 def memory(mid="m1", value="500 mg", **kwargs):
@@ -48,8 +49,8 @@ class Harness(ReadQueryOrchestratorMixin, QuestionReadRuntimeMixin, QueryMixin):
     _effective_runtime_config = staticmethod(lambda: {})
     _refresh_index = staticmethod(lambda: None)
     _is_state_head = staticmethod(lambda m: m.get("head", False))
-    _rg_question_owned_identity = staticmethod(
-        lambda slot, m: (m.get("identity_ok", True), {})
+    _ec_identity = staticmethod(
+        lambda question, m, advisory: (m.get("identity_ok", True), {})
     )
     _response_usage = staticmethod(
         lambda response, prompt: {"total_tokens": 12, "latency": 0.01}
@@ -328,6 +329,8 @@ def test_real_facade_with_real_hybrid_and_identity_guard(monkeypatch):
     assert len(calls) <= 2
     assert result.extra["base_world_retention_rate"] == 1.0
     assert result.extra["candidate_world_unchanged_after_certificate"]
+    assert result.output == "500 mg"
+    assert len(calls) == 1
 
 
 def test_certificate_mutation_is_a_hard_failure():
@@ -397,3 +400,193 @@ def test_causal_topology_requires_stored_provenance_and_both_endpoints():
     agent._relations[0]["provenance_evidence_ids"] = ["ev1"]
     prepared = agent.prepare_batch_query("Dose?")
     assert "E1 --CAUSES--> E2" in str(prepared["messages"])
+
+
+@pytest.mark.parametrize(
+    "raw,status",
+    [
+        (None, "NOT_REQUESTED"),
+        ({}, "NOT_REQUESTED"),
+        ({"relation": "", "axis": ""}, "NOT_REQUESTED"),
+        ("bad", "INVALID"),
+        ({"relation": []}, "INVALID"),
+        ({"axis": "event_time"}, "INVALID"),
+        ({"extra": 1}, "INVALID"),
+        ({"relation": "LATEST", "axis": "event_time"}, "VALID"),
+    ],
+)
+def test_selector_tristate(raw, status):
+    assert (
+        Harness()._ad_normalize({"selector_hint": raw}, "q")["selector_status"]
+        == status
+    )
+
+
+@pytest.mark.parametrize(
+    "relation", ["VERIFY_SOURCE", "TEMPORAL_ORDER", "INFER", "COMPARE", "CAUSES"]
+)
+def test_relation_advice_alone_cannot_veto_atomic_terminal(relation):
+    agent = Harness(advisor={"projection_hint": "VALUE", "relation_hints": [relation]})
+    result = agent.query("Dose?")
+    assert result.output == "500 mg"
+    assert len(agent.calls) == 1
+
+
+class RealIdentityHarness(Harness):
+    _ec_identity = EvidenceCertificateMixin._ec_identity
+
+
+@pytest.mark.parametrize("predicate", ["dose", "liều dùng", "投与量", "الجرعة"])
+def test_real_certificate_binds_predicate_without_whole_question_similarity(predicate):
+    agent = RealIdentityHarness(
+        [memory(state_key=predicate, claim=f"{predicate}: 500 mg")],
+        {"projection_hint": "VALUE", "focus_spans": [predicate]},
+    )
+    result = agent.query(f"Please report the recorded {predicate}?")
+    assert result.output == "500 mg"
+    assert len(agent.calls) == 1
+
+
+def test_name_alone_is_not_question_predicate():
+    agent = RealIdentityHarness(
+        [memory(object_anchor="Cefuroxime", claim="Cefuroxime was prescribed")],
+        {"projection_hint": "ENTITY", "focus_spans": ["Cefuroxime"]},
+    )
+    assert not agent.query("Was Cefuroxime contraindicated?").extra["terminal"][
+        "closed"
+    ]
+
+
+def test_does_not_invent_avoid_instruction_from_allergy():
+    agent = RealIdentityHarness(
+        [memory(object_anchor="Cefuroxime", claim="Allergy to Cefuroxime")],
+        {"projection_hint": "ENTITY", "focus_spans": ["instructed to avoid"]},
+    )
+    assert not agent.query("Which drug was I instructed to avoid?").extra["terminal"][
+        "closed"
+    ]
+    agent._memories[0]["claim"] = "The patient was instructed to avoid Cefuroxime"
+    prepared = agent.prepare_batch_query("Which drug was I instructed to avoid?")
+    # Reset the fake LLM, whose second response otherwise represents synthesis.
+    agent.calls.clear()
+    assert agent.query("Which drug was I instructed to avoid?").output == "Cefuroxime"
+
+
+def test_exact_named_rail_rejects_high_df_in_any_language():
+    agent = Harness(
+        [
+            memory(str(i), entities=["patient", "患者", "rare" if i == 0 else "common"])
+            for i in range(10)
+        ]
+    )
+    for item in agent._memories:
+        item["claim"] = " ".join(item["entities"])
+    surfaces = agent._ad_exact_surfaces('patient 患者 rare "patient" 15.1')
+    assert "患者" not in surfaces
+    assert "rare" in surfaces
+    assert "patient" in surfaces  # Explicit quotes override DF.
+    assert any("15.1" in s for s in surfaces)
+    assert "patient" not in agent._ad_exact_surfaces("patient")
+
+
+def test_hypothesis_is_additive_and_shares_world_cap():
+    agent = Harness([memory(str(i), str(i)) for i in range(20)])
+    base = deepcopy(agent._memories[:12])
+    agent._ad_search = lambda *args: deepcopy(agent._memories[12:])
+    ir = agent._ad_normalize(
+        {
+            "projection_hint": "ENTITY",
+            "answer_hypothesis": "h",
+            "semantic_hints": ["a", "b"],
+        },
+        "q",
+    )
+    world, trace = agent._ad_expand("q", base, ir)
+    assert len(world) == 16
+    assert {m["id"] for m in base} <= {m["id"] for m in world}
+    assert trace["retrieval_trace"][-1]["operation"] == "ATOMIC_HYPOTHESIS"
+    assert trace["retrieval_trace"][-1]["output_ids"]
+
+
+def test_hint_survives_final_context_reservation():
+    agent = Harness([memory(str(i), str(i)) for i in range(14)])
+    acquisition = {
+        "base_exact_ids": ["0"],
+        "base_lexical_ids": list(map(str, range(4))),
+        "base_dense_ids": list(map(str, range(4, 8))),
+        "option_candidate_ids": {},
+        "retrieval_trace": [{"operation": "ADVISORY_HINT", "output_ids": ["12", "13"]}],
+    }
+    certificate = {
+        "support_ids": [],
+        "supported_surfaces": [],
+        "status": "INSUFFICIENT",
+        "terminal": {"closed": False, "eligible": False},
+    }
+    selected = agent._ad_context_selection(agent._memories, certificate, acquisition)
+    assert len(selected) <= 8
+    assert "12" in {m["id"] for m in selected}
+
+
+def test_call_counters_track_observed_not_planned_in_sync_and_batch():
+    agent = Harness(advisor={"projection_hint": "TEXT"})
+    prepared = agent.prepare_batch_query("Explain")
+    assert prepared["extra"]["method_llm_calls"]["answer"] == 0
+    result = agent.finalize_batch_query(prepared, "batch answer")
+    agent.record_batch_query_usage(result, 20, 5)
+    assert result.extra["method_llm_calls"]["total"] == 2
+    assert result.extra["two_stage_audit"]["answer_calls"] == 1
+    terminal = Harness().query("Dose?")
+    assert terminal.extra["method_llm_calls"]["total"] == 1
+    assert "retrieval_complete" not in terminal.extra
+    assert terminal.extra["candidate_world_nonempty"]
+
+
+def test_aggregate_counts_match_actual_one_and_two_call_queries():
+    from benchmarks.medmemorybench.smart_mem0_batch_integration import _method_llm_usage
+
+    one = Harness().query("Dose?")
+    two = Harness(advisor={"projection_hint": "TEXT"}).query("Explain")
+    evaluator = SimpleNamespace(
+        aggregator=SimpleNamespace(
+            results=[
+                SimpleNamespace(details={"agent_telemetry": r.extra})
+                for r in (one, two)
+            ]
+        )
+    )
+    summary = _method_llm_usage(evaluator)
+    assert summary["controller_calls"] == 2
+    assert summary["answer_calls"] == 1
+    assert summary["total_calls"] == 3
+
+
+def test_composition_without_one_atom_covering_all_predicates_needs_synthesis():
+    agent = RealIdentityHarness(
+        [memory(claim="left: 100"), memory("m2", claim="right: 100")],
+        {
+            "projection_hint": "VALUE",
+            "focus_spans": ["left", "right"],
+            "relation_hints": [],
+        },
+    )
+    result = agent.query("Compare left and right")
+    assert not result.extra["terminal"]["closed"]
+    assert len(agent.calls) == 2
+
+
+def test_no_legacy_certificate_or_controller_in_active_mro():
+    names = {c.__name__ for c in SmartMem0Agent.__mro__}
+    assert "ReadRequirementIdentityRuntimeMixin" not in names
+    assert "ReadStableSemanticRuntimeMixin" not in names
+    assert "ReadUsageContractMixin" not in names
+
+
+def test_text_hypothesis_does_not_add_search():
+    agent = Harness()
+    ir = agent._ad_normalize(
+        {"projection_hint": "TEXT", "answer_hypothesis": "An invented explanation"}, "q"
+    )
+    world, trace = agent._ad_expand("q", agent._memories, ir)
+    assert not trace["retrieval_trace"]
+    assert not agent.searches

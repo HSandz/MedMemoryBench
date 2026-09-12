@@ -7,6 +7,7 @@ from methods.base import AgentResponse
 from utils.llm_client import format_messages
 
 from .canonicalization import state_identity
+from .read_usage_contract import record_read_usage
 
 QUERY_TOKEN_STAGES = (
     "controller",
@@ -1019,6 +1020,7 @@ class QueryMixin:
         response.extra["direct_generation_violation"] = bool(
             response.extra.get("precomputed_answer_present") and answer_tokens
         )
+        record_read_usage(response.extra)
 
     def reset(self) -> None:
         super().reset()

@@ -5,12 +5,85 @@ drop, or mutate memories. Ambiguity is retained for the synthesis model.
 """
 
 import re
+import unicodedata
 
 from .canonicalization import state_identity
 from .contracts import VALID_TEMPORAL_AXES
 
 
 class EvidenceCertificateMixin:
+    @staticmethod
+    def _ec_surface(value):
+        return " ".join(
+            unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+        )
+
+    @staticmethod
+    def _ec_text(value):
+        return " ".join(
+            re.findall(
+                r"\w+(?:[./%+-]\w+)*",
+                unicodedata.normalize("NFKC", str(value or ""))
+                .casefold()
+                .replace("_", " "),
+            )
+        )
+
+    def _ec_identity(self, question, memory, advisory):
+        """Bind exact question predicates to stored assertions, never retrieval scores.
+
+        A name/value alone is not a predicate. Unknown paraphrases remain synthesis
+        work: we do not equate allergy with an instruction to avoid a drug.
+        """
+        normalize = self._ec_text
+        predicate = normalize(memory.get("state_key") or memory.get("predicate"))
+        assertion = normalize(memory.get("claim"))
+        excluded = {
+            normalize(v)
+            for v in [
+                memory.get("subject"),
+                memory.get("subject_id"),
+                memory.get("scope"),
+                memory.get("object_anchor"),
+                memory.get("value"),
+                memory.get("verbatim_value"),
+                *(memory.get("entities") or []),
+            ]
+            if v
+        }
+        spans = [normalize(s) for s in advisory.get("focus_spans", []) if s in question]
+        if not spans and normalize(question) == predicate:
+            spans = [predicate]
+        if not spans or not all(spans):
+            return False, "NO_QUESTION_PREDICATE_BINDING"
+
+        def contains(text, span):
+            return bool(
+                span and re.search(r"(?<!\w)" + re.escape(span) + r"(?!\w)", text)
+            )
+
+        object_bound = contains(
+            normalize(question), normalize(memory.get("object_anchor"))
+        )
+        binding = any(
+            s == predicate
+            or (
+                not any(contains(surface, s) for surface in excluded)
+                and (
+                    contains(assertion, s) or (object_bound and contains(predicate, s))
+                )
+            )
+            for s in spans
+        )
+        qualifiers = all(
+            contains(assertion, s) or contains(predicate, s) for s in spans
+        )
+        return bool(binding and qualifiers), (
+            "EXACT_PREDICATE_AND_QUALIFIERS"
+            if binding and qualifiers
+            else "UNRESOLVED_PREDICATE_OR_QUALIFIER"
+        )
+
     def _ec_projections(self, memory, projection, selector):
         if projection == "DATE":
             axis = selector.get("axis")
@@ -20,7 +93,9 @@ class EvidenceCertificateMixin:
         if projection == "ENTITY":
             # Multiple possible entity fields are competition, not license to pick the
             # first entity (which is often the subject, not the requested object).
-            values = [memory.get("object_anchor"), memory.get("value")]
+            anchor = memory.get("object_anchor")
+            # Prefer the durable object for ENTITY; its dose/value is not a second entity.
+            values = [anchor] if anchor else [memory.get("value")]
             return list(dict.fromkeys(str(v).replace("_", " ") for v in values if v))
         return []
 
@@ -76,12 +151,6 @@ class EvidenceCertificateMixin:
         projection = advisory["projection_hint"]
         selector = advisory["selector_hint"]
         evidence_ids = {e["id"] for e in self._evidence}
-        slot = {
-            "requested_projection": projection,
-            "proof_need": question,
-            "proof_question_span": question,
-            "selector": selector,
-        }
         known_subjects = {
             str(m.get("subject_id") or m.get("subject") or "") for m in self._memories
         }
@@ -121,9 +190,7 @@ class EvidenceCertificateMixin:
             elif status == "superseded" and not historical:
                 reason = "SUPERSEDED"
             else:
-                # Keep the existing discriminative guard, but its input is the entire
-                # original question, never an advisor focus/hypothesis/retrieval hint.
-                identity, _ = self._rg_question_owned_identity(slot, memory)
+                identity, _ = self._ec_identity(question, memory, advisory)
                 if not identity:
                     reason = "QUESTION_PREDICATE_NOT_ESTABLISHED"
                 elif memory.get("stance", "AFFIRM") != "AFFIRM":
@@ -134,12 +201,12 @@ class EvidenceCertificateMixin:
             else:
                 eligible.append(memory)
         selected, selector_status = self._ec_selector(eligible, selector)
-        if not advisory["selector_valid"]:
+        if advisory.get("selector_status", "INVALID") == "INVALID":
             selected, selector_status = [], "INVALID_SELECTOR"
         groups = {}
         for memory in selected:
             for value in self._ec_projections(memory, projection, selector):
-                key = self._rc_text(value)
+                key = self._ec_surface(value)
                 if key and key != "unknown":
                     group = groups.setdefault(key, {"value": value, "support_ids": []})
                     if memory["id"] not in group["support_ids"]:
@@ -168,20 +235,17 @@ class EvidenceCertificateMixin:
             else "SUPPORTED_UNIQUE" if len(groups) == 1 else "INSUFFICIENT"
         )
         hypothesis = advisory.get("answer_hypothesis")
-        hypothesis_key = self._rc_text(hypothesis)
+        hypothesis_key = self._ec_surface(hypothesis)
         hypothesis_status = (
             status
             if hypothesis_key in groups
             else "UNSUPPORTED" if hypothesis else "NOT_PROPOSED"
         )
-        synthesis = (
-            len(explicit_subjects) > 1
-            or projection not in {"ENTITY", "VALUE", "DATE"}
-            or bool(
-                set(advisory["relation_hints"])
-                & {"COMPARE", "CAUSES", "TEMPORAL_ORDER", "INFER", "VERIFY_SOURCE"}
-            )
-        )
+        synthesis = len(explicit_subjects) > 1 or projection not in {
+            "ENTITY",
+            "VALUE",
+            "DATE",
+        }
         terminal = status == "SUPPORTED_UNIQUE" and not synthesis
         return {
             "status": status,

@@ -11,7 +11,8 @@ You are an advisor, never a retrieval planner or evidence certifier.
 Return JSON with only:
 projection_hint: ENTITY|VALUE|DATE|TEXT|OPTION_SET (TEXT for synthesis),
 answer_hypothesis: optional short proposed answer or null,
-focus_spans: up to 3 exact contiguous quotations from QUESTION,
+focus_spans: up to 3 exact contiguous quotations from QUESTION that together cover
+the requested predicate and its qualifiers (not just an entity name or category),
 semantic_hints: up to 2 short retrieval expansions,
 missing_evidence_hints: optional short retrieval expansions,
 selector_hint: {relation: '', LOCATE, CURRENT, EXACT, BEFORE, AFTER, BETWEEN,
@@ -53,7 +54,9 @@ class AdvisoryReadMixin:
         surfaces += re.findall(
             r"(?<!\w)\d+(?:[.,:/-]\d+)*(?:\s*[%\w]+(?:/\w+)?)?", question
         )
-        # Match stored names literally; do not invent language-dependent NER labels.
+        # Proper names are admitted by corpus information value, not English stopwords.
+        texts = [self._memory_text(m).casefold() for m in self._memories]
+        candidates = set()
         for memory in self._memories:
             for value in [memory.get("object_anchor"), *(memory.get("entities") or [])]:
                 if isinstance(value, str) and len(value) >= 3:
@@ -61,7 +64,12 @@ class AdvisoryReadMixin:
                     if re.search(
                         r"(?<!\w)" + re.escape(surface) + r"(?!\w)", question, re.I
                     ):
-                        surfaces.append(surface)
+                        candidates.add(surface)
+        for surface in sorted(candidates):
+            pattern = re.compile(r"(?<!\w)" + re.escape(surface.casefold()) + r"(?!\w)")
+            df = sum(bool(pattern.search(text)) for text in texts)
+            if df / max(1, len(texts)) <= 0.2:
+                surfaces.append(surface)
         return list(dict.fromkeys(s for s in surfaces if s.strip()))[:16]
 
     def _ad_base_world(self, question):
@@ -142,7 +150,8 @@ class AdvisoryReadMixin:
             projection = "TEXT"
         if self._question_options(question):
             projection = "OPTION_SET"
-        selector = raw.get("selector_hint")
+        raw_selector = raw.get("selector_hint")
+        selector = raw_selector
         selector = selector if isinstance(selector, dict) else {}
         relation = selector.get("relation", "")
         axis = selector.get("axis", "")
@@ -181,6 +190,18 @@ class AdvisoryReadMixin:
                 and end in question
                 and bool(self._parse_date(end))
             )
+        fields = {"relation", "axis", "anchor", "end"}
+        absent = raw_selector is None or (
+            isinstance(raw_selector, dict)
+            and not (set(raw_selector) - fields)
+            and all(v is None or v == "" for v in raw_selector.values())
+        )
+        valid = valid and (raw_selector is None or isinstance(raw_selector, dict))
+        if isinstance(raw_selector, dict) and set(raw_selector) - fields:
+            valid = False
+        if not absent and not relation:
+            valid = False
+        selector_status = "NOT_REQUESTED" if absent else "VALID" if valid else "INVALID"
         selector = (
             {
                 "relation": relation,
@@ -210,7 +231,7 @@ class AdvisoryReadMixin:
                 )
             )[:2],
             "selector_hint": selector,
-            "selector_valid": bool(valid),
+            "selector_status": selector_status,
             "relation_hints": [
                 v
                 for v in texts("relation_hints", 3)
@@ -259,10 +280,25 @@ class AdvisoryReadMixin:
         world = list(base)
         seen = {m["id"] for m in world}
         candidates, novel, trace = [], [], []
-        for hint in advisory["semantic_hints"]:
+        searches = [("ADVISORY_HINT", hint, 2) for hint in advisory["semantic_hints"]]
+        hypothesis = advisory.get("answer_hypothesis")
+        if (
+            advisory["projection_hint"] in {"ENTITY", "VALUE", "DATE"}
+            and hypothesis
+            and len(hypothesis) <= 160
+            and hypothesis not in advisory["semantic_hints"]
+        ):
+            searches.append(("ATOMIC_HYPOTHESIS", hypothesis, 2))
+        for index, (operation, hint, quota) in enumerate(searches):
+            remaining = self.CANDIDATE_WORLD_LIMIT - len(world)
+            if remaining <= 0:
+                break
+            quota = min(quota, max(1, remaining - (len(searches) - index - 1)))
             outputs = self._ad_search(hint, 8)
             candidates.extend(m["id"] for m in outputs)
-            added = [m for m in outputs if m["id"] not in seen][:2]
+            added = self._ad_round_robin(
+                [[m for m in outputs if m["id"] not in seen]], min(quota, remaining)
+            )
             for memory in added:
                 if len(world) < self.CANDIDATE_WORLD_LIMIT:
                     world.append(memory)
@@ -270,7 +306,7 @@ class AdvisoryReadMixin:
                     novel.append(memory["id"])
             trace.append(
                 {
-                    "operation": "ADVISORY_HINT",
+                    "operation": operation,
                     "input": hint,
                     "output_ids": [m["id"] for m in added],
                 }
