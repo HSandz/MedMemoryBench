@@ -94,14 +94,62 @@ def order_json_artifact(value: Any) -> Any:
 
 
 def dump_json_artifact(value: Any, handle: TextIO, *, indent: int = 2) -> None:
-    """Write an artifact with stable summary-first ordering."""
-    json.dump(
-        order_json_artifact(value),
-        handle,
-        ensure_ascii=False,
-        indent=indent,
-    )
-    handle.write("\n")
+    """Write an artifact with stable summary-first ordering without blowing up memory."""
+    if not isinstance(value, dict):
+        json.dump(
+            order_json_artifact(value),
+            handle,
+            ensure_ascii=False,
+            indent=indent,
+        )
+        handle.write("\n")
+        return
+
+    def sort_key(item: tuple[int, tuple[str, Any]]) -> tuple[int, int, int]:
+        original_index, (key, _) = item
+        if key in _PRIORITY_INDEX:
+            return (0, _PRIORITY_INDEX[key], original_index)
+        if key in _DETAIL_INDEX:
+            return (2, _DETAIL_INDEX[key], original_index)
+        return (1, 0, original_index)
+
+    sorted_items = [v for _, v in sorted(enumerate(value.items()), key=sort_key)]
+    has_large_list = any(isinstance(v, list) and len(v) > 10 for _, v in sorted_items)
+    if not has_large_list:
+        json.dump(
+            order_json_artifact(value),
+            handle,
+            ensure_ascii=False,
+            indent=indent,
+        )
+        handle.write("\n")
+        return
+
+    # Stream large list fields item-by-item to avoid cloning gigabytes of memory
+    handle.write("{\n")
+    num_items = len(sorted_items)
+    for i, (k, v) in enumerate(sorted_items):
+        comma = "," if i < num_items - 1 else ""
+        if isinstance(v, list) and len(v) > 10:
+            handle.write(f"  {json.dumps(k, ensure_ascii=False)}: [")
+            if not v:
+                handle.write(f"]{comma}\n")
+            else:
+                handle.write("\n")
+                num_sub = len(v)
+                for j, sub_item in enumerate(v):
+                    sub_comma = "," if j < num_sub - 1 else ""
+                    ordered_sub = order_json_artifact(sub_item)
+                    rendered = json.dumps(ordered_sub, ensure_ascii=False, indent=indent)
+                    indented = "\n".join("    " + line for line in rendered.split("\n"))
+                    handle.write(f"{indented}{sub_comma}\n")
+                handle.write(f"  ]{comma}\n")
+        else:
+            ordered_v = order_json_artifact(v)
+            rendered = json.dumps(ordered_v, ensure_ascii=False, indent=indent)
+            indented = "\n".join("  " + line if idx > 0 else line for idx, line in enumerate(rendered.split("\n")))
+            handle.write(f"  {json.dumps(k, ensure_ascii=False)}: {indented}{comma}\n")
+    handle.write("}\n")
 
 
 def rewrite_json_artifact(

@@ -1,5 +1,6 @@
 """LoCoMo evaluation module."""
 
+import gc
 import hashlib
 import json
 import os
@@ -780,6 +781,7 @@ class LoCoMoEvaluator:
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
+        gc.collect()
         report = self._generate_report(start_time, end_time, duration)
 
         return report
@@ -1467,7 +1469,7 @@ class LoCoMoEvaluator:
 
         # Query-compiler mode is deliberately two-stage: all memory-free plans
         # first, then local retrieval, then one shared final-answer stage.
-        if self.agent_manager and self.agent_manager.uses_query_compiler():
+        if self.agent_manager and getattr(self.agent_manager, "uses_query_compiler", lambda: False)():
             event_state_snapshot = self._export_event_state_for_transfer(self.agent_manager, unit.context_id)
             plan_cache = self._load_query_compiler_plan_cache()
             for query in unit.queries_to_evaluate:
@@ -1615,7 +1617,7 @@ class LoCoMoEvaluator:
 
     def _complete_combined_batch_queries(self) -> Iterator[Dict[str, Any]]:
         """Submit one Vertex stage and stream local finalization results."""
-        if self._pending_query_plan_requests:
+        if getattr(self, "_pending_query_plan_requests", None):
             stage = "query-plan"
             batch_client = self._get_batch_client()
             pending_plans = self._pending_query_plan_requests
@@ -1647,6 +1649,7 @@ class LoCoMoEvaluator:
                     managers_by_context[context_id] = manager
                     self._batch_manager_creation_count += 1
                     self._batch_memory_import_count += 1
+                item["memory_state"] = None
                 prepared = manager.prepare_query_compiler_result(item["question"], content,
                     context_id=item["sample_id"], **self._answer_query_kwargs(item["query"]))
                 compiler_diagnostics = prepared.get("extra", {}).get("query_compiler", {})
@@ -1680,6 +1683,14 @@ class LoCoMoEvaluator:
                         "compiler_cache_hits": self._compiler_cache_hits, "compiler_cache_misses": self._compiler_cache_misses,
                         "compiler_calls_this_run": self._compiler_calls_this_run}})
             self._batch_retrieval_preparation_wall_time = getattr(self, "_batch_retrieval_preparation_wall_time", 0.0) + time.perf_counter() - retrieval_started
+            # Release heavy stage-1 resources and run garbage collection before stage 2
+            managers_by_context.clear()
+            del managers_by_context
+            del pending_plans
+            del responses
+            del requests
+            del misses
+            gc.collect()
             yield from self._complete_combined_batch_queries()
             return
         if not self._pending_batch_queries:
@@ -1745,6 +1756,9 @@ class LoCoMoEvaluator:
                         })
 
                 result.memory_construction_time = item["memory_time_per_query"]
+                # Progressively free prompt and request payload memory
+                item["prepared"] = None
+                item["request"] = None
                 progress.update(1)
                 yield {
                     "sample_id": item["sample_id"],
@@ -1752,6 +1766,10 @@ class LoCoMoEvaluator:
                 }
         finally:
             progress.close()
+            pending_items.clear()
+            if isinstance(responses, dict):
+                responses.clear()
+            gc.collect()
 
     def _evaluate_query(
         self,
@@ -2001,6 +2019,8 @@ class LoCoMoEvaluator:
         result.details["locomo_retrieval_quality"] = self._locomo_retrieval_quality(
             query, retrieved_memories, response_extra if isinstance(response_extra, dict) else None,
         )
+        if isinstance(result.details.get("method_retrieval"), dict):
+            result.details["method_retrieval"].pop("retrieval_stage_candidates", None)
 
         return result
 

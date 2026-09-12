@@ -721,18 +721,17 @@ class ResultCollector:
 
         by_context = {}
         for result in self._results:
-            for ctx_id, ctx_results in self._results_by_context.items():
-                if result in ctx_results:
-                    if ctx_id not in by_context:
-                        by_context[ctx_id] = {
-                            "total": 0,
-                            "correct": 0,
-                            "query_ids": [],
-                        }
-                    by_context[ctx_id]["total"] += 1
-                    by_context[ctx_id]["correct"] += 1 if result.is_correct else 0
-                    by_context[ctx_id]["query_ids"].append(result.query_id)
-                    break
+            ctx_id = context_by_result.get(id(result))
+            if ctx_id is not None:
+                if ctx_id not in by_context:
+                    by_context[ctx_id] = {
+                        "total": 0,
+                        "correct": 0,
+                        "query_ids": [],
+                    }
+                by_context[ctx_id]["total"] += 1
+                by_context[ctx_id]["correct"] += 1 if result.is_correct else 0
+                by_context[ctx_id]["query_ids"].append(result.query_id)
 
         retrieval_records_path = None
         if retrieval_records:

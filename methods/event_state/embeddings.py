@@ -57,13 +57,29 @@ class DenseEmbedder:
             return []
         client = self._get_client()
         if hasattr(client, "encode"):
-            return [self._normalize(vector) for vector in client.encode(list(texts), normalize_embeddings=True)]
+            try:
+                import torch
+                context_manager = torch.inference_mode()
+            except (ImportError, AttributeError):
+                from contextlib import nullcontext
+                context_manager = nullcontext()
+            with context_manager:
+                vectors = client.encode(list(texts), normalize_embeddings=True, batch_size=64, show_progress_bar=False)
+            return [self._normalize(vector) for vector in vectors]
         return [self._normalize(vector) for vector in client.embed_documents(list(texts))]
 
     def embed_query(self, text: str) -> List[float]:
         client = self._get_client()
         if hasattr(client, "encode"):
-            return self._normalize(client.encode(text, normalize_embeddings=True))
+            try:
+                import torch
+                context_manager = torch.inference_mode()
+            except (ImportError, AttributeError):
+                from contextlib import nullcontext
+                context_manager = nullcontext()
+            with context_manager:
+                vector = client.encode(text, normalize_embeddings=True)
+            return self._normalize(vector)
         return self._normalize(client.embed_query(text))
 
 
