@@ -135,7 +135,7 @@ def test_focus_spans_are_exact_and_hints_share_one_budget():
         "Dose?",
     )
     assert value["focus_spans"] == ["Dose"]
-    assert value["semantic_hints"] == ["a", "b"]
+    assert value["semantic_hints"] == ["a", "b", "c", "d"]
 
 
 def test_hint_cannot_replace_base_or_expand_via_relation():
@@ -382,7 +382,10 @@ def test_linked_evidence_does_not_open_unlinked_turns():
 
 
 def test_causal_topology_requires_stored_provenance_and_both_endpoints():
-    agent = Harness([memory(), memory("m2")])
+    agent = Harness(
+        [memory(), memory("m2", claim="A different consequence")],
+        {"projection_hint": "TEXT", "relation_hints": ["CAUSES"]},
+    )
     agent._valid_causal_relation = lambda r, by_id: bool(
         r.get("provenance_evidence_ids")
     )
@@ -398,6 +401,7 @@ def test_causal_topology_requires_stored_provenance_and_both_endpoints():
     prepared = agent.prepare_batch_query("Dose?")
     assert "--CAUSES-->" not in str(prepared["messages"])
     agent._relations[0]["provenance_evidence_ids"] = ["ev1"]
+    agent.calls.clear()
     prepared = agent.prepare_batch_query("Dose?")
     assert "E1 --CAUSES--> E2" in str(prepared["messages"])
 
@@ -466,6 +470,7 @@ def test_does_not_invent_avoid_instruction_from_allergy():
         "closed"
     ]
     agent._memories[0]["claim"] = "The patient was instructed to avoid Cefuroxime"
+    agent._memories[0]["state_key"] = "instructed to avoid"
     prepared = agent.prepare_batch_query("Which drug was I instructed to avoid?")
     # Reset the fake LLM, whose second response otherwise represents synthesis.
     agent.calls.clear()

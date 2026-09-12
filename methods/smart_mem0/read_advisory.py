@@ -13,8 +13,8 @@ projection_hint: ENTITY|VALUE|DATE|TEXT|OPTION_SET (TEXT for synthesis),
 answer_hypothesis: optional short proposed answer or null,
 focus_spans: up to 3 exact contiguous quotations from QUESTION that together cover
 the requested predicate and its qualifiers (not just an entity name or category),
-semantic_hints: up to 2 short retrieval expansions,
-missing_evidence_hints: optional short retrieval expansions,
+evidence_hints: up to 4 distinct missing premises for TEXT/OPTION_SET synthesis,
+or up to 2 short retrieval expansions for atomic projections,
 selector_hint: {relation: '', LOCATE, CURRENT, EXACT, BEFORE, AFTER, BETWEEN,
 EARLIEST or LATEST; axis: event_time, document_time, origin_document_time,
 effective_event_time or ''; anchor: exact question span or ''; end: same},
@@ -24,7 +24,7 @@ CURRENT needs a durable state. Event time is not documentation time.
 For synthesis, comparison or inference use TEXT, not an atomic projection.
 Hints only add retrieval candidates. Hypotheses are not facts. Never emit needs,
 requirements, operations, budgets, support IDs, proof or certificates.
-Never treat answer options as observed participant facts.
+Never treat answer options as stored facts.
 """
 
 
@@ -97,7 +97,7 @@ class AdvisoryReadMixin:
         exact = [m for _, _, m in sorted(exact, key=lambda x: (-x[0], x[1]))[:2]]
         options = self._question_options(question) or {}
         option_rails = {
-            label: self._ad_search(question + "\n" + text, 2)
+            label: self._ad_search(self._question_stem(question) + "\n" + text, 2)
             for label, text in list(options.items())[:8]
         }
         # Reserve one candidate per visible proposition before relevance fill. With
@@ -217,6 +217,7 @@ class AdvisoryReadMixin:
             else {}
         )
         hypothesis = raw.get("answer_hypothesis")
+        hint_limit = 4 if projection in {"TEXT", "OPTION_SET"} else 2
         return {
             "projection_hint": projection,
             "answer_hypothesis": (
@@ -227,9 +228,11 @@ class AdvisoryReadMixin:
             "focus_spans": texts("focus_spans", 3, exact=True),
             "semantic_hints": list(
                 dict.fromkeys(
-                    texts("semantic_hints", 2) + texts("missing_evidence_hints", 2)
+                    texts("evidence_hints", hint_limit)
+                    + texts("semantic_hints", hint_limit)
+                    + texts("missing_evidence_hints", hint_limit)
                 )
-            )[:2],
+            )[:hint_limit],
             "selector_hint": selector,
             "selector_status": selector_status,
             "relation_hints": [
@@ -243,6 +246,8 @@ class AdvisoryReadMixin:
     def _ad_advise(self, question, base):
         fields = (
             "claim",
+            "owner_id",
+            "subject_id",
             "subject",
             "scope",
             "state_key",

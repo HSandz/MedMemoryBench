@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .canonicalization import state_identity
 from .contracts import (
-    CLINICAL_SCOPES,
     RETRIEVAL_BUDGETS,
     SLOT_REQUIRED_FIELDS,
     VALID_EVIDENCE_ROLES,
@@ -25,6 +24,9 @@ from .prompts import (
     MEDICAL_PLANNER_GUIDANCE,
     TYPED_PLANNER_PROMPT,
 )
+
+# Historical planner compatibility only; never imported by the active READ facade.
+CLINICAL_SCOPES = frozenset()
 
 
 class PlanningMixin:

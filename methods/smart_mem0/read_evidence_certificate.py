@@ -1,6 +1,6 @@
 """One read-only support checkpoint over a frozen candidate world.
 
-The certificate can establish that stored participant evidence supports a projected
+The certificate can establish that stored entity-specific evidence supports a projected
 answer under the original question's constraints. It is not a real-world truth
 oracle and cannot acquire, drop, rerank, or mutate memories.
 """
@@ -14,7 +14,7 @@ from .contracts import VALID_TEMPORAL_AXES
 
 
 class EvidenceCertificateMixin:
-    CERTIFICATE_VERSION = "question-owned-support-v3"
+    CERTIFICATE_VERSION = "stored-predicate-support-v4"
     PREDICATE_RARE_DF_RATIO = 0.10
     PREDICATE_MEDIUM_DF_RATIO = 0.25
 
@@ -86,17 +86,23 @@ class EvidenceCertificateMixin:
         ]
 
         corpus_terms = [
-            set(self._ec_terms(self._ec_assertion_text(item))) for item in self._memories
+            set(self._ec_terms(self._ec_assertion_text(item)))
+            for item in self._memories
         ]
         total = max(1, len(corpus_terms))
-        df = {term: sum(term in terms for terms in corpus_terms) for term in question_terms}
+        df = {
+            term: sum(term in terms for terms in corpus_terms)
+            for term in question_terms
+        }
         rare_limit = max(1, math.ceil(total * self.PREDICATE_RARE_DF_RATIO))
         medium_limit = max(2, math.ceil(total * self.PREDICATE_MEDIUM_DF_RATIO))
         rare = [
             term
             for term in shared
             if df.get(term, total) <= rare_limit
-            and (len(term) >= 4 or any(ch.isdigit() for ch in term) or not term.isascii())
+            and (
+                len(term) >= 4 or any(ch.isdigit() for ch in term) or not term.isascii()
+            )
         ]
         medium = [
             term
@@ -110,16 +116,13 @@ class EvidenceCertificateMixin:
             predicate
             and re.search(r"(?<!\w)" + re.escape(predicate) + r"(?!\w)", question_text)
         )
-        established = bool(predicate_exact or rare or len(set(medium)) >= 2)
+        # Corpus rarity is only relevance telemetry. It cannot prove a predicate.
+        established = predicate_exact
         matched = list(dict.fromkeys([*rare, *medium]))
         return established, {
             "source": (
                 "EXACT_STORED_PREDICATE"
                 if predicate_exact
-                else "RARE_QUESTION_PREDICATE_TERM"
-                if rare
-                else "MULTI_QUESTION_PREDICATE_TERMS"
-                if established
                 else "UNRESOLVED_QUESTION_PREDICATE"
             ),
             "matched_predicate_terms": matched[:12],
@@ -134,7 +137,9 @@ class EvidenceCertificateMixin:
             axis = selector.get("axis")
             return [self._date_for(memory, axis)] if axis in VALID_TEMPORAL_AXES else []
         if projection == "VALUE":
-            value = str(memory.get("verbatim_value") or memory.get("value") or "").strip()
+            value = str(
+                memory.get("verbatim_value") or memory.get("value") or ""
+            ).strip()
             return [value] if value else []
         if projection == "ENTITY":
             # Prefer a durable answer object. A dose/status value is not a second entity.
@@ -148,7 +153,9 @@ class EvidenceCertificateMixin:
         if not relation:
             return memories, "NOT_REQUESTED"
         if relation == "CURRENT":
-            heads = [m for m in memories if state_identity(m) and self._is_state_head(m)]
+            heads = [
+                m for m in memories if state_identity(m) and self._is_state_head(m)
+            ]
             return heads, "RESOLVED" if heads else "NO_DURABLE_STATE_HEAD"
         axis = selector.get("axis")
         if axis not in VALID_TEMPORAL_AXES:
@@ -188,13 +195,16 @@ class EvidenceCertificateMixin:
         return [m for m, _ in dated], "RESOLVED" if dated else "NO_MATCHING_TIME"
 
     def _ec_explicit_subjects(self, question):
+        supplied_owner = getattr(question, "owner_id", None)
+        if supplied_owner:
+            return {str(supplied_owner)}, True
         # Prefer durable subject_id. Only legacy stores with no subject_id at all
         # fall back to conversational subject labels, avoiding "Doctor, ..." as an
         # accidental owner constraint in modern snapshots.
         durable = {
-            str(m.get("subject_id") or "").strip()
+            str(m.get("owner_id") or m.get("subject_id") or "").strip()
             for m in self._memories
-            if str(m.get("subject_id") or "").strip()
+            if str(m.get("owner_id") or m.get("subject_id") or "").strip()
         }
         fallback = not durable
         if fallback:
@@ -238,6 +248,12 @@ class EvidenceCertificateMixin:
         projection = advisory["projection_hint"]
         selector = advisory["selector_hint"]
         selector_contract = advisory.get("selector_status", "INVALID")
+        selector_required = getattr(question, "selector_required", None)
+        if selector_required is False:
+            selector, selector_contract = {}, "NOT_REQUESTED"
+        selector_blocked = selector_contract == "INVALID" or (
+            selector_required is True and selector_contract != "VALID"
+        )
         evidence_ids = {e["id"] for e in self._evidence}
         explicit_subjects, subject_fallback = self._ec_explicit_subjects(question)
 
@@ -249,12 +265,13 @@ class EvidenceCertificateMixin:
             mid = memory["id"]
             status = self._belief_status.get(mid, memory.get("_status", "active"))
             owner = str(
-                memory.get("subject_id")
+                memory.get("owner_id")
+                or memory.get("subject_id")
                 or (memory.get("subject") if subject_fallback else "")
                 or ""
             )
             reason = ""
-            if explicit_subjects and owner and owner not in explicit_subjects:
+            if explicit_subjects and owner not in explicit_subjects:
                 reason = "EXPLICIT_SUBJECT_MISMATCH"
             elif not set(memory.get("evidence_ids") or []) & evidence_ids:
                 reason = "NO_STORED_LINKED_EVIDENCE"
@@ -277,7 +294,7 @@ class EvidenceCertificateMixin:
 
         selected, selector_resolution = self._ec_selector(eligible, selector)
         if selector_contract == "INVALID":
-            selected, selector_resolution = [], "INVALID_SELECTOR"
+            selected, selector_resolution = eligible, "INVALID_SELECTOR"
 
         groups = {}
         for memory in selected:
@@ -288,7 +305,9 @@ class EvidenceCertificateMixin:
                     if memory["id"] not in group["support_ids"]:
                         group["support_ids"].append(memory["id"])
         support_ids = list(
-            dict.fromkeys(mid for group in groups.values() for mid in group["support_ids"])
+            dict.fromkeys(
+                mid for group in groups.values() for mid in group["support_ids"]
+            )
         )
         conflicting = contradicted or any(
             self._belief_status.get(m["id"], m.get("_status")) == "conflicting"
@@ -322,21 +341,13 @@ class EvidenceCertificateMixin:
         hypothesis_status = (
             status
             if hypothesis_supported
-            else "UNSUPPORTED"
-            if hypothesis
-            else "NOT_PROPOSED"
+            else "UNSUPPORTED" if hypothesis else "NOT_PROPOSED"
         )
 
         atomic = projection in {"ENTITY", "VALUE", "DATE"}
-        # Exact focus spans can only veto an optimization, never authorize proof.
-        # Multiple spans conservatively indicate possible composition even when the
-        # advisor mislabeled the projection as atomic.
-        composition_veto = atomic and len(advisory.get("focus_spans") or []) > 1
-        synthesis = not atomic or composition_veto
+        synthesis = not atomic
         terminal = (
-            status == "SUPPORTED_UNIQUE"
-            and not synthesis
-            and selector_contract != "INVALID"
+            status == "SUPPORTED_UNIQUE" and not synthesis and not selector_blocked
         )
         return {
             "version": self.CERTIFICATE_VERSION,
@@ -348,21 +359,22 @@ class EvidenceCertificateMixin:
                 [group["value"] for group in groups.values()] if len(groups) > 1 else []
             ),
             "selector_status": selector_contract,
+            "selector_required": selector_required,
             "selector_resolution": selector_resolution,
             "binding": binding,
             "rejected": rejected,
             "terminal": {
-                "eligible": atomic and not composition_veto and selector_contract != "INVALID",
+                "eligible": atomic and not selector_blocked,
                 "closed": terminal,
                 "answer_source": "memory_projection" if terminal else "",
                 "reason": (
                     "UNIQUE_STORED_SUPPORT"
                     if terminal
-                    else "SYNTHESIS_REQUIRED"
-                    if synthesis
-                    else "INVALID_SELECTOR"
-                    if selector_contract == "INVALID"
-                    else status
+                    else (
+                        "SYNTHESIS_REQUIRED"
+                        if synthesis
+                        else "INVALID_SELECTOR" if selector_blocked else status
+                    )
                 ),
             },
             "answer": next(iter(groups.values()))["value"] if terminal else None,

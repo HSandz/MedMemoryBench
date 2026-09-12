@@ -2,5 +2,6 @@
 
 from .agent import SmartMem0Agent
 from .contracts import MemoryWriteContext, QueryFrame
+from .question_input import QuestionInput
 
-__all__ = ["MemoryWriteContext", "QueryFrame", "SmartMem0Agent"]
+__all__ = ["MemoryWriteContext", "QueryFrame", "QuestionInput", "SmartMem0Agent"]

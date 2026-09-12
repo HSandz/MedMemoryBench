@@ -3,64 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
-STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
-        "for",
-        "from",
-        "has",
-        "have",
-        "he",
-        "her",
-        "his",
-        "how",
-        "in",
-        "is",
-        "it",
-        "of",
-        "on",
-        "or",
-        "she",
-        "the",
-        "their",
-        "to",
-        "was",
-        "were",
-        "what",
-        "when",
-        "which",
-        "who",
-        "with",
-        "about",
-        "does",
-        "did",
-        "do",
-        "that",
-        "this",
-        "these",
-        "those",
-        "my",
-        "me",
-        "i",
-        "you",
-        "your",
-        "please",
-        "can",
-        "would",
-        "could",
-        "tell",
-        "said",
-        "say",
-        "mentioned",
-    }
-)
+STOPWORDS = frozenset()
 
 VALID_KINDS = {"FACT", "EVENT", "STATE"}
 
@@ -81,47 +24,12 @@ VALID_MEMORY_TIERS = {"HOT", "COLD"}
 
 # Bump this whenever capture, normalization, identity, or consolidation changes
 # can alter the durable ledger. It is included in the snapshot fingerprint.
-MEMORY_WRITE_SCHEMA_VERSION = 10
+MEMORY_WRITE_SCHEMA_VERSION = 11
 
-# These are topical labels, not versionable attributes. If a capture model emits
-# one without an object owner, treating every later symptom/emotion as a new
-# version of the same state makes unrelated claims supersede one another.
-GENERIC_STATE_KEYS = frozenset(
-    {
-        "state",
-        "status",
-        "symptom",
-        "symptoms",
-        "condition",
-        "clinical",
-        "clinical_profile",
-        "emotional",
-        "emotion",
-        "general",
-        "current",
-        "recent",
-        "update",
-        "issue",
-        "problem",
-    }
-)
+# Missing structural identifiers, not domain vocabulary.
+GENERIC_STATE_KEYS = frozenset({"", "unknown"})
 
-# Values sometimes emitted in object_anchor are really the subject or a broad
-# body-level scope. They do not identify an owned object and must not rescue a
-# generic state key into versioned state tracking.
-GENERIC_OBJECT_ANCHORS = frozenset(
-    {
-        "patient",
-        "user",
-        "person",
-        "doctor",
-        "physician",
-        "clinician",
-        "body",
-        "general",
-        "health",
-    }
-)
+GENERIC_OBJECT_ANCHORS = frozenset({"", "unknown"})
 
 # Only these kinds participate in versioned state-head resolution. FACT and
 # EVENT nodes may mention a state-like topic without being state versions.
@@ -187,22 +95,7 @@ VALID_REASONING_TYPES = {
 
 # Scope aliases are deliberately small and domain-agnostic. They normalize
 # grammatical variants only; entity ownership remains in object_anchor.
-SCOPE_ALIASES = {
-    "drugs": "medication",
-    "drug": "medication",
-    "medications": "medication",
-    "medicines": "medication",
-    "medicine": "medication",
-    "symptoms": "symptom",
-    "tests": "test",
-    "labs": "lab",
-    "laboratory": "lab",
-    "vitals": "vital",
-    "vital_signs": "vital",
-    "treatments": "treatment",
-    "preferences": "preference",
-    "plans": "plan",
-}
+SCOPE_ALIASES = {}
 
 VALID_EVIDENCE_ROLES = {
     "ANSWER",
@@ -251,21 +144,6 @@ VALID_TEMPORAL_RELATIONS = {
     "BETWEEN",
 }
 
-CLINICAL_SCOPES = frozenset(
-    {
-        "allergy",
-        "diagnosis",
-        "lab",
-        "medication",
-        "procedure",
-        "surgery",
-        "symptom",
-        "test",
-        "treatment",
-        "vital",
-    }
-)
-
 # Planner chooses a coarse workload class; the executor owns the exact limits.
 # MEDIUM permits four one-step gap operations so a four-option query cannot be
 # silently truncated after evaluating only two options. Multi-step temporal or
@@ -299,35 +177,7 @@ MONTH_NUMBERS = {
     "december": 12,
 }
 
-STATE_KEY_NOISE = frozenset(
-    {
-        "patient",
-        "doctor",
-        "clinician",
-        "physician",
-        "assistant",
-        "user",
-        "person",
-        "current",
-        "currently",
-        "recent",
-        "recently",
-        "latest",
-        "present",
-        "ongoing",
-        "status",
-        "state",
-        "update",
-        "updated",
-        "information",
-        "details",
-        "reported",
-        "assessment",
-        "experience",
-        "pattern",
-        "trajectory",
-    }
-)
+STATE_KEY_NOISE = frozenset()
 
 
 @dataclass(frozen=True)

@@ -7,10 +7,11 @@ from copy import deepcopy
 from utils.llm_client import format_messages
 from .read_advisory import AdvisoryReadMixin
 from .read_evidence_certificate import EvidenceCertificateMixin
+from .question_input import QuestionInput, StructuredQuestion
 
 
 class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
-    QUESTION_READ_VERSION = "question-authoritative-advisory-v4"
+    QUESTION_READ_VERSION = "general-domain-advisory-v5"
 
     def _ad_context_selection(self, world, certificate, acquisition):
         by_id = {m["id"]: m for m in world}
@@ -45,17 +46,61 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
             for operation in acquisition.get("retrieval_trace", [])
             if operation["operation"] in {"ADVISORY_HINT", "ATOMIC_HYPOTHESIS"}
         ]
-        ordered = unique[:limit]
-        # Small explicit reservations: hints cannot be starved by a full raw top-8.
-        fill = self._ad_round_robin(
-            [rails[1][:1], rails[2][:1], *hint_groups, *option_groups, rails[0][:2]],
-            limit,
-        )
-        seen = {m["id"] for m in ordered}
-        for memory in fill + certified + world:
-            if memory["id"] not in seen and len(ordered) < limit:
+        ordered, seen, propositions = [], set(), set()
+
+        def add(memory):
+            proposition = tuple(
+                str(memory.get(k) or "").strip().casefold()
+                for k in (
+                    "owner_id",
+                    "subject_id",
+                    "subject",
+                    "scope",
+                    "state_key",
+                    "object_anchor",
+                    "value",
+                    "verbatim_value",
+                    "claim",
+                    "stance",
+                    "event_time",
+                    "document_time",
+                    "assertion_mode",
+                )
+            )
+            if (
+                len(ordered) < limit
+                and memory["id"] not in seen
+                and proposition not in propositions
+            ):
                 ordered.append(memory)
                 seen.add(memory["id"])
+                propositions.add(proposition)
+
+        for memory in unique:
+            add(memory)
+        if certificate["terminal"]["closed"]:
+            return ordered
+        if "CAUSES" in acquisition.get("relation_hints", []):
+            for relation in self._relations:
+                source, target = relation.get("source_id"), relation.get("target_id")
+                if (
+                    source in by_id
+                    and target in by_id
+                    and self._valid_causal_relation(relation, by_id)
+                ):
+                    if len(ordered) + len({source, target} - seen) <= limit:
+                        add(by_id[source])
+                        add(by_id[target])
+        # Each reservation has a distinct acquisition role. No trailing world fill.
+        # Candidate absence does not imply falsity; final synthesis evaluates relevance.
+        for group in [*hint_groups, *option_groups, *[rail[:1] for rail in rails]]:
+            for memory in group:
+                before = len(ordered)
+                add(memory)
+                if len(ordered) > before:
+                    break
+        if not ordered and world:
+            add(world[0])  # Best available candidate, explicitly uncertified.
         return ordered
 
     def _ad_structured_context(
@@ -133,7 +178,10 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
         started = time.perf_counter()
         # Preserve the caller's actual question, including requested answer format.
         # Legacy benchmark-specific unwrapping is not an acquisition authority.
-        question = str(question or "").strip()
+        if isinstance(question, QuestionInput):
+            question = question.render()
+        elif not isinstance(question, StructuredQuestion):
+            question = str(question or "").strip()
         base, acquisition = self._ad_base_world(question)
         advisory, usage, error = self._ad_advise(question, base)
         world, expansion = self._ad_expand(question, base, advisory)
@@ -145,7 +193,9 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
         assert base_ids <= world_ids, "Advisor evicted question-owned evidence"
         assert len(world) <= self.CANDIDATE_WORLD_LIMIT
         selected = self._ad_context_selection(
-            world, certificate, {**acquisition, **expansion}
+            world,
+            certificate,
+            {**acquisition, **expansion, "relation_hints": advisory["relation_hints"]},
         )
         final_ids = {m["id"] for m in selected}
         assert final_ids <= world_ids, "Context introduced an unacquired memory"
@@ -162,7 +212,7 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
             "Never substitute a missing temporal axis. Consider conflicting evidence explicitly. "
             "Use all relevant premises for synthesis, comparison or decisions. You may connect grounded "
             "premises using general knowledge, but label such reasoning as inference, not remembered history. "
-            "Do not invent participant facts. State an evidence gap only when the supplied facts cannot "
+            "Do not invent stored entity-specific facts. State an evidence gap only when the supplied facts cannot "
             "support the requested conclusion. Follow the requested language and output format."
         )
         if self._question_options(question):
@@ -172,7 +222,7 @@ class QuestionReadRuntimeMixin(AdvisoryReadMixin, EvidenceCertificateMixin):
             instruction += (
                 " For each option internally separate supporting facts, contradicting facts, "
                 "and missing information before applying the question predicate. Unknown is "
-                "not automatically false or contraindicated. Check all supplied evidence, "
+                "not automatically false. Check all supplied evidence, "
                 "not only the retrieval associations listed for that option."
             )
         messages = format_messages(

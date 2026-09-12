@@ -10,8 +10,7 @@ model:
   max_completion_tokens: 8192
 
 agent_params:
-  subject_aliases:
-    patient: "primary_user"
+  subject_aliases: {}  # Only caller-supplied owner aliases; no built-in ontology.
 
   # Bounded, architecture-level retrieval limits. They are not benchmark routes.
   retrieve_num: 8
@@ -29,24 +28,22 @@ agent_params:
   max_new_memories: 12
 
   # READ architecture ------------------------------------------------------
-  # LLM #1 is a question-only semantic parser. It receives no retrieved memory.
-  # It may emit only projection, minimal participant-memory requirements,
-  # optional selectors, and genuine semantic relations.
+  # LLM #1 sees the original question and question-owned BaseWorld evidence.
+  # It advises projection, optional selector and bounded additive evidence hints.
   #
   # Runtime code owns:
   # - raw BM25/dense recall
   # - durable-address resolution
   # - selector execution
   # - fusion / candidate budgets
-  # - structural coverage and bounded zero-hit recovery
+  # - bounded structural zero-hit recovery
   # - one-shot, post-retrieval, non-destructive proof
   # - context retention and terminal certification
   #
-  # Proof is an architecture invariant rather than a tuning switch: it cannot
-  # trigger acquisition, downgrade structural FOUND/EMPTY, or prune CandidateWorld.
+  # Certificate is read-only: it cannot retrieve or prune CandidateWorld.
   #
   # The only optional second retrieval pass is deterministic structural recovery,
-  # and it is eligible only when a required evidence lane has zero viable support.
+  # and it is eligible only when CandidateWorld is empty.
   enable_zero_result_recovery: true
 
 embedding:

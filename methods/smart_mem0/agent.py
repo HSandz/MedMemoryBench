@@ -4,12 +4,10 @@ from methods.base import BaseAgent
 from .capture import CaptureMixin
 from .consolidation import ConsolidationMixin
 from .core import CoreMemoryMixin
-from .execution import ExecutionMixin
 from .query import QueryMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
 from .read_question_runtime import QuestionReadRuntimeMixin
-from .read_runtime_support import ReadRuntimeSupportMixin
-from .retrieval import RetrievalOperationsMixin
+from .read_structural_resolution import ReadStructuralResolutionMixin
 from .write import WriteLifecycleMixin
 
 
@@ -17,9 +15,7 @@ class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
     QuestionReadRuntimeMixin,
     QueryMixin,
-    ExecutionMixin,
-    RetrievalOperationsMixin,
-    ReadRuntimeSupportMixin,
+    ReadStructuralResolutionMixin,
     WriteLifecycleMixin,
     ConsolidationMixin,
     CaptureMixin,

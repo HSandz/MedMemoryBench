@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from utils.llm_client import create_llm_client
 
+from .lexical import lexical_tokens, identifier, normalized_text, candidate_structure
 from .canonicalization import (
     StateSpine,
     canonicalize_state,
@@ -451,92 +452,20 @@ class CoreMemoryMixin:
         return windows
 
     @staticmethod
-    def _tokenize(text: str) -> List[str]:
-        raw = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_.%+-]*", str(text or "").lower())
-        output = []
-        for token in raw:
-            if token in STOPWORDS or len(token) <= 1:
-                continue
-            terms = [token]
-            if "-" in token or "_" in token:
-                terms.extend(
-                    part
-                    for part in re.split(r"[-_]", token)
-                    if len(part) > 1 and part not in STOPWORDS
-                )
-            for term in terms:
-                output.append(term)
-                if not term.isalpha() or len(term) <= 4:
-                    continue
-                if term.endswith("ing") and len(term) > 6:
-                    output.append(term[:-3])
-                elif term.endswith("ied") and len(term) > 5:
-                    output.append(term[:-3] + "y")
-                elif term.endswith("ed") and len(term) > 5:
-                    output.append(term[:-2])
-                elif term.endswith("ies") and len(term) > 5:
-                    output.append(term[:-3] + "y")
-                elif term.endswith("s") and term not in {"diabetes", "status"}:
-                    output.append(term[:-1])
-        return output
+    def _tokenize(text):
+        return lexical_tokens(text)
 
     @staticmethod
-    def _canonical_state_key(value: str) -> str:
-        """Remove volatile wording while preserving the domain attribute."""
-        parts = re.findall(r"[a-z0-9]+", str(value or "").lower())
-        aliases = {
-            "waking": "morning",
-            "wake": "morning",
-            "wakeup": "morning",
-        }
-        parts = [aliases.get(part, part) for part in parts]
-        parts = [
-            part
-            for part in parts
-            if part not in STATE_KEY_NOISE
-            and part not in STOPWORDS
-            and not part.isdigit()
-        ]
-        if "glucose" in parts:
-            parts = [part for part in parts if part != "blood"]
-        tail_noise = {
-            "level",
-            "levels",
-            "value",
-            "values",
-            "reading",
-            "readings",
-            "result",
-        }
-        while len(parts) > 1 and parts[-1] in tail_noise:
-            parts.pop()
-        normalized = []
-        for part in parts:
-            if (
-                part.endswith("s")
-                and len(part) > 4
-                and not part.endswith(("ss", "us", "is", "ness"))
-                and part not in {"diabetes", "status"}
-            ):
-                part = part[:-1]
-            if not normalized or normalized[-1] != part:
-                normalized.append(part)
-        return "_".join(normalized[:6])
+    def _canonical_state_key(value):
+        return identifier(value)
 
     @staticmethod
-    def _canonical_identifier(value: Any, default: str = "") -> str:
-        parts = re.findall(r"[a-z0-9]+", str(value or "").lower())
-        return "_".join(parts[:8]) or default
+    def _canonical_identifier(value, default=""):
+        return identifier(value) or default
 
     @staticmethod
-    def _canonical_scope(value: Any) -> str:
-        """Keep scope semantic; entity-specific ownership belongs in anchor."""
-        raw = str(value or "").strip().lower()
-        # Accept legacy ``scope:entity`` data without allowing the entity to
-        # silently become part of state identity.
-        raw = re.split(r"[:|/]", raw, maxsplit=1)[0]
-        scope = CoreMemoryMixin._canonical_identifier(raw, "general")
-        return SCOPE_ALIASES.get(scope, scope)
+    def _canonical_scope(value):
+        return normalized_text(value)
 
     @staticmethod
     def _memory_value(memory: Dict[str, Any]) -> str:
@@ -636,37 +565,17 @@ class CoreMemoryMixin:
         return ""
 
     @staticmethod
-    def _question_stem(question: str) -> str:
-        """Exclude answer choices before deriving retrieval constraints."""
-        text = str(question or "")
-        text = re.split(
-            r"(?im)\n\s*(?:answer\s+choices?|options?|choices?)\s*:\s*",
-            text,
-            maxsplit=1,
-        )[0]
-        return re.split(
-            r"(?im)\n\s*(?:\(?[a-h]\)|[a-h][.)])\s+",
-            text,
-            maxsplit=1,
-        )[0]
+    def _question_stem(question):
+        if hasattr(question, "candidates"):
+            return question.stem
+        _, start = candidate_structure(question)
+        return str(question or "")[:start].strip() if start is not None else str(question or "").strip()
 
     @staticmethod
-    def _question_options(question: str) -> Dict[str, str]:
-        """Parse visibly enumerated answer options without inferring query intent."""
-        matches = list(
-            re.finditer(
-                r"(?im)(?:^|\n)\s*(?:\(([a-h])\)|([a-h])[.)])\s+",
-                str(question or ""),
-            )
-        )
-        options: Dict[str, str] = {}
-        for index, match in enumerate(matches):
-            label = str(match.group(1) or match.group(2) or "").upper()
-            end = matches[index + 1].start() if index + 1 < len(matches) else None
-            value = str(question or "")[match.end() : end].strip()
-            if label and value:
-                options[label] = value
-        return options
+    def _question_options(question):
+        if hasattr(question, "candidates"):
+            return dict(question.candidates)
+        return candidate_structure(question)[0]
 
     @staticmethod
     def _gate_skip_surface(question: str) -> str:
@@ -730,33 +639,8 @@ class CoreMemoryMixin:
         )
 
     @staticmethod
-    def _unwrap_question(question: str) -> str:
-        text = str(question or "").strip()
-        match = re.search(
-            r"(?is)\bquestion\s*:\s*(.+?)(?=\n\s*(?:\[answer requirements?\]|"
-            r"answer format(?:\s*\(critical\))?|answer\s*:|$))",
-            text,
-        )
-        if match:
-            return match.group(1).strip()
-        body = re.split(
-            r"(?is)\n\s*(?:\[answer requirements?\]|answer format(?:\s*\(critical\))?|"
-            r"format requirements|critical instructions|answer\s*:)",
-            text,
-            maxsplit=1,
-        )[0]
-        marker = re.search(r"(?is)answer the following question\s*:\s*", body)
-        body = body[marker.end() :].strip() if marker else body
-
-        # Remove MedMemoryBench MCD wrapper prefix
-        mcd_marker = re.search(
-            r"(?is)based on the relevant information from the memory store, carefully review.*?multiple visits:\s*",
-            body,
-        )
-        if mcd_marker:
-            body = body[mcd_marker.end() :].strip()
-
-        return body
+    def _unwrap_question(question):
+        return str(question or "").strip()
 
     @staticmethod
     def _normalise_memory(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -977,25 +861,8 @@ class CoreMemoryMixin:
         return staged, mapping
 
     def _memory_text(self, memory: Dict[str, Any]) -> str:
-        # Index answer-bearing content and discriminative anchors. High-frequency
-        # bookkeeping fields such as patient/AFFIRM/STATE/source speaker create
-        # artificial BM25 and dense overlap and are enforced separately by the
-        # query frame and typed-slot validators.
-        role_entities = {
-            "assistant",
-            "clinician",
-            "doctor",
-            "human",
-            "patient",
-            "person",
-            "physician",
-            "user",
-        }
-        entities = [
-            str(entity)
-            for entity in memory.get("entities", [])
-            if str(entity).strip().lower() not in role_entities
-        ]
+        # Entity vocabulary is data; no domain or profession is a stopword.
+        entities = [str(entity) for entity in memory.get("entities", [])]
         return " ".join(
             filter(
                 None,
@@ -1035,7 +902,7 @@ class CoreMemoryMixin:
             m_id = memory["id"]
             tier = memory.get("memory_tier", "COLD")
 
-            sub = str(memory.get("subject_id") or "primary_user").strip().lower()
+            sub = normalized_text(memory.get("owner_id") or memory.get("subject_id") or memory.get("subject"))
             self._subject_postings.setdefault(sub, set()).add(m_id)
 
             obj = str(memory.get("object_anchor") or "").strip().lower()
