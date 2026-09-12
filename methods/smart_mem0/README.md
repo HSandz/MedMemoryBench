@@ -1,5 +1,56 @@
 # SmartMem0 Module Map
 
+## Active READ: Question-Authoritative Advisory Runtime
+
+`read_question_runtime.py` is the sole active preparation owner, immediately after
+the two-call auditor in the facade MRO. The older RequirementGraph mixins remain
+compatibility utilities, not alternative public READ routes. Their preparation,
+controller, operation compilation and proof-driven retrieval are bypassed.
+
+1. `read_advisory.py`: raw-question BM25 and dense rails, literal surface matches,
+   and visibly enumerated proposition rails build BaseWorld **before** any LLM.
+   Reserve two lexical and two dense hits plus proposition coverage, then fill.
+   BaseWorld has at most 10 memories normally (12 for large explicit option sets).
+2. One advisor call sees the question and BaseWorld. Only projection, hypothesis,
+   exact question spans, selector and relation hints are accepted. All expansion
+   hints share a two-hint budget, at most two novel candidates each.
+3. BaseWorld is retained unconditionally; CandidateWorld is capped at 16. Only an
+   empty acquired world permits one deterministic recovery. A failed certificate
+   never initiates retrieval. Relation hints do not traverse stored edges.
+4. `read_evidence_certificate.py` inspects the frozen world once. It retains the
+   existing discriminative question-identity guard, provenance, explicit temporal
+   axis and durable current-state checks. It groups stored projections rather
+   than trusting the advisor hypothesis. It returns supported-unique,
+   supported-competing or insufficient; an unsupported hypothesis is reported
+   separately. This is memory support, **not** proof of real-world truth.
+5. A unique atomic supported projection can terminate without an answer call.
+   Options, inference, comparison and ambiguity use one synthesis call with
+   structured evidence, local evidence labels and valid stored relation topology.
+   The answer context contains at most eight memories. Hints are not facts, and
+   option associations are not precomputed support/contradiction verdicts.
+
+No WRITE schema or snapshot revision changes are introduced by this READ patch.
+Reuse existing compatible memory snapshots, but start a **new query run**: old
+prepared requests and old controller responses do not exercise this architecture.
+
+Telemetry includes base/hint/final IDs, introduction provenance, retained-base
+rate, certificate/terminal status, actual second-call use, tokens and boundary
+audits. The two-call ceiling concerns method calls, not transport retries.
+
+Validation: the new offline suite covers the real facade and hybrid index with
+a deterministic embedder, plus mocked-advisor terminal, ambiguity, provenance,
+temporal-axis, multilingual rendering, recovery and monotonicity cases. It does
+not establish benchmark accuracy, latency gains or terminal precision. The
+inherited identity matcher is conservative but lexical; language-independent
+control flow is not a claim of equal semantic recall across languages.
+
+Historical certificate tests that expect controller `proof_spec`, mid-operation
+STOP and the old retrieval fixtures are not the active READ contract. At the
+pre-patch HEAD, 19 tests in `test_smart_mem0_read_certificates.py` already failed;
+the old full-query fixture must also be migrated for the new preparation owner.
+The replacement end-to-end call-budget and restored-terminal cases are in
+`tests/test_smart_mem0_question_runtime.py`.
+
 ## Lean Migration: Capture Retention
 
 Write schema 10 retains every provenance-valid captured atom in the HOT semantic

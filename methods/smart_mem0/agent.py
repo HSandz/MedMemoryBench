@@ -27,6 +27,7 @@ from .read_requirement_projection_runtime import ReadRequirementProjectionRuntim
 from .read_requirement_resolution_runtime import ReadRequirementResolutionRuntimeMixin
 from .read_reasoning_bridge import ReadReasoningBridgeMixin
 from .read_query_orchestrator import ReadQueryOrchestratorMixin
+from .read_question_runtime import QuestionReadRuntimeMixin
 from .read_query_memory_alignment import ReadQueryMemoryAlignmentMixin
 from .read_evidence_policy import ReadEvidencePolicyMixin
 from .read_evidence_precision import ReadEvidencePrecisionMixin
@@ -46,6 +47,7 @@ from .write import WriteLifecycleMixin
 
 class SmartMem0Agent(
     ReadQueryOrchestratorMixin,
+    QuestionReadRuntimeMixin,
     ReadStableSemanticRuntimeMixin,
     ReadRequirementIdentityRuntimeMixin,
     ReadRequirementResolutionRuntimeMixin,

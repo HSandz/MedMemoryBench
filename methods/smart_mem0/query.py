@@ -959,6 +959,8 @@ class QueryMixin:
         # Query evaluation must be reproducible; write-time creativity is
         # configured separately and is already frozen in the memory snapshot.
         extra["answer_llm_called"] = True
+        if "second_call" in extra:
+            extra["second_call"]["called"] = True
         response = self._llm_client.chat(
             prepared["messages"], temperature=0.0, max_tokens=1024
         )
@@ -1012,6 +1014,8 @@ class QueryMixin:
         tokens["answer"] = answer_tokens
         tokens["total"] = QueryMixin._total_query_tokens(tokens)
         response.extra["answer_llm_called"] = bool(answer_tokens) or not response.extra.get("precomputed_answer_present")
+        if "second_call" in response.extra:
+            response.extra["second_call"]["called"] = response.extra["answer_llm_called"]
         response.extra["direct_generation_violation"] = bool(
             response.extra.get("precomputed_answer_present") and answer_tokens
         )
