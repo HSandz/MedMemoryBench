@@ -2,54 +2,80 @@
 
 ## Constitution: General-Domain First
 
-Architectural decisions must be domain-neutral, benchmark-neutral and language-neutral
-at the control level. Domain aliases, English stemming and benchmark wrappers may not
-authorize eligibility, terminal output, state merging or context expansion.
+Architectural decisions are domain-neutral, benchmark-neutral and language-neutral at
+the control level. The READ core has no MedMemoryBench, LoCoMo, multiple-choice,
+medical, or language-specific route. Visible alternatives and numbered lists remain
+ordinary question text. Hard caller metadata is explicit and separate from natural
+language.
 
 ## Durable Records
 
 MemoryAtom contains a stored assertion, owner, predicate, object, value, stance,
 modality, temporal axes and linked EvidenceRecords. Source speaker is not fact owner.
-StateIdentity is the normalized tuple (owner, scope, predicate, object). Values,
-scope_entities and times are not identity. Missing owner/predicate produces no state
-identity; the shared resolver does not fabricate patient or primary_user ownership.
-Namespaces and predicate suffixes are preserved rather than guessed equivalent.
+StateIdentity is the normalized tuple (owner, scope, predicate, object). Missing
+identity fields remain unknown. Typed relations remain ledger data. CAUSES requires
+valid stored endpoints/provenance; time order alone is not causality.
 
-Typed relations remain in the ledger. SUPPORT/RELATED never prove answers or expand
-READ. SUPERSEDE/REFINE/CONFLICT retain state semantics. CAUSES requires endpoint and
-relation evidence; time order alone is not causality.
+## READ Semantic Boundary
 
-## Query Contracts
+The first LLM call is a grounded ANSWER-or-SEARCH controller. It receives the original
+question plus BaseWorld memories and valid stored relations.
 
-QuestionInput has text, optional candidates, optional explicit owner_id and optional
-selector_required. Raw strings use structural enumeration only, without language cue
-lists. Projection is ENTITY, VALUE, DATE, TEXT or OPTION_SET. DATE is retained for
-compatibility, not renamed to imply duration support that does not exist.
+It owns semantic interpretation: paraphrases, reference resolution, comparison,
+ordinary logical composition and the judgment of whether the displayed evidence is
+sufficient. It may either:
 
-Advisor output is a proposal, not a certificate. Exact stored predicate binding is
-required for terminal support; lexical rarity only measures relevance. Unknown
-paraphrases must go to synthesis. Multiple focus spans do not veto an atomic answer.
-The certificate is not a general semantic theorem prover: exact predicates and
-structured selectors cannot guarantee interpretation of every free-text qualifier.
+- return ANSWER with the final response and exact support receipts; or
+- return SEARCH with at most four concise probes for missing evidence.
 
-Selectors respect event_time, document_time, origin_document_time or explicitly
-requested effective_event_time. No implicit axis substitution. An invalid selector
-preserves eligible evidence but blocks terminal when required or unspecified. Caller
-selector_required=False ignores the selector; True requires a valid resolved selector.
+The controller may not control physical retrieval, budgets, candidate eligibility,
+stored relations, provenance, or memory mutation. SEARCH probes are additive retrieval
+hints only.
 
-## Boundaries
+Code does not attempt natural-language entailment with regexes, token overlap,
+frequency, synonym tables, embedding thresholds, or benchmark-specific rules.
+Lexical/dense scores are retrieval signals, never truth conditions.
 
-BaseWorld is a subset of CandidateWorld, whose size is at most 16. Certificate is
-read-only and never retrieves. Final context IDs are a subset of CandidateWorld.
-Evidence is opened only through selected memories' pointers. Context reserves supports,
-competitors, hint premises, option associations and requested stored causal endpoints;
-there is no unconditional fill-to-eight tail. Associations are not verdicts.
+## Grounding Integrity
 
-One advisor call is mandatory; the answer call is conditional. No repair/planner/gate
-calls are allowed between them. Counts and token usage record the actual lifecycle.
+There is no active semantic EvidenceCertificate in READ. Early stopping is permitted
+only when the controller returns ANSWER and GroundingGuard mechanically validates:
 
-## Scope of This Revision
+- every cited memory id was in BaseWorld;
+- every cited quote is an exact displayed memory span;
+- every cited memory has linked stored provenance; and
+- any caller-supplied hard owner constraint is respected.
 
-Capture/consolidation and their historical prompt are frozen. Shared normalization
-changes require schema 11. Full WRITE language/owner generalization remains explicit
-follow-up work, not a claim that old memories are already universal.
+GroundingGuard does not decide whether an answer is semantically correct. It cannot
+retrieve, rerank, prune, mutate, or infer. Failure to pass the guard means only that
+the one-call shortcut is unavailable; it is not evidence absence.
+
+## Acquisition
+
+The original question owns BaseWorld through independent lexical, dense and literal
+retrieval rails. BaseWorld is created before LLM output and is never evicted by it.
+
+If the controller returns SEARCH, code executes the bounded probes and unions novel
+results with BaseWorld. CandidateWorld is at most 16 and BaseWorld is always a subset.
+A single zero-hit recovery may rerun the original question when the world is empty.
+
+The fallback reader receives acquired evidence after only deterministic duplicate
+removal. Code does not perform semantic pruning.
+
+## LLM Call Policy
+
+There are at most two READ LLM calls:
+
+1. grounded ANSWER-or-SEARCH controller;
+2. final grounded reader only when the first call requests more evidence or its
+   grounding receipt fails mechanical validation.
+
+Any query may finish after one call, including inference or multi-premise questions,
+when BaseWorld already contains sufficient grounded evidence. The system optimizes
+precision of early ANSWER decisions before early-answer coverage.
+
+## WRITE Scope
+
+This revision changes the READ contract only. Capture/consolidation and snapshot
+semantics remain a separate concern; READ changes must not claim WRITE generalization
+that has not been implemented and evaluated.

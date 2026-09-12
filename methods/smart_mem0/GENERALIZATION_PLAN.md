@@ -2,42 +2,78 @@
 
 ## Design Target
 
-MedMemoryBench and LoCoMo are regression suites, not design oracles. Use equivalent
-invariants across personal memory, software/configuration, project state, preferences,
-travel, accounts, documents, multiple owners and multilingual records.
+SmartMem0's READ path must be domain-neutral, benchmark-neutral and language-neutral at
+the control level. MedMemoryBench, LoCoMo and other suites are regression/evaluation
+sources, not routing taxonomies.
+
+The core accepts natural-language question text plus optional hard caller metadata.
+There are no benchmark query types, multiple-choice fields, medical routes, per-language
+routers or answer-type-specific planners.
 
 ## Current READ Gate
 
-Offline tests exercise real Unicode tokenization, memory text, BM25/hybrid retrieval,
-state resolution and certificates with a deterministic embedding stub. Include English,
-Vietnamese, Japanese and Arabic predicates and values. Stubbed embeddings validate
-control/lexical behavior only, not cross-language semantic retrieval quality.
+The active query lifecycle is:
 
-Check: no rarity-as-proof; no span-count veto; no fabricated owner in shared identity;
-invalid selector preserves evidence; four hints stay bounded and additive; structured
-candidate labels survive; context has roles rather than quota fill; active READ cannot
-import legacy execution/planning; at most two method LLM calls.
+1. original-question lexical+dense+literal BaseWorld;
+2. one grounded ANSWER-or-SEARCH LLM;
+3. mechanical support-receipt validation for one-call answers;
+4. bounded additive search when evidence is missing;
+5. one grounded fallback answer call when needed.
 
-## Experiment Sequence
+The important separation is:
 
-1. Offline current READ, write lifecycle and snapshot tests.
-2. Query-only paired ablation on the same compatible frozen memory at each unit.
-3. Report answer-bearing memory existence, retrieval recall and final-context survival
-   separately from answer-model correctness, including previously correct questions.
-4. Compare total/mean/median/P90/P95/max tokens, observed calls and latency.
-5. Evaluate each supported embedding backend on same-language and cross-language
-   queries before claiming multilingual dense retrieval. Do not silently swap models.
+- lexical/dense/exact matching = retrieval/ranking;
+- LLM = semantic interpretation, paraphrase understanding and grounded reasoning;
+- code = budgets, provenance, hard metadata, relation validity and execution control.
+
+Code must never promote lexical rarity, token overlap, regexes or embedding similarity
+into semantic proof.
+
+## Evaluation Sequence
+
+1. Run offline active READ contracts.
+2. Run query-only paired ablations on the same compatible frozen memory snapshot.
+3. Measure BaseWorld and CandidateWorld answer-bearing recall separately from answer
+   correctness.
+4. Measure early-answer coverage and, more importantly, early-answer precision /
+   false-ANSWER rate.
+5. Measure false-SEARCH rate, calls/query, controller and answer token percentiles,
+   latency and CandidateWorld expansion.
+6. Repeat on multiple domains and languages. Benchmark labels may be reported as slices
+   but may not change the pipeline.
+
+## Required Regression Cases
+
+Include at least:
+
+- direct factual paraphrase;
+- temporal/state questions;
+- comparison/inference with all premises already in BaseWorld;
+- missing-premise search expansion;
+- conflicting stored evidence;
+- raw visible alternatives without a special query type;
+- vocatives/names that must not become owner constraints;
+- explicit hard owner metadata that must be enforced;
+- English, Vietnamese and non-Latin-script predicates/values.
 
 ## Separate WRITE Phase
 
-Do not combine capture/consolidation changes into this READ patch. Shared normalization
-uses schema 11 and requires new snapshot fingerprints. Next, audit owner extraction,
-recap handling, qualifier preservation and source attribution across domains; then
-revise WRITE prompts/heuristics in a separate measured commit and rebuild memories.
-Old schema memories must never be stamped compatible without migration/rebuild.
+Do not attribute READ gains or regressions to WRITE unless the snapshot changes.
+Capture/consolidation, owner extraction, qualifier retention and state identity require
+their own measured commit and snapshot generation. A query-phase experiment should
+reuse a compatible frozen snapshot whenever possible.
 
-## Legacy
+## Acceptance Rule
 
-Historical architecture tests and reports remain useful records, not the current
-specification. The active facade and direct import boundary are tested explicitly.
-No performance milestone is considered achieved merely because unit tests pass.
+Reject a patch even if benchmark accuracy rises when the improvement depends on:
+
+- benchmark labels or hidden evaluator metadata;
+- medical/domain-specific branches;
+- English-only semantic cue lists;
+- extra online LLM stages beyond the two-call ceiling;
+- LLM-proposed memory IDs that were never retrieved;
+- lexical/embedding similarity used as truth;
+- pruning question-owned BaseWorld because of controller output.
+
+Unit tests establish architecture invariants only. Benchmark accuracy and controller
+calibration must be measured separately.

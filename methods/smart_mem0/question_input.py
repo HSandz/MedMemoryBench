@@ -1,63 +1,34 @@
-"""Caller-owned query structure; no inference from language-specific wrappers."""
+"""Caller-owned query text plus optional hard metadata.
+
+The core query contract intentionally has no benchmark/query-type fields. Visible
+alternatives, numbered lists, or other presentation structures remain part of text.
+"""
 
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
 class QuestionInput:
     text: str
-    candidates: Mapping[str, str] = field(default_factory=dict)
-    owner_id: Optional[str] = None
-    selector_required: Optional[bool] = None
+    hard_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def render(self):
         if not isinstance(self.text, str):
             raise TypeError("QuestionInput.text must be a string")
-        if self.owner_id is not None and (
-            not isinstance(self.owner_id, str) or not self.owner_id.strip()
-        ):
-            raise ValueError("owner_id must be a nonempty string or None")
-        if (
-            self.selector_required is not None
-            and type(self.selector_required) is not bool
-        ):
-            raise TypeError("selector_required must be bool or None")
-        candidates = dict(self.candidates)
-        if any(
-            not isinstance(k, str)
-            or not k.strip()
-            or not isinstance(v, str)
-            or not v.strip()
-            for k, v in candidates.items()
-        ):
-            raise ValueError(
-                "Candidates require nonempty string labels and propositions"
-            )
-        return StructuredQuestion(
-            self.text, candidates, self.owner_id, self.selector_required
-        )
+        text = self.text.strip()
+        if not text:
+            raise ValueError("QuestionInput.text must be nonempty")
+        metadata = dict(self.hard_metadata or {})
+        if any(not isinstance(key, str) or not key.strip() for key in metadata):
+            raise ValueError("hard_metadata keys must be nonempty strings")
+        return StructuredQuestion(text, metadata)
 
 
 class StructuredQuestion(str):
-    """String-compatible request carrying metadata without mutable agent state."""
+    """String-compatible request carrying hard metadata outside natural language."""
 
-    def __new__(cls, text, candidates, owner_id=None, selector_required=None):
-        import json
-
-        rendered = (
-            text
-            if not candidates
-            else text + "\nCANDIDATES: " + json.dumps(candidates, ensure_ascii=False)
-        )
-        if owner_id is not None or selector_required is not None:
-            rendered += "\nREQUEST METADATA: " + json.dumps(
-                {"owner_id": owner_id, "selector_required": selector_required},
-                ensure_ascii=False,
-            )
-        obj = super().__new__(cls, rendered)
-        obj.stem = text
-        obj.candidates = dict(candidates)
-        obj.owner_id = owner_id
-        obj.selector_required = selector_required
+    def __new__(cls, text, hard_metadata=None):
+        obj = super().__new__(cls, str(text))
+        obj.hard_metadata = dict(hard_metadata or {})
         return obj

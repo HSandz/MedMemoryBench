@@ -1,6 +1,6 @@
 method_name: "smart_mem0"
 method_type: "agentic_memory"
-description: "SmartMem0: Stable Semantic Evidence-Grounded Long-Term Memory"
+description: "SmartMem0: Grounded Answer-or-Search Long-Term Memory"
 
 model:
   provider: "openai"
@@ -29,21 +29,21 @@ agent_params:
 
   # READ architecture ------------------------------------------------------
   # LLM #1 sees the original question and question-owned BaseWorld evidence.
-  # It advises projection, optional selector and bounded additive evidence hints.
+  # It either returns a grounded final ANSWER with exact support receipts or
+  # returns up to four SEARCH probes for missing evidence.
   #
   # Runtime code owns:
-  # - raw BM25/dense recall
-  # - durable-address resolution
-  # - selector execution
-  # - fusion / candidate budgets
-  # - bounded structural zero-hit recovery
-  # - one-shot, post-retrieval, non-destructive proof
-  # - context retention and terminal certification
+  # - raw lexical/dense/literal recall
+  # - retrieval execution and CandidateWorld <= 16
+  # - BaseWorld retention
+  # - provenance and hard caller metadata checks
+  # - stored relation validity
+  # - one structural zero-hit recovery
+  # - the two-call budget
   #
-  # Certificate is read-only: it cannot retrieve or prune CandidateWorld.
-  #
-  # The only optional second retrieval pass is deterministic structural recovery,
-  # and it is eligible only when CandidateWorld is empty.
+  # Code does not attempt semantic entailment. Lexical/embedding similarity is
+  # retrieval-only, never proof. A failed grounding receipt simply falls back
+  # to LLM #2 over acquired evidence.
   enable_zero_result_recovery: true
 
 embedding:

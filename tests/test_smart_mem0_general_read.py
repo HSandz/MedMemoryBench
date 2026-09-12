@@ -1,4 +1,4 @@
-"""Production-path contracts, with real lexical/hybrid logic and no external API."""
+"""Production-path contracts for the general-domain grounded READ pipeline."""
 
 import ast
 import json
@@ -16,21 +16,28 @@ from methods.smart_mem0.canonicalization import state_identity
 def agent_factory(monkeypatch):
     class Embedder:
         def encode(self, texts, **kwargs):
+            # Deterministic local embedding stub; lexical ranking remains real.
             return np.asarray([[1.0, 0.0, 0.0] for _ in texts])
 
     monkeypatch.setattr(core, "SentenceTransformer", lambda *a, **k: Embedder())
 
-    def create(records, advisory=None):
+    def create(records, controller=None):
         calls = []
+        default = {
+            "decision": "ANSWER",
+            "answer": str(records[0].get("value") or records[0].get("claim") or ""),
+            "supports": [
+                {
+                    "memory_id": records[0]["id"],
+                    "quote": str(records[0].get("value") or records[0].get("claim") or ""),
+                }
+            ],
+        } if records else {"decision": "SEARCH", "queries": []}
 
         def chat(messages, **kwargs):
             calls.append(messages)
             return SimpleNamespace(
-                content=(
-                    json.dumps(advisory or {"projection_hint": "VALUE"})
-                    if len(calls) == 1
-                    else "synthesis"
-                ),
+                content=json.dumps(controller or default) if len(calls) == 1 else "synthesis",
                 input_tokens=5,
                 output_tokens=5,
                 latency=0.0,
@@ -41,7 +48,12 @@ def agent_factory(monkeypatch):
         )
         agent = SmartMem0Agent()
         agent._memories = records
-        agent._evidence = [{"id": "ev1", "text": "source"}]
+        evidence_ids = {
+            eid
+            for record in records
+            for eid in (record.get("evidence_ids") or [])
+        }
+        agent._evidence = [{"id": eid, "text": "source"} for eid in sorted(evidence_ids)]
         return agent, calls
 
     return create
@@ -59,7 +71,7 @@ def atom(predicate, value, mid="m1", **extra):
         claim=f"{predicate}: {value}",
         value=value,
         entities=["entity-1"],
-        evidence_ids=["ev1"],
+        evidence_ids=[f"ev-{mid}"],
         stance="AFFIRM",
         assertion_mode="DIRECT",
         event_time="2024-01-15",
@@ -82,27 +94,34 @@ def atom(predicate, value, mid="m1", **extra):
         ("الخطة", "أساسية"),
     ],
 )
-def test_real_lexical_hybrid_certificate_across_domains(
+def test_real_hybrid_and_grounded_early_answer_across_domains(
     agent_factory, predicate, value
 ):
-    agent, calls = agent_factory(
-        [
-            atom(predicate, value),
-            atom("unrelated", "noise", "m2"),
-            atom("different", "other", "m3"),
-        ]
-    )
+    records = [
+        atom(predicate, value),
+        atom("unrelated", "noise", "m2"),
+        atom("different", "other", "m3"),
+    ]
+    controller = {
+        "decision": "ANSWER",
+        "answer": value,
+        "supports": [{"memory_id": "m1", "quote": value}],
+    }
+    agent, calls = agent_factory(records, controller)
     question = predicate.replace("_", " ")
     assert agent._tokenize(question)
     agent._refresh_index()
     candidates = agent._hybrid_search(question, top_k=2)
     assert candidates[0]["id"] == "m1"
     assert candidates[0]["_bm25_score"] > 0
+
     result = agent.query(question)
     assert result.output == value
     assert len(calls) == 1
+    assert result.extra["grounding_guard"]["accepted"]
     assert result.extra["final_context_ids"] == ["m1"]
-    assert not result.extra["boundary_violation"]
+    assert result.extra["base_world_retention_rate"] == 1.0
+    assert result.extra["two_stage_audit"]["valid"]
 
 
 def test_generic_identity_no_aliases_no_owner_invention():
@@ -135,88 +154,85 @@ def test_unicode_units_and_no_english_stemming():
     assert "runn" not in tokens
 
 
-def test_rare_topical_overlap_is_not_proof(agent_factory):
-    agent, _ = agent_factory([atom("latency", "20%", claim_extra="unused")])
-    agent._memories[0]["claim"] = "Production latency decreased 20%"
+def test_retrieval_overlap_never_becomes_semantic_proof(agent_factory):
+    record = atom("latency", "20%")
+    record["claim"] = "Production latency decreased 20%"
+    agent, calls = agent_factory(
+        [record],
+        {"decision": "SEARCH", "queries": ["selected production database"]},
+    )
     result = agent.query("Which database was selected for production?")
+    assert result.output == "synthesis"
+    assert len(calls) == 2
     assert not result.extra["terminal"]["closed"]
+    assert result.extra["grounding_guard_semantic_proof"] is False
 
 
-def test_focus_span_count_does_not_control_terminal(agent_factory):
-    for spans in ([], ["plan"], ["subscription", "plan"]):
-        agent, _ = agent_factory(
-            [atom("subscription_plan", "Pro")],
-            {"projection_hint": "VALUE", "focus_spans": spans},
-        )
-        assert agent.query("subscription plan").extra["terminal"]["closed"]
+def test_hard_owner_metadata_is_authoritative_but_raw_names_are_not(agent_factory):
+    records = [atom("plan", "Pro")]
+    controller = {
+        "decision": "ANSWER",
+        "answer": "Pro",
+        "supports": [{"memory_id": "m1", "quote": "Pro"}],
+    }
 
+    agent, _ = agent_factory(records, controller)
+    assert agent.query("Manager, what is the plan?").output == "Pro"
 
-@pytest.mark.parametrize(
-    "required,closed", [(None, False), (True, False), (False, True)]
-)
-def test_invalid_selector_retains_evidence(agent_factory, required, closed):
-    agent, _ = agent_factory(
-        [atom("color", "blue")],
-        {"projection_hint": "VALUE", "selector_hint": {"relation": "bogus"}},
+    agent, calls = agent_factory(records, controller)
+    result = agent.query(
+        QuestionInput("What is the plan?", hard_metadata={"owner_id": "entity-2"})
     )
-    result = agent.query(QuestionInput("color", selector_required=required))
-    assert result.extra["certificate"]["support_ids"] == ["m1"]
-    assert result.extra["terminal"]["closed"] is closed
+    assert result.output == "synthesis"
+    assert len(calls) == 2
+    assert result.extra["grounding_guard"]["failures"][0]["reason"] == "HARD_OWNER_MISMATCH"
 
 
-def test_structured_options_use_stem_and_preserve_labels_without_leak(agent_factory):
-    agent, _ = agent_factory([atom("plan", "Pro")])
-    probes = []
-    search = agent._ad_search
-
-    def traced(question, top_k=16):
-        probes.append(str(question))
-        return search(question, top_k)
-
-    agent._ad_search = traced
-    result = agent.query(QuestionInput("plan?", {"選択甲": "Pro", "β": "Free"}))
-    assert "plan?\nPro" in probes and "plan?\nFree" in probes
-    assert set(result.extra["option_candidate_ids"]) == {"選択甲", "β"}
-    assert not agent._question_options("plan?")
-    assert len(agent._question_options("plan?\n1) Pro\n2) Free")) == 2
+def test_question_input_has_no_benchmark_specific_candidate_or_selector_fields():
+    request = QuestionInput(
+        "Which statement is supported?\nA) Alpha\nB) Beta",
+        hard_metadata={"request_id": "r1"},
+    ).render()
+    assert str(request).startswith("Which statement is supported?")
+    assert request.hard_metadata == {"request_id": "r1"}
+    assert not hasattr(request, "candidates")
+    assert not hasattr(request, "selector_required")
 
 
-def test_four_premise_hints_share_bounded_world(agent_factory):
+def test_four_search_probes_share_one_bounded_candidate_world(agent_factory):
     records = [atom(f"property{i}", str(i), f"m{i}") for i in range(20)]
-    agent, _ = agent_factory(
-        records,
-        {
-            "projection_hint": "TEXT",
-            "evidence_hints": [f"property{i}" for i in range(10, 16)],
-        },
-    )
+    controller = {
+        "decision": "SEARCH",
+        "queries": [f"property{i}" for i in range(10, 14)],
+    }
+    agent, calls = agent_factory(records, controller)
     result = agent.query("Explain the combined outcome")
     extra = result.extra
-    assert len(extra["llm_semantic_hints"]) == 4
+
+    assert len(calls) == 2
+    assert len(extra["controller_search_queries"]) == 4
     assert set(extra["base_world_ids"]) <= set(extra["candidate_world_ids"])
     assert len(extra["candidate_world_ids"]) <= 16
-    assert len(extra["final_context_ids"]) <= 8
+    assert set(extra["final_context_ids"]) <= set(extra["candidate_world_ids"])
+    assert len(extra["final_context_ids"]) <= 16
 
 
-def test_context_does_not_fill_unassigned_tail(agent_factory):
-    records = [atom("other", str(i), f"m{i}") for i in range(15)]
-    agent, _ = agent_factory(records, {"projection_hint": "TEXT"})
-    result = agent.query("Explain the outcome")
-    assert len(result.extra["candidate_world_ids"]) > len(
-        result.extra["final_context_ids"]
-    )
-    assert len(result.extra["final_context_ids"]) <= 3
+def test_fallback_context_only_deduplicates_structural_duplicates(agent_factory):
+    records = [
+        atom("status", "ready", "m1"),
+        atom("status", "ready", "m2"),
+        atom("owner", "alice", "m3"),
+        atom("region", "apac", "m4"),
+    ]
+    records[1]["evidence_ids"] = records[0]["evidence_ids"]
+    controller = {"decision": "SEARCH", "queries": []}
+    agent, _ = agent_factory(records, controller)
+    result = agent.query("Summarize the evidence")
+    assert len(result.extra["candidate_world_ids"]) >= len(result.extra["final_context_ids"])
+    assert len(result.extra["final_context_ids"]) >= 3
 
 
-def test_explicit_owner_rejects_missing_owner(agent_factory):
-    agent, _ = agent_factory([atom("plan", "Pro")])
-    for key in ("owner_id", "subject_id", "subject"):
-        agent._memories[0].pop(key)
-    result = agent.query(QuestionInput("plan", owner_id="entity-2"))
-    assert result.extra["certificate"]["rejected"]["m1"] == "EXPLICIT_SUBJECT_MISMATCH"
-
-
-def test_active_read_has_no_legacy_import_or_mro():
+def test_active_read_does_not_import_semantic_certificate_or_legacy_planners():
     root = Path(core.__file__).parent
     active = [
         "agent",
@@ -224,31 +240,25 @@ def test_active_read_has_no_legacy_import_or_mro():
         "query_rendering",
         "query_answer_runtime",
         "read_advisory",
-        "read_evidence_certificate",
         "read_question_runtime",
         "read_query_orchestrator",
         "read_structural_resolution",
         "read_usage_contract",
     ]
-    allowed = set(active) | {
-        "canonicalization",
-        "contracts",
-        "core",
-        "question_input",
-        "lexical",
-        "write",
-        "capture",
-        "consolidation",
-    }
-    for name in active:
-        for node in ast.walk(ast.parse((root / f"{name}.py").read_text())):
-            if isinstance(node, ast.ImportFrom) and node.level:
-                assert (node.module or "").split(".")[0] in allowed, (name, node.module)
-    modules = {cls.__module__.split(".")[-1] for cls in SmartMem0Agent.__mro__}
-    assert not modules & {
+    forbidden_modules = {
+        "read_evidence_certificate",
         "execution",
         "retrieval",
         "planning",
         "read_controller",
         "legacy",
     }
+    for name in active:
+        tree = ast.parse((root / f"{name}.py").read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level:
+                imported = (node.module or "").split(".")[0]
+                assert imported not in forbidden_modules, (name, node.module)
+
+    modules = {cls.__module__.split(".")[-1] for cls in SmartMem0Agent.__mro__}
+    assert not modules & forbidden_modules

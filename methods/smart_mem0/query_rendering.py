@@ -1,22 +1,9 @@
-"""Domain-neutral rendering of stored facts and candidate propositions."""
+"""Domain-neutral rendering of stored evidence."""
 
 from typing import Any, Dict, Iterable, List
 
 
 class QueryRenderingMixin:
-    @staticmethod
-    def _multiple_choice_answer_instruction(option_labels: Iterable[str]) -> str:
-        labels = ", ".join(str(label) for label in option_labels)
-        return (
-            f" This is a multiple-choice question with options {labels}. "
-            "Identify the proposition requested by the stem. Evaluate EVERY candidate independently "
-            "under that same predicate, distinguishing supported, contradicted and unresolved. "
-            "Retrieval association is not a verdict. Missing evidence is not false. Preserve "
-            "polarity, quantifiers and scope. Output ONLY the original labels of candidates satisfying the stem, "
-            "separated by commas, with absolutely no prose, explanation, or other text. "
-            "If no option satisfies it, output NONE."
-        )
-
     def _format_answer_memory(self, memory: Dict[str, Any]) -> str:
         """Render evidence without exposing internal ledger identifiers."""
         status = memory.get(
@@ -64,8 +51,6 @@ class QueryRenderingMixin:
             memory = by_memory.get(memory_id)
             if not memory:
                 continue
-            # Keep evidence balanced across claims instead of letting one
-            # verbose memory consume the entire global evidence budget.
             evidence_ids = list(dict.fromkeys(memory.get("evidence_ids") or []))
             for evidence_id in evidence_ids[:per_memory_limit]:
                 if evidence_id in by_id and evidence_id not in seen:
