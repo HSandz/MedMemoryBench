@@ -261,9 +261,13 @@ class EventStateRetriever:
             details.update({
                 "query_compiler_channels": [{"channel_index": 0, "query": question, "role": "original",
                                              "structured_candidates": len(structured), "turn_candidates": len(turns)}],
+                "channel_semantic_candidates": list(structured) + list(turns),
+                "merged_semantic_union": list(structured) + list(turns),
+                "temporally_reranked_union": list(structured) + list(turns),
                 "original_query_channel": question, "coverage_merge_mode": "single_channel",
                 "anchor_resolution_status": "none", "anchor_candidate_count": 0,
                 "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
+                "resolved_anchor_source_types": [], "resolved_anchor_source_ids": [],
             })
             return structured, turns, details
         structured_channels, turn_channels, channel_details = [], [], []
@@ -283,6 +287,9 @@ class EventStateRetriever:
                                     "structured_candidates": len(structured), "turn_candidates": len(turns)})
         structured = self.merge_rank_channels(structured_channels)
         turns = self.merge_rank_channels(turn_channels) if turn_channels else []
+        channel_semantic = [item for channel in structured_channels for item in channel]
+        channel_semantic.extend(item for channel in turn_channels for item in channel)
+        merged_semantic = list(structured) + list(turns)
         anchor_spans, anchor_diagnostics = self._resolve_anchor_spans(plan, structured_channels, turn_channels)
         structured = self._rerank_query_plan_temporal(structured, plan, anchor_spans)
         turns = self._rerank_query_plan_temporal(turns, plan, anchor_spans)
@@ -292,6 +299,9 @@ class EventStateRetriever:
             "coverage_merge_mode": self.config.get("planner_merge_mode", "coverage_interleave"),
             "anchor_temporal_resolution_success": anchor_diagnostics["anchor_resolution_status"] == "resolved",
             "resolved_anchor_spans_count": len(anchor_spans),
+            "channel_semantic_candidates": channel_semantic,
+            "merged_semantic_union": merged_semantic,
+            "temporally_reranked_union": list(structured) + list(turns),
             **anchor_diagnostics,
             "temporalized_candidate_count": sum(bool(item.get("temporal_score")) for item in structured + turns),
         }
@@ -320,22 +330,55 @@ class EventStateRetriever:
                   "precision": claim.event_time_precision}]
                 if claim.event_time_start and claim.event_time_end else [])
 
+    def _anchor_candidate_spans(self, item: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Return event time only when it is attributable to anchor evidence."""
+        if item["type"] == "state_claim":
+            claim = self.store.claims.get(item["id"])
+            if claim and claim.event_time_start and claim.event_time_end:
+                return [{"start": claim.event_time_start, "end": claim.event_time_end,
+                         "precision": claim.event_time_precision, "source_type": "claim",
+                         "source_id": claim.claim_id}]
+            return []
+        if item["type"] != "turn":
+            # An episode is a container, not an assertion that all of its
+            # claims occurred at every date mentioned inside it.
+            return []
+        episode, turn = self.store.turn_for_key(item["id"])
+        if not episode or not turn:
+            return []
+        spans = []
+        for claim in self.store.claims.values():
+            if not claim.event_time_start or not claim.event_time_end:
+                continue
+            if any(ref.episode_id == episode.episode_id and turn.turn_id in ref.source_turn_ids for ref in claim.evidence):
+                spans.append({"start": claim.event_time_start, "end": claim.event_time_end,
+                              "precision": claim.event_time_precision, "source_type": "turn_claim",
+                              "source_id": f"{episode.episode_id}:{turn.turn_id}:{claim.claim_id}"})
+        return spans
+
     def _resolve_anchor_spans(self, plan: QueryPlan, structured_channels: Sequence[Sequence[Dict[str, Any]]], turn_channels: Sequence[Sequence[Dict[str, Any]]]) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
         anchor = plan.temporal.anchor_search
         if anchor is None:
             return [], {"anchor_resolution_status": "none", "anchor_candidate_count": 0,
-                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": []}
+                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
+                        "resolved_anchor_source_types": [], "resolved_anchor_source_ids": []}
         # +1 accounts for the always-on original-query channel.
-        rows = list(structured_channels[anchor + 1]) + (list(turn_channels[anchor + 1]) if anchor + 1 < len(turn_channels) else [])
+        channel_index = anchor + 1
+        if channel_index >= len(structured_channels):
+            return [], {"anchor_resolution_status": "missing_metadata", "anchor_candidate_count": 0,
+                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
+                        "resolved_anchor_source_types": [], "resolved_anchor_source_ids": []}
+        rows = list(structured_channels[channel_index]) + (list(turn_channels[channel_index]) if channel_index < len(turn_channels) else [])
         temporal_rows = []
         for item in rows:
-            for span in self._candidate_spans(item, "event"):
+            for span in self._anchor_candidate_spans(item):
                 start, end = self._span_dates(span)
                 if start and end:
                     temporal_rows.append((span, max(0.0, float(item.get("final_score", item.get("score", 0.0))))))
         if not temporal_rows:
             return [], {"anchor_resolution_status": "missing_metadata", "anchor_candidate_count": len(rows),
-                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": []}
+                        "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
+                        "resolved_anchor_source_types": [], "resolved_anchor_source_ids": []}
         # Greedily group overlapping event intervals. This intentionally does
         # not union disjoint dates merely because they were retrieved together.
         clusters: List[Dict[str, Any]] = []
@@ -353,11 +396,15 @@ class EventStateRetriever:
         clusters.sort(key=lambda cluster: (-cluster["score"], cluster["start"], cluster["end"]))
         if len(clusters) > 1 and clusters[1]["score"] >= clusters[0]["score"] * .8:
             return [], {"anchor_resolution_status": "ambiguous", "anchor_candidate_count": len(rows),
-                        "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": []}
+                        "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": [],
+                        "resolved_anchor_source_types": [], "resolved_anchor_source_ids": []}
         resolved = [{"start": clusters[0]["start"].isoformat(), "end": clusters[0]["end"].isoformat(),
                      "precision": "bounded" if clusters[0]["start"] != clusters[0]["end"] else "exact"}]
+        source_types = sorted({str(row.get("source_type", "unknown")) for row in clusters[0]["rows"]})
+        source_ids = sorted({str(row.get("source_id")) for row in clusters[0]["rows"] if row.get("source_id")})
         return resolved, {"anchor_resolution_status": "resolved", "anchor_candidate_count": len(rows),
-                          "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": resolved}
+                          "anchor_temporal_candidate_count": len(temporal_rows), "resolved_anchor_spans": resolved,
+                          "resolved_anchor_source_types": source_types, "resolved_anchor_source_ids": source_ids}
 
     def _rerank_query_plan_temporal(self, candidates: List[Dict[str, Any]], plan: QueryPlan, anchors: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
         temporal = plan.temporal
@@ -385,7 +432,9 @@ class EventStateRetriever:
                         (point - low).days / (high - low).days if temporal.relation == "latest"
                         else (high - point).days / (high - low).days
                     )
-                    item["temporal_score"] = min(1.0, float(item["temporal_score"]) * (.5 + .5 * order))
+                    # Chronology is a bounded secondary preference inside the
+                    # semantic pool: compatible spans contribute .25-.50.
+                    item["temporal_score"] = min(1.0, float(item["temporal_score"]) * (.25 + .25 * order))
         # Missing annotations are neutral. Temporal compatibility can only
         # amplify semantic relevance; it cannot manufacture it.
         weight = float(self.config.get("temporal_retrieval_weight", 1.0))

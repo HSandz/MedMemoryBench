@@ -4,10 +4,13 @@ from datetime import date
 
 import pytest
 
-from methods.event_state.planner import QueryPlan, QueryTemporal, salvage_query_compiler_output
+from methods.event_state.context import render_claim
+from methods.event_state.planner import QueryPlan, QuerySearch, QueryTemporal, salvage_query_compiler_output
 from methods.event_state.prompts import QUERY_COMPILER_SYSTEM_PROMPT
 from methods.event_state.retrieval import EventStateRetriever
+from methods.event_state.schemas import Claim, Episode, EvidenceRef, TurnEvidence
 from methods.event_state.store import EventStateStore
+from methods.event_state_agent import EventStateAgent
 
 
 class _Embedder:
@@ -79,3 +82,116 @@ def test_temporal_boost_cannot_create_relevance_from_zero_semantics():
 def test_compiler_prompt_is_memory_free_and_method_general():
     assert "no memory or other context" in QUERY_COMPILER_SYSTEM_PROMPT
     assert all(term not in QUERY_COMPILER_SYSTEM_PROMPT.casefold() for term in ("locomo", "medmemorybench", "benchmark", "gold evidence", "query_type"))
+
+
+@pytest.mark.parametrize(
+    ("raw", "relation", "start", "end", "warning"),
+    [
+        ({"axis": "event", "relation": "before", "start": None, "end": "2025-03-20", "anchor_search": None, "precision": "exact"}, "before", "2025-03-20", "2025-03-20", "before_single_boundary_canonicalized"),
+        ({"axis": "event", "relation": "before", "start": "2025-03-20", "end": None, "anchor_search": None, "precision": "exact"}, "before", "2025-03-20", "2025-03-20", "before_single_boundary_canonicalized"),
+        ({"axis": "event", "relation": "after", "start": "2025-03-20", "end": None, "anchor_search": None, "precision": "exact"}, "after", "2025-03-20", "2025-03-20", "after_single_boundary_canonicalized"),
+        ({"axis": "event", "relation": "after", "start": None, "end": "2025-03-20", "anchor_search": None, "precision": "exact"}, "after", "2025-03-20", "2025-03-20", "after_single_boundary_canonicalized"),
+        ({"axis": "event", "relation": "none", "start": "2025-03-20", "end": "2025-03-20", "anchor_search": None, "precision": "exact"}, "none", None, None, "none_fields_cleared"),
+    ],
+)
+def test_temporal_canonicalization_has_one_boundary_contract(raw, relation, start, end, warning):
+    plan, warnings, salvaged = salvage_query_compiler_output({"searches": [{"query": "event", "role": "target"}], "temporal": raw, "state_view": "current"}, 3)
+    assert salvaged and warning in warnings
+    assert plan.temporal.relation == relation
+    assert (plan.temporal.start.isoformat() if plan.temporal.start else None) == start
+    assert (plan.temporal.end.isoformat() if plan.temporal.end else None) == end
+
+
+def test_reversed_temporal_constraint_preserves_semantic_searches():
+    plan, warnings, _ = salvage_query_compiler_output({
+        "searches": [{"query": "useful semantic request", "role": "target"}],
+        "temporal": {"axis": "event", "relation": "overlap", "start": "2025-03-21", "end": "2025-03-20", "anchor_search": None, "precision": "bounded"},
+        "state_view": "current",
+    }, 3)
+    assert [search.query for search in plan.searches] == ["useful semantic request"]
+    assert plan.temporal == QueryTemporal()
+    assert "temporal_reversed_interval" in warnings
+
+
+def test_knowledge_as_of_requires_its_complete_contract():
+    valid, _, _ = salvage_query_compiler_output({
+        "searches": [],
+        "temporal": {"axis": "knowledge", "relation": "as_of", "start": None, "end": "2025-03-20", "anchor_search": None, "precision": "exact"},
+        "state_view": "as_of",
+    }, 3)
+    invalid, warnings, _ = salvage_query_compiler_output({
+        "searches": [],
+        "temporal": {"axis": "knowledge", "relation": "as_of", "start": "2025-03-19", "end": "2025-03-20", "anchor_search": None, "precision": "bounded"},
+        "state_view": "as_of",
+    }, 3)
+    assert valid.temporal.relation == "as_of"
+    assert invalid.temporal == QueryTemporal()
+    assert "temporal_invalid_as_of" in warnings
+
+
+def test_explicit_before_after_and_overlap_use_strict_canonical_bounds():
+    retriever = EventStateRetriever(EventStateStore(), _Embedder())
+    spans = lambda day: [{"start": day, "end": day, "precision": "exact"}]
+    before = QueryTemporal("event", "before", date(2025, 3, 20), date(2025, 3, 20), None, "exact")
+    after = QueryTemporal("event", "after", date(2025, 3, 20), date(2025, 3, 20), None, "exact")
+    overlap = QueryTemporal("event", "overlap", date(2025, 3, 20), date(2025, 3, 20), None, "exact")
+    assert retriever._temporal_compatibility(spans("2025-03-19"), before, [])[0] > 0
+    assert retriever._temporal_compatibility(spans("2025-03-20"), before, [])[0] == 0
+    assert retriever._temporal_compatibility(spans("2025-03-21"), after, [])[0] > 0
+    assert retriever._temporal_compatibility(spans("2025-03-20"), after, [])[0] == 0
+    assert retriever._temporal_compatibility(spans("2025-03-20"), overlap, [])[0] > 0
+
+
+def test_latest_and_earliest_order_only_semantic_candidates():
+    retriever = EventStateRetriever(EventStateStore(), _Embedder(), temporal_retrieval_weight=1.0)
+    retriever._candidate_spans = lambda item, _axis: [{"start": item["day"], "end": item["day"], "precision": "exact"}]  # type: ignore[method-assign]
+    rows = [_candidate("old", .5) | {"day": "2025-01-01"}, _candidate("new", .5) | {"day": "2025-03-01"}, _candidate("irrelevant", 0.0) | {"day": "2026-01-01"}]
+    latest = retriever._rerank_query_plan_temporal([dict(row) for row in rows], QueryPlan([], QueryTemporal("event", "latest"), "current"), [])
+    earliest = retriever._rerank_query_plan_temporal([dict(row) for row in rows], QueryPlan([], QueryTemporal("event", "earliest"), "current"), [])
+    assert latest[0]["id"] == "new"
+    assert earliest[0]["id"] == "old"
+    assert latest[-1]["id"] == "irrelevant"
+
+
+def test_event_time_is_rendered_without_lifecycle_confusion_and_valid_from_is_not_inferred():
+    claim = Claim("C", "User", "primary_user", "did", "an activity", recorded_at="2025-03-20", valid_time_text="yesterday", event_time_start="2025-03-19", event_time_end="2025-03-19", event_time_precision="exact")
+    rendered = render_claim(claim, [], {claim.claim_id: claim})
+    assert "Recorded: 2025-03-20" in rendered
+    assert "Event time: 2025-03-19" in rendered
+    assert "Event-time precision: exact" in rendered
+    assert "Source temporal wording: yesterday" in rendered
+    assert EventStateAgent._valid_from(None, "2025-03-20", "yesterday", True) is None
+
+
+def test_anchor_resolution_uses_claim_or_exact_turn_provenance_not_episode_union():
+    store = EventStateStore("ctx")
+    episode = Episode("E", "ctx", "s", 0, None, "2025-03-20", ["User"], "primary_user", "", "two events", [TurnEvidence("a", "User", "user", "event A"), TurnEvidence("b", "User", "user", "event B")])
+    store.add_episode(episode, [1.0, 0.0], [[1.0, 0.0], [1.0, 0.0]])
+    a = Claim("A", "User", "primary_user", "event", "A", evidence=[EvidenceRef("E", "s", ["a"])], event_time_start="2025-01-05", event_time_end="2025-01-05", event_time_precision="exact")
+    b = Claim("B", "User", "primary_user", "event", "B", evidence=[EvidenceRef("E", "s", ["b"])], event_time_start="2025-02-12", event_time_end="2025-02-12", event_time_precision="exact")
+    store.add_claim(a, [1.0, 0.0])
+    store.add_claim(b, [1.0, 0.0])
+    store.rebuild_temporal_indexes()
+    retriever = EventStateRetriever(store, _Embedder())
+    plan = QueryPlan([QuerySearch("A", "anchor")], QueryTemporal("event", "after", anchor_search=0), "current")
+    anchor_rows = [{"id": "A", "type": "state_claim", "final_score": 1.0}, {"id": "E", "type": "episode", "final_score": 0.9}]
+    spans, diagnostics = retriever._resolve_anchor_spans(plan, [[], anchor_rows], [])
+    assert spans[0]["start"] == "2025-01-05"
+    assert diagnostics["resolved_anchor_source_ids"] == ["A"]
+
+
+def test_incompatible_precise_anchor_spans_are_ambiguous_and_missing_metadata_is_neutral():
+    store = EventStateStore("ctx")
+    episode = Episode("E", "ctx", "s", 0, None, "2025-03-20", ["User"], "primary_user", "", "events", [])
+    store.add_episode(episode, [1.0, 0.0])
+    first = Claim("A", "User", "primary_user", "event", "first", evidence=[EvidenceRef("E", "s", [])], event_time_start="2025-01-05", event_time_end="2025-01-05", event_time_precision="exact")
+    second = Claim("B", "User", "primary_user", "event", "second", evidence=[EvidenceRef("E", "s", [])], event_time_start="2025-02-12", event_time_end="2025-02-12", event_time_precision="exact")
+    store.add_claim(first, [1.0, 0.0])
+    store.add_claim(second, [1.0, 0.0])
+    retriever = EventStateRetriever(store, _Embedder())
+    plan = QueryPlan([QuerySearch("anchor", "anchor")], QueryTemporal("event", "before", anchor_search=0), "current")
+    rows = [{"id": "A", "type": "state_claim", "final_score": 1.0}, {"id": "B", "type": "state_claim", "final_score": 1.0}]
+    spans, diagnostics = retriever._resolve_anchor_spans(plan, [[], rows], [])
+    assert spans == [] and diagnostics["anchor_resolution_status"] == "ambiguous"
+    spans, diagnostics = retriever._resolve_anchor_spans(plan, [[], [{"id": "E", "type": "episode", "final_score": 1.0}]], [])
+    assert spans == [] and diagnostics["anchor_resolution_status"] == "missing_metadata"

@@ -46,6 +46,15 @@ def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str
     relations = relation_lines(claim.claim_id, edges)
     evidence = "\n".join(f"  session {ref.source_session_id} ({ref.support_type})" for ref in claim.evidence)
     prior_states = prior_state_lines(claim, edges, claims or {})
+    event_time = []
+    if claim.event_time_start and claim.event_time_end:
+        event_time.append(
+            f"Event time: {claim.event_time_start}"
+            + (f" through {claim.event_time_end}" if claim.event_time_end != claim.event_time_start else "")
+        )
+        event_time.append(f"Event-time precision: {claim.event_time_precision}")
+    if claim.valid_time_text:
+        event_time.append(f"Source temporal wording: {claim.valid_time_text}")
     lines = [
         f"[State {claim.claim_id}]",
         f"Subject: {display_subject(claim.subject_id or claim.subject_key, claim.subject)}",
@@ -57,6 +66,7 @@ def render_claim(claim: Claim, edges: Sequence[Dict[str, Any]], claims: Dict[str
         f"Recorded: {claim.recorded_at or 'unknown'}",
         f"Valid from: {claim.valid_from or 'unknown'}",
         f"Valid to: {claim.valid_to or 'unknown'}",
+        *event_time,
         f"Claim: {claim.predicate} = {claim.value}",
         f"Qualifiers: {claim.qualifiers or 'none'}",
         "Relations:\n" + ("\n".join(f"  {item}" for item in relations) if relations else "  none"),

@@ -513,3 +513,25 @@ def test_locomo_stage_telemetry_remains_evaluator_only():
     assert quality["answer_visible_exact_turn"]["hit"] is True
     assert quality["answer_visible_gold_turn_via_direct_turn_count"] == 1
     assert quality["answer_visible_gold_turn_via_episode_excerpt_count"] == 0
+
+
+def test_compiler_stage_telemetry_uses_semantic_stage_names():
+    evaluator = LoCoMoEvaluator.__new__(LoCoMoEvaluator)
+    query = LoCoMoQuery(
+        query_id="q", question="", query_type="single_hop", expected_answers=[""],
+        evidence=["D2:4"],
+    )
+    quality = evaluator._locomo_retrieval_quality(
+        query, [],
+        {"retrieval_stage_candidates": {
+            "channel_semantic_candidates": [{"source_session_ids": ["1"]}],
+            "merged_semantic_union": [{"source_session_ids": ["2"]}],
+            "temporally_reranked_union": [{"source_session_ids": ["2"]}],
+            "final_memory_object_selection": [{"source_session_ids": ["2"]}],
+        }},
+    )
+    assert quality["channel_semantic_candidates_session"]["hit"] is False
+    assert quality["merged_semantic_union_session"]["hit"] is True
+    assert quality["temporally_reranked_union_session"]["hit"] is True
+    assert quality["final_memory_object_selection_session"]["hit"] is True
+    assert "post_candidate_count_session" not in quality

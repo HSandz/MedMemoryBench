@@ -10,7 +10,6 @@ import contextvars
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from methods.base import AgentResponse, BaseAgent, MemoryBuildResult
@@ -639,21 +638,14 @@ class EventStateAgent(BaseAgent):
 
     @staticmethod
     def _valid_from(value: Any, recorded_at: Any, valid_time_text: Any, enabled: bool) -> Any:
-        if not enabled:
-            return None
-        if value or not recorded_at:
-            return value
-        phrase = str(valid_time_text or "").casefold()
-        try:
-            base = datetime.fromisoformat(str(recorded_at).replace("Z", "+00:00"))
-            match = re.search(r"(\d+)\s+days?\s+ago", phrase)
-            if match:
-                return (base - timedelta(days=int(match.group(1)))).date().isoformat()
-            if "yesterday" in phrase:
-                return (base - timedelta(days=1)).date().isoformat()
-        except (TypeError, ValueError):
-            pass
-        return None
+        """Retain only extractor-established lifecycle bounds.
+
+        Relative occurrence wording belongs to normalized event time, not the
+        lifecycle of a state/version.  The extra arguments remain for callers
+        and old integrations, but intentionally do not infer a date.
+        """
+        del recorded_at, valid_time_text
+        return value if enabled else None
 
     def truncate_to_tokens(self, text: str, limit: int) -> str:
         return self._tokenizer.decode(self._tokenizer.encode(text)[:max(0, int(limit))])
@@ -1299,13 +1291,20 @@ class EventStateAgent(BaseAgent):
         interpretation_block = f"\n\n[Retrieval interpretation]\n{interpretation}" if interpretation else ""
         user_content = (f"{instruction}\n\n{context}{interpretation_block}\n\n{question}"
                         if context else f"{instruction}{interpretation_block}\n\n{question}")
-        pre_candidates = retrieval_extra.get("pre_candidate_truncation_candidates", [])
-        post_candidates = retrieval_extra.get("post_candidate_truncation_candidates", [])
         candidate_stages = {
-            "pre_candidate_truncation_fused": self._candidate_trace(pre_candidates, store, len(pre_candidates)),
-            "post_candidate_count": self._candidate_trace(post_candidates, store, len(post_candidates)),
-            "final_memory_object_selection": self._candidate_trace(selected, store, len(selected)),
+            key: self._candidate_trace(rows, store, len(rows))
+            for key in ("channel_semantic_candidates", "merged_semantic_union", "temporally_reranked_union")
+            if isinstance((rows := retrieval_extra.get(key)), list)
         }
+        # Legacy paths genuinely expose these truncation stages. Compiler
+        # paths instead retain their semantic-union stage names above.
+        for key, source_key in (
+            ("pre_candidate_truncation_fused", "pre_candidate_truncation_candidates"),
+            ("post_candidate_count", "post_candidate_truncation_candidates"),
+        ):
+            if isinstance((rows := retrieval_extra.get(source_key)), list):
+                candidate_stages[key] = self._candidate_trace(rows, store, len(rows))
+        candidate_stages["final_memory_object_selection"] = self._candidate_trace(selected, store, len(selected))
         base_extra = {
             key: value for key, value in retrieval_extra.items()
             if key not in {
@@ -1335,8 +1334,9 @@ class EventStateAgent(BaseAgent):
             for item in (item for record in records for item in record.get("included_provenance_evidence", []))
             for turn_id in item.get("evidence", {}).get("source_turn_ids", [])
         })
+        candidate_stage_for_sessions = candidate_stages.get("temporally_reranked_union", candidate_stages.get("post_candidate_count", []))
         candidate_episode_sessions = {
-            source_id for item in candidate_stages["post_candidate_count"]
+            source_id for item in candidate_stage_for_sessions
             if item.get("type") == "episode" for source_id in item.get("source_session_ids", [])
         }
         selected_episode_sessions = {
@@ -1348,10 +1348,20 @@ class EventStateAgent(BaseAgent):
                            if record["type"] == "state_claim" and record["id"] in store.claims]
         extra["selected_claim_status_counts"] = dict(sorted(Counter(claim.status for claim in selected_claims).items()))
         extra["selected_claim_persistence_counts"] = dict(sorted(Counter(claim.persistence for claim in selected_claims).items()))
+        selected_by_id = {item["id"]: item for item in selected}
+        extra["selected_temporal_claim_count"] = sum(
+            bool(selected_by_id[claim.claim_id].get("temporal_score", 0.0)) for claim in selected_claims
+        )
+        extra["selected_temporal_episode_count"] = sum(
+            bool(selected_by_id[record["id"]].get("temporal_score", 0.0))
+            for record in records if record["type"] == "episode" and record["id"] in selected_by_id
+        )
         if sum(extra["selected_claim_status_counts"].values()) != extra["selected_claim_count"]:
             raise AssertionError("selected claim status diagnostics must describe final evidence")
         if sum(extra["selected_claim_persistence_counts"].values()) != extra["selected_claim_count"]:
             raise AssertionError("selected claim persistence diagnostics must describe final evidence")
+        if extra["selected_temporal_claim_count"] > extra["selected_claim_count"] or extra["selected_temporal_episode_count"] > extra["selected_episode_count"]:
+            raise AssertionError("selected temporal diagnostics must describe final evidence")
         return {"messages": format_messages(user_content, answer_system), "context": context, "retrieved_count": len(records), "retrieved_memories": records, "extra": extra}
 
     def _initial_query_context(self, question: str, system_message: Optional[str], **kwargs):

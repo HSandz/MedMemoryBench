@@ -86,6 +86,14 @@ class QuerySearch:
 
 @dataclass(frozen=True)
 class QueryTemporal:
+    """Canonical query-time temporal contract.
+
+    ``start``/``end`` are the inclusive target interval, never asymmetric
+    boundary aliases.  ``none`` has no bounds or anchor; ``overlap`` has both
+    bounds; ``before``/``after`` have either both explicit bounds or an anchor
+    search; ``as_of`` is knowledge-only and stores its date in ``end``;
+    ``latest``/``earliest`` are unbounded event ordering requests.
+    """
     axis: str = "none"
     relation: str = "none"
     start: Optional[date] = None
@@ -221,6 +229,87 @@ def query_compiler_json_schema() -> Dict[str, Any]:
     }
 
 
+def canonicalize_query_temporal(
+    raw: Dict[str, Any], searches: List[QuerySearch], state_view: str,
+) -> tuple[QueryTemporal, List[str], bool]:
+    """Safely normalize compiler temporal output without semantic guessing.
+
+    This is the only boundary that accepts legacy one-sided before/after
+    bounds. Retrieval consumes the returned interval-only representation.
+    """
+    warnings: List[str] = []
+    salvaged = False
+    try:
+        axis, relation = raw.get("axis"), raw.get("relation")
+        precision = raw.get("precision")
+        if axis not in _QUERY_AXES or relation not in _QUERY_RELATIONS or precision not in _QUERY_PRECISIONS:
+            raise ValueError("enum")
+        start_raw, end_raw = raw.get("start"), raw.get("end")
+        if (start_raw is not None and not isinstance(start_raw, str)) or (end_raw is not None and not isinstance(end_raw, str)):
+            raise ValueError("date_type")
+        start = _parse_date(start_raw) if start_raw else None
+        end = _parse_date(end_raw) if end_raw else None
+        anchor = raw.get("anchor_search")
+        if anchor is not None:
+            if not isinstance(anchor, int) or isinstance(anchor, bool) or not 0 <= anchor < len(searches):
+                raise ValueError("invalid_anchor")
+            if searches[anchor].role != "anchor":
+                searches[anchor] = QuerySearch(searches[anchor].query, "anchor")
+                warnings.append("anchor_role_canonicalized")
+                salvaged = True
+
+        if start and end and start > end:
+            raise ValueError("reversed_interval")
+        if relation in {"before", "after"} and ((start is None) != (end is None)):
+            # A lone ISO date is an unambiguous legacy boundary, whichever
+            # field carried it.  Canonical retrieval always receives both.
+            boundary = start or end
+            start = end = boundary
+            warnings.append(f"{relation}_single_boundary_canonicalized")
+            salvaged = True
+        if precision == "exact" and start and end and start != end:
+            precision = "bounded"
+            warnings.append("exact_interval_canonicalized")
+            salvaged = True
+
+        if relation == "none":
+            canonical_axis = axis if axis in {"none", "event"} else "none"
+            if canonical_axis != axis:
+                warnings.append("none_axis_canonicalized")
+                salvaged = True
+            if start or end or anchor is not None:
+                warnings.append("none_fields_cleared")
+                salvaged = True
+            return QueryTemporal(canonical_axis, "none"), warnings, salvaged
+        if axis == "none":
+            raise ValueError("none_axis_relation")
+        if relation == "overlap":
+            if start is None or end is None or anchor is not None:
+                raise ValueError("invalid_overlap")
+        elif relation in {"before", "after"}:
+            if axis not in {"event", "record"}:
+                raise ValueError("ordering_axis")
+            if anchor is not None and (start is not None or end is not None):
+                raise ValueError("mixed_anchor_and_bounds")
+            if anchor is None and (start is None or end is None):
+                raise ValueError("unbound_ordering")
+        elif relation == "as_of":
+            if axis != "knowledge" or start is not None or end is None or anchor is not None or state_view != "as_of":
+                raise ValueError("invalid_as_of")
+        elif relation in {"latest", "earliest"}:
+            if axis != "event":
+                raise ValueError("ordering_axis")
+            if start is not None or end is not None or anchor is not None:
+                warnings.append("ordering_fields_cleared")
+                salvaged = True
+                start = end = anchor = None
+        if axis == "knowledge" and relation != "as_of":
+            raise ValueError("invalid_knowledge")
+        return QueryTemporal(axis, relation, start, end, anchor, precision), warnings, salvaged
+    except ValueError as exc:
+        return QueryTemporal(), warnings + [f"temporal_{exc}"], True
+
+
 def salvage_query_compiler_output(value: Any, max_searches: int) -> tuple[QueryPlan, List[str], bool]:
     """Validate independent plan components without inventing semantics.
 
@@ -278,44 +367,11 @@ def salvage_query_compiler_output(value: Any, max_searches: int) -> tuple[QueryP
         warnings.append("invalid_temporal")
         salvage_used = True
     else:
-        axis, relation = raw_temporal.get("axis"), raw_temporal.get("relation")
-        precision = raw_temporal.get("precision")
-        try:
-            if axis not in _QUERY_AXES or relation not in _QUERY_RELATIONS or precision not in _QUERY_PRECISIONS:
-                raise ValueError("enum")
-            start_raw, end_raw = raw_temporal.get("start"), raw_temporal.get("end")
-            if (start_raw is not None and not isinstance(start_raw, str)) or (end_raw is not None and not isinstance(end_raw, str)):
-                raise ValueError("date_type")
-            start = _parse_date(start_raw) if start_raw else None
-            end = _parse_date(end_raw) if end_raw else None
-            if start and end and start > end:
-                raise ValueError("reversed_interval")
-            if precision == "exact" and start and end and start != end:
-                precision = "bounded"
-                warnings.append("exact_interval_canonicalized")
-                salvage_used = True
-            anchor = raw_temporal.get("anchor_search")
-            if anchor is not None:
-                if not isinstance(anchor, int) or isinstance(anchor, bool) or not 0 <= anchor < len(searches):
-                    raise ValueError("invalid_anchor")
-                if searches[anchor].role != "anchor":
-                    searches[anchor] = QuerySearch(searches[anchor].query, "anchor")
-                    warnings.append("anchor_role_canonicalized")
-                    salvage_used = True
-            if axis == "none" and relation != "none":
-                raise ValueError("none_axis_relation")
-            if relation in {"before", "after"} and not (anchor is not None or start or end):
-                raise ValueError("unbound_ordering")
-            if relation == "overlap" and (start is None or end is None):
-                raise ValueError("incomplete_overlap")
-            if relation == "as_of" and (axis != "knowledge" or end is None or state_view != "as_of"):
-                raise ValueError("invalid_as_of")
-            if axis == "knowledge" and relation != "as_of":
-                raise ValueError("invalid_knowledge")
-            temporal = QueryTemporal(axis, relation, start, end, anchor, precision)
-        except ValueError as exc:
-            warnings.append(f"temporal_{str(exc)}")
-            salvage_used = True
+        temporal, temporal_warnings, temporal_salvaged = canonicalize_query_temporal(
+            raw_temporal, searches, state_view,
+        )
+        warnings.extend(temporal_warnings)
+        salvage_used = salvage_used or temporal_salvaged
     if state_view == "as_of" and temporal.relation != "as_of":
         state_view = "current"
         warnings.append("as_of_without_knowledge_constraint")

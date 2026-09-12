@@ -198,7 +198,9 @@ class LoCoMoEvaluator:
             "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
             "reference_time": reference_time,
             "provider": getattr(model, "provider", None), "model": getattr(model, "name", None),
-            "prompt_version": "event_state_query_compiler_v1", "schema_version": 1,
+            # v2 changes the compiler temporal contract.  Cached raw output
+            # from v1 is intentionally not assumed equivalent.
+            "prompt_version": "event_state_query_compiler_v2", "schema_version": 2,
             "max_searches": retrieval.get("query_compiler_max_searches", 3),
             "temperature": retrieval.get("planner_temperature", 0.0),
         }
@@ -265,9 +267,17 @@ class LoCoMoEvaluator:
             except (OSError, subprocess.CalledProcessError):
                 return None
         status = run("status", "--porcelain")
+        commit_sha = run("rev-parse", "HEAD")
+        branch = run("branch", "--show-current")
+        available = status is not None and commit_sha is not None
         return {
-            "git_commit_sha": run("rev-parse", "HEAD"),
-            "git_branch": run("branch", "--show-current"),
+            "commit_sha": commit_sha,
+            "branch": branch,
+            "dirty": None if status is None else bool(status),
+            "git_metadata_available": available,
+            # Legacy fields remain readable for older result consumers.
+            "git_commit_sha": commit_sha,
+            "git_branch": branch,
             "git_dirty": None if status is None else bool(status),
         }
 
@@ -1658,7 +1668,7 @@ class LoCoMoEvaluator:
                         "fingerprint": item["compiler_fingerprint"], "question_sha256": hashlib.sha256(item["raw_question"].encode("utf-8")).hexdigest(),
                         "reference_time": item["reference_time"],
                         "provider": getattr(self.method_config.model, "provider", None), "model": getattr(self.method_config.model, "name", None),
-                        "prompt_version": "event_state_query_compiler_v1", "schema_version": 1,
+                        "prompt_version": "event_state_query_compiler_v2", "schema_version": 2,
                         "max_searches": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("query_compiler_max_searches", 3),
                         "temperature": (getattr(self.method_config, "raw_config", {}) or {}).get("retrieval_config", {}).get("planner_temperature", 0.0),
                         "raw_model_output": content, "validated_plan": compiler_diagnostics.get("validated_plan"),
@@ -1946,17 +1956,17 @@ class LoCoMoEvaluator:
             route: sum(route in visible_routes.get(turn_id, set()) for turn_id in gold_turn_ids)
             for route in ("claim_provenance", "episode_excerpt", "direct_immutable_turn")
         }
-        return {
+        compiler_stage_names = (
+            "channel_semantic_candidates", "merged_semantic_union",
+            "temporally_reranked_union", "final_memory_object_selection",
+        )
+        compiler_stages = {
+            name: candidate_quality(name, stage_candidates[name])
+            for name in compiler_stage_names if name in stage_candidates
+        }
+        result = {
             "gold_evidence_turn_ids": gold_turn_ids,
             "gold_evidence_session_ids": list(dict.fromkeys(gold_session_ids)),
-            "pre_candidate_truncation_fused_session": candidate_quality(
-                "pre_candidate_truncation_fused",
-                stage_candidates.get("pre_candidate_truncation_fused"),
-            ),
-            "post_candidate_count_session": candidate_quality(
-                "post_candidate_count",
-                stage_candidates.get("post_candidate_count"),
-            ),
             "selected_memory_session": session_quality,
             "selected_episode_archive_exact_turn": archive_quality,
             "answer_visible_exact_turn": self._turn_quality(gold_turn_ids, visible_turn_ids),
@@ -1970,6 +1980,13 @@ class LoCoMoEvaluator:
             "answer_visible_gold_turn_via_episode_excerpt_count": route_counts["episode_excerpt"],
             "answer_visible_gold_turn_via_direct_turn_count": route_counts["direct_immutable_turn"],
         }
+        # Do not claim compiler stages are legacy truncation stages. Retain
+        # old labels only when the method actually supplied those traces.
+        for key in ("pre_candidate_truncation_fused", "post_candidate_count"):
+            if key in stage_candidates:
+                result[f"{key}_session"] = candidate_quality(key, stage_candidates[key])
+        result.update({f"{key}_session": value for key, value in compiler_stages.items()})
+        return result
 
     def _score_agent_response(self, query: LoCoMoQuery, response: Any) -> MetricResult:
         if isinstance(response, dict):
@@ -2067,6 +2084,17 @@ class LoCoMoEvaluator:
             "category_coverage": self.dataset.get_category_distribution(),
             "complete": scored_queries == expected_queries,
         }
+        run_metadata = self._git_metadata()
+        reproducibility_warning = None
+        if not run_metadata["git_metadata_available"]:
+            reproducibility_warning = "Canonical benchmark run has unavailable Git metadata; commit identity and dirty state are uncertain."
+        elif run_metadata["dirty"] is True:
+            reproducibility_warning = "Canonical benchmark run uses a dirty worktree."
+        elif run_metadata["dirty"] is None:
+            reproducibility_warning = "Canonical benchmark run has unknown worktree cleanliness."
+        if reproducibility_warning:
+            self._log(reproducibility_warning, level="WARNING")
+            run_metadata["reproducibility_warning"] = reproducibility_warning
 
         report = EvaluationReport(
             method_name=self.method_config.method_name,
@@ -2107,7 +2135,7 @@ class LoCoMoEvaluator:
             metadata={
                 "prompt_protocol": self.prompt_protocol,
                 "query_type_aware_prompting": self.prompt_protocol == "type_aware",
-                "run_metadata": self._git_metadata(),
+                "run_metadata": run_metadata,
                 "dataset_coverage": {
                     "available_sample_count": self.dataset.get_available_sample_count(),
                     "evaluated_sample_count": len(self.dataset.get_sample_ids()),
@@ -2186,6 +2214,10 @@ class LoCoMoEvaluator:
         stages = {
             "pre_candidate_truncation_fused_session": "pre_candidate_truncation_fused_session",
             "post_candidate_count_session": "post_candidate_count_session",
+            "channel_semantic_candidates_session": "channel_semantic_candidates_session",
+            "merged_semantic_union_session": "merged_semantic_union_session",
+            "temporally_reranked_union_session": "temporally_reranked_union_session",
+            "final_memory_object_selection_session": "final_memory_object_selection_session",
             "selected_memory_session": "selected_memory_session",
             "selected_episode_archive_exact_turn": "selected_episode_archive_exact_turn",
             "answer_visible_exact_turn": "answer_visible_exact_turn",

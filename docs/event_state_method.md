@@ -216,6 +216,42 @@ is not itself a temporal retrieval filter. Expanded channels form a bounded
 union with per-channel relevance/support metadata rather than replacing the
 original query's semantic relevance.
 
+### Canonical query temporal contract
+
+`QueryTemporal.start` and `end` always denote the inclusive explicit target
+interval. The compiler performs semantic interpretation; local code only
+validates and canonicalizes its JSON before retrieval. `axis=none` or an
+unconstrained event lookup uses `relation=none` with null bounds and anchor.
+`event/overlap` requires both bounds (an exact date repeats the same date in
+both fields). `event/before` and `event/after` use either both explicit bounds
+or one anchor search, never both: a candidate is before when its event end is
+strictly earlier than the target start, and after when its event start is
+strictly later than the target end. Legacy one-sided before/after dates are
+locally duplicated into both canonical bounds; reversed or contradictory
+constraints are cleared while semantic searches remain usable.
+
+`knowledge/as_of` requires `state_view=as_of`, null `start`, and an `end`
+date. `event/latest` and `event/earliest` have null bounds and anchor; among
+semantically retrieved candidates with event spans they apply a bounded
+chronological preference. The joint score is
+`semantic_score * (1 + temporal_retrieval_weight * temporal_compatibility)`;
+for ordering, compatible spans contribute `precision * (0.25 + 0.25 * order)`.
+Thus temporal evidence can amplify relevance but cannot manufacture it, and
+missing event time is neutral. `recorded_at` remains record time,
+`event_time_start/end` describe the underlying occurrence, `valid_from/to`
+describe a state lifecycle, and `valid_time_text` preserves source wording.
+Event time is rendered beside selected claims when available. Relative dates
+are resolved by the compiler only with caller `REFERENCE_TIME` or an explicit
+absolute anchor in the visible question; otherwise no calendar interval is
+invented.
+
+Anchor resolution is provenance-scoped: a claim uses its own event span and a
+turn uses only claims citing that exact immutable turn. An episode container
+does not donate all of its claims' dates to an anchor. Compatible spans are
+confidence/precision clustered; similarly supported incompatible clusters are
+reported as ambiguous, and absent trustworthy metadata as missing_metadata.
+Both cases continue semantic retrieval with no anchor temporal boost.
+
 With the Vertex batch transport query compiler uses exactly two combined stages:
 `query-plan` for every eligible query, local plan validation/retrieval after the
 entire stage completes, then `query-final` for every final answer. No planner
@@ -227,6 +263,9 @@ question hash, authoritative reference time, compiler provider/model, prompt
 and schema versions, maximum searches, and temperature--not retrieval settings.
 Cache hits make no compiler provider call; cache entries retain raw output, the
 validated plan, parse/salvage status, and bounded warning codes.
+The current compiler cache fingerprint uses prompt version
+`event_state_query_compiler_v2` and schema version `2`; v1 entries are not
+reused because their temporal contract may have been interpreted differently.
 
 The query-only planner is disabled by default. Under `retrieval_config`, use:
 
