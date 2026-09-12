@@ -1,0 +1,43 @@
+method_name: event_state
+method_type: agentic_memory
+description: Event-State with one-shot query compiler and two-stage Vertex batching
+query_model:
+  provider: vertex
+  name: gemini-3.5-flash-lite
+  temperature: 0.0
+  max_completion_tokens: 32000
+memorize_model:
+  provider: openai
+  name: gemini/gemini-3.5-flash-lite
+  temperature: 0.0
+  max_completion_tokens: 32000
+embedding:
+  provider: local
+  model: sentence-transformers/all-MiniLM-L6-v2
+build_config:
+  event_state_semantic_version: "2.9"
+  enable_episodes: true
+  enable_state_claims: true
+  enable_state_compilation: true
+  event_time_normalization_enabled: true
+retrieval_config:
+  planner_mode: query_compiler
+  planner_rounds: 0
+  query_compiler_max_searches: 3
+  planner_temperature: 0.0
+  planner_max_tokens: 256
+  planner_merge_mode: coverage_interleave
+  temporal_retrieval_enabled: true
+  temporal_retrieval_weight: 1.0
+  retrieve_claims: true
+  retrieve_episodes: true
+  retrieve_turns: true
+  claim_top_k: 30
+  episode_top_k: 20
+  turn_top_k: 10
+  turn_lexical_retrieval_enabled: true
+  evidence_count: 12
+  turn_evidence_count: 5
+  max_source_excerpts_per_claim: 2
+  max_episode_source_excerpts_total: 4
+  ppr_enabled: false

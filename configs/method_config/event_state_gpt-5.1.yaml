@@ -30,8 +30,11 @@ build_config:
   update_min_confidence: 0.55
   store_raw_episode_text: true
   enable_bitemporal_time: true
+  event_time_normalization_enabled: true
   preserve_turn_evidence: true
 retrieval_config:
+  planner_mode: off
+  query_compiler_max_searches: 3
   planner_rounds: 0
   planner_max_requests: 3
   planner_temperature: 0.0
@@ -61,6 +64,7 @@ retrieval_config:
   ppr_mix_weight: 0.35
   selector_mode: state_mmr
   evidence_count: 8
+  turn_evidence_count: 0
   mmr_lambda: 0.7
   state_relation_bonus: 0.05
   source_diversity_bonus: 0.02

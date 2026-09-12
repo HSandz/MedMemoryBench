@@ -33,7 +33,7 @@ build_config:
   event_time_normalization_enabled: true
   preserve_turn_evidence: true
 retrieval_config:
-  planner_mode: query_compiler
+  planner_mode: off
   query_compiler_max_searches: 3
   planner_rounds: 0
   planner_max_requests: 3
@@ -43,17 +43,17 @@ retrieval_config:
   max_context_tokens: 120000
   retrieve_claims: true
   retrieve_episodes: true
-  retrieve_turns: true
+  retrieve_turns: false
   claim_top_k: 30
   episode_top_k: 20
-  turn_top_k: 10
+  turn_top_k: 8
   candidate_count: 50
   fusion_mode: rrf
   rrf_k: 60.0
   claim_retrieval_weight: 1.0
   episode_retrieval_weight: 1.0
   turn_retrieval_weight: 1.0
-  turn_lexical_retrieval_enabled: true
+  turn_lexical_retrieval_enabled: false
   temporal_retrieval_enabled: true
   temporal_retrieval_weight: 1.0
   ppr_enabled: false
@@ -68,7 +68,6 @@ retrieval_config:
   ppr_mix_weight: 0.35
   selector_mode: state_mmr
   evidence_count: 12
-  turn_evidence_count: 5
   mmr_lambda: 0.7
   state_relation_bonus: 0.05
   source_diversity_bonus: 0.02

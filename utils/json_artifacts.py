@@ -51,6 +51,13 @@ _SCORE_SUMMARY_KEYS = (
 )
 
 
+_SKIP_DEEP_ORDER_KEYS = {
+    "requests", "responses", "messages", "memory_state", "channel_semantic_candidates",
+    "retrieval_stage_candidates", "merged_semantic_union", "temporally_reranked_union",
+    "raw_config",
+}
+
+
 def score_summary(summary: Any) -> dict[str, Any]:
     """Return score headlines without retrieval, timing, or provider detail."""
     if not isinstance(summary, dict):
@@ -88,7 +95,7 @@ def order_json_artifact(value: Any) -> Any:
         return (1, 0, original_index)
 
     return {
-        key: order_json_artifact(item)
+        key: (item if key in _SKIP_DEEP_ORDER_KEYS else order_json_artifact(item))
         for _, (key, item) in sorted(enumerate(value.items()), key=sort_key)
     }
 
@@ -139,13 +146,13 @@ def dump_json_artifact(value: Any, handle: TextIO, *, indent: int = 2) -> None:
                 num_sub = len(v)
                 for j, sub_item in enumerate(v):
                     sub_comma = "," if j < num_sub - 1 else ""
-                    ordered_sub = order_json_artifact(sub_item)
+                    ordered_sub = sub_item if k in _SKIP_DEEP_ORDER_KEYS else order_json_artifact(sub_item)
                     rendered = json.dumps(ordered_sub, ensure_ascii=False, indent=indent)
                     indented = "\n".join("    " + line for line in rendered.split("\n"))
                     handle.write(f"{indented}{sub_comma}\n")
                 handle.write(f"  ]{comma}\n")
         else:
-            ordered_v = order_json_artifact(v)
+            ordered_v = v if k in _SKIP_DEEP_ORDER_KEYS else order_json_artifact(v)
             rendered = json.dumps(ordered_v, ensure_ascii=False, indent=indent)
             indented = "\n".join("  " + line if idx > 0 else line for idx, line in enumerate(rendered.split("\n")))
             handle.write(f"  {json.dumps(k, ensure_ascii=False)}: {indented}{comma}\n")

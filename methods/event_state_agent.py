@@ -1306,22 +1306,15 @@ class EventStateAgent(BaseAgent):
             "post_candidate_count": self._candidate_trace(post_candidates, store, len(post_candidates)),
             "final_memory_object_selection": self._candidate_trace(selected, store, len(selected)),
         }
-        compiler_stages = retrieval_extra.get("channel_semantic_candidates")
-        if isinstance(compiler_stages, dict):
-            candidate_stages["channel_semantic_candidates"] = {
-                key: [self._candidate_trace(channel, store, len(channel)) for channel in channels]
-                for key, channels in compiler_stages.items() if isinstance(channels, list)
-            }
-            for stage_name in ("merged_semantic_union", "temporally_reranked_union"):
-                stage = retrieval_extra.get(stage_name, {})
-                if isinstance(stage, dict):
-                    candidate_stages[stage_name] = {
-                        key: self._candidate_trace(candidates, store, len(candidates))
-                        for key, candidates in stage.items() if isinstance(candidates, list)
-                    }
         base_extra = {
             key: value for key, value in retrieval_extra.items()
-            if key not in {"pre_candidate_truncation_candidates", "post_candidate_truncation_candidates"}
+            if key not in {
+                "pre_candidate_truncation_candidates",
+                "post_candidate_truncation_candidates",
+                "channel_semantic_candidates",
+                "merged_semantic_union",
+                "temporally_reranked_union",
+            }
         }
         selected_context_tokens = sum(self.count_tokens(block["text"]) for block in blocks)
         source_turn_count = len({

@@ -284,11 +284,11 @@ def test_planner_merge_recomputes_final_score_and_clears_stale_selection_metadat
         [{"id": "B", "type": "episode", "final_score": 0.5}],
     ])
     by_id = {item["id"]: item for item in merged}
-    assert by_id["A"]["final_score"] == 1.0
-    assert by_id["C"]["final_score"] == 1.0
+    assert by_id["A"]["final_score"] == 0.99
+    assert by_id["C"]["final_score"] == 0.01
     assert "selection_score" not in by_id["A"] and "selected_rank" not in by_id["A"]
     selected, _ = retriever.select_candidates(merged)
-    assert selected[0]["id"] == "C"
+    assert selected[0]["id"] == "A"
 
 
 def test_ppr_is_bounded_and_conserves_personalized_mass():

@@ -2,13 +2,15 @@ method_name: amem
 method_type: agentic_memory
 description: A-Mem with hybrid Gemini provider final-answer generation
 query_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: vertex
+  name: gemini-3.5-flash-lite
   temperature: 0.0
   max_completion_tokens: 20000
 memorize_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: openai
+  name: gemini/gemini-3.5-flash-lite
+  temperature: 0.0
+  max_completion_tokens: 20000
 build_config:
   amem_embedding_model: BAAI/bge-small-zh-v1.5
   amem_evo_threshold: 100

@@ -2,13 +2,13 @@ method_name: lightmem
 method_type: agentic_memory
 description: LightMem using hybrid Gemini provider
 query_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: vertex
+  name: gemini-3.5-flash-lite
   temperature: 0.0
   max_completion_tokens: 20000
 memorize_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: openai
+  name: gemini/gemini-3.5-flash-lite
   temperature: 0.0
   max_completion_tokens: 20000
 embedding:

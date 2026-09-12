@@ -2,13 +2,13 @@ method_name: graph_rag
 method_type: rag
 description: Graph RAG Agent with Gemini model configuration
 query_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: openai
+  name: gemini/gemini-3.5-flash-lite
   temperature: 0.0
   max_tokens: 10000
 memorize_model:
-  provider: gemini
-  name: gemini-2.5-flash
+  provider: openai
+  name: gemini/gemini-3.5-flash-lite
   temperature: 0.0
   max_tokens: 10000
 embedding:

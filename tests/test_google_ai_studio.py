@@ -60,6 +60,9 @@ def _success(text: str = "complete"):
 
 
 def _configure_fake_vertex_accounts(monkeypatch, files, calls, operation):
+    monkeypatch.delenv("GOOGLE_AUTH_MODE", raising=False)
+    monkeypatch.delenv("GOOGLE_VERTEX_AUTH_MODE", raising=False)
+
     class Credentials:
         @staticmethod
         def from_service_account_file(path, scopes):

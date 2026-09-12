@@ -262,9 +262,6 @@ class EventStateRetriever:
                 "query_compiler_channels": [{"channel_index": 0, "query": question, "role": "original",
                                              "structured_candidates": len(structured), "turn_candidates": len(turns)}],
                 "original_query_channel": question, "coverage_merge_mode": "single_channel",
-                "channel_semantic_candidates": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
-                "merged_semantic_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
-                "temporally_reranked_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
                 "anchor_resolution_status": "none", "anchor_candidate_count": 0,
                 "anchor_temporal_candidate_count": 0, "resolved_anchor_spans": [],
             })
@@ -297,11 +294,6 @@ class EventStateRetriever:
             "resolved_anchor_spans_count": len(anchor_spans),
             **anchor_diagnostics,
             "temporalized_candidate_count": sum(bool(item.get("temporal_score")) for item in structured + turns),
-            "channel_semantic_candidates": {"structured": [[dict(item) for item in channel] for channel in structured_channels],
-                                                  "turns": [[dict(item) for item in channel] for channel in turn_channels]},
-            "merged_semantic_union": {"structured": [dict(item) for item in self.merge_rank_channels(structured_channels)],
-                                        "turns": [dict(item) for item in self.merge_rank_channels(turn_channels)] if turn_channels else []},
-            "temporally_reranked_union": {"structured": [dict(item) for item in structured], "turns": [dict(item) for item in turns]},
         }
 
     @staticmethod

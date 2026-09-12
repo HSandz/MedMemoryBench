@@ -64,7 +64,10 @@ class DenseEmbedder:
                 from contextlib import nullcontext
                 context_manager = nullcontext()
             with context_manager:
-                vectors = client.encode(list(texts), normalize_embeddings=True, batch_size=64, show_progress_bar=False)
+                try:
+                    vectors = client.encode(list(texts), normalize_embeddings=True, batch_size=64, show_progress_bar=False)
+                except TypeError:
+                    vectors = client.encode(list(texts), normalize_embeddings=True)
             return [self._normalize(vector) for vector in vectors]
         return [self._normalize(vector) for vector in client.embed_documents(list(texts))]
 

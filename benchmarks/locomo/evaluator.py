@@ -2020,7 +2020,14 @@ class LoCoMoEvaluator:
             query, retrieved_memories, response_extra if isinstance(response_extra, dict) else None,
         )
         if isinstance(result.details.get("method_retrieval"), dict):
-            result.details["method_retrieval"].pop("retrieval_stage_candidates", None)
+            mr = result.details["method_retrieval"]
+            for key in (
+                "retrieval_stage_candidates",
+                "channel_semantic_candidates",
+                "merged_semantic_union",
+                "temporally_reranked_union",
+            ):
+                mr.pop(key, None)
 
         return result
 
@@ -2363,28 +2370,133 @@ class LoCoMoEvaluator:
                 unique_paths.append(path)
         return unique_paths
 
+    @classmethod
+    def _stream_manifest_stages(cls, path: Path) -> List[Dict[str, Any]]:
+        """Extract stage lifecycle metadata from large manifests without full JSON decoding."""
+        stages: List[Dict[str, Any]] = []
+        current_stage: Optional[Dict[str, Any]] = None
+        in_jobs = False
+        in_requests = False
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    indent = len(line) - len(line.lstrip(" "))
+                    stripped = line.strip()
+
+                    if not in_jobs:
+                        if stripped == '"jobs": {':
+                            in_jobs = True
+                        continue
+
+                    if indent <= 2 and stripped.startswith("}"):
+                        break
+
+                    if indent == 4 and stripped.endswith("{"):
+                        m = re.match(r'^"([^"]+)":\s*\{', stripped)
+                        if m:
+                            current_stage = {
+                                "stage": m.group(1),
+                                "request_count": 0,
+                                "state": None,
+                                "submitted_at": None,
+                                "running_at": None,
+                                "completed_at": None,
+                            }
+                            stages.append(current_stage)
+                            in_requests = False
+                            continue
+
+                    if current_stage is None:
+                        continue
+
+                    if indent == 6 and stripped == '"requests": [':
+                        in_requests = True
+                        continue
+                    elif indent == 6 and stripped in ("]", "],"):
+                        in_requests = False
+                        continue
+
+                    if in_requests:
+                        if indent == 10 and stripped.startswith('"request_id":'):
+                            current_stage["request_count"] += 1
+                    elif indent == 6:
+                        if stripped.startswith('"request_count":'):
+                            val_m = re.search(r'"request_count":\s*(\d+)', stripped)
+                            if val_m:
+                                current_stage["request_count"] = int(val_m.group(1))
+                        for key in ("state", "submitted_at", "running_at", "completed_at"):
+                            if stripped.startswith(f'"{key}":'):
+                                val_m = re.search(rf'"{key}":\s*"([^"]*)"', stripped)
+                                if val_m:
+                                    current_stage[key] = val_m.group(1)
+        except OSError:
+            return []
+
+        for stage in stages:
+            stage["overall_latency_seconds"] = cls._batch_overall_latency_seconds(stage)
+            stage["queue_inclusive_elapsed_seconds"] = cls._batch_wall_time_seconds(stage)
+        return stages
+
+    @classmethod
+    def _extract_batch_stages_from_manifest(cls, manifest_path: Path) -> List[Dict[str, Any]]:
+        path = Path(manifest_path)
+        if not path.exists():
+            return []
+        try:
+            if path.stat().st_size <= 5 * 1024 * 1024:
+                with path.open("r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                stages = []
+                for name, stage in (manifest.get("jobs") or {}).items():
+                    if not isinstance(stage, dict):
+                        continue
+                    request_count = stage.get("request_count")
+                    if request_count is None:
+                        requests = stage.get("requests")
+                        request_count = len(requests) if isinstance(requests, list) else 0
+                    stages.append({
+                        "stage": name,
+                        "state": stage.get("state"),
+                        "request_count": request_count,
+                        "submitted_at": stage.get("submitted_at"),
+                        "running_at": stage.get("running_at"),
+                        "completed_at": stage.get("completed_at"),
+                        "overall_latency_seconds": cls._batch_overall_latency_seconds(stage),
+                        "queue_inclusive_elapsed_seconds": cls._batch_wall_time_seconds(stage),
+                    })
+                return stages
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        return cls._stream_manifest_stages(path)
+
     def _stage_usage_report(self, llm_usage: Dict[str, Any]) -> Dict[str, Any]:
         """Expose local phase accounting and batch lifecycle without fake latency."""
         operations = llm_usage.get("operations", {})
         query_operations = operations.get("query", {})
-        batch_stages = []
-        for manifest_path in self._batch_manifest_paths_for_report():
+        batch_stages: List[Dict[str, Any]] = []
+
+        batch_client = getattr(self, "_batch_client", None)
+        if batch_client is not None and hasattr(batch_client, "get_stage_summaries"):
             try:
-                manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-                for name, stage in (manifest.get("jobs") or {}).items():
-                    if not isinstance(stage, dict):
-                        continue
+                for summary in batch_client.get_stage_summaries():
                     batch_stages.append({
-                        "stage": name, "state": stage.get("state"),
-                        "request_count": len(stage.get("requests") or []),
-                        "submitted_at": stage.get("submitted_at"),
-                        "running_at": stage.get("running_at"),
-                        "completed_at": stage.get("completed_at"),
-                        "overall_latency_seconds": self._batch_overall_latency_seconds(stage),
-                        "queue_inclusive_elapsed_seconds": self._batch_wall_time_seconds(stage),
+                        "stage": summary.get("stage"),
+                        "state": summary.get("state"),
+                        "request_count": summary.get("request_count", 0),
+                        "submitted_at": summary.get("submitted_at"),
+                        "running_at": summary.get("running_at"),
+                        "completed_at": summary.get("completed_at"),
+                        "overall_latency_seconds": self._batch_overall_latency_seconds(summary),
+                        "queue_inclusive_elapsed_seconds": self._batch_wall_time_seconds(summary),
                     })
-            except (OSError, json.JSONDecodeError):
+            except Exception:
                 pass
+
+        if not batch_stages:
+            for manifest_path in self._batch_manifest_paths_for_report():
+                batch_stages.extend(self._extract_batch_stages_from_manifest(manifest_path))
         retrieval_usage = query_operations.get("query.retrieval_preparation", {})
         retrieval_end_to_end = getattr(
             self, "_batch_retrieval_preparation_wall_time", 0.0

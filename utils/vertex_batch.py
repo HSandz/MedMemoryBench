@@ -379,6 +379,25 @@ def snapshot_prepared_query(prepared: Dict[str, Any]) -> Dict[str, Any]:
     the prepared response metadata with the submitted request lets a resumed
     evaluator finalize the same prompt without running retrieval again.
     """
+    if isinstance(prepared, dict):
+        extra = prepared.get("extra")
+        if isinstance(extra, dict):
+            cleaned_extra = dict(extra)
+            for k in (
+                "channel_semantic_candidates",
+                "merged_semantic_union",
+                "temporally_reranked_union",
+                "pre_candidate_truncation_candidates",
+                "post_candidate_truncation_candidates",
+            ):
+                cleaned_extra.pop(k, None)
+            candidates = cleaned_extra.get("retrieval_stage_candidates")
+            if isinstance(candidates, dict):
+                cleaned_extra["retrieval_stage_candidates"] = {
+                    k: v for k, v in candidates.items()
+                    if k in ("pre_candidate_truncation_fused", "post_candidate_count", "final_memory_object_selection")
+                }
+            prepared = {**prepared, "extra": cleaned_extra}
     try:
         serialized = json.dumps(prepared, ensure_ascii=False, default=str)
         snapshot = json.loads(serialized)
@@ -647,6 +666,27 @@ class VertexBatchClient:
         manifest = self._load_manifest()
         return isinstance(manifest.get("jobs", {}).get(stage), dict)
 
+    def get_stage_summaries(self) -> List[Dict[str, Any]]:
+        """Return lightweight summary for each stage without copying entire requests."""
+        manifest = self._load_manifest()
+        summaries = []
+        for name, stage in (manifest.get("jobs") or {}).items():
+            if not isinstance(stage, dict):
+                continue
+            request_count = stage.get("request_count")
+            if request_count is None:
+                requests = stage.get("requests")
+                request_count = len(requests) if isinstance(requests, list) else 0
+            summaries.append({
+                "stage": name,
+                "state": stage.get("state"),
+                "request_count": request_count,
+                "submitted_at": stage.get("submitted_at"),
+                "running_at": stage.get("running_at"),
+                "completed_at": stage.get("completed_at"),
+            })
+        return summaries
+
     def _save_manifest(self, manifest: Dict[str, Any]) -> None:
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest["updated_at"] = _utc_now()
@@ -739,6 +779,7 @@ class VertexBatchClient:
             "input_uri": input_uri,
             "output_uri": output_uri,
             "submitted_at": submitted_at,
+            "request_count": len(requests),
             "requests": [request.to_manifest_dict() for request in requests],
             "request_fingerprint": self._request_fingerprint(requests),
             "responses": {},
