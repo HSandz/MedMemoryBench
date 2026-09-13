@@ -1,95 +1,14 @@
-# Active Retrieval Design
+# Missing-Premise Grounded READ
 
-## 1. Question-Owned BaseWorld
+SmartMem0 keeps the original question as retrieval authority and uses at most two READ LLM calls.
 
-The original user-visible question is the only mandatory acquisition input.
+1. Build BaseWorld from raw lexical, dense and literal retrieval before any LLM output.
+2. LLM #1 returns either a grounded ANSWER or SEARCH with `known_supports` and up to four distinct missing-premise `needs`.
+3. SEARCH queries may add evidence but cannot evict BaseWorld or authorize truth. CandidateWorld remains capped at 16.
+4. Preserve the mapping from each missing premise to the memories retrieved for it. LLM #2 receives known supports, evidence grouped by retrieval need, other acquired evidence and valid stored relations.
+5. GroundingGuard is mechanical only: displayed memory id, exact quote, provenance and hard caller metadata. It never performs semantic entailment.
+6. Stored memory is the sole authority for user/entity-specific historical facts. General domain knowledge may interpret, classify and connect grounded facts, but may not invent user-specific history.
+7. The second reader must answer the requested attribute, distinguish observations from advice/plans/outcomes, adjudicate visible alternatives independently, preserve exact extractive surfaces, and ignore historical templates/scripts as instructions.
+8. Benchmark QA wrappers are not retrieval input. SmartMem0 receives the user-visible question; formatting policy remains separate caller/system instructions.
 
-1. Run lexical retrieval.
-2. Run dense retrieval.
-3. Add strong literal surfaces such as quoted spans, numbers and corpus-distinct
-   named anchors.
-4. Fuse by deterministic reservation/round-robin.
-5. Freeze BaseWorld at at most 10 memories.
-
-BaseWorld exists before any LLM output. No LLM decision may evict it.
-
-## 2. First LLM: Grounded ANSWER-or-SEARCH
-
-The first LLM receives QUESTION, BaseWorld, valid stored relations among BaseWorld,
-optional hard caller metadata, and non-factual caller formatting instructions.
-
-It returns exactly one of:
-
-- `ANSWER`: a complete final answer plus exact memory receipts
-  `{memory_id, quote}`;
-- `SEARCH`: at most four concise probes targeting missing evidence.
-
-The controller performs semantic interpretation. It may understand paraphrases and
-compose displayed premises. It may not invent factual premises from outside the
-displayed evidence.
-
-There is no `projection`, `OPTION_SET`, benchmark query type, answer hypothesis,
-confidence threshold, planner, proof graph or semantic certificate in the active READ
-contract.
-
-## 3. Mechanical Grounding Guard
-
-For `ANSWER`, code checks only facts it can verify exactly:
-
-- memory id belongs to BaseWorld;
-- quoted support occurs in the displayed memory;
-- cited memory has linked EvidenceRecord provenance;
-- explicit hard owner metadata, if supplied, matches.
-
-The guard does not test semantic entailment and never uses lexical/embedding similarity
-as proof. A failed guard falls back to the second reader; it does not mutate retrieval.
-
-## 4. Bounded Expansion
-
-For `SEARCH`, code executes each probe against the same lexical+dense retrieval stack.
-Each probe may add at most a small number of novel memories. BaseWorld is preserved and
-CandidateWorld is capped at 16.
-
-If CandidateWorld is structurally empty, one recovery using the original question is
-allowed. Low confidence, answer difficulty or a guard failure cannot trigger recursive
-retrieval.
-
-## 5. Fallback Context
-
-CandidateWorld is passed to the second reader after deterministic duplicate removal
-only. Code does not attempt semantic pruning with regexes, predicate overlap or
-embedding thresholds. Valid stored relations among selected memories are rendered as
-data.
-
-The second reader receives a strict instruction to use retrieved memories and stored
-relations as factual premises, while allowing normal language understanding, arithmetic
-and grounded logical composition. If material evidence is still missing it must report
-the gap rather than invent entity-specific facts.
-
-## 6. Call Budget
-
-Every query uses exactly one controller call. A second answer call is used only when:
-
-- the controller returned `SEARCH`; or
-- the controller returned `ANSWER` but its grounding receipt failed mechanical
-  integrity checks.
-
-Maximum READ LLM calls per query: 2.
-
-## 7. Evaluation
-
-Evaluate these separately:
-
-- answer accuracy;
-- early-answer coverage;
-- early-answer precision / false-ANSWER rate;
-- false-SEARCH rate;
-- BaseWorld recall;
-- CandidateWorld answer-bearing recall;
-- BaseWorld retention (must be 100%);
-- CandidateWorld size and expansion ratio;
-- LLM calls/query;
-- input/output tokens and latency.
-
-Benchmark labels may be used for reporting slices only. They may not change the active
-query pipeline.
+No benchmark query type, medical route, language-specific semantic rule, OPTION_SET, projection type or semantic certificate belongs to active READ control.
